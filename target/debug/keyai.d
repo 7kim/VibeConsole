@@ -1,0 +1,1 @@
+/home/developer/Documents/KeyAI/target/debug/keyai: /home/developer/Documents/KeyAI/src/keyboard.rs /home/developer/Documents/KeyAI/src/main.rs /home/developer/Documents/KeyAI/src/mappings.rs /home/developer/Documents/KeyAI/src/midi.rs

@@ -1,0 +1,9 @@
+[package]
+name = "keyai"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+evdev = "0.13.2"
+libc = { version = "0.2", default-features = false }
+signal-hook = { version = "0.4.4", default-features = false }

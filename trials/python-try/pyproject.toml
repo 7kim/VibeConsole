@@ -1,0 +1,20 @@
+[project]
+name = "python-try"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "7kim", email = "thebournejason16@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "mido>=1.3.3",
+    "python-rtmidi",
+]
+
+[project.scripts]
+python-try = "python_try:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
