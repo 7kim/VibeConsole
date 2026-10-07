@@ -39,7 +39,6 @@ fn modifier(key: KeyCode) -> bool {
 
 struct Assignment {
     control: Control,
-    label: String,
     keys: Vec<KeyCode>,
     behavior: Behavior,
     active: bool,
@@ -70,7 +69,6 @@ impl Keyboard {
                 .collect::<Result<_>>()?;
             assignments.push(Assignment {
                 control: mapping.control,
-                label: mapping.label.clone(),
                 keys,
                 behavior: mapping.behavior.clone(),
                 active: false,
@@ -246,24 +244,14 @@ impl Keyboard {
             .any(|assignment| assignment.control == control && assignment.active)
     }
 
-    pub(crate) fn status(&self) -> String {
+    pub(crate) fn status(&self, name: impl Fn(Control) -> String) -> String {
         let active = self
             .assignments
             .iter()
             .filter(|a| a.active)
-            .map(|a| a.label.clone())
+            .map(|a| name(a.control))
             .collect::<Vec<_>>();
-        let mut down = self
-            .down
-            .iter()
-            .map(|p| {
-                self.assignments
-                    .iter()
-                    .find(|a| a.control == *p)
-                    .map(|a| a.label.clone())
-                    .unwrap_or_else(|| p.label())
-            })
-            .collect::<Vec<_>>();
+        let mut down = self.down.iter().map(|p| name(*p)).collect::<Vec<_>>();
         down.sort();
         format!(
             "{} | {} saved (/list shows keys/modes) | {} await release\nActive holds/toggles: {}\nPhysically down: {}",

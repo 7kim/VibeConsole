@@ -40,6 +40,9 @@ trait Ui {
     fn context(&self) -> u8 {
         0
     }
+    fn program(&self) -> Option<(u8, crate::feedback::Payload)> {
+        None
+    }
     fn label(&mut self, control: Control, _current: &[Mapping]) -> Result<Option<String>> {
         Ok(Some(control.label()))
     }
@@ -102,6 +105,14 @@ struct Terminal {
 }
 
 impl Terminal {
+    fn name(&self, control: Control) -> String {
+        let program = self.program();
+        match self.run_mappings.iter().find(|m| m.control == control) {
+            Some(mapping) => mapping.name(program.as_ref()),
+            None => mappings::control_name(control, None, self.context, program.as_ref()),
+        }
+    }
+
     fn reset_input_lights(&mut self) {
         self.detector = Detector::default();
         self.input_flash = None;
@@ -136,7 +147,7 @@ impl Terminal {
             .filter(|mapping| mapping.behavior == mappings::Behavior::Toggle)
             .map(|mapping| {
                 (
-                    format!("{}\n{}", mapping.action_label(), mapping.label),
+                    format!("{}\n{}", mapping.action_label(), self.name(mapping.control)),
                     self.output
                         .as_ref()
                         .is_some_and(|output| output.keyboard.active(mapping.control)),
@@ -167,31 +178,32 @@ impl Terminal {
     fn detection_view(&self, page: usize) -> (String, usize) {
         let now = Instant::now();
         let width = self.width().saturating_sub(5);
-        let mut notes = (36..=51)
-            .map(|id| Control::from_note(10, id).unwrap())
-            .collect::<Vec<_>>();
-        notes.extend(
-            self.note_flashes
-                .keys()
-                .filter(|control| Control::from_note(control.channel, control.id).is_none())
-                .copied(),
-        );
+        // Pads come from the verified program only; other notes appear once pressed.
+        let mut notes = Vec::new();
+        let pads = self
+            .program()
+            .map(|(_, payload)| mappings::pad_controls(&payload));
+        for control in pads.into_iter().flatten().flatten() {
+            if !notes.contains(&control) {
+                notes.push(control);
+            }
+        }
+        for control in self.note_flashes.keys() {
+            if !notes.contains(control) {
+                notes.push(*control);
+            }
+        }
         let per_page =
             (self.height().saturating_sub(11) / 2).max(1) * crate::screen::light_columns(width);
-        let pages = notes.len().div_ceil(per_page);
+        let pages = notes.len().div_ceil(per_page).max(1);
         let first = page.min(pages - 1) * per_page;
         let items = notes
             .iter()
             .skip(first)
             .take(per_page)
             .map(|control| {
-                let label = if Control::from_note(control.channel, control.id).is_some() {
-                    control.label()
-                } else {
-                    format!("Ch {} Note {}", control.channel, control.id)
-                };
                 (
-                    label,
+                    self.name(*control),
                     self.input.is_some() && self.note_light(*control, now),
                 )
             })
@@ -967,7 +979,7 @@ impl Terminal {
             }
             for event in events {
                 self.observe_light(Some(&event), Instant::now());
-                self.last_event = crate::describe_event(&event);
+                self.last_event = crate::describe_event(&event, |control| self.name(control));
                 if let Event::Press(pad) = &event {
                     self.last_press = Some(*pad);
                 }
@@ -1268,7 +1280,13 @@ Changing musical settings while running is unsupported.",
                     if choose(
                         self,
                         &format!(
-                            "Observed Note press/release: channel {} note {}.\nConfirm this was a {}. Identical pad/piano messages cannot be separate assignments.",
+                            "Observed Note press/release: {} (channel {} note {}).\nConfirm this was a {}. Identical pad/piano messages cannot be separate assignments.",
+                            mappings::control_name(
+                                control,
+                                piano.then_some(mappings::Input::Piano),
+                                self.context,
+                                self.program().as_ref()
+                            ),
                             control.channel,
                             control.id,
                             if piano { "piano key" } else { "pad" }
@@ -1356,7 +1374,7 @@ impl Ui for Terminal {
         let state = self
             .output
             .as_ref()
-            .map(|o| o.keyboard.status())
+            .map(|o| o.keyboard.status(|control| self.name(control)))
             .unwrap_or_else(|| format!("PAUSED | {} saved assignments", self.run_mappings.len()));
         let state = if self.wanted_run {
             let label = if !self.context_verified {
@@ -1574,7 +1592,27 @@ impl Ui for Terminal {
     fn context(&self) -> u8 {
         self.context
     }
+    fn program(&self) -> Option<(u8, crate::feedback::Payload)> {
+        self.program_snapshot
+            .filter(|_| self.context_verified)
+            .map(|payload| (self.context, payload))
+    }
     fn label(&mut self, control: Control, current: &[Mapping]) -> Result<Option<String>> {
+        let program = self.program();
+        if let Ok(name) = mappings::physical_name(
+            control,
+            Some(mappings::Input::Pad),
+            self.context,
+            program.as_ref(),
+        ) {
+            if !current.iter().any(|mapping| {
+                mapping.context == self.context
+                    && mapping.control != control
+                    && mapping.label == name
+            }) {
+                return Ok(Some(name));
+            }
+        }
         let labels = pad_labels(control, current, self.context);
         Ok(choose(
             self,
@@ -2195,11 +2233,11 @@ Requires wpctl in your desktop session. Brightness/media/lock and absolute volum
     }
 }
 
-fn mapping_label(mapping: &Mapping) -> String {
+fn mapping_label(mapping: &Mapping, program: Option<&(u8, crate::feedback::Payload)>) -> String {
     format!(
         "{} | {} | {} | {} | {} | Feedback: {}",
         mappings::program_label(mapping.context),
-        mapping.label,
+        mapping.name(program),
         mapping.input.description(),
         mapping.action_label(),
         mapping.behavior,
@@ -2359,7 +2397,7 @@ fn configure(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) -> Resul
                 &current
                     .iter()
                     .filter(|m| m.context == ui.context())
-                    .map(mapping_label)
+                    .map(|m| mapping_label(m, ui.program().as_ref()))
                     .collect::<Vec<_>>(),
             )?
             else {
@@ -2375,8 +2413,11 @@ fn configure(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) -> Resul
         let existing = current
             .iter()
             .find(|m| m.context == ui.context() && m.control == pad)
-            .map(mapping_label)
-            .unwrap_or_else(|| format!("{}: unassigned", pad.label()));
+            .map(|m| mapping_label(m, ui.program().as_ref()))
+            .unwrap_or_else(|| {
+                let name = mappings::control_name(pad, None, ui.context(), ui.program().as_ref());
+                format!("{name}: unassigned")
+            });
         if action == 5 {
             if choose(
                 ui,
@@ -2509,7 +2550,7 @@ fn configure(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) -> Resul
         mapping.validate()?;
         match choose(
             ui,
-            &format!("Review: {}", mapping_label(&mapping)),
+            &format!("Review: {}", mapping_label(&mapping, ui.program().as_ref())),
             &options(&["Save and configure another", "Save and finish", "Cancel"]),
         )? {
             Some(choice @ (0 | 1)) => {
@@ -2566,7 +2607,7 @@ pub fn daemon(path: &Path, current: Vec<Mapping>, feedback: bool, flow: bool) ->
             "{} | {}",
             ui.output
                 .as_ref()
-                .map(|o| o.keyboard.status())
+                .map(|o| o.keyboard.status(|control| ui.name(control)))
                 .unwrap_or_default(),
             ui.error
         );
@@ -2674,7 +2715,7 @@ pub fn start(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()
                 let labels = current
                     .iter()
                     .map(|mapping| {
-                        let label = mapping_label(mapping);
+                        let label = mapping_label(mapping, ui.program().as_ref());
                         if mapping.behavior == mappings::Behavior::Toggle {
                             let active = mapping.context == ui.context
                                 && ui
@@ -2696,7 +2737,7 @@ pub fn start(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()
                     let text = current
                         .iter()
                         .find(|m| m.context == ui.context() && m.control == pad)
-                        .map(mapping_label)
+                        .map(|m| mapping_label(m, ui.program().as_ref()))
                         .unwrap_or_else(|| "Unassigned".into());
                     choose(&mut ui, &text, &options(&["Back"]))?;
                 }
@@ -3366,7 +3407,7 @@ mod tests {
         assert!(
             ui.screens
                 .iter()
-                .any(|s| s.contains("Bank B Pad 1") && s.contains("Ctrl"))
+                .any(|s| s.contains("Note ch10 #44 (Program 1 unverified)") && s.contains("Ctrl"))
         );
         assert_eq!(current, mappings::load(&path).unwrap());
         assert_eq!(current.len(), 1);

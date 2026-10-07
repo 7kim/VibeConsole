@@ -249,7 +249,10 @@ fn main() -> Result<()> {
                 .find(|mapping| mapping.context == 0 && mapping.control == pad)
             {
                 Some(mapping) => println!("Current assignment: {mapping}"),
-                None => println!("{} has no assignment.", pad.label()),
+                None => println!(
+                    "{} has no assignment.",
+                    mappings::control_name(pad, None, 0, None)
+                ),
             }
             Ok(())
         }
@@ -313,7 +316,12 @@ fn learn_pad() -> Result<Control> {
         let mut detector = Detector::default();
         for message in midi::messages(stdout) {
             if let Some(Event::Press(pad)) = detector.observe(message?) {
-                println!("Learned: {}", describe_event(&Event::Press(pad)));
+                println!(
+                    "Learned: {}",
+                    describe_event(&Event::Press(pad), |c| mappings::control_name(
+                        c, None, 0, None
+                    ))
+                );
                 return Ok(pad);
             }
         }
@@ -325,7 +333,7 @@ fn learn_pad() -> Result<Control> {
     result
 }
 
-fn describe_event(event: &Event) -> String {
+fn describe_event(event: &Event, name: impl Fn(Control) -> String) -> String {
     let (pad, action) = match event {
         Event::Press(pad) => (pad, "PRESS: Note On"),
         Event::Release(pad, ReleaseType::NoteOff) => (pad, "RELEASE: Note Off"),
@@ -345,7 +353,7 @@ fn describe_event(event: &Event) -> String {
     };
     format!(
         "{action} | {} | MIDI {} channel {} | id {} (0x{:02X})",
-        pad.label(),
+        name(*pad),
         pad.message.text(),
         pad.channel,
         pad.id,

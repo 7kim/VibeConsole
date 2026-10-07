@@ -155,7 +155,83 @@ pub fn program_label(context: u8) -> String {
     }
 }
 
+/// Pads 1–8 of Bank A then Bank B, from a stored program payload (verified 2026-10-07 captures).
+pub fn pad_controls(payload: &crate::feedback::Payload) -> Vec<Option<Control>> {
+    (0..16)
+        .map(|k| Control::note(payload[0x10] + 1, payload[0x24 + 3 * k]))
+        .collect()
+}
+
+/// Physical position of a control in the verified program, or its raw identity with the reason.
+/// Display only: saved identities are unchanged. `program` is the verified (context, payload).
+pub fn physical_name(
+    control: Control,
+    input: Option<Input>,
+    context: u8,
+    program: Option<&(u8, crate::feedback::Payload)>,
+) -> std::result::Result<String, String> {
+    let side = match control.direction {
+        1 => " increase",
+        -1 => " decrease",
+        _ => "",
+    };
+    let raw = match control.message {
+        crate::Message::Note => format!("Note ch{} #{}", control.channel, control.id),
+        crate::Message::Cc => format!("CC ch{} #{}{side}", control.channel, control.id),
+        crate::Message::Bend => return Ok(format!("Joystick X{side}")),
+    };
+    if input == Some(Input::Piano) {
+        const NOTES: [&str; 12] = [
+            "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+        ];
+        let (id, octave) = (control.id as usize, control.id as i32 / 12 - 1);
+        return Ok(format!("Piano {}{octave} (note {id})", NOTES[id % 12]));
+    }
+    let Some((_, payload)) = program.filter(|(slot, _)| *slot == context) else {
+        return Err(format!("{raw} ({} unverified)", program_label(context)));
+    };
+    let program = program_label(context);
+    let (hits, kind): (Vec<usize>, _) = if control.message == crate::Message::Note {
+        let pads = pad_controls(payload);
+        let hits = (0..16).filter(|k| pads[*k] == Some(control)).collect();
+        (hits, "pad")
+    } else {
+        // ponytail: knob entries hold no channel, so match the CC on any channel; add the channel once its payload byte is verified.
+        let hits = (0..8)
+            .filter(|k| payload[0x55 + 20 * k] == control.id)
+            .collect();
+        (hits, "knob")
+    };
+    match hits[..] {
+        [k] if kind == "pad" => Ok(format!(
+            "Bank {} Pad {}",
+            if k < 8 { 'A' } else { 'B' },
+            k % 8 + 1
+        )),
+        [k] => Ok(format!("Knob {}{side}", k + 1)),
+        [] => Err(format!("{raw} (not on a {kind} in {program})")),
+        _ => Err(format!("{raw} (on several {kind}s in {program})")),
+    }
+}
+
+pub fn control_name(
+    control: Control,
+    input: Option<Input>,
+    context: u8,
+    program: Option<&(u8, crate::feedback::Payload)>,
+) -> String {
+    physical_name(control, input, context, program).unwrap_or_else(|raw| raw)
+}
+
 impl Mapping {
+    /// Joysticks keep their observed axis/side label; other controls are named by position.
+    pub fn name(&self, program: Option<&(u8, crate::feedback::Payload)>) -> String {
+        if matches!(self.input, Input::Joystick { .. }) {
+            return self.label.clone();
+        }
+        control_name(self.control, Some(self.input), self.context, program)
+    }
+
     pub fn new(pad: Control, shortcut: &str, behavior: &str) -> Result<Self> {
         pad.validate()?;
         let behavior = match behavior.trim().to_ascii_lowercase().as_str() {
@@ -730,6 +806,80 @@ pub fn save_config(path: &Path, config: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captured_programs_name_pads_knobs_and_fall_back_to_raw_identity() {
+        let capture = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/mpk-mini3-programs.hex"
+        ));
+        // Line 0 is RAM; lines 1–8 are stored Programs 1–8 (contexts 0–7).
+        let program = |context: u8| {
+            let line = capture.lines().filter(|l| !l.starts_with('#'));
+            let payload: crate::feedback::Payload = line
+                .clone()
+                .nth(context as usize + 1)
+                .unwrap()
+                .split_whitespace()
+                .map(|b| u8::from_str_radix(b, 16).unwrap())
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap();
+            (context, payload)
+        };
+        let note = |channel, id| Control::note(channel, id).unwrap();
+        let name = |control, context, p: &(u8, _)| control_name(control, None, context, Some(p));
+        let cc = |id, direction| Control {
+            channel: 1,
+            id,
+            message: crate::Message::Cc,
+            direction,
+        };
+        // Live cross-checks recorded in tickets/01-physical-control-names.md.
+        let (p1, p2, p4) = (program(0), program(1), program(3));
+        assert_eq!(name(note(1, 21), 1, &p2), "Bank A Pad 1");
+        assert_eq!(name(note(1, 29), 1, &p2), "Bank B Pad 1");
+        assert_eq!(name(note(2, 5), 0, &p1), "Bank A Pad 1");
+        assert_eq!(name(note(10, 37), 3, &p4), "Bank A Pad 1");
+        assert_eq!(name(cc(70, 1), 3, &p4), "Knob 1 increase");
+        assert_eq!(name(cc(72, -1), 3, &p4), "Knob 3 decrease");
+        // Fallbacks never guess.
+        assert_eq!(
+            name(note(10, 29), 1, &p2),
+            "Note ch10 #29 (not on a pad in Program 2)"
+        );
+        assert_eq!(
+            name(note(1, 21), 0, &p2),
+            "Note ch1 #21 (Program 1 unverified)"
+        );
+        assert_eq!(
+            control_name(note(1, 21), None, 1, None),
+            "Note ch1 #21 (Program 2 unverified)"
+        );
+        assert_eq!(
+            name(cc(99, 1), 3, &p4),
+            "CC ch1 #99 increase (not on a knob in Program 4)"
+        );
+        let mut twice = p4;
+        twice.1[0x24 + 3] = 37;
+        assert_eq!(
+            name(note(10, 37), 3, &twice),
+            "Note ch10 #37 (on several pads in Program 4)"
+        );
+        // Piano keys and joysticks need no table; joysticks keep their observed side label.
+        let piano = control_name(note(1, 60), Some(Input::Piano), 3, None);
+        assert_eq!(piano, "Piano C4 (note 60)");
+        let mut joystick = Mapping::new(note(10, 36), "Shift", "hold").unwrap();
+        joystick.input = Input::Joystick {
+            center: 64,
+            min: 0,
+            max: 127,
+            deadzone: 8,
+            hysteresis: 2,
+        };
+        joystick.label = "Joystick Right".into();
+        assert_eq!(joystick.name(Some(&p1)), "Joystick Right");
+    }
 
     #[test]
     fn per_program_idle_migrates_preserves_mappings_and_rejects_piano_feedback() {
