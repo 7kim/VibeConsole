@@ -98,7 +98,7 @@ Highlight commands with Up/Down and press Enter. These are menu entries, not she
 | `/release-all` | Clear holds/toggles while retaining running mode |
 | `/list` | Inspect saved mappings and toggle states |
 | `/get` | Inspect an observed Note control in the selected context |
-| `/detect` | Show paged Note activity, identities, and events without mapped effects |
+| `/detect` | Show Bank A / Bank B pads, knobs, joystick and other notes live, without mapped effects |
 | `/prog-select` | Select and verify an actual hardware program |
 | `/program-name` | Review, rename, and verify a stored program name |
 | `/feedback-idle` | Configure the selected program's idle musical settings |

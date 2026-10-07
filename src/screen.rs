@@ -90,6 +90,31 @@ pub fn lights(items: &[(String, bool)], width: usize) -> Vec<String> {
     rows
 }
 
+/// `items` in as many 24-column cells as fit `width`.
+pub fn grid(items: &[String], width: usize) -> Vec<String> {
+    let columns = (width / 24).max(1);
+    items
+        .chunks(columns)
+        .map(|row| {
+            let row: String = row.iter().map(|item| fit(item, width / columns)).collect();
+            row.trim_end().into()
+        })
+        .collect()
+}
+
+/// Plain titled box `width` columns wide, for grouping lines inside a pane.
+pub fn group(title: &str, lines: &[String], width: usize) -> Vec<String> {
+    let inner = width.saturating_sub(4);
+    let title = fit(&format!(" {title} "), inner.min(width_of(title) + 2));
+    let mut rows = vec![format!(
+        "┌─{title}{}┐",
+        "─".repeat(width.saturating_sub(3 + width_of(&title)))
+    )];
+    rows.extend(lines.iter().map(|line| format!("│ {} │", fit(line, inner))));
+    rows.push(format!("└{}┘", "─".repeat(width.saturating_sub(2))));
+    rows
+}
+
 pub fn wrap(text: &str, width: usize) -> Vec<String> {
     let width = width.max(2);
     let mut rows = Vec::new();
@@ -120,6 +145,8 @@ const RUNNING: &str = "38;2;158;206;106";
 const PAUSED: &str = "38;2;224;175;104";
 const ERROR: &str = "38;2;247;118;142";
 const DIM: &str = "38;2;86;95;137";
+const BANK_A: &str = "1;38;2;247;118;142";
+const BANK_B: &str = "1;38;2;158;206;106";
 
 fn paint(text: &str, style: &str, color: bool) -> String {
     if color {
@@ -132,6 +159,8 @@ fn paint(text: &str, style: &str, color: bool) -> String {
 fn paint_bulbs(text: &str, color: bool) -> String {
     text.replace(bulb(true), &paint(bulb(true), PAUSED, color))
         .replace(bulb(false), &paint(bulb(false), DIM, color))
+        .replace("Bank A", &paint("Bank A", BANK_A, color))
+        .replace("Bank B", &paint("Bank B", BANK_B, color))
 }
 
 fn width_of(text: &str) -> usize {

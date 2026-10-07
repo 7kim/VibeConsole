@@ -99,6 +99,8 @@ struct Terminal {
     last_event: String,
     input_flash: Option<Instant>,
     note_flashes: BTreeMap<Control, Instant>,
+    cc_values: BTreeMap<(u8, u8), u8>,
+    bend: Option<(u8, u16)>,
     at_menu: bool,
     menu: usize,
     rendered: String,
@@ -230,6 +232,8 @@ impl Terminal {
         self.detector = Detector::default();
         self.input_flash = None;
         self.note_flashes.clear();
+        self.cc_values.clear();
+        self.bend = None;
     }
 
     fn note_light(&self, control: Control, now: Instant) -> bool {
@@ -283,52 +287,138 @@ impl Terminal {
         rows
     }
 
-    fn detection_view(&self, page: usize) -> (String, usize) {
+    /// Bank A | Bank B panes over piano, knobs and joystick; one Unidentified pane when the
+    /// program is unverified (SPEC-UI story 4). `live` gates bulbs on an open MIDI input.
+    fn detection_view(&self, (columns, rows): (usize, usize), live: bool) -> String {
+        use crate::screen::{bulb, fit, grid, group};
         let now = Instant::now();
-        let width = self.width().saturating_sub(5);
-        // Pads come from the verified program only; other notes appear once pressed.
-        let mut notes = Vec::new();
-        let pads = self
-            .program()
-            .map(|(_, payload)| mappings::pad_controls(&payload));
-        for control in pads.into_iter().flatten().flatten() {
-            if !notes.contains(&control) {
-                notes.push(control);
+        let width = self.screen("").details_size(columns, rows).0;
+        let lit = |control| fit(bulb(live && self.note_light(control, now)), 6);
+        let raw = |c: Control| format!("{} Note ch{} #{}", lit(c), c.channel, c.id);
+        let value = |v: Option<String>| v.unwrap_or_else(|| "–".into());
+        let mut rows = Vec::new();
+        let Some((_, payload)) = self.program() else {
+            let mut items = self
+                .note_flashes
+                .keys()
+                .map(|c| raw(*c))
+                .collect::<Vec<_>>();
+            items.extend(
+                self.cc_values
+                    .iter()
+                    .map(|((channel, id), v)| format!("CC ch{channel} #{id}: {v}")),
+            );
+            items.extend(
+                self.bend
+                    .map(|(channel, v)| format!("Bend ch{channel}: {v}")),
+            );
+            rows.extend(group(
+                "Unidentified",
+                &grid(&items, width.saturating_sub(4)),
+                width,
+            ));
+            rows.push(fit(&self.last_event, width).trim_end().into());
+            return rows.join("\n");
+        };
+        let pads = mappings::pad_controls(&payload);
+        // As on the MPK Mini MK3: Pads 5–8 above Pads 1–4, each a name / bulb / note cell,
+        // boxed where 10-column boxes fit (stacked, 160+) and a plain grid otherwise.
+        let bank = |title, first: usize, width: usize| {
+            let cell = width.saturating_sub(4) / 4;
+            let boxed = cell >= 10;
+            let pad = " ".repeat(cell.saturating_sub(10) / 2); // centres each box in its cell
+            let edge =
+                |left, right| fit(&format!("{pad}{left}{}{right}", "─".repeat(8)), cell).repeat(4);
+            let mut lines = Vec::new();
+            for row in [4, 0] {
+                let cells = |text: &dyn Fn(usize) -> String| {
+                    (row..row + 4)
+                        .map(|n| {
+                            let text = text(n);
+                            fit(
+                                &if boxed {
+                                    format!("{pad}│ {} │", fit(&text, 6))
+                                } else {
+                                    text
+                                },
+                                cell,
+                            )
+                        })
+                        .collect::<String>()
+                };
+                if boxed {
+                    lines.push(edge('┌', '┐'));
+                } else if row == 0 {
+                    lines.push(String::new());
+                }
+                lines.push(cells(&|n| format!("Pad {}", n + 1)));
+                lines.push(cells(&|n| match pads[first + n] {
+                    Some(c) => lit(c),
+                    None => bulb(false).into(),
+                }));
+                lines.push(cells(&|n| match pads[first + n] {
+                    Some(c) => format!("#{}", c.id),
+                    None => "none".into(),
+                }));
+                if boxed {
+                    lines.push(edge('└', '┘'));
+                }
             }
-        }
-        for control in self.note_flashes.keys() {
-            if !notes.contains(control) {
-                notes.push(*control);
+            group(title, &lines, width)
+        };
+        if columns >= 100 {
+            let half = width / 2;
+            let right = bank("Bank B", 8, width - half);
+            for (a, b) in bank("Bank A", 0, half).iter().zip(&right) {
+                rows.push(format!("{a}{b}"));
             }
+        } else {
+            rows.extend(bank("Bank A", 0, width));
+            rows.extend(bank("Bank B", 8, width));
         }
-        let per_page =
-            (self.height().saturating_sub(11) / 2).max(1) * crate::screen::light_columns(width);
-        let pages = notes.len().div_ceil(per_page).max(1);
-        let first = page.min(pages - 1) * per_page;
-        let items = notes
+        let knobs = (0..8).map(|k| payload[0x55 + 20 * k]).collect::<Vec<_>>();
+        let mut items = knobs
             .iter()
-            .skip(first)
-            .take(per_page)
-            .map(|control| {
-                (
-                    self.name(*control),
-                    self.input.is_some() && self.note_light(*control, now),
+            .enumerate()
+            .map(|(k, id)| {
+                let v = self.cc_values.iter().find(|((_, cc), _)| cc == id);
+                format!(
+                    "Knob {} · CC {id}: {}",
+                    k + 1,
+                    value(v.map(|(_, v)| v.to_string()))
                 )
             })
             .collect::<Vec<_>>();
-        let mut rows = vec![format!(
-            "Detect · Note inputs · page {}/{}",
-            first / per_page + 1,
-            pages
-        )];
-        rows.extend(crate::screen::lights(&items, width));
-        rows.push(
-            crate::screen::fit(&self.last_event, width)
-                .trim_end()
-                .into(),
+        items.push(format!(
+            "Joystick X: {}",
+            value(self.bend.map(|(_, v)| v.to_string()))
+        ));
+        items.extend(
+            self.cc_values
+                .iter()
+                .filter(|((_, id), _)| !knobs.contains(id))
+                .map(|((channel, id), v)| format!("CC ch{channel} #{id}: {v}")),
         );
-        rows.push("↑↓: page | Enter/Esc: back".into());
-        (rows.join("\n"), pages)
+        // Notes off the pad table, e.g. piano keys; mapped ones keep their saved physical name.
+        items.extend(
+            self.note_flashes
+                .keys()
+                .filter(|c| !pads.contains(&Some(**c)))
+                .map(|c| {
+                    if self.run_mappings.iter().any(|m| m.control == *c) {
+                        format!("{} {}", lit(*c), self.name(*c))
+                    } else {
+                        raw(*c)
+                    }
+                }),
+        );
+        rows.extend(group(
+            "Piano · Knobs · Joystick",
+            &grid(&items, width.saturating_sub(4)),
+            width,
+        ));
+        rows.push(fit(&self.last_event, width).trim_end().into());
+        rows.join("\n")
     }
 
     fn detect(&mut self) -> Result<()> {
@@ -337,19 +427,15 @@ impl Terminal {
             self.input = Some(midi::Input::open()?);
             self.reset_input_lights();
         }
-        let mut page = 0;
         loop {
             self.tick()?;
-            let (view, pages) = self.detection_view(page);
+            let view = self.detection_view(self.size(), self.input.is_some());
             self.draw(&view)?;
             if self.input.is_none() {
                 return Err(self.error.clone().into());
             }
-            match self.key()? {
-                Some(Key::Up | Key::Left) => page = page.saturating_sub(1),
-                Some(Key::Down | Key::Right) => page = (page + 1).min(pages - 1),
-                Some(Key::Enter | Key::Escape) => return Ok(()),
-                _ => {}
+            if let Some(Key::Enter | Key::Escape) = self.key()? {
+                return Ok(());
             }
         }
     }
@@ -424,6 +510,8 @@ impl Terminal {
             last_event: String::new(),
             input_flash: None,
             note_flashes: BTreeMap::new(),
+            cc_values: BTreeMap::new(),
+            bend: None,
             at_menu: false,
             menu: 1,
             rendered: String::new(),
@@ -1054,6 +1142,16 @@ impl Terminal {
                 (message[0] & 15) + 1
             );
             self.observe_light(None, Instant::now());
+            let channel = (message[0] & 15) + 1;
+            match message[0] & 0xf0 {
+                0xb0 => {
+                    self.cc_values.insert((channel, message[1]), message[2]);
+                }
+                0xe0 => {
+                    self.bend = Some((channel, u16::from(message[1]) | u16::from(message[2]) << 7))
+                }
+                _ => {}
+            }
             if message[0] & 0xf0 == 0xc0 && self.follow_programs {
                 self.abandon_program()?;
                 break;
@@ -3219,6 +3317,69 @@ mod tests {
             1
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn detection_splits_banks_by_verified_program_and_falls_back_to_unidentified() {
+        let mut ui = Terminal::open_mode(Path::new("/unused-keyai-detect-test"), true).unwrap();
+        let capture = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/mpk-mini3-programs.hex"
+        ));
+        // Line 0 is RAM; line 2 is stored Program 2, where Bank B Pad 1 sends ch1 note 29.
+        let payload = capture
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .nth(2)
+            .unwrap();
+        let payload = payload.split_whitespace();
+        let payload = payload.map(|b| u8::from_str_radix(b, 16).unwrap());
+        ui.program_snapshot = Some(payload.collect::<Vec<_>>().try_into().unwrap());
+        ui.context = 1;
+        for packet in [[0x90, 29, 100], [0x90, 60, 100]] {
+            let event = ui.detector.observe(packet);
+            ui.observe_light(event.as_ref(), Instant::now());
+        }
+        ui.cc_values.insert((1, 70), 64);
+        let row_of = |view: &str, text: &str| {
+            view.lines()
+                .enumerate()
+                .find_map(|(row, line)| line.find(text).map(|column| (row, column)))
+                .unwrap_or_else(|| panic!("{text:?} missing from\n{view}"))
+        };
+        for (size, side_by_side) in [((120, 40), true), ((80, 40), false), ((170, 40), true)] {
+            let view = ui.detection_view(size, true);
+            let (a, b) = (row_of(&view, " Bank A "), row_of(&view, " Bank B "));
+            assert_eq!(a.0 == b.0 && a.1 < b.1, side_by_side);
+            assert!(side_by_side || a.0 < b.0);
+            let lower = row_of(&view, "Piano · Knobs · Joystick");
+            assert!(lower.0 > b.0);
+            // Pads 5–8 sit above Pads 1–4, as on the controller.
+            assert!(row_of(&view, "Pad 5").0 < row_of(&view, "Pad 1").0);
+            // Bank B Pad 1 (#29) is the only lit pad; Bank A Pad 1 (#21) is not.
+            let (on, b29, a21) = (
+                row_of(&view, "💡 ON "),
+                row_of(&view, "#29"),
+                row_of(&view, "#21"),
+            );
+            assert!(on.0 + 1 == b29.0 && (on.0 > b.0 || on.1 >= b.1));
+            assert_eq!(view.matches("💡 ON ").count(), 2); // the pad and piano note 60
+            assert!(a21.0 == b29.0 || a21.0 < b.0);
+            assert_eq!(view.contains("│ Pad 5  │"), size.0 != 120);
+            assert!(view.contains("💡 ON  Note ch1 #60") && view.contains(": 64"));
+            assert!(!view.contains("Unidentified"));
+            let frame = ui.screen(&view).render(size.0, size.1, false);
+            assert!(frame.contains("Bank B") && frame.contains("Pad 8"));
+            assert!(
+                ui.screen(&view)
+                    .render(size.0, size.1, true)
+                    .contains("\x1b[1;38;2;158;206;106mBank B")
+            );
+        }
+        ui.context_verified = false;
+        let view = ui.detection_view((120, 40), true);
+        assert!(view.contains(" Unidentified ") && !view.contains("Bank A"));
+        assert!(view.contains("💡 ON  Note ch1 #29") && view.contains("CC ch1 #70: 64"));
     }
 
     #[test]
