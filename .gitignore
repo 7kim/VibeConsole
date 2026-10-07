@@ -1,2 +1,6 @@
 archive/
 /target
+tickets/
+notes.md
+SPEC-BEHAVIOR.md
+SPEC-UI.md
