@@ -161,13 +161,13 @@ impl Terminal {
         };
         let connection_line = if size.0 < 75 {
             format!(
-                "KeyAI | MIDI {} | Input {}",
+                "VibeConsole | MIDI {} | Input {}",
                 crate::screen::bulb(self.input.is_some()),
                 crate::screen::bulb(input_on)
             )
         } else {
             format!(
-                "KeyAI | MIDI {} {midi_status} | Input {}",
+                "VibeConsole | MIDI {} {midi_status} | Input {}",
                 crate::screen::bulb(self.input.is_some()),
                 crate::screen::bulb(input_on)
             )
@@ -556,7 +556,7 @@ impl Terminal {
     fn cancel_actions(&mut self) {
         self.actions.cancel();
         if self.flow_pending {
-            self.error = "Flow work cancelled; output remains paused. If Flow was already quit, reopen it manually after KeyAI's keyboard is ready, test physical Shift, then /resume.".into();
+            self.error = "Flow work cancelled; output remains paused. If Flow was already quit, reopen it manually after VibeConsole's keyboard is ready, test physical Shift, then /resume.".into();
         }
         self.flow_pending = false;
     }
@@ -3188,7 +3188,7 @@ mod tests {
     #[test]
     fn detected_hardware_context_overrides_old_context_preserves_pause_and_refuses_ambiguity() {
         let directory =
-            std::env::temp_dir().join(format!("keyai-follow-ui-{}", std::process::id()));
+            std::env::temp_dir().join(format!("vibeconsole-follow-ui-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join("mappings.tsv");
         mappings::save(&path, &[]).unwrap();
@@ -3273,7 +3273,8 @@ mod tests {
     #[test]
     fn pad_label_picker_prevents_duplicate_save_and_keeps_programs_separate() {
         use Key::*;
-        let dir = std::env::temp_dir().join(format!("keyai-pad-labels-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-pad-labels-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mappings.tsv");
         let pad = Control::note(1, 22).unwrap();
@@ -3328,7 +3329,8 @@ mod tests {
 
     #[test]
     fn detection_splits_banks_by_verified_program_and_falls_back_to_unidentified() {
-        let mut ui = Terminal::open_mode(Path::new("/unused-keyai-detect-test"), true).unwrap();
+        let mut ui =
+            Terminal::open_mode(Path::new("/unused-vibeconsole-detect-test"), true).unwrap();
         let capture = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/testdata/mpk-mini3-programs.hex"
@@ -3391,7 +3393,8 @@ mod tests {
 
     #[test]
     fn simulated_input_bulbs_cover_hold_fast_release_motion_and_disconnect_reset() {
-        let mut ui = Terminal::open_mode(Path::new("/unused-keyai-indicator-test"), true).unwrap();
+        let mut ui =
+            Terminal::open_mode(Path::new("/unused-vibeconsole-indicator-test"), true).unwrap();
         let now = Instant::now();
         let pad = Control::from_note(10, 36).unwrap();
         let piano = Control::note(1, 48).unwrap();
@@ -3457,7 +3460,8 @@ mod tests {
     }
     #[test]
     fn running_intent_survives_menu_suspension_but_explicit_pause_stays_paused() {
-        let dir = std::env::temp_dir().join(format!("keyai-running-mode-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-running-mode-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mappings.tsv");
         mappings::save(&path, &[]).unwrap();
@@ -3671,7 +3675,8 @@ mod tests {
     #[test]
     fn editing_marks_saved_choices_without_moving_the_mark_and_new_mappings_have_none() {
         use Key::*;
-        let dir = std::env::temp_dir().join(format!("keyai-saved-mark-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-saved-mark-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mappings.tsv");
         let a = Control::from_note(10, 36).unwrap();
@@ -3716,7 +3721,8 @@ mod tests {
     fn configure_action_families_cancel_and_save_without_dispatch() {
         use crate::actions::Action;
         use Key::*;
-        let dir = std::env::temp_dir().join(format!("keyai-action-menu-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-action-menu-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mappings.tsv");
         let a = Control::from_note(10, 36).unwrap();
@@ -3785,7 +3791,8 @@ mod tests {
     #[test]
     fn menus_save_both_banks_cancel_edit_remove_and_preserve_failed_save() {
         use Key::*;
-        let dir = std::env::temp_dir().join(format!("keyai-menu-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-menu-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join("mappings.tsv");

@@ -156,7 +156,7 @@ fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args == ["--help"] || args == ["help"] {
         println!(
-            "Usage: keyai [--paused|detect|list|get|configure|run|feedback-read]\n\
+            "Usage: vibeconsole [--paused|detect|list|get|configure|run|feedback-read]\n\
                   no subcommand: start running Program 1 in the interactive terminal\n\
                   --paused: open the session explicitly paused\n\
                   detect: show live input bulbs and MIDI events in the terminal\n\
@@ -213,7 +213,7 @@ fn main() -> Result<()> {
             )
         })
     {
-        return Err("unknown command; use keyai --help".into());
+        return Err("unknown command; use vibeconsole --help".into());
     }
     let path = config_path()?;
     let mappings = load(&path)?;

@@ -45,8 +45,6 @@ pub const NAMED_KEYS: &[&str] = &[
     "Slash",
 ];
 
-const HEADER: &str = "keyai-mappings-v1";
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Behavior {
     Hold,
@@ -455,7 +453,14 @@ pub fn config_path() -> Result<PathBuf> {
     if !base.is_absolute() {
         return Err("configuration directory must be absolute (XDG_CONFIG_HOME or HOME)".into());
     }
-    Ok(base.join("keyai/mappings.tsv"))
+    let path = base.join("vibeconsole/mappings.tsv");
+    // Copy a pre-rename KeyAI configuration once; the old file stays as a backup.
+    let old = base.join("keyai/mappings.tsv");
+    if !path.exists() && old.exists() {
+        std::fs::create_dir_all(base.join("vibeconsole"))?;
+        std::fs::copy(&old, &path)?;
+    }
+    Ok(path)
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -519,15 +524,21 @@ fn opt_text(value: Option<impl fmt::Display>) -> String {
 
 fn parse_config(contents: &str) -> Result<Config> {
     let mut lines = contents.lines();
-    let version = match lines.next() {
-        Some(HEADER) => 1,
-        Some("keyai-mappings-v2") => 2,
-        Some("keyai-mappings-v3") => 3,
-        Some("keyai-mappings-v4") => 4,
-        Some("keyai-mappings-v5") => 5,
+    // Files saved before the KeyAI → VibeConsole rename keep their old header.
+    let version = lines.next().and_then(|header| {
+        header
+            .strip_prefix("vibeconsole-mappings-v")
+            .or_else(|| header.strip_prefix("keyai-mappings-v"))
+    });
+    let version = match version {
+        Some("1") => 1,
+        Some("2") => 2,
+        Some("3") => 3,
+        Some("4") => 4,
+        Some("5") => 5,
         _ => {
             return Err(
-                "invalid configuration header; expected keyai-mappings-v1/v2/v3/v4/v5".into(),
+                "invalid configuration header; expected vibeconsole-mappings-v1/v2/v3/v4/v5".into(),
             );
         }
     };
@@ -730,7 +741,7 @@ pub fn save(path: &Path, mappings: &[Mapping]) -> Result<()> {
 pub fn save_config(path: &Path, config: &Config) -> Result<()> {
     config.idle.validate()?;
     let mut contents = format!(
-        "keyai-mappings-v5\nidle\t{}\t{}\t{}\n",
+        "vibeconsole-mappings-v5\nidle\t{}\t{}\t{}\n",
         opt_text(config.idle.octave),
         opt_text(config.idle.tempo),
         arp_text(config.idle.arp)
@@ -883,7 +894,7 @@ mod tests {
 
     #[test]
     fn per_program_idle_migrates_preserves_mappings_and_rejects_piano_feedback() {
-        let old = "keyai-mappings-v4\nidle\t0\t1\ton\n";
+        let old = "vibeconsole-mappings-v4\nidle\t0\t1\ton\n";
         let mut config = parse_config(old).unwrap();
         assert_eq!(config.idle_for(0).tempo, Some(1));
         for context in 1..8 {
@@ -903,7 +914,8 @@ mod tests {
         pad.context = 1;
         pad.feedback.octave = Some(Octave::Offset(1));
         config.mappings.push(pad);
-        let dir = std::env::temp_dir().join(format!("keyai-program-idle-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-program-idle-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mappings.tsv");
         save_config(&path, &config).unwrap();
@@ -928,7 +940,8 @@ mod tests {
     #[test]
     fn action_families_round_trip_and_invalid_save_preserves_shortcuts() {
         use crate::actions::Action;
-        let dir = std::env::temp_dir().join(format!("keyai-action-config-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-action-config-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mappings.tsv");
         let mut maps =
@@ -978,7 +991,8 @@ mod tests {
     #[test]
     fn control_profiles_round_trip_and_invalid_or_ambiguous_saves_preserve_data() {
         use crate::Message;
-        let dir = std::env::temp_dir().join(format!("keyai-profile-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-profile-test-{}", std::process::id()));
         fs::create_dir(&dir).unwrap();
         let path = dir.join("mappings.tsv");
         let mut piano = Mapping::new(Control::note(1, 48).unwrap(), "Shift", "hold").unwrap();
@@ -1081,8 +1095,14 @@ mod tests {
     #[test]
     fn contexts_preserve_original_and_reject_ambiguous_or_failed_migrations() {
         let original =
-            parse_config("keyai-mappings-v1\n09e8:1049\tnote\t10\t36\thold\tShift\n").unwrap();
-        let dir = std::env::temp_dir().join(format!("keyai-context-test-{}", std::process::id()));
+            parse_config("vibeconsole-mappings-v1\n09e8:1049\tnote\t10\t36\thold\tShift\n")
+                .unwrap();
+        // Pre-rename KeyAI files still load.
+        let legacy = parse_config("keyai-mappings-v1\n09e8:1049\tnote\t10\t36\thold\tShift\n");
+        assert_eq!(legacy.unwrap(), original);
+        assert!(parse_config("keyai-mappings-v+5\n").is_err());
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-context-test-{}", std::process::id()));
         fs::create_dir(&dir).unwrap();
         let path = dir.join("mappings.tsv");
         let mut config = original.clone();
@@ -1106,12 +1126,13 @@ mod tests {
 
     #[test]
     fn earlier_config_migrates_with_feedback_and_idle_and_failed_saves_preserve_it() {
-        let dir = std::env::temp_dir().join(format!("keyai-migration-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-migration-test-{}", std::process::id()));
         fs::create_dir(&dir).unwrap();
         let path = dir.join("mappings.tsv");
         fs::write(
             &path,
-            "keyai-mappings-v1\n09e8:1049\tnote\t10\t36\thold\tShift\n",
+            "vibeconsole-mappings-v1\n09e8:1049\tnote\t10\t36\thold\tShift\n",
         )
         .unwrap();
         let mut config = load_config(&path).unwrap();
@@ -1141,10 +1162,10 @@ mod tests {
         assert!(save_config(&path, &bad).is_err());
         assert_eq!(fs::read(&path).unwrap(), before);
         for bad in [
-            "keyai-mappings-v2\n",
-            "keyai-mappings-v2\nidle\t5\t120\ton\n",
-            "keyai-mappings-v2\nidle\t-\t120\tyes\n",
-            "keyai-mappings-v2\nidle\t-\t-\t-\n09e8:1049\tnote\t10\t36\thold\tShift\toffset:5\t-\t-\n",
+            "vibeconsole-mappings-v2\n",
+            "vibeconsole-mappings-v2\nidle\t5\t120\ton\n",
+            "vibeconsole-mappings-v2\nidle\t-\t120\tyes\n",
+            "vibeconsole-mappings-v2\nidle\t-\t-\t-\n09e8:1049\tnote\t10\t36\thold\tShift\toffset:5\t-\t-\n",
         ] {
             assert!(parse_config(bad).is_err());
         }
@@ -1154,7 +1175,7 @@ mod tests {
     #[test]
     fn round_trip_replacement_and_failures_preserve_saved_mappings() {
         let directory =
-            std::env::temp_dir().join(format!("keyai-config-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("vibeconsole-config-test-{}", std::process::id()));
         fs::create_dir(&directory).unwrap();
         let path = directory.join("mappings.tsv");
         assert!(load(&path).unwrap().is_empty());
@@ -1192,12 +1213,12 @@ mod tests {
 
         for malformed in [
             "",
-            "keyai-mappings-v2\n",
-            "keyai-mappings-v1\n09e8:1049\tnote\t10\t36\thold\tBogus\n",
-            "keyai-mappings-v1\n09e8:1049\tcc\t10\t36\thold\tShift\n",
-            "keyai-mappings-v1\nother\tnote\t10\t36\thold\tShift\n",
-            "keyai-mappings-v1\n09e8:1049\tnote\t1\t36\thold\tShift\n",
-            "keyai-mappings-v1\n09e8:1049\tnote\t10\t52\thold\tShift\n",
+            "vibeconsole-mappings-v2\n",
+            "vibeconsole-mappings-v1\n09e8:1049\tnote\t10\t36\thold\tBogus\n",
+            "vibeconsole-mappings-v1\n09e8:1049\tcc\t10\t36\thold\tShift\n",
+            "vibeconsole-mappings-v1\nother\tnote\t10\t36\thold\tShift\n",
+            "vibeconsole-mappings-v1\n09e8:1049\tnote\t1\t36\thold\tShift\n",
+            "vibeconsole-mappings-v1\n09e8:1049\tnote\t10\t52\thold\tShift\n",
         ] {
             fs::write(&path, malformed).unwrap();
             assert!(load(&path).is_err());

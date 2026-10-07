@@ -306,7 +306,7 @@ fn create_output() -> Result<VirtualDevice> {
     let output = VirtualDevice::builder()
         .and_then(|builder| {
             builder
-                .name("KeyAI virtual keyboard")
+                .name("VibeConsole virtual keyboard")
                 .with_keys(&supported)?
                 .build()
         })

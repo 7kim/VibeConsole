@@ -29,19 +29,19 @@ impl Owner {
             );
         }
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err("another KeyAI session owns MIDI/keyboard/configuration; keep that session for editing, or explicitly stop it first (keyai startup-stop). No keyboard was replaced".into());
+            return Err("another VibeConsole session owns MIDI/keyboard/configuration; keep that session for editing, or explicitly stop it first (vibeconsole startup-stop). No keyboard was replaced".into());
         }
         Ok(Self { _file: file })
     }
     pub fn acquire() -> Result<Self> {
         if unsafe { libc::geteuid() } == 0 {
-            return Err("run KeyAI as your desktop user, not root".into());
+            return Err("run VibeConsole as your desktop user, not root".into());
         }
         let dir = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .filter(|p| p.is_absolute())
             .ok_or("XDG_RUNTIME_DIR is unavailable; run in your desktop session")?;
-        Self::at(&dir.join("keyai.lock"))
+        Self::at(&dir.join("vibeconsole.lock"))
     }
 }
 
@@ -59,17 +59,17 @@ fn unit() -> Result<PathBuf> {
     if !base.is_absolute() {
         return Err("XDG_CONFIG_HOME must be absolute".into());
     }
-    Ok(base.join("systemd/user/keyai.service"))
+    Ok(base.join("systemd/user/vibeconsole.service"))
 }
 fn service(feedback: bool, flow: bool) -> String {
     format!(
-        "# Managed by KeyAI\n[Unit]\nDescription=KeyAI controller shortcuts\nAfter=graphical-session-pre.target pipewire.service wireplumber.service\nPartOf=graphical-session.target\n\n[Service]\nType=simple\nExecStart=\"%h/.local/bin/keyai\" daemon{}{}\nRestart=no\n# amidi must outlive SIGTERM so handled shutdown can restore controller feedback\nKillMode=mixed\nTimeoutStopSec=15\n\n[Install]\nWantedBy=graphical-session.target\n",
+        "# Managed by VibeConsole\n[Unit]\nDescription=VibeConsole controller shortcuts\nAfter=graphical-session-pre.target pipewire.service wireplumber.service\nPartOf=graphical-session.target\n\n[Service]\nType=simple\nExecStart=\"%h/.local/bin/vibeconsole\" daemon{}{}\nRestart=no\n# amidi must outlive SIGTERM so handled shutdown can restore controller feedback\nKillMode=mixed\nTimeoutStopSec=15\n\n[Install]\nWantedBy=graphical-session.target\n",
         if feedback { " --feedback" } else { "" },
         if flow { " --start-flow" } else { "" }
     )
 }
 fn managed(path: &Path) -> Result<()> {
-    if path.exists() && !fs::read_to_string(path)?.starts_with("# Managed by KeyAI\n") {
+    if path.exists() && !fs::read_to_string(path)?.starts_with("# Managed by VibeConsole\n") {
         return Err(format!("refusing to replace/remove unmanaged {}", path.display()).into());
     }
     Ok(())
@@ -92,7 +92,7 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
     {
         return Err("flags are supported only by startup-enable: --feedback, --start-flow".into());
     }
-    let binary = home()?.join(".local/bin/keyai");
+    let binary = home()?.join(".local/bin/vibeconsole");
     match command {
         "install" => {
             let _owner = Owner::acquire()?;
@@ -124,7 +124,7 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
         }
         "startup-enable" => {
             if !binary.is_file() {
-                return Err("run keyai install first".into());
+                return Err("run vibeconsole install first".into());
             }
             let path = unit()?;
             managed(&path)?;
@@ -137,19 +137,19 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                 ),
             )?;
             systemctl(&["daemon-reload"])?;
-            systemctl(&["enable", "keyai.service"])?;
+            systemctl(&["enable", "vibeconsole.service"])?;
             println!(
-                "Login startup enabled. Start explicitly with keyai startup-start; journalctl --user -u keyai.service shows errors. --feedback explicitly confirms the original Program 1 setup; --start-flow opts into ordered Flow startup."
+                "Login startup enabled. Start explicitly with vibeconsole startup-start; journalctl --user -u vibeconsole.service shows errors. --feedback explicitly confirms the original Program 1 setup; --start-flow opts into ordered Flow startup."
             );
         }
-        "startup-start" => systemctl(&["start", "keyai.service"])?,
-        "startup-stop" => systemctl(&["stop", "keyai.service"])?,
-        "startup-status" => systemctl(&["status", "keyai.service", "--no-pager"])?,
-        "startup-disable" => systemctl(&["disable", "--now", "keyai.service"])?,
+        "startup-start" => systemctl(&["start", "vibeconsole.service"])?,
+        "startup-stop" => systemctl(&["stop", "vibeconsole.service"])?,
+        "startup-status" => systemctl(&["status", "vibeconsole.service", "--no-pager"])?,
+        "startup-disable" => systemctl(&["disable", "--now", "vibeconsole.service"])?,
         "uninstall" => {
             if unit()?.exists() {
                 managed(&unit()?)?;
-                systemctl(&["disable", "--now", "keyai.service"])?;
+                systemctl(&["disable", "--now", "vibeconsole.service"])?;
                 fs::remove_file(unit()?)?;
                 systemctl(&["daemon-reload"])?;
             }
@@ -157,7 +157,7 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
             if binary.exists() {
                 fs::remove_file(&binary)?;
             }
-            println!("Removed KeyAI executable/service; saved mappings preserved.");
+            println!("Removed VibeConsole executable/service; saved mappings preserved.");
         }
         "doctor" => {
             println!(
@@ -217,7 +217,7 @@ mod tests {
     use super::*;
     #[test]
     fn one_owner_and_opt_in_unit_do_not_mutate_desktop() {
-        let path = std::env::temp_dir().join(format!("keyai-owner-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("vibeconsole-owner-{}", std::process::id()));
         let owner = Owner::at(&path).unwrap();
         assert!(Owner::at(&path).is_err());
         drop(owner);

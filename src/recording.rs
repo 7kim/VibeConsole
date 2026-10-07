@@ -74,7 +74,7 @@ fn devices() -> Result<Vec<RawDevice>> {
             continue;
         };
         let path = std::fs::canonicalize(entry.path().join("device"))?;
-        // Physical Linux input paths exclude uinput, including KeyAI and other virtual keyboards.
+        // Physical Linux input paths exclude uinput, including VibeConsole and other virtual keyboards.
         if !physical_path(&path) {
             continue;
         }
@@ -87,7 +87,7 @@ fn devices() -> Result<Vec<RawDevice>> {
         }
         let node = format!("/dev/input/{name}");
         let device = RawDevice::open(&node).map_err(|error| format!("cannot record from physical keyboard {node}: {error}; grant input read access or use Select keys"))?;
-        if device.name() == Some("KeyAI virtual keyboard") {
+        if device.name() == Some("VibeConsole virtual keyboard") {
             continue;
         }
         // SAFETY: borrowed device fd; only change its nonblocking status.

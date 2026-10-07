@@ -604,7 +604,7 @@ fn flow(action: &Action, node: &Path, cancelled: &impl Fn() -> bool) -> Result<S
         )?;
         Ok("Flow helper opened the current keyboard; dictation remains unverified. Output is paused: test physical Shift, then explicitly /resume.".into())
     })();
-    result.map_err(|e| format!("{e}. Manual recovery: fully Quit Wispr Flow from its tray; keep KeyAI's keyboard ready; reopen Wispr Flow; test physical Shift; then /resume. No forced stop or settings reset was attempted.").into())
+    result.map_err(|e| format!("{e}. Manual recovery: fully Quit Wispr Flow from its tray; keep VibeConsole's keyboard ready; reopen Wispr Flow; test physical Shift; then /resume. No forced stop or settings reset was attempted.").into())
 }
 
 #[cfg(test)]

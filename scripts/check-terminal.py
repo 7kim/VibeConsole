@@ -14,7 +14,7 @@ import tempfile
 import termios
 import time
 
-binary = Path(__file__).resolve().parents[1] / "target/debug/keyai"
+binary = Path(__file__).resolve().parents[1] / "target/debug/vibeconsole"
 # Grouped command order (headings are skipped); the cursor starts on /run.
 ORDER = ["/run", "/pause", "/resume", "/release-all", "/quit", "/configure", "/list",
          "/prog-select", "/program-name", "/feedback-idle", "/feedback-check",
@@ -42,17 +42,17 @@ def read_until(master, token):
 
 
 for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_settings", "contexts", "default_running", "panes", "narrow_resize", "toggle_panel", "idle_no_device", "unverified_run", "unverified_resume"):
-    with tempfile.TemporaryDirectory(prefix="keyai-pty-") as directory:
-        config = Path(directory) / "keyai"
+    with tempfile.TemporaryDirectory(prefix="vibeconsole-pty-") as directory:
+        config = Path(directory) / "vibeconsole"
         config.mkdir()
         path = config / "mappings.tsv"
-        contents = b"keyai-mappings-v1\n09e8:1049\tnote\t10\t36\thold\tShift\n"
+        contents = b"vibeconsole-mappings-v1\n09e8:1049\tnote\t10\t36\thold\tShift\n"
         if ending == "default_running":
-            contents = b"keyai-mappings-v4\nidle\t-\t-\t-\n"
+            contents = b"vibeconsole-mappings-v4\nidle\t-\t-\t-\n"
         if ending == "current_settings":
-            contents = b"keyai-mappings-v2\nidle\t0\t240\ton\n09e8:1049\tnote\t10\t36\ttoggle\tShift\tabsolute:1\t240\ton\n"
+            contents = b"vibeconsole-mappings-v2\nidle\t0\t240\ton\n09e8:1049\tnote\t10\t36\ttoggle\tShift\tabsolute:1\t240\ton\n"
         if ending == "toggle_panel":
-            contents = b"keyai-mappings-v1\n09e8:1049\tnote\t10\t36\ttoggle\tShift\n09e8:1049\tnote\t10\t37\ttoggle\tCtrl+K\n"
+            contents = b"vibeconsole-mappings-v1\n09e8:1049\tnote\t10\t36\ttoggle\tShift\n09e8:1049\tnote\t10\t37\ttoggle\tCtrl+K\n"
         path.write_bytes(contents)
         # No PTY scenario may reach real MIDI, even on a connected developer desktop.
         bin_dir = Path(directory) / "bin"
@@ -77,7 +77,7 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
                 assert b"Operation failed" not in notice
                 assert b"PAUSED" in initial_screen
                 assert b"RUNNING" not in notice
-                assert b"Registered KeyAI keyboard" not in notice
+                assert b"Registered VibeConsole keyboard" not in notice
                 os.write(master, b"\r")
                 read_until(master, b"/quit")
                 go(master, command, "/quit")

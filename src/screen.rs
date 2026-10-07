@@ -398,7 +398,7 @@ mod tests {
         );
         assert!(toggle_line(2, "Knob 3", "Ctrl+K", false).starts_with("[○] Toggle 2"));
         let screen = Screen {
-            header: "KeyAI | MIDI 💡 ON connected hw:1,0,0 | Input 💡 OFF\nProgram 2 — VSCode (hardware/RAM verified) | RUNNING".into(),
+            header: "VibeConsole | MIDI 💡 ON connected hw:1,0,0 | Input 💡 OFF\nProgram 2 — VSCode (hardware/RAM verified) | RUNNING".into(),
             commands: vec!["── Run".into(), "> /run".into(), "  /pause".into()],
             anchor: 1,
             focus_commands: true,

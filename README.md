@@ -1,13 +1,13 @@
-# KeyAI
+# VibeConsole
 
-Turn an **Akai MPK Mini MK3** into a shortcut and desktop-action controller on **Fedora GNOME Wayland**. KeyAI is a Rust terminal application with saved per-program mappings, hold/toggle shortcuts, application launching, audio controls, and optional musical-setting feedback.
+Turn an **Akai MPK Mini MK3** into a shortcut and desktop-action controller on **Fedora GNOME Wayland**. VibeConsole is a Rust terminal application with saved per-program mappings, hold/toggle shortcuts, application launching, audio controls, and optional musical-setting feedback.
 
 ## Features
 
 - Learn Note-mode pads from both banks and piano keys; select shortcuts from menus or record a physical keyboard chord.
 - Use hold/toggle shortcuts with shared-key ownership, duplicate suppression, release guards, and cleanup on pause, program transitions, disconnect, and handled exit.
 - Configure absolute, non-wrapping knob directions/steps and calibrated joystick axes with neutral regions, hysteresis, and supported diagonals.
-- Follow the controller's current hardware program automatically at startup and during use. Explicitly select any of eight hardware programs from KeyAI when desired.
+- Follow the controller's current hardware program automatically at startup and during use. Explicitly select any of eight hardware programs from VibeConsole when desired.
 - Display and rename stored hardware programs while keeping mappings attached to their numeric program.
 - Save independent idle octave, tempo, and arpeggiator preferences for each compatible program; add per-pad active feedback and restore owned settings.
 - Launch installed applications and request native output-volume, output-mute, or microphone-mute changes from supported controls.
@@ -23,17 +23,17 @@ Use a Rust toolchain supporting the 2024 edition. Connect the controller by USB,
 ```bash
 sudo dnf install alsa-utils usbutils acl
 cargo build --locked
-./target/debug/keyai doctor
-./target/debug/keyai
+./target/debug/vibeconsole doctor
+./target/debug/vibeconsole
 ```
 
 Start explicitly paused with:
 
 ```bash
-./target/debug/keyai --paused
+./target/debug/vibeconsole --paused
 ```
 
-KeyAI uses `amidi` for MIDI input, `lsusb` for device identification, and Linux uinput for keyboard output. App launching uses `gio`; audio actions require `wpctl`; optional login startup uses the native user `systemctl`. `doctor` reports prerequisites without creating a keyboard, injecting events, launching applications, or changing controller settings.
+VibeConsole uses `amidi` for MIDI input, `lsusb` for device identification, and Linux uinput for keyboard output. App launching uses `gio`; audio actions require `wpctl`; optional login startup uses the native user `systemctl`. `doctor` reports prerequisites without creating a keyboard, injecting events, launching applications, or changing controller settings.
 
 To inspect the connected device:
 
@@ -42,7 +42,7 @@ lsusb -d 09e8:1049
 amidi --list-devices
 ```
 
-Device numbers can change. KeyAI discovers the matching port; close other MIDI readers/editors before using it. Run KeyAI as your desktop user, not as root.
+Device numbers can change. VibeConsole discovers the matching port; close other MIDI readers/editors before using it. Run VibeConsole as your desktop user, not as root.
 
 ### Keyboard permissions
 
@@ -59,29 +59,29 @@ sudo modprobe uinput
 sudo setfacl -m "u:$(id -un):rw" /dev/uinput
 ```
 
-Recheck afterward. The ACL may need reapplying after reboot or device-node recreation; KeyAI does not install persistent permission rules. Physical shortcut recording separately needs read access to the detected `/dev/input/event*` keyboard nodes. Recording errors identify the missing access; menu-based key selection remains available.
+Recheck afterward. The ACL may need reapplying after reboot or device-node recreation; VibeConsole does not install persistent permission rules. Physical shortcut recording separately needs read access to the detected `/dev/input/event*` keyboard nodes. Recording errors identify the missing access; menu-based key selection remains available.
 
 ## Programs and automatic detection
 
 The interactive app starts with **running intent**, but mapped effects wait until the current hardware program is identified. `--paused` performs detection while retaining PAUSED. Empty programs have no mapped effects. Piano programs retain the explicit `/run` confirmation for physical arpeggiator Off and intended octave.
 
-The **controller's current state takes priority** over the last program selected in KeyAI. For example, selecting Program 3 in KeyAI, quitting, physically selecting Program 1, and reopening should use Program 1 when its RAM matches uniquely. This uses the hardware as the source of truth; it does not blindly restore a saved program number.
+The **controller's current state takes priority** over the last program selected in VibeConsole. For example, selecting Program 3 in VibeConsole, quitting, physically selecting Program 1, and reopening should use Program 1 when its RAM matches uniquely. This uses the hardware as the source of truth; it does not blindly restore a saved program number.
 
-KeyAI reads the eight stored presets and compares their complete payloads with current RAM. One exact match identifies the numeric program; names alone do not. Programs with identical names can still be distinguished by different settings. Identical full presets or externally edited RAM can be ambiguous: mapped output stays inactive and `/prog-select` remains the explicit recovery path.
+VibeConsole reads the eight stored presets and compares their complete payloads with current RAM. One exact match identifies the numeric program; names alone do not. Programs with identical names can still be distinguished by different settings. Identical full presets or externally edited RAM can be ambiguous: mapped output stays inactive and `/prog-select` remains the explicit recovery path.
 
 `/prog-select` deliberately selects a hardware slot, reads back RAM, and enables that context only after verification. Hardware slots 1–8 correspond to saved contexts 0–7. Renaming never moves mappings between contexts.
 
 ### Why the 250 ms check exists
 
-The observed physical program switches produced no unsolicited MIDI notification. KeyAI therefore asks for current RAM periodically through the existing coordinated MIDI response stream.
+The observed physical program switches produced no unsolicited MIDI notification. VibeConsole therefore asks for current RAM periodically through the existing coordinated MIDI response stream.
 
 - The worker **sleeps for 250 ms between idle checks**, then requests RAM. This is approximately four periodic checks per second at most, excluding other operation-specific queries.
-- If the reply differs from KeyAI's last confirmed state, KeyAI clears old ownership and re-identifies the program. It recognizes its own confirmed temporary feedback changes.
+- If the reply differs from VibeConsole's last confirmed state, VibeConsole clears old ownership and re-identifies the program. It recognizes its own confirmed temporary feedback changes.
 - **250 ms is not an extra delay after detection**, and it is not an artificial delay on ordinary pad/key events. MIDI release handling runs separately from the query worker.
 - Total visible switching time includes the polling wait, MIDI response time, re-identification, and UI processing. Wait for the header to show the new verified program before using mapped controls.
 - The worker waits rather than busy-spinning. Some CPU and MIDI traffic is added, but **CPU usage and timing have not been benchmarked**; no measured percentage or guaranteed response time is claimed. The interval is currently fixed in code, not a menu preference.
 
-On a physical switch, old feedback ownership is discarded: KeyAI must not restore the previous program's snapshot into the newly selected preset. On a KeyAI-requested switch, outgoing owned feedback is restored before selection. Held keys/toggles start inactive in the incoming program; explicit pause is preserved. Hardware changes during configuration can interrupt the operation rather than silently save under a different context.
+On a physical switch, old feedback ownership is discarded: VibeConsole must not restore the previous program's snapshot into the newly selected preset. On a VibeConsole-requested switch, outgoing owned feedback is restored before selection. Held keys/toggles start inactive in the incoming program; explicit pause is preserved. Hardware changes during configuration can interrupt the operation rather than silently save under a different context.
 
 External octave/arpeggiator/tempo edits can invalidate exact matching. This affects the remaining piano-transposition test, which needs review before continuing. Automatic following belongs to the interactive session; the optional legacy daemon still has the narrower original-pad scope described below.
 
@@ -154,7 +154,7 @@ Names represent physical keyboard keys; the desktop layout determines the result
 
 ## Application and audio actions
 
-Launch application lists installed visible desktop entries by name and saves their exact identifier/path. GIO performs native desktop launching; KeyAI does not run a parsed `Exec` line as a shell command. A successful launch request is separate from an observed window or application readiness. Start/Repair Wispr Flow are also selectable application actions.
+Launch application lists installed visible desktop entries by name and saves their exact identifier/path. GIO performs native desktop launching; VibeConsole does not run a parsed `Exec` line as a shell command. A successful launch request is separate from an observed window or application readiness. Start/Repair Wispr Flow are also selectable application actions.
 
 Audio choices are **Output volume up**, **Output volume down**, **Output mute**, and **Microphone mute**. Volume steps are selectable from 1–100%; ordinary output volume is capped at 100%. `wpctl` resolves the current default sink/source at activation, changes that exact object, and reads it back. Calibrated knob directions support audio actions per movement step.
 
@@ -178,39 +178,39 @@ Use a pad mapped to **Shift / hold** with Flow's Shift push-to-talk binding. `/s
 
 `/repair-flow` first releases synthetic keys and pauses, then requests the intended app's graceful quit, waits boundedly for the app/helper to stop, and launches it again. It does not force-kill processes, reset settings, modify third-party files, or restart unrelated apps. Both commands finish paused; check physical Shift and actual dictation before explicitly resuming.
 
-Ordinary configuration, pause/resume, context changes, and MIDI reconnect retain the virtual keyboard instead of implicitly restarting Flow. If recovery fails, its stage and manual fallback are reported: fully quit Flow, keep KeyAI's keyboard ready, reopen Flow, test physical Shift, then resume. Helper capture is not proof of listening or dictated text. The inspected adapter targets the installed `/usr/lib/wispr-flow` package; application updates may require rechecking it. Start/repair and ordinary continuity passed user acceptance in guides 13–15. A fresh KeyAI keyboard is still missed when Flow was already running; explicit repair recovers it and intentionally leaves KeyAI paused, including when triggered from a pad. Use `/resume` afterward.
+Ordinary configuration, pause/resume, context changes, and MIDI reconnect retain the virtual keyboard instead of implicitly restarting Flow. If recovery fails, its stage and manual fallback are reported: fully quit Flow, keep VibeConsole's keyboard ready, reopen Flow, test physical Shift, then resume. Helper capture is not proof of listening or dictated text. The inspected adapter targets the installed `/usr/lib/wispr-flow` package; application updates may require rechecking it. Start/repair and ordinary continuity passed user acceptance in guides 13–15. A fresh VibeConsole keyboard is still missed when Flow was already running; explicit repair recovers it and intentionally leaves VibeConsole paused, including when triggered from a pad. Use `/resume` afterward.
 
 ## CLI commands and installation
 
-Use `./target/debug/keyai` for the current local build. After installation, use `keyai`. Equivalent Cargo invocation: `cargo run --locked -- COMMAND` (omit `-- COMMAND` for the default session).
+Use `./target/debug/vibeconsole` for the current local build. After installation, use `vibeconsole`. Equivalent Cargo invocation: `cargo run --locked -- COMMAND` (omit `-- COMMAND` for the default session).
 
 | CLI command | Purpose |
 |---|---|
-| `keyai` | Interactive session with automatic detection and running intent |
-| `keyai --paused` | Interactive detection with output explicitly paused |
-| `keyai run` | Start the interactive run workflow |
-| `keyai list` | Read saved assignments without opening MIDI |
-| `keyai detect` | Direct Note/event detection view |
-| `keyai get` | Direct Note inspection in the original context; use interactive `/get` for others |
-| `keyai configure` | Direct configuration menus; use the interactive session for program-aware setup |
-| `keyai feedback-read` | Read/validate current RAM musical settings without changing them |
-| `keyai doctor` | Inspect session, device, configuration, and prerequisite availability |
-| `keyai install` | Copy the invoking executable to `~/.local/bin/keyai` |
-| `keyai uninstall` | Remove managed installation/service; preserve mappings |
-| `keyai startup-enable [--feedback] [--start-flow]` | Opt into the managed user service without starting it immediately |
-| `keyai startup-start` | Start the managed service |
-| `keyai startup-status` | Show service status |
-| `keyai startup-stop` | Stop the service |
-| `keyai startup-disable` | Disable and stop the service |
-| `keyai daemon [--feedback] [--start-flow]` | Headless original-pad runtime used by the optional service |
-| `keyai --help` / `keyai help` | Show CLI help |
+| `vibeconsole` | Interactive session with automatic detection and running intent |
+| `vibeconsole --paused` | Interactive detection with output explicitly paused |
+| `vibeconsole run` | Start the interactive run workflow |
+| `vibeconsole list` | Read saved assignments without opening MIDI |
+| `vibeconsole detect` | Direct Note/event detection view |
+| `vibeconsole get` | Direct Note inspection in the original context; use interactive `/get` for others |
+| `vibeconsole configure` | Direct configuration menus; use the interactive session for program-aware setup |
+| `vibeconsole feedback-read` | Read/validate current RAM musical settings without changing them |
+| `vibeconsole doctor` | Inspect session, device, configuration, and prerequisite availability |
+| `vibeconsole install` | Copy the invoking executable to `~/.local/bin/vibeconsole` |
+| `vibeconsole uninstall` | Remove managed installation/service; preserve mappings |
+| `vibeconsole startup-enable [--feedback] [--start-flow]` | Opt into the managed user service without starting it immediately |
+| `vibeconsole startup-start` | Start the managed service |
+| `vibeconsole startup-status` | Show service status |
+| `vibeconsole startup-stop` | Stop the service |
+| `vibeconsole startup-disable` | Disable and stop the service |
+| `vibeconsole daemon [--feedback] [--start-flow]` | Headless original-pad runtime used by the optional service |
+| `vibeconsole --help` / `vibeconsole help` | Show CLI help |
 
-Install/update after quitting the running KeyAI session:
+Install/update after quitting the running VibeConsole session:
 
 ```bash
 cargo build --locked
-./target/debug/keyai install
-~/.local/bin/keyai doctor
+./target/debug/vibeconsole install
+~/.local/bin/vibeconsole doctor
 ```
 
 Ensure `~/.local/bin` is on PATH. Rebuilding alone does not update the installed executable. Installation does not enable/start login startup. One runtime owns MIDI, keyboard output, and editing; a second session refuses the conflict, while `list` remains readable. Keep ordinary editing in the same foreground session to preserve keyboard continuity.
@@ -220,19 +220,21 @@ Ensure `~/.local/bin` is on PATH. Rebuilding alone does not update the installed
 The legacy service supports the **original Program 1 pad setup**, not interactive eight-program following. Use the interactive session for the current multi-program workflow. `--feedback` explicitly confirms the original hardware setup; `--start-flow` opts into keyboard-before-Flow startup and does not implicitly repair an already-running Flow.
 
 ```bash
-keyai startup-enable
-keyai startup-start
-keyai startup-status
-journalctl --user -u keyai.service
-keyai startup-stop
-keyai startup-disable
+vibeconsole startup-enable
+vibeconsole startup-start
+vibeconsole startup-status
+journalctl --user -u vibeconsole.service
+vibeconsole startup-stop
+vibeconsole startup-disable
 ```
 
 Only opt in when this scope matches your setup. Live login behavior remains unverified. Service configuration is inspectable/removable, unmanaged units are not overwritten, and mappings survive uninstall. Stop the service before starting a foreground owner; a new process creates a new keyboard and may require Flow discovery/recovery.
 
 ## Saved configuration
 
-Mappings live at `$XDG_CONFIG_HOME/keyai/mappings.tsv`, or `~/.config/keyai/mappings.tsv` when the variable is unset/empty. The configuration directory must be absolute.
+Mappings live at `$XDG_CONFIG_HOME/vibeconsole/mappings.tsv`, or `~/.config/vibeconsole/mappings.tsv` when the variable is unset/empty. The configuration directory must be absolute.
+
+VibeConsole was previously named **KeyAI**. On first start, an existing `keyai/mappings.tsv` is copied to the new location (the old file stays as a backup) and old `keyai-mappings-v*` headers remain readable. An earlier install is replaced with `keyai uninstall`, then `vibeconsole install` with the same startup options.
 
 Versions 1–4 remain readable; successful saves use **version 5 TSV**, including per-program idle preferences, numeric contexts, labels, input calibration, actions, shortcuts, and feedback. Validation precedes saving; a private temporary file is written/synced before replacing the previous configuration. Failed saves preserve the prior valid file. Active holds and toggle states are never saved.
 
@@ -249,7 +251,7 @@ Do not concurrently edit an active configuration. If an interrupted save leaves 
 | Cannot create keyboard | Check `/dev/uinput` access; do not run the full application as root |
 | Cannot record shortcut | Check the named physical keyboard node's read permission or select keys through menus |
 | Shift works in an editor but not Flow | Test `/start-flow` or explicit `/repair-flow`; verify actual push-to-talk separately |
-| Installed command behaves differently | Rebuild, quit KeyAI, then install the new local executable |
+| Installed command behaves differently | Rebuild, quit VibeConsole, then install the new local executable |
 | Program changes feel delayed | Allow polling plus response/re-identification time; check the verified header before playing mapped controls |
 
 Unsupported or unverified areas include relative/wrapping knobs, absolute-volume mapping, CC/Program Change pad holds, joystick system actions, indistinguishable joystick directions, pedals, brightness/media/lock actions, timed macros, shell commands, independent pad LED control, and direct Flow listening-state integration. There is no GUI. Other desktop environments/controller models have not been verified.

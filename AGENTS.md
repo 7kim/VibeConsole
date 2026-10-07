@@ -1,4 +1,4 @@
-# KeyAI agent instructions
+# VibeConsole agent instructions
 
 ## Start here
 
