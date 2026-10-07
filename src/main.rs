@@ -10,6 +10,7 @@ mod motion;
 mod recording;
 mod runtime;
 mod screen;
+mod status;
 mod terminal;
 use mappings::{config_path, load};
 
@@ -157,7 +158,7 @@ fn main() -> Result<()> {
     if args == ["--help"] || args == ["help"] {
         println!(
             "Usage: vibeconsole [--paused|detect|list|get|configure|run|feedback-read]\n\
-                  no subcommand: start running Program 1 in the interactive terminal\n\
+                  no subcommand: detect the current controller program with running intent\n\
                   --paused: open the session explicitly paused\n\
                   detect: show live input bulbs and MIDI events in the terminal\n\
                   list: display saved assignments without opening MIDI\n\
@@ -165,14 +166,19 @@ fn main() -> Result<()> {
                   configure: press a pad, inspect, then assign or replace it\n\
                   run: start mappings in the interactive session; Ctrl+C releases and exits\n\
                   feedback-read: validate Program 0 snapshot without changing settings\n\
+                  agent-status <agent|-> <idle|thinking|needs-input|finished>: report agent state (for hooks)\n\
                   setup: install, uninstall, doctor; startup-enable/start/stop/status/disable
 \
-                  startup-enable [--feedback] [--start-flow]: opt into login startup\n\
-                  daemon [--feedback] [--start-flow]: optional native user service
+                  startup-enable: opt into login startup (old flags are accepted and ignored)\n\
+                  daemon: native user service (old flags are accepted and ignored)
 \
-                  The default session, run/resume and opted-in daemon run mappings; selected Flow actions create a paused keyboard."
+                  The default session, Run and opted-in daemon run mappings; selected Flow actions create a paused keyboard."
         );
         return Ok(());
+    }
+    // Called from agent hooks while the session or service runs: no MIDI, keyboard, or owner lock.
+    if args.first().is_some_and(|s| s == "agent-status") {
+        return status::command(&args[1..]);
     }
     if let Some(command) = args.first().filter(|s| {
         matches!(
@@ -196,14 +202,14 @@ fn main() -> Result<()> {
         {
             return Err("daemon flags: --feedback, --start-flow".into());
         }
+        if args.len() > 1 {
+            eprintln!(
+                "Legacy daemon flags ignored; saved Flow setting and verified program now control startup."
+            );
+        }
         let _owner = runtime::Owner::acquire()?;
         let path = config_path()?;
-        return terminal::daemon(
-            &path,
-            load(&path)?,
-            args.iter().any(|s| s == "--feedback"),
-            args.iter().any(|s| s == "--start-flow"),
-        );
+        return terminal::daemon(&path, load(&path)?);
     }
     if args.len() > 1
         || args.first().is_some_and(|arg| {

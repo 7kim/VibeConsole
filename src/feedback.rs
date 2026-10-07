@@ -509,6 +509,77 @@ pub fn rename(input: &mut midi::Input, slot: u8, name: &str) -> Result<()> {
     with_programs(input, |hardware| rename_program(hardware, slot, name))
 }
 
+pub fn set_knob_mode(
+    input: &mut midi::Input,
+    context: u8,
+    knob: u8,
+    cc: u8,
+    relative: bool,
+) -> Result<Payload> {
+    with_programs(input, |hardware| {
+        change_knob_mode(hardware, context, knob, cc, relative)
+    })
+}
+
+fn change_knob_mode(
+    hardware: &mut impl Programs,
+    context: u8,
+    knob: u8,
+    cc: u8,
+    relative: bool,
+) -> Result<Payload> {
+    let slot = context
+        .checked_add(1)
+        .filter(|n| *n <= 8)
+        .ok_or("program must be 1–8")?;
+    if !(1..=8).contains(&knob) {
+        return Err("knob must be 1–8".into());
+    }
+    (|| {
+        let original = hardware.read_slot(slot)?;
+        if hardware.read_slot(0)? != original {
+            return Err(
+                "current RAM differs from stored program; select it before changing knob mode"
+                    .into(),
+            );
+        }
+        let offset = 0x54 + 20 * usize::from(knob - 1);
+        if original[offset + 1] != cc || original[offset] > 1 {
+            return Err("knob CC or mode differs from the observed program; retry learning".into());
+        }
+        let mut next = original;
+        next[offset] = u8::from(relative);
+        if next == original {
+            return Ok(next);
+        }
+        let changed = (|| -> Result<()> {
+            hardware.write_slot(slot, &next)?;
+            if hardware.read_slot(slot)? != next {
+                return Err("stored knob-mode readback mismatch".into());
+            }
+            hardware.write_slot(0, &next)?;
+            if hardware.read_slot(0)? != next {
+                return Err("RAM knob-mode readback mismatch".into());
+            }
+            Ok(())
+        })();
+        if let Err(error) = changed {
+            let restored = (|| -> Result<()> {
+                hardware.write_slot(slot, &original)?;
+                hardware.write_slot(0, &original)?;
+                if hardware.read_slot(slot)? != original || hardware.read_slot(0)? != original {
+                    return Err("restoration readback mismatch".into());
+                }
+                Ok(())
+            })();
+            return Err(
+                format!("Knob mode change failed: {error}; restore result: {restored:?}").into(),
+            );
+        }
+        Ok(next)
+    })()
+}
+
 // The feedback worker must be finished before borrowing its single response stream.
 fn with_programs<T>(
     input: &mut midi::Input,
@@ -612,6 +683,23 @@ impl Controller {
     #[cfg(test)]
     fn spawn(transport: impl Transport + Send + 'static) -> Self {
         Self::spawn_verified(transport, None)
+    }
+    #[cfg(test)]
+    pub(crate) fn fake_for_reset(writes: Arc<Mutex<usize>>) -> Self {
+        struct Fake(Arc<Mutex<usize>>);
+        impl Transport for Fake {
+            fn read(&mut self) -> Result<Payload> {
+                let mut payload = [0; 245];
+                payload[0x13] = 4;
+                payload[0x1C] = 120;
+                Ok(payload)
+            }
+            fn write(&mut self, _: &Payload) -> Result<()> {
+                *self.0.lock().unwrap() += 1;
+                Ok(())
+            }
+        }
+        Self::spawn(Fake(writes))
     }
     fn spawn_verified(
         transport: impl Transport + Send + 'static,
@@ -857,6 +945,64 @@ pub fn read_only() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn knob_mode_changes_only_one_byte_in_stored_program_and_ram() {
+        struct Fake {
+            stored: Payload,
+            ram: Payload,
+            fail_ram: bool,
+        }
+        impl Programs for Fake {
+            fn read_slot(&mut self, slot: u8) -> Result<Payload> {
+                Ok(if slot == 0 { self.ram } else { self.stored })
+            }
+            fn write_slot(&mut self, slot: u8, payload: &Payload) -> Result<()> {
+                if slot == 0 {
+                    if self.fail_ram {
+                        self.fail_ram = false;
+                        return Err("simulated RAM write failure".into());
+                    }
+                    self.ram = *payload;
+                } else {
+                    self.stored = *payload;
+                }
+                Ok(())
+            }
+            fn select_slot(&mut self, _slot: u8) -> Result<()> {
+                Ok(())
+            }
+        }
+        let mut original = [0u8; 245];
+        original[0x55] = 16;
+        let mut fake = Fake {
+            stored: original,
+            ram: original,
+            fail_ram: false,
+        };
+        let changed = change_knob_mode(&mut fake, 0, 1, 16, true).unwrap();
+        assert_eq!(changed[0x54], 1);
+        assert_eq!(
+            changed
+                .iter()
+                .zip(original)
+                .filter(|(a, b)| **a != *b)
+                .count(),
+            1
+        );
+        assert_eq!(fake.stored, changed);
+        assert_eq!(fake.ram, changed);
+        assert_eq!(identify_program(&fake.ram, &[fake.stored]), Some(0));
+        change_knob_mode(&mut fake, 0, 1, 16, false).unwrap();
+        assert_eq!(fake.stored, original);
+        assert_eq!(fake.ram, original);
+        fake.fail_ram = true;
+        assert!(change_knob_mode(&mut fake, 0, 1, 16, true).is_err());
+        assert_eq!(fake.stored, original);
+        assert_eq!(fake.ram, original);
+        assert!(change_knob_mode(&mut fake, 0, 1, 17, true).is_err());
+        assert_eq!(fake.stored, original);
+    }
     fn payload() -> Payload {
         let mut p = [0; 245];
         p[0x13] = 4;

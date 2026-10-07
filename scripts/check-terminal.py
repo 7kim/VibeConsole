@@ -15,10 +15,10 @@ import termios
 import time
 
 binary = Path(__file__).resolve().parents[1] / "target/debug/vibeconsole"
-# Grouped command order (headings are skipped); the cursor starts on /run.
-ORDER = ["/run", "/pause", "/resume", "/release-all", "/quit", "/configure", "/list",
+# Grouped command order (headings are skipped); the cursor starts on Run/Pause.
+ORDER = ["Run", "/pause", "/release-all", "/quit", "/configure", "/list", "Agents", "Reset settings",
          "/prog-select", "/program-name", "/feedback-idle", "/feedback-check",
-         "/start-flow", "/repair-flow", "/detect", "/get"]
+         "Start Wispr Flow with VibeConsole", "/start-flow", "/repair-flow", "/detect", "/get"]
 
 
 def go(master, source, target):
@@ -26,8 +26,10 @@ def go(master, source, target):
     Flow commands would launch the real application, so no scenario may open them."""
     assert target not in ("/start-flow", "/repair-flow"), target
     if source != target:  # otherwise the target is already highlighted
-        os.write(master, b"\x1b[B" * ((ORDER.index(target) - ORDER.index(source)) % len(ORDER)))
-        read_until(master, b"> " + target.encode())
+        index = lambda name: 0 if name == "Pause" else ORDER.index(name)
+        os.write(master, b"\x1b[B" * ((index(target) - index(source)) % len(ORDER)))
+        visible = "Start Wispr Flow with V" if target == "Start Wispr Flow with VibeConsole" else target
+        read_until(master, b"> " + visible.encode())
     os.write(master, b"\r")
 
 
@@ -41,7 +43,7 @@ def read_until(master, token):
     return data
 
 
-for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_settings", "contexts", "default_running", "panes", "narrow_resize", "toggle_panel", "idle_no_device", "unverified_run", "unverified_resume"):
+for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_settings", "contexts", "default_running", "run_subcommand", "toggle_run_pause", "pause_alias", "modified_navigation", "flow_setting", "panes", "narrow_resize", "toggle_panel", "idle_no_device", "unverified_run"):
     with tempfile.TemporaryDirectory(prefix="vibeconsole-pty-") as directory:
         config = Path(directory) / "vibeconsole"
         config.mkdir()
@@ -65,14 +67,13 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
         original = termios.tcgetattr(slave)
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
         child = subprocess.Popen(
-            [binary, *([] if ending in ("default_running", "idle_no_device") else ["--paused"])], stdin=slave, stdout=slave, stderr=slave,
-            env=dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ["PATH"], XDG_CONFIG_HOME=directory, XDG_RUNTIME_DIR=directory, TERM="xterm-256color", **({"NO_COLOR": "1"} if ending == "narrow_resize" else {})),
+            [binary, *(["run"] if ending == "run_subcommand" else [] if ending in ("default_running", "toggle_run_pause", "pause_alias", "idle_no_device") else ["--paused"])], stdin=slave, stdout=slave, stderr=slave,
+            env=dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ["PATH"], XDG_CONFIG_HOME=directory, XDG_RUNTIME_DIR=directory, XDG_DATA_HOME=directory, XDG_DATA_DIRS=directory, TERM="xterm-256color", **({"NO_COLOR": "1"} if ending == "narrow_resize" else {})),
         )
         try:
             initial_screen=read_until(master, b"/quit")
-            if ending in ("unverified_run", "unverified_resume"):
-                command = "/run" if ending == "unverified_run" else "/resume"
-                go(master, "/run", command)
+            if ending == "unverified_run":
+                go(master, "Run", "Run")
                 notice = read_until(master, b"Select /prog-select before running")
                 assert b"Operation failed" not in notice
                 assert b"PAUSED" in initial_screen
@@ -80,17 +81,54 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
                 assert b"Registered VibeConsole keyboard" not in notice
                 os.write(master, b"\r")
                 read_until(master, b"/quit")
-                go(master, command, "/quit")
+                go(master, "Run", "/quit")
+            elif ending == "toggle_run_pause":
+                assert b"RUNNING (detecting program" in initial_screen
+                assert b"> Pause" in initial_screen
+                go(master, "Pause", "Pause")
+                paused = read_until(master, b"> Run")
+                assert b"PAUSED" in paused
+                go(master, "Run", "Run")
+                read_until(master, b"Select /prog-select before running")
+                os.write(master, b"\r")
+                read_until(master, b"/quit")
+                go(master, "Run", "/quit")
+            elif ending == "pause_alias":
+                go(master, "Pause", "/pause")
+                paused = read_until(master, b"  Run")
+                assert b"PAUSED" in paused
+                go(master, "/pause", "/quit")
+            elif ending == "modified_navigation":
+                os.write(master, b"\x1b[1;2B")  # Shift+Down
+                read_until(master, b"> /pause")
+                os.write(master, b"\x1b[1;3A")  # Alt+Up
+                read_until(master, b"> Run")
+                os.write(master, b"\x1b[13;5u")  # Ctrl+Enter
+                read_until(master, b"Select /prog-select before running")
+                os.write(master, b"\x1b[27;3u")  # Alt+Esc
+                read_until(master, b"> Run")
+                go(master, "Run", "Reset settings")
+                read_until(master, b"Type reset")
+                os.write(master, b"ReSeT\r")
+                read_until(master, b"> Reset settings")
+                assert not list(config.glob("mappings.tsv.bak-*"))
+                go(master, "Reset settings", "/quit")
+            elif ending == "flow_setting":
+                assert b"Wispr Flow not installed" in initial_screen
+                go(master, "Run", "Start Wispr Flow with VibeConsole")
+                read_until(master, b"Off. Enter to turn on")
+                assert b"start-flow\toff\n" in path.read_bytes()
+                go(master, "Start Wispr Flow with VibeConsole", "/quit")
             elif ending == "idle_no_device":
-                go(master, "/run", "/feedback-idle")
+                go(master, "Run", "/feedback-idle")
                 read_until(master, b"> No hardware feedback")
                 os.write(master, b"\x1b")
                 read_until(master, b"> /feedback-idle")
                 go(master, "/feedback-idle", "/quit")
-            elif ending == "default_running":
+            elif ending in ("default_running", "run_subcommand"):
                 assert b"RUNNING (detecting program" in initial_screen
                 # Startup retains intent, but no output is created before verified selection.
-                go(master, "/run", "/prog-select")
+                go(master, "Pause", "/prog-select")
                 failure = read_until(master, b"Operation failed")
                 if b"unavailable" not in failure:  # error notice, pinned below in the details pane
                     read_until(master, b"unavailable")
@@ -98,9 +136,9 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
                 read_until(master, b"/quit")
                 go(master, "/prog-select", "/quit")
             elif ending == "quit":
-                go(master, "/run", "/quit")
+                go(master, "Run", "/quit")
             elif ending == "configuration_error":
-                go(master, "/run", "/configure")
+                go(master, "Run", "/configure")
                 read_until(master, b"Configure controls")
                 os.write(master, b"\x1b[B" * 5 + b"\r")
                 read_until(master, b"Saved assignments")
@@ -113,7 +151,7 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
                 read_until(master, b"/quit")
                 go(master, "/configure", "/quit")
             elif ending in ("panes", "narrow_resize"):
-                go(master, "/run", "/configure")
+                go(master, "Run", "/configure")
                 wide = read_until(master, b"Tab / Left / Right")
                 assert b"Learn a piano key" in wide and b"Learn a knob" in wide
                 assert re.search(rb"Learn controls[^\n]*Saved assignments", wide)
@@ -167,9 +205,9 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
                 assert "[○] Toggle 1:".encode() in narrow and b"(Shift)" in narrow
                 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
                 read_until(master, b"/prog-select")
-                go(master, "/run", "/quit")
+                go(master, "Run", "/quit")
             elif ending == "contexts":
-                go(master, "/run", "/prog-select")
+                go(master, "Run", "/prog-select")
                 failure = read_until(master, b"Operation failed")
                 if b"unavailable" not in failure:  # error notice, pinned below in the details pane
                     read_until(master, b"unavailable")
@@ -177,7 +215,7 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
                 read_until(master, b"/quit")
                 go(master, "/prog-select", "/quit")
             elif ending == "current_settings":
-                go(master, "/run", "/feedback-idle")
+                go(master, "Run", "/feedback-idle")
                 read_until(master, b"> Octave")
                 os.write(master, b"\r")
                 read_until(master, b"> Absolute octave")
@@ -199,7 +237,7 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
                 read_until(master, b"> /feedback-idle")
                 go(master, "/feedback-idle", "/quit")
             else:
-                go(master, "/run", "/configure")
+                go(master, "Run", "/configure")
                 read_until(master, b"Configure controls")
                 child.send_signal(signal.SIGINT if ending == "sigint" else signal.SIGTERM)
             # Drain full-screen frames while quitting; a PTY is a bounded output buffer.
@@ -208,7 +246,10 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
             child.wait(timeout=3)
             assert child.returncode == (1 if ending in ("sigint", "sigterm") else 0)
             assert termios.tcgetattr(slave) == original
-            assert path.read_bytes() == contents
+            if ending == "flow_setting":
+                assert b"start-flow\toff\n" in path.read_bytes()
+            else:
+                assert path.read_bytes() == contents
             print(f"{ending}: PASS (terminal restored, saved mappings preserved)")
         finally:
             if child.poll() is None:

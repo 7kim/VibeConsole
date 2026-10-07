@@ -4,6 +4,7 @@
 
 - Before implementation, debugging, or changing scope, read [SPEC-BEHAVIOR.md](SPEC-BEHAVIOR.md) for agreed V3 behavior and acceptance checks. The completed V3 UI work (SPEC-UI and tickets 01–05) is in `archive/V3.0/`. V2 behavior, hardware limitations and evidence are in `archive/V2.0/SPEC.md` (local only; `archive/` is git-ignored).
 - Inspect the current code and trace affected callers before choosing a change. Treat the specification's implementation-status statements as historical; verify progress against the working tree and runnable checks.
+- For V5 AI coding controls (prompts, commands, sequences, agent status), read [v5/SPEC-V5.md](v5/SPEC-V5.md); its tickets are in `v5/README.md` and live checks in `tests-to-do/v5/` (local only; git-ignored).
 - Work on the requested ticket from `tickets/README.md` only after its blockers are complete. Report its verified outcome before advancing; a request for one ticket is not a request to build the entire application. Consult `archive/V1.0/SPEC.md` when checking original MVP behavior or acceptance evidence.
 
 ## Implementation style
