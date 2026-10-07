@@ -58,36 +58,12 @@ pub fn bulb(on: bool) -> &'static str {
     if on { "💡 ON" } else { "💡 OFF" }
 }
 
-pub fn light_columns(width: usize) -> usize {
-    (width / 20).clamp(1, 4)
-}
-
-pub fn lights(items: &[(String, bool)], width: usize) -> Vec<String> {
-    let columns = light_columns(width);
-    let cell = width / columns;
-    let mut rows = Vec::new();
-    for group in items.chunks(columns) {
-        let labels = group
-            .iter()
-            .map(|(label, _)| label.lines().count())
-            .max()
-            .unwrap_or(0);
-        for row in 0..=labels {
-            let mut line = String::new();
-            for (label, on) in group {
-                let text = if row == 0 {
-                    bulb(*on)
-                } else {
-                    label.lines().nth(row - 1).unwrap_or("")
-                };
-                let used = cells(text).iter().map(|(_, width)| width).sum::<usize>();
-                let padding = cell.saturating_sub(used) / 2;
-                line.push_str(&fit(&format!("{}{text}", " ".repeat(padding)), cell));
-            }
-            rows.push(line);
-        }
-    }
-    rows
+/// One toggle as `[●] Toggle 1: Bank A Pad 1 (Shift)`; `[○]` when not latched.
+pub fn toggle_line(number: usize, name: &str, action: &str, on: bool) -> String {
+    format!(
+        "[{}] Toggle {number}: {name} ({action})",
+        if on { '●' } else { '○' }
+    )
 }
 
 /// `items` in as many 24-column cells as fit `width`.
@@ -159,6 +135,7 @@ fn paint(text: &str, style: &str, color: bool) -> String {
 fn paint_bulbs(text: &str, color: bool) -> String {
     text.replace(bulb(true), &paint(bulb(true), PAUSED, color))
         .replace(bulb(false), &paint(bulb(false), DIM, color))
+        .replace("[●]", &paint("[●]", PAUSED, color))
         .replace("Bank A", &paint("Bank A", BANK_A, color))
         .replace("Bank B", &paint("Bank B", BANK_B, color))
 }
@@ -415,15 +392,11 @@ mod tests {
         assert_eq!(fit("界界界", 4), "界… ");
         assert_eq!(fit("a\x1bb", 4), "a b ");
         assert_eq!(fit(bulb(true), 5), "💡 ON");
-        let cards = lights(
-            &[
-                ("Pad 1\nShift".into(), true),
-                ("Pad 2\nCtrl+K".into(), false),
-            ],
-            40,
+        assert_eq!(
+            toggle_line(1, "Bank A Pad 1", "Shift", true),
+            "[●] Toggle 1: Bank A Pad 1 (Shift)"
         );
-        assert!(cards[0].contains(bulb(true)) && cards[0].contains(bulb(false)));
-        assert!(cards[1].contains("Pad 1") && cards[2].contains("Shift"));
+        assert!(toggle_line(2, "Knob 3", "Ctrl+K", false).starts_with("[○] Toggle 2"));
         let screen = Screen {
             header: "KeyAI | MIDI 💡 ON connected hw:1,0,0 | Input 💡 OFF\nProgram 2 — VSCode (hardware/RAM verified) | RUNNING".into(),
             commands: vec!["── Run".into(), "> /run".into(), "  /pause".into()],

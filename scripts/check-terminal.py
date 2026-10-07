@@ -160,10 +160,11 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
                     initial_screen += read_until(master, b"Ctrl+K")
                 assert b"/prog-select" in initial_screen and b"Toggles 2/2" in initial_screen
                 assert b"Shift" in initial_screen and b"Ctrl+K" in initial_screen
-                assert "💡 OFF".encode() in initial_screen
+                assert "[○] Toggle 1:".encode() in initial_screen and "[○] Toggle 2:".encode() in initial_screen
                 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 18, 50, 0, 0))
-                narrow = read_until(master, b"Toggles 2/2")
-                assert b"Shift" in narrow and b"Ctrl+K" in narrow
+                # Long raw names wrap rather than truncate; the pane shows what fits and points to /list.
+                narrow = read_until(master, b"Toggles 1/2 \xc2\xb7 /list")
+                assert "[○] Toggle 1:".encode() in narrow and b"(Shift)" in narrow
                 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
                 read_until(master, b"/prog-select")
                 go(master, "/run", "/quit")

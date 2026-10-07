@@ -524,16 +524,14 @@ mod tests {
         let mut keyboard = Keyboard::new(&[mapping.clone()]).unwrap();
         let mut emit = |_, _| Ok(());
         let view = |keyboard: &Keyboard| {
-            crate::screen::lights(
-                &[(
-                    format!("{}\n{}", mapping.label, mapping.action_label()),
-                    keyboard.active(control),
-                )],
-                34,
+            crate::screen::toggle_line(
+                1,
+                &mapping.label,
+                &mapping.action_label(),
+                keyboard.active(control),
             )
-            .join("\n")
         };
-        assert!(view(&keyboard).contains(crate::screen::bulb(false)));
+        assert!(view(&keyboard).starts_with("[○]"));
         keyboard.observe(Event::Press(control), &mut emit).unwrap();
         keyboard
             .observe(
@@ -541,10 +539,10 @@ mod tests {
                 &mut emit,
             )
             .unwrap();
-        assert!(view(&keyboard).contains(crate::screen::bulb(true)));
+        assert!(view(&keyboard).starts_with("[●]"));
         assert!(view(&keyboard).contains("Shift"));
         keyboard.observe(Event::Press(control), &mut emit).unwrap();
-        assert!(view(&keyboard).contains(crate::screen::bulb(false)));
+        assert!(view(&keyboard).starts_with("[○]"));
         keyboard
             .observe(
                 Event::Release(control, crate::ReleaseType::NoteOnVelocityZero),
@@ -553,9 +551,9 @@ mod tests {
             .unwrap();
         keyboard.observe(Event::Press(control), &mut emit).unwrap();
         keyboard.pause(&mut emit).unwrap();
-        assert!(view(&keyboard).contains(crate::screen::bulb(false)));
+        assert!(view(&keyboard).starts_with("[○]"));
         keyboard.replace(&[mapping.clone()]).unwrap();
-        assert!(view(&keyboard).contains(crate::screen::bulb(false)));
+        assert!(view(&keyboard).starts_with("[○]"));
     }
 
     #[test]

@@ -258,32 +258,39 @@ impl Terminal {
         }
     }
 
-    fn toggle_items(&self) -> Vec<(String, bool)> {
-        self.run_mappings
+    /// `[●] Toggle N: <physical name> (<shortcut>)` per toggle mapping, in saved order (SPEC-UI story 5).
+    fn toggle_preview(&self, width: usize, height: usize) -> Vec<String> {
+        let toggles = self
+            .run_mappings
             .iter()
             .filter(|mapping| mapping.behavior == mappings::Behavior::Toggle)
-            .map(|mapping| {
-                (
-                    format!("{}\n{}", mapping.action_label(), self.name(mapping.control)),
-                    self.output
-                        .as_ref()
-                        .is_some_and(|output| output.keyboard.active(mapping.control)),
-                )
-            })
-            .collect()
-    }
-
-    fn toggle_preview(&self, width: usize, height: usize) -> Vec<String> {
-        let items = self.toggle_items();
-        if items.is_empty() {
+            .collect::<Vec<_>>();
+        if toggles.is_empty() {
             return Vec::new();
         }
-        let count = items
-            .len()
-            .min(crate::screen::light_columns(width) * height.saturating_sub(1) / 3);
-        // ponytail: compact pane previews cards; /list shows every mapping/state in large setups.
-        let mut rows = vec![format!("Toggles {count}/{} · /list", items.len())];
-        rows.extend(crate::screen::lights(&items[..count], width));
+        let mut lines = Vec::new();
+        let mut count = 0;
+        for (index, mapping) in toggles.iter().enumerate() {
+            let on = self
+                .output
+                .as_ref()
+                .is_some_and(|output| output.keyboard.active(mapping.control));
+            let line = crate::screen::toggle_line(
+                index + 1,
+                &self.name(mapping.control),
+                &mapping.action_label(),
+                on,
+            );
+            let rows = crate::screen::wrap(&line, width);
+            if lines.len() + rows.len() >= height {
+                break;
+            }
+            lines.extend(rows);
+            count += 1;
+        }
+        // ponytail: the pane shows what fits; /list shows every mapping/state in large setups.
+        let mut rows = vec![format!("Toggles {count}/{} · /list", toggles.len())];
+        rows.extend(lines);
         rows
     }
 
