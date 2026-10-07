@@ -99,7 +99,8 @@ struct Terminal {
     last_event: String,
     input_flash: Option<Instant>,
     note_flashes: BTreeMap<Control, Instant>,
-    show_toggles: bool,
+    at_menu: bool,
+    menu: usize,
     rendered: String,
     rendered_size: (usize, usize),
 }
@@ -111,6 +112,118 @@ impl Terminal {
             Some(mapping) => mapping.name(program.as_ref()),
             None => mappings::control_name(control, None, self.context, program.as_ref()),
         }
+    }
+
+    /// Tiled layout for `text` in the details pane (SPEC-UI layout).
+    fn screen(&self, text: &str) -> crate::screen::Screen {
+        let size = self.size();
+        let state = self
+            .output
+            .as_ref()
+            .map(|o| o.keyboard.status(|control| self.name(control)))
+            .unwrap_or_else(|| format!("PAUSED | {} saved assignments", self.run_mappings.len()));
+        let state = if self.wanted_run {
+            let label = if !self.context_verified {
+                "RUNNING (detecting program; actions inactive)"
+            } else if self.suspended {
+                "RUNNING (menu open; actions suspended)"
+            } else if self.retry.is_some() || self.connecting {
+                "RUNNING (waiting for MIDI/readiness)"
+            } else {
+                "RUNNING"
+            };
+            state.replacen("PAUSED", label, 1)
+        } else {
+            state
+        };
+        let feedback = if !self.feedback_allowed
+            && (self.idle.enabled() || self.run_mappings.iter().any(|m| m.feedback.enabled()))
+        {
+            "Saved feedback off: select and verify hardware with /prog-select."
+        } else {
+            ""
+        };
+        let connection = self
+            .input
+            .as_ref()
+            .map(|input| format!("connected {}", input.port))
+            .unwrap_or_else(|| "closed/disconnected".into());
+        let mut state_lines = state.lines();
+        let input_on = self.input.is_some() && self.input_light(Instant::now());
+        let midi_status = if self.connecting {
+            "preparing fresh snapshot"
+        } else if self.retry.is_some() {
+            "waiting/retrying"
+        } else {
+            &connection
+        };
+        let connection_line = if size.0 < 75 {
+            format!(
+                "KeyAI | MIDI {} | Input {}",
+                crate::screen::bulb(self.input.is_some()),
+                crate::screen::bulb(input_on)
+            )
+        } else {
+            format!(
+                "KeyAI | MIDI {} {midi_status} | Input {}",
+                crate::screen::bulb(self.input.is_some()),
+                crate::screen::bulb(input_on)
+            )
+        };
+        let program = if self.program_names.len() == 8 {
+            self.program_names[self.context as usize].clone()
+        } else {
+            mappings::program_label(self.context)
+        };
+        let program = if self.context_verified {
+            format!("{program} (hardware/RAM verified)")
+        } else {
+            format!("{program} (select hardware to verify)")
+        };
+        let header = format!(
+            "{connection_line}\n{program} | {}",
+            state_lines.next().unwrap_or_default()
+        );
+        let mut live = state_lines.map(String::from).collect::<Vec<_>>();
+        let notice = if !self.error.is_empty() {
+            format!("Error: {}", self.error.replace('\n', " "))
+        } else if !self.notice.is_empty() {
+            self.notice.replace('\n', " ")
+        } else if !feedback.is_empty() {
+            feedback.into()
+        } else {
+            self.controller
+                .as_ref()
+                .map(|c| format!("Feedback: {}", c.status))
+                .unwrap_or_default()
+        };
+        let hints = if size.0 < 75 {
+            "↑↓ · Enter · Space · Esc · Ctrl+C: quit"
+        } else {
+            "Up/Down: move | Enter: confirm | Space: select | Esc: back | Ctrl+C: quit"
+        };
+        let mut screen = crate::screen::Screen {
+            header,
+            commands: Vec::new(),
+            anchor: self.menu,
+            focus_commands: self.at_menu,
+            details: text.into(),
+            notice,
+            live: Vec::new(),
+            hints: hints.into(),
+        };
+        for (index, (name, command)) in command_rows().iter().enumerate() {
+            screen.commands.push(match command {
+                None => format!("── {name}"),
+                Some(_) if index == self.menu && self.at_menu => format!("> {name}"),
+                Some(_) if index == self.menu => format!("• {name}"),
+                Some(_) => format!("  {name}"),
+            });
+        }
+        let (width, height) = screen.live_size(size.0, size.1);
+        live.extend(self.toggle_preview(width, height.saturating_sub(live.len())));
+        screen.live = live;
+        screen
     }
 
     fn reset_input_lights(&mut self) {
@@ -158,6 +271,9 @@ impl Terminal {
 
     fn toggle_preview(&self, width: usize, height: usize) -> Vec<String> {
         let items = self.toggle_items();
+        if items.is_empty() {
+            return Vec::new();
+        }
         let count = items
             .len()
             .min(crate::screen::light_columns(width) * height.saturating_sub(1) / 3);
@@ -165,14 +281,6 @@ impl Terminal {
         let mut rows = vec![format!("Toggles {count}/{} · /list", items.len())];
         rows.extend(crate::screen::lights(&items[..count], width));
         rows
-    }
-
-    fn has_toggle_panel(&self) -> bool {
-        self.show_toggles
-            && self
-                .run_mappings
-                .iter()
-                .any(|mapping| mapping.behavior == mappings::Behavior::Toggle)
     }
 
     fn detection_view(&self, page: usize) -> (String, usize) {
@@ -316,7 +424,8 @@ impl Terminal {
             last_event: String::new(),
             input_flash: None,
             note_flashes: BTreeMap::new(),
-            show_toggles: false,
+            at_menu: false,
+            menu: 1,
             rendered: String::new(),
             rendered_size: (0, 0),
         };
@@ -721,7 +830,7 @@ impl Terminal {
         if !self.follow_programs {
             return Ok(());
         }
-        if self.show_toggles && self.controller.is_none() && Instant::now() >= self.follow_retry {
+        if self.at_menu && self.controller.is_none() && Instant::now() >= self.follow_retry {
             if let Err(error) = self.controller() {
                 self.follow_retry = Instant::now() + Duration::from_secs(1);
                 self.notice = format!("Waiting to detect controller program: {error}");
@@ -735,7 +844,7 @@ impl Terminal {
         let Some(observation) = controller.program.take() else {
             return Ok(());
         };
-        if !self.show_toggles
+        if !self.at_menu
             && !self.context_verified
             && matches!(
                 observation,
@@ -754,7 +863,7 @@ impl Terminal {
             crate::feedback::ProgramObservation::Changed => {
                 self.abandon_program()?;
                 self.notice = "Controller settings changed; detecting current program. Old holds/toggles cleared.".into();
-                if !self.show_toggles {
+                if !self.at_menu {
                     return Err(
                         "Controller changed during operation; return to commands for detection"
                             .into(),
@@ -773,7 +882,7 @@ impl Terminal {
                 {
                     return Ok(()); // worker restarted after an explicit selection/menu
                 }
-                if !self.show_toggles {
+                if !self.at_menu {
                     self.abandon_program()?;
                     return Err("Controller changed during operation; configuration interrupted; return to commands for detection".into());
                 }
@@ -859,7 +968,7 @@ impl Terminal {
             self.pause()?;
             self.follow_retry = Instant::now() + Duration::from_secs(1);
             self.error = error.to_string();
-            if !self.show_toggles {
+            if !self.at_menu {
                 return Err(error);
             }
         }
@@ -1371,133 +1480,9 @@ impl Ui for Terminal {
     fn draw(&mut self, text: &str) -> Result<()> {
         self.tick()?;
         let size = self.size();
-        let state = self
-            .output
-            .as_ref()
-            .map(|o| o.keyboard.status(|control| self.name(control)))
-            .unwrap_or_else(|| format!("PAUSED | {} saved assignments", self.run_mappings.len()));
-        let state = if self.wanted_run {
-            let label = if !self.context_verified {
-                "RUNNING (detecting program; actions inactive)"
-            } else if self.suspended {
-                "RUNNING (menu open; actions suspended)"
-            } else if self.retry.is_some() || self.connecting {
-                "RUNNING (waiting for MIDI/readiness)"
-            } else {
-                "RUNNING"
-            };
-            state.replacen("PAUSED", label, 1)
-        } else {
-            state
-        };
-        let feedback = if !self.feedback_allowed
-            && (self.idle.enabled() || self.run_mappings.iter().any(|m| m.feedback.enabled()))
-        {
-            "Saved feedback off: select and verify hardware with /prog-select."
-        } else {
-            ""
-        };
-        let connection = self
-            .input
-            .as_ref()
-            .map(|input| format!("connected {}", input.port))
-            .unwrap_or_else(|| "closed/disconnected".into());
-        let mut state_lines = state.lines();
-        let input_on = self.input.is_some() && self.input_light(Instant::now());
-        let midi_status = if self.connecting {
-            "preparing fresh snapshot"
-        } else if self.retry.is_some() {
-            "waiting/retrying"
-        } else {
-            &connection
-        };
-        let connection_line = if size.0 < 75 {
-            format!(
-                "KeyAI | MIDI {} | Input {}",
-                crate::screen::bulb(self.input.is_some()),
-                crate::screen::bulb(input_on)
-            )
-        } else {
-            format!(
-                "KeyAI | MIDI {} {midi_status} | Input {}",
-                crate::screen::bulb(self.input.is_some()),
-                crate::screen::bulb(input_on)
-            )
-        };
-        let program = if self.program_names.len() == 8 {
-            self.program_names[self.context as usize].clone()
-        } else {
-            mappings::program_label(self.context)
-        };
-        let program = if self.context_verified {
-            format!("{program} (hardware/RAM verified)")
-        } else {
-            format!("{program} (select hardware to verify)")
-        };
-        let header = format!(
-            "{connection_line}\n{program}\n{}",
-            state_lines.next().unwrap_or_default()
-        );
-        let activity = state_lines.collect::<Vec<_>>().join(" | ");
-        let notice = if !self.error.is_empty() {
-            format!("Error: {}", self.error.replace('\n', " "))
-        } else if !self.notice.is_empty() {
-            self.notice.replace('\n', " ")
-        } else if !feedback.is_empty() {
-            feedback.into()
-        } else {
-            self.controller
-                .as_ref()
-                .map(|c| format!("Feedback: {}", c.status))
-                .unwrap_or_default()
-        };
-        let hints = if size.0 < 75 {
-            "↑↓ · Enter · Space · Esc · Ctrl+C: quit"
-        } else {
-            "Up/Down: move | Enter: confirm | Space: select | Esc: back | Ctrl+C: quit"
-        };
-        let footer = format!("{activity}\n{notice}\n{hints}");
-        let small = size.0 < 40 || size.1 < 16;
-        let body = if self.has_toggle_panel() {
-            if size.0 >= 90 {
-                let left = size.0.saturating_sub(42);
-                let content = crate::screen::wrap(text, left);
-                let toggles = self.toggle_preview(34, size.1.saturating_sub(8));
-                (0..size.1.saturating_sub(8))
-                    .map(|row| {
-                        format!(
-                            "{} │ {}",
-                            crate::screen::fit(
-                                content.get(row).map(String::as_str).unwrap_or(""),
-                                left
-                            ),
-                            crate::screen::fit(
-                                toggles.get(row).map(String::as_str).unwrap_or(""),
-                                34
-                            )
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            } else {
-                let mut content = crate::screen::wrap(text, size.0.saturating_sub(5));
-                content.resize(size.1.saturating_sub(12), String::new());
-                content.extend(self.toggle_preview(size.0.saturating_sub(5), 4));
-                content.join("\n")
-            }
-        } else {
-            text.into()
-        };
-        let screen = crate::screen::frame(
+        let screen = self.screen(text).render(
             size.0,
             size.1,
-            &header,
-            if small {
-                "Resize terminal to at least 40 × 16.\nEsc: back | Ctrl+C: quit"
-            } else {
-                &body
-            },
-            &footer,
             std::env::var_os("NO_COLOR").is_none()
                 && std::env::var("TERM").as_deref() != Ok("dumb"),
         );
@@ -1518,22 +1503,15 @@ impl Ui for Terminal {
         }
         Ok(())
     }
+    // Screens size themselves as if the details pane were a whole terminal:
+    // 5 columns of frame and 8 rows of chrome around their text.
     fn height(&self) -> usize {
         let size = self.size();
-        size.1
-            .saturating_sub(if self.has_toggle_panel() && size.0 < 90 {
-                4
-            } else {
-                0
-            })
+        self.screen("").details_size(size.0, size.1).1 + 8
     }
     fn width(&self) -> usize {
-        let width = self.size().0;
-        width.saturating_sub(if self.has_toggle_panel() && width >= 90 {
-            37
-        } else {
-            0
-        })
+        let size = self.size();
+        self.screen("").details_size(size.0, size.1).0 + 5
     }
     fn key(&mut self) -> Result<Option<Key>> {
         self.tick()?;
@@ -2620,6 +2598,150 @@ pub fn daemon(path: &Path, current: Vec<Mapping>, feedback: bool, flow: bool) ->
     ui.pause()
 }
 
+// Command pane groups (SPEC-UI). Numbers are the command ids `start` dispatches on.
+const COMMANDS: &[(&str, &[(usize, &str, &str)])] = &[
+    (
+        "Run",
+        &[
+            (
+                1,
+                "/run",
+                "Enable the verified program's mappings; retain applicable safety confirmations.",
+            ),
+            (
+                3,
+                "/pause",
+                "Release synthetic keys, cancel pending mapped actions, and remain paused.",
+            ),
+            (
+                4,
+                "/resume",
+                "Resume paused output with fresh-activation guards.",
+            ),
+            (
+                5,
+                "/release-all",
+                "Clear holds/toggles while retaining running mode.",
+            ),
+            (
+                11,
+                "/quit",
+                "Release keys, attempt owned-feedback restoration, and restore the terminal.",
+            ),
+        ],
+    ),
+    (
+        "Configure",
+        &[
+            (
+                0,
+                "/configure",
+                "Learn controls; edit, save, or explicitly remove assignments.",
+            ),
+            (2, "/list", "Inspect saved mappings and toggle states."),
+        ],
+    ),
+    (
+        "Programs",
+        &[
+            (
+                10,
+                "/prog-select",
+                "Select and verify an actual hardware program.",
+            ),
+            (
+                14,
+                "/program-name",
+                "Review, rename, and verify a stored program name.",
+            ),
+        ],
+    ),
+    (
+        "Feedback",
+        &[
+            (
+                9,
+                "/feedback-idle",
+                "Configure the selected program's idle musical settings.",
+            ),
+            (
+                8,
+                "/feedback-check",
+                "Run the bounded original-program feedback/restoration trial.",
+            ),
+        ],
+    ),
+    (
+        "Wispr Flow",
+        &[
+            (
+                12,
+                "/start-flow",
+                "Prepare the virtual keyboard, start Flow if absent, and check helper capture.",
+            ),
+            (
+                13,
+                "/repair-flow",
+                "Pause output and explicitly request targeted graceful Flow reopening.",
+            ),
+        ],
+    ),
+    (
+        "Inspect",
+        &[
+            (
+                7,
+                "/detect",
+                "Show paged Note activity, identities, and events without mapped effects.",
+            ),
+            (
+                6,
+                "/get",
+                "Inspect an observed Note control in the selected context.",
+            ),
+        ],
+    ),
+];
+
+/// Command pane rows: a heading has no command; others carry (id, description).
+fn command_rows() -> Vec<(&'static str, Option<(usize, &'static str)>)> {
+    let mut rows = Vec::new();
+    for (heading, commands) in COMMANDS {
+        rows.push((*heading, None));
+        rows.extend(
+            commands
+                .iter()
+                .map(|(id, name, about)| (*name, Some((*id, *about)))),
+        );
+    }
+    rows
+}
+
+/// Highlighted command row; Up/Down skip headings and wrap. Esc quits as before.
+fn command_menu(ui: &mut Terminal) -> Result<Option<usize>> {
+    let rows = command_rows();
+    loop {
+        let Some((command, about)) = rows[ui.menu].1 else {
+            ui.menu = (ui.menu + 1) % rows.len();
+            continue;
+        };
+        ui.draw(&format!("{}\n\n{about}\n\nEnter: open", rows[ui.menu].0))?;
+        let step = match ui.key()? {
+            Some(Key::Up) => rows.len() - 1,
+            Some(Key::Down) => 1,
+            Some(Key::Enter) => return Ok(Some(command)),
+            Some(Key::Escape) => return Ok(None),
+            _ => continue,
+        };
+        loop {
+            ui.menu = (ui.menu + step) % rows.len();
+            if rows[ui.menu].1.is_some() {
+                break;
+            }
+        }
+    }
+}
+
 pub fn start(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> {
     let mut ui = Terminal::open(path)?;
     ui.idle = mappings::load_config(path)?.idle;
@@ -2649,41 +2771,17 @@ pub fn start(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()
             initial == "run",
         )?;
     }
-    let mut cursor = 0;
     loop {
         ui.run_mappings = current
             .iter()
             .filter(|mapping| mapping.context == ui.context)
             .cloned()
             .collect();
-        ui.show_toggles = true;
-        let Some(command) = choose_at(
-            &mut ui,
-            "Commands",
-            &options(&[
-                "/configure",
-                "/run",
-                "/list",
-                "/pause",
-                "/resume",
-                "/release-all",
-                "/get",
-                "/detect",
-                "/feedback-check",
-                "/feedback-idle",
-                "/prog-select",
-                "/quit",
-                "/start-flow",
-                "/repair-flow",
-                "/program-name",
-            ]),
-            cursor,
-        )?
-        else {
+        ui.at_menu = true;
+        let Some(command) = command_menu(&mut ui)? else {
             return Ok(());
         };
-        ui.show_toggles = false;
-        cursor = command;
+        ui.at_menu = false;
         let was_running = ui.wanted_run;
         let result = match command {
             0 => (|| {
@@ -2932,7 +3030,7 @@ mod tests {
         let path = directory.join("mappings.tsv");
         mappings::save(&path, &[]).unwrap();
         let mut ui = Terminal::open_mode(&path, true).unwrap();
-        ui.show_toggles = true;
+        ui.at_menu = true;
         ui.context = 2; // last used program was 3; hardware now has Program 1
         ui.context_verified = false;
         ui.wanted_run = true;
@@ -2952,7 +3050,7 @@ mod tests {
         ui.observe_program(observation(None)).unwrap();
         assert!(!ui.context_verified && !ui.feedback_allowed);
         assert!(ui.notice.contains("no unique"));
-        ui.show_toggles = false;
+        ui.at_menu = false;
         assert!(ui.observe_program(observation(Some(0))).is_err()); // interrupt a configuration menu
         assert!(!ui.context_verified);
         drop(ui);
@@ -3373,6 +3471,27 @@ mod tests {
         assert!(action_menu(&mut Script::default(), 1, mappings::Input::Knob { step: 4 }).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
+    #[test]
+    fn grouped_commands_reach_every_command_once_and_headings_are_not_commands() {
+        let rows = command_rows();
+        let mut ids = rows
+            .iter()
+            .filter_map(|(_, command)| command.map(|(id, _)| id))
+            .collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(ids, (0..=14).collect::<Vec<_>>());
+        let headings = rows.iter().filter(|(_, c)| c.is_none()).map(|(h, _)| *h);
+        assert!(headings.eq([
+            "Run",
+            "Configure",
+            "Programs",
+            "Feedback",
+            "Wispr Flow",
+            "Inspect"
+        ]));
+        assert!(rows[0].1.is_none() && rows[1].0 == "/run"); // the cursor starts on /run
+    }
+
     #[test]
     fn menus_save_both_banks_cancel_edit_remove_and_preserve_failed_save() {
         use Key::*;

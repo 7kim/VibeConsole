@@ -15,6 +15,20 @@ import termios
 import time
 
 binary = Path(__file__).resolve().parents[1] / "target/debug/keyai"
+# Grouped command order (headings are skipped); the cursor starts on /run.
+ORDER = ["/run", "/pause", "/resume", "/release-all", "/quit", "/configure", "/list",
+         "/prog-select", "/program-name", "/feedback-idle", "/feedback-check",
+         "/start-flow", "/repair-flow", "/detect", "/get"]
+
+
+def go(master, source, target):
+    """Move from the highlighted command to the target by name; Enter only once it is highlighted.
+    Flow commands would launch the real application, so no scenario may open them."""
+    assert target not in ("/start-flow", "/repair-flow"), target
+    if source != target:  # otherwise the target is already highlighted
+        os.write(master, b"\x1b[B" * ((ORDER.index(target) - ORDER.index(source)) % len(ORDER)))
+        read_until(master, b"> " + target.encode())
+    os.write(master, b"\r")
 
 
 def read_until(master, token):
@@ -57,8 +71,8 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
         try:
             initial_screen=read_until(master, b"/quit")
             if ending in ("unverified_run", "unverified_resume"):
-                command = 1 if ending == "unverified_run" else 4
-                os.write(master, b"\x1b[B" * command + b"\r")
+                command = "/run" if ending == "unverified_run" else "/resume"
+                go(master, "/run", command)
                 notice = read_until(master, b"Select /prog-select before running")
                 assert b"Operation failed" not in notice
                 assert b"PAUSED" in initial_screen
@@ -66,26 +80,27 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
                 assert b"Registered KeyAI keyboard" not in notice
                 os.write(master, b"\r")
                 read_until(master, b"/quit")
-                os.write(master, b"\x1b[B" * (11 - command) + b"\r")
+                go(master, command, "/quit")
             elif ending == "idle_no_device":
-                os.write(master, b"\x1b[B" * 9 + b"\r")
+                go(master, "/run", "/feedback-idle")
                 read_until(master, b"> No hardware feedback")
                 os.write(master, b"\x1b")
                 read_until(master, b"> /feedback-idle")
-                os.write(master, b"\x1b[B" * 2 + b"\r")
+                go(master, "/feedback-idle", "/quit")
             elif ending == "default_running":
                 assert b"RUNNING (detecting program" in initial_screen
                 # Startup retains intent, but no output is created before verified selection.
-                os.write(master, b"\x1b[B" * 10 + b"\r")
+                go(master, "/run", "/prog-select")
                 failure = read_until(master, b"Operation failed")
-                assert b"unavailable" in failure
+                if b"unavailable" not in failure:  # error notice, pinned below in the details pane
+                    read_until(master, b"unavailable")
                 os.write(master, b"\r")
                 read_until(master, b"/quit")
-                os.write(master, b"\x1b[B\r")
+                go(master, "/prog-select", "/quit")
             elif ending == "quit":
-                os.write(master, b"\x1b[B" * 11 + b"\r")
+                go(master, "/run", "/quit")
             elif ending == "configuration_error":
-                os.write(master, b"\r")
+                go(master, "/run", "/configure")
                 read_until(master, b"Configure controls")
                 os.write(master, b"\x1b[B" * 5 + b"\r")
                 read_until(master, b"Saved assignments")
@@ -96,20 +111,21 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
                 assert path.read_bytes() == contents
                 os.write(master, b"\r")
                 read_until(master, b"/quit")
-                os.write(master, b"\x1b[B" * 11 + b"\r")
+                go(master, "/configure", "/quit")
             elif ending in ("panes", "narrow_resize"):
-                os.write(master, b"\r")
+                go(master, "/run", "/configure")
                 wide = read_until(master, b"Tab / Left / Right")
                 assert b"Learn a piano key" in wide and b"Learn a knob" in wide
                 assert re.search(rb"Learn controls[^\n]*Saved assignments", wide)
-                assert b"\x1b[1;30;46m" in wide or ending == "narrow_resize" or "NO_COLOR" in os.environ
+                assert b"\x1b[1;38;2;26;27;38;48;2;122;162;247m" in wide or ending == "narrow_resize" or "NO_COLOR" in os.environ
                 if ending == "narrow_resize":
                     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 18, 50, 0, 0))
                     narrow = read_until(master, b"Tab / Left / Right")
                     assert not re.search(rb"\x1b\[[0-9;]*m", narrow)
                     frame = narrow.rsplit(b"\x1b[H", 1)[-1]
                     plain = re.sub(rb"\x1b\[[0-9;?]*[A-Za-z]", b"", frame).decode()
-                    assert "Finish" in plain and "Ctrl+C: quit" in plain
+                    # Tiled panes and the unclipped notice leave Configure in its scrolling short mode here.
+                    assert "> Learn a pad" in plain and "Ctrl+C: quit" in plain, plain
                     assert len(plain.splitlines()) == 18
                     assert all(len(line) < 50 for line in plain.splitlines())
                     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 12, 30, 0, 0))
@@ -138,8 +154,10 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
                 read_until(master, b"Tab / Left / Right")
                 os.write(master, b"\t\t\r")  # Finish centered below both panes.
                 read_until(master, b"/quit")
-                os.write(master, b"\x1b[B" * 11 + b"\r")
+                go(master, "/configure", "/quit")
             elif ending == "toggle_panel":
+                if b"Ctrl+K" not in initial_screen:  # the live pane renders after the command pane
+                    initial_screen += read_until(master, b"Ctrl+K")
                 assert b"/prog-select" in initial_screen and b"Toggles 2/2" in initial_screen
                 assert b"Shift" in initial_screen and b"Ctrl+K" in initial_screen
                 assert "💡 OFF".encode() in initial_screen
@@ -148,16 +166,17 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
                 assert b"Shift" in narrow and b"Ctrl+K" in narrow
                 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
                 read_until(master, b"/prog-select")
-                os.write(master, b"\x1b[B" * 11 + b"\r")
+                go(master, "/run", "/quit")
             elif ending == "contexts":
-                os.write(master, b"\x1b[B" * 10 + b"\r")
+                go(master, "/run", "/prog-select")
                 failure = read_until(master, b"Operation failed")
-                assert b"unavailable" in failure
+                if b"unavailable" not in failure:  # error notice, pinned below in the details pane
+                    read_until(master, b"unavailable")
                 os.write(master, b"\r")
                 read_until(master, b"/quit")
-                os.write(master, b"\x1b[B\r")
+                go(master, "/prog-select", "/quit")
             elif ending == "current_settings":
-                os.write(master, b"\x1b[B" * 9 + b"\r")
+                go(master, "/run", "/feedback-idle")
                 read_until(master, b"> Octave")
                 os.write(master, b"\r")
                 read_until(master, b"> Absolute octave")
@@ -177,9 +196,9 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
                 read_until(master, b"> Arpeggiator")
                 os.write(master, b"\x1b")
                 read_until(master, b"> /feedback-idle")
-                os.write(master, b"\x1b[B\x1b[B\r")
+                go(master, "/feedback-idle", "/quit")
             else:
-                os.write(master, b"\r")
+                go(master, "/run", "/configure")
                 read_until(master, b"Configure controls")
                 child.send_signal(signal.SIGINT if ending == "sigint" else signal.SIGTERM)
             # Drain full-screen frames while quitting; a PTY is a bounded output buffer.

@@ -87,7 +87,7 @@ External octave/arpeggiator/tempo edits can invalidate exact matching. This affe
 
 ## Terminal commands
 
-Highlight commands with Up/Down and press Enter. These are menu entries, not shell commands.
+Highlight commands with Up/Down and press Enter. These are menu entries, not shell commands. They are grouped as Run, Configure, Programs, Feedback, Wispr Flow and Inspect; Up/Down skip the group headings, and the Details pane describes the highlighted command.
 
 | Menu command | Purpose |
 |---|---|
@@ -109,7 +109,7 @@ Highlight commands with Up/Down and press Enter. These are menu entries, not she
 
 Esc cancels/returns; Ctrl+C performs handled shutdown. Configuration has learning and saved-assignment panes, with Tab/Left/Right navigation. The interface supports narrow layouts, a minimum 40×16 terminal size, and `NO_COLOR=1`. Only changed screen rows are redrawn.
 
-The header shows MIDI connection, input activity, selected program, verification, and run/pause state. Quick Note taps remain visible for 200 ms. The Toggles pane shows actual synthetic latch state; `/list` shows the full list when the preview is too small. These indicators do not establish application response or physical LED control. Routine keyboard startup diagnostics no longer print over the menu; selecting Run before identification shows guidance instead of treating missing selection as an operation failure.
+Every screen uses one tiled layout: a header, the Commands pane, a Details pane for the active screen, errors and notices, a Live pane for held controls and toggles, and a key-hint status line. At 160+ columns the three panes sit side by side; at 100–159 Live sits below Details; narrower terminals stack them, showing only the active command and hiding Live while another screen is open. The header shows MIDI connection, input activity, selected program, verification, and run/pause state. Quick Note taps remain visible for 200 ms. The Toggles pane shows actual synthetic latch state; `/list` shows the full list when the preview is too small. These indicators do not establish application response or physical LED control. Routine keyboard startup diagnostics no longer print over the menu; selecting Run before identification shows guidance instead of treating missing selection as an operation failure.
 
 ## Configure controls and shortcuts
 
