@@ -1,64 +1,116 @@
+mod actions;
 use std::collections::HashSet;
-use std::io::{self, Write};
 use std::process::Command;
-use std::thread;
-use std::time::{Duration, Instant};
 
+mod feedback;
 mod keyboard;
 mod mappings;
 mod midi;
-use mappings::{Mapping, config_path, load, save};
+mod motion;
+mod recording;
+mod runtime;
+mod screen;
+mod terminal;
+use mappings::{config_path, load};
 
 const PAD_CHANNEL: u8 = 10;
 const DEVICE: &str = "09e8:1049";
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct Pad {
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+enum Message {
+    Note,
+    Cc,
+    Bend,
+}
+impl Message {
+    fn text(self) -> &'static str {
+        match self {
+            Self::Note => "note",
+            Self::Cc => "cc",
+            Self::Bend => "bend",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct Control {
     channel: u8,
-    note: u8,
-    bank: char,
-    number: u8,
+    id: u8,
+    message: Message,
+    direction: i8,
 }
 
-impl Pad {
+impl Control {
     fn from_note(channel: u8, note: u8) -> Option<Self> {
-        if channel != PAD_CHANNEL {
-            return None;
-        }
-        let (bank, number) = match note {
-            0x24..=0x2B => ('A', note - 0x24 + 1),
-            0x2C..=0x33 => ('B', note - 0x2C + 1),
-            _ => return None,
-        };
-        Some(Self {
+        (channel == PAD_CHANNEL && (36..=51).contains(&note)).then_some(Self {
             channel,
-            note,
-            bank,
-            number,
+            id: note,
+            message: Message::Note,
+            direction: 0,
         })
+    }
+    fn note(channel: u8, note: u8) -> Option<Self> {
+        ((1..=16).contains(&channel) && note <= 127).then_some(Self {
+            channel,
+            id: note,
+            message: Message::Note,
+            direction: 0,
+        })
+    }
+    fn validate(self) -> Result<()> {
+        if !(1..=16).contains(&self.channel)
+            || self.id > 127
+            || match self.message {
+                Message::Note => self.direction != 0,
+                Message::Cc => ![-1, 1].contains(&self.direction),
+                Message::Bend => self.id != 0 || ![-1, 1].contains(&self.direction),
+            }
+        {
+            return Err("invalid control identity".into());
+        }
+        Ok(())
+    }
+    fn label(self) -> String {
+        if self.message != Message::Note {
+            return format!(
+                "{} channel {} id {} direction {}",
+                self.message.text(),
+                self.channel,
+                self.id,
+                self.direction
+            );
+        }
+        if Self::from_note(self.channel, self.id).is_some() {
+            let bank = if self.id < 44 { 'A' } else { 'B' };
+            format!("Bank {bank} Pad {}", (self.id - 36) % 8 + 1)
+        } else {
+            format!("Note channel {} note {}", self.channel, self.id)
+        }
     }
 }
 
 #[derive(Debug, PartialEq)]
 enum Event {
-    Press(Pad),
-    Release(Pad, ReleaseType),
-    DuplicatePress(Pad),
-    UnmatchedRelease(Pad),
-    Pressure(Pad),
+    Press(Control),
+    Release(Control, ReleaseType),
+    DuplicatePress(Control),
+    UnmatchedRelease(Control),
+    Pressure(Control),
+    Pulse(Control),
 }
 
 #[derive(Debug, PartialEq)]
 enum ReleaseType {
     NoteOff,
     NoteOnVelocityZero,
+    Neutral,
+    PulseComplete,
 }
 
 #[derive(Default)]
 struct Detector {
-    down: HashSet<Pad>,
-    pressure_seen: HashSet<Pad>,
+    down: HashSet<Control>,
+    pressure_seen: HashSet<Control>,
 }
 
 impl Detector {
@@ -66,7 +118,7 @@ impl Detector {
         let [status, note, value] = bytes;
         let kind = status & 0xF0;
         let channel = (status & 0x0F) + 1;
-        let pad = Pad::from_note(channel, note)?;
+        let pad = Control::note(channel, note)?;
 
         match kind {
             0x90 if value > 0 => {
@@ -104,28 +156,79 @@ fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args == ["--help"] || args == ["help"] {
         println!(
-            "Usage: keyai [detect|list|get|configure|run]\n\
-                  detect: display MIDI events (default)\n\
+            "Usage: keyai [--paused|detect|list|get|configure|run|feedback-read]\n\
+                  no subcommand: start running Program 1 in the interactive terminal\n\
+                  --paused: open the session explicitly paused\n\
+                  detect: show live input bulbs and MIDI events in the terminal\n\
                   list: display saved assignments without opening MIDI\n\
-                  get: press a pad to inspect its assignment\n\
+                  get: inspect a Note control in original context (use /prog-select in the session for others)\n\
                   configure: press a pad, inspect, then assign or replace it\n\
-                  run: operate saved hold/toggle shortcuts; Ctrl+C releases and exits\n\
-                  Only run generates keyboard input."
+                  run: start mappings in the interactive session; Ctrl+C releases and exits\n\
+                  feedback-read: validate Program 0 snapshot without changing settings\n\
+                  setup: install, uninstall, doctor; startup-enable/start/stop/status/disable
+\
+                  startup-enable [--feedback] [--start-flow]: opt into login startup\n\
+                  daemon [--feedback] [--start-flow]: optional native user service
+\
+                  The default session, run/resume and opted-in daemon run mappings; selected Flow actions create a paused keyboard."
         );
         return Ok(());
+    }
+    if let Some(command) = args.first().filter(|s| {
+        matches!(
+            s.as_str(),
+            "install"
+                | "uninstall"
+                | "startup-enable"
+                | "startup-start"
+                | "startup-stop"
+                | "startup-disable"
+                | "startup-status"
+                | "doctor"
+        )
+    }) {
+        return runtime::command(command, &args[1..]);
+    }
+    if args.first().is_some_and(|s| s == "daemon") {
+        if args[1..]
+            .iter()
+            .any(|s| s != "--feedback" && s != "--start-flow")
+        {
+            return Err("daemon flags: --feedback, --start-flow".into());
+        }
+        let _owner = runtime::Owner::acquire()?;
+        let path = config_path()?;
+        return terminal::daemon(
+            &path,
+            load(&path)?,
+            args.iter().any(|s| s == "--feedback"),
+            args.iter().any(|s| s == "--start-flow"),
+        );
     }
     if args.len() > 1
         || args.first().is_some_and(|arg| {
             !matches!(
                 arg.as_str(),
-                "detect" | "list" | "get" | "configure" | "run"
+                "--paused" | "detect" | "list" | "get" | "configure" | "run" | "feedback-read"
             )
         })
     {
         return Err("unknown command; use keyai --help".into());
     }
     let path = config_path()?;
-    let mut mappings = load(&path)?;
+    let mappings = load(&path)?;
+    let _owner = if args == ["list"] {
+        None
+    } else {
+        Some(runtime::Owner::acquire()?)
+    };
+    if args.is_empty() || args == ["configure"] || args == ["--paused"] || args == ["detect"] {
+        return terminal::start(
+            &path,
+            mappings,
+            args.first().map(String::as_str).unwrap_or("session"),
+        );
+    }
     println!("Configuration: {}", path.display());
     if mappings.is_empty() {
         println!("No saved assignments.");
@@ -136,43 +239,22 @@ fn main() -> Result<()> {
     }
     match args.first().map(String::as_str).unwrap_or("detect") {
         "list" => Ok(()),
-        "detect" => detect(),
-        "run" => keyboard::run(&mappings),
-        command => {
+        "feedback-read" => feedback::read_only(),
+        "detect" => unreachable!("handled by terminal session"),
+        "run" => terminal::start(&path, mappings, "run"),
+        "get" => {
             let pad = learn_pad()?;
-            match mappings.iter().find(|mapping| mapping.pad == pad) {
+            match mappings
+                .iter()
+                .find(|mapping| mapping.context == 0 && mapping.control == pad)
+            {
                 Some(mapping) => println!("Current assignment: {mapping}"),
-                None => println!("Bank {} Pad {} has no assignment.", pad.bank, pad.number),
+                None => println!("{} has no assignment.", pad.label()),
             }
-            if command == "get" {
-                return Ok(());
-            }
-            let shortcut = prompt("Shortcut (e.g. Shift or Ctrl+Alt+K; blank cancels): ")?;
-            if shortcut.is_empty() {
-                println!("Cancelled; configuration unchanged.");
-                return Ok(());
-            }
-            let keys = mappings::parse_shortcut(&shortcut)?;
-            let behavior = prompt("Behavior (hold or toggle): ")?;
-            let mapping = Mapping::new(pad, &keys.join("+"), &behavior)?;
-            mappings.retain(|existing| existing.pad != pad);
-            mappings.push(mapping.clone());
-            mappings.sort_by_key(|mapping| (mapping.pad.channel, mapping.pad.note));
-            save(&path, &mappings)?;
-            println!("Saved: {mapping}");
             Ok(())
         }
+        _ => unreachable!("validated command"),
     }
-}
-
-fn prompt(message: &str) -> Result<String> {
-    print!("{message}");
-    io::stdout().flush()?;
-    let mut input = String::new();
-    if io::stdin().read_line(&mut input)? == 0 {
-        return Err("terminal input ended; configuration unchanged".into());
-    }
-    Ok(input.trim().to_owned())
 }
 
 fn input_port() -> Result<String> {
@@ -219,21 +301,19 @@ fn input_port() -> Result<String> {
         }
     };
 
-    println!("Device: AKAI MPK mini 3 (USB 09e8:1049)");
-    println!("MIDI input: {port}");
     Ok(port)
 }
 
-fn learn_pad() -> Result<Pad> {
+fn learn_pad() -> Result<Control> {
     let port = input_port()?;
     println!("Press a pad in either bank to learn it. No shortcuts are generated; Ctrl+C cancels.");
     let mut child = midi::command(&port).spawn()?;
     let stdout = child.stdout.take().expect("piped MIDI input");
-    let result = (|| -> Result<Pad> {
+    let result = (|| -> Result<Control> {
         let mut detector = Detector::default();
         for message in midi::messages(stdout) {
             if let Some(Event::Press(pad)) = detector.observe(message?) {
-                println!("Learned: {}", describe(Event::Press(pad)));
+                println!("Learned: {}", describe_event(&Event::Press(pad)));
                 return Ok(pad);
             }
         }
@@ -245,73 +325,31 @@ fn learn_pad() -> Result<Pad> {
     result
 }
 
-fn detect() -> Result<()> {
-    let port = input_port()?;
-    println!("Pad mode observed: MIDI Note messages on channel 10; Ctrl+C exits.");
-    println!(
-        "Press, hold, vary pressure, and release pads in either bank. No shortcuts are generated."
-    );
-
-    let mut child = midi::command(&port).spawn()?;
-    let stdout = child.stdout.take().expect("piped MIDI input");
-    let reader = thread::spawn(move || -> io::Result<Detector> {
-        let mut detector = Detector::default();
-        let started = Instant::now();
-        for message in midi::messages(stdout) {
-            let bytes = message?;
-            if let Some(event) = detector.observe(bytes) {
-                println!(
-                    "+{:.3}s {:02X} {:02X} {:02X} | {}",
-                    started.elapsed().as_secs_f64(),
-                    bytes[0],
-                    bytes[1],
-                    bytes[2],
-                    describe(event)
-                );
-            }
-        }
-        Ok(detector)
-    });
-
-    thread::sleep(Duration::from_millis(100));
-    if let Some(status) = child.try_wait()? {
-        let _ = reader.join();
-        return Err(
-            format!("MIDI input could not start; amidi exited with status {status}").into(),
-        );
-    }
-    println!("Listening. Stop with Ctrl+C.");
-
-    let status = child.wait()?;
-    let detector = reader
-        .join()
-        .map_err(|_| "MIDI input reader stopped unexpectedly")??;
-    if !status.success() {
-        if !detector.down.is_empty() {
-            eprintln!(
-                "Input ended with {} pad(s) still down; resetting input state. Reconnect the device and restart.",
-                detector.down.len()
-            );
-        }
-        return Err(format!("MIDI input ended with status {status}").into());
-    }
-    Ok(())
-}
-
-fn describe(event: Event) -> String {
+fn describe_event(event: &Event) -> String {
     let (pad, action) = match event {
         Event::Press(pad) => (pad, "PRESS: Note On"),
         Event::Release(pad, ReleaseType::NoteOff) => (pad, "RELEASE: Note Off"),
         Event::Release(pad, ReleaseType::NoteOnVelocityZero) => {
             (pad, "RELEASE: Note On velocity 0")
         }
+        Event::Release(pad, ReleaseType::Neutral) => {
+            (pad, "RELEASE: joystick neutral region / prior direction")
+        }
+        Event::Release(pad, ReleaseType::PulseComplete) => {
+            (pad, "RELEASE: shortcut pulse complete")
+        }
         Event::DuplicatePress(pad) => (pad, "REPEAT IGNORED: pad already down"),
         Event::UnmatchedRelease(pad) => (pad, "RELEASE IGNORED: pad was not down"),
+        Event::Pulse(pad) => (pad, "PULSE: movement step"),
         Event::Pressure(pad) => (pad, "PRESSURE IGNORED: does not change pad state"),
     };
     format!(
-        "{action} | Bank {} Pad {} | MIDI channel {} | note {} (0x{:02X})",
-        pad.bank, pad.number, pad.channel, pad.note, pad.note
+        "{action} | {} | MIDI {} channel {} | id {} (0x{:02X})",
+        pad.label(),
+        pad.message.text(),
+        pad.channel,
+        pad.id,
+        pad.id
     )
 }
 
@@ -341,8 +379,7 @@ mod tests {
 
         match detector.observe([0x99, 0x2C, 0x20]) {
             Some(Event::Press(pad)) => {
-                assert_eq!(pad.bank, 'B');
-                assert_eq!(pad.number, 1);
+                assert_eq!(pad.label(), "Bank B Pad 1");
             }
             event => panic!("expected Bank B Pad 1 press, got {event:?}"),
         }

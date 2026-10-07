@@ -1,12 +1,8 @@
 use crate::mappings::{Behavior, Mapping};
-use crate::{Detector, Event, Pad, Result, input_port, midi};
+use crate::{Control, Event, Result};
 use evdev::{AttributeSet, EventType, InputEvent, KeyCode, uinput::VirtualDevice};
 use std::collections::HashSet;
 use std::io;
-use std::os::unix::fs::MetadataExt;
-use std::os::unix::process::CommandExt;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -42,32 +38,30 @@ fn modifier(key: KeyCode) -> bool {
 }
 
 struct Assignment {
-    pad: Pad,
+    control: Control,
+    label: String,
     keys: Vec<KeyCode>,
     behavior: Behavior,
     active: bool,
 }
 
-struct Keyboard {
+pub(crate) struct Keyboard {
     assignments: Vec<Assignment>,
-    down: HashSet<Pad>,
+    down: HashSet<Control>,
+    blocked: HashSet<Control>,
     // Includes attempted key-downs: emit can fail after the kernel received the key.
     held: HashSet<KeyCode>,
+    running: bool,
 }
 
 impl Keyboard {
-    fn new(mappings: &[Mapping]) -> Result<Self> {
+    pub(crate) fn new(mappings: &[Mapping]) -> Result<Self> {
         let mut seen = HashSet::new();
         let mut assignments = Vec::new();
         for mapping in mappings {
-            if Mapping::new(
-                mapping.pad,
-                &mapping.keys.join("+"),
-                &mapping.behavior.to_string(),
-            )? != *mapping
-                || !seen.insert(mapping.pad)
-            {
-                return Err("invalid or duplicate assignment".into());
+            mapping.validate()?;
+            if !seen.insert(mapping.control) {
+                return Err("duplicate assignment".into());
             }
             let keys = mapping
                 .keys
@@ -75,7 +69,8 @@ impl Keyboard {
                 .map(|key| key_code(key))
                 .collect::<Result<_>>()?;
             assignments.push(Assignment {
-                pad: mapping.pad,
+                control: mapping.control,
+                label: mapping.label.clone(),
                 keys,
                 behavior: mapping.behavior.clone(),
                 active: false,
@@ -84,26 +79,63 @@ impl Keyboard {
         Ok(Self {
             assignments,
             down: HashSet::new(),
+            blocked: mappings
+                .iter()
+                .filter(|m| {
+                    m.behavior == Behavior::Trigger && m.control.message == crate::Message::Note
+                })
+                .map(|m| m.control)
+                .collect(),
             held: HashSet::new(),
+            running: true,
         })
     }
 
-    fn observe(
+    pub(crate) fn observe(
         &mut self,
         event: Event,
         emit: &mut impl FnMut(KeyCode, bool) -> io::Result<()>,
-    ) -> io::Result<Option<(Pad, bool)>> {
+    ) -> io::Result<Option<(Control, bool)>> {
+        if let Event::Pulse(control) = event {
+            // A pulse acquires/releases only keys not owned by another active mapping.
+            // Key-up follows immediately; no timer can delay another control's release.
+            let transition = self.observe(Event::Press(control), emit)?;
+            self.observe(
+                Event::Release(control, crate::ReleaseType::PulseComplete),
+                emit,
+            )?;
+            return Ok(transition.filter(|_| {
+                self.assignments
+                    .iter()
+                    .any(|a| a.control == control && a.behavior == Behavior::Trigger)
+            }));
+        }
         let (pad, pressed) = match event {
-            Event::Press(pad) if self.down.insert(pad) => (pad, true),
-            Event::Release(pad, _) if self.down.remove(&pad) => (pad, false),
+            Event::Press(pad) if self.down.insert(pad) => {
+                if self.blocked.contains(&pad) {
+                    return Ok(None);
+                }
+                (pad, true)
+            }
+            Event::Release(pad, _) | Event::UnmatchedRelease(pad) => {
+                self.blocked.remove(&pad);
+                if !self.down.remove(&pad) {
+                    return Ok(None);
+                }
+                (pad, false)
+            }
             _ => return Ok(None),
         };
-        let Some(index) = self.assignments.iter().position(|item| item.pad == pad) else {
+        if !self.running {
+            return Ok(None);
+        }
+        let Some(index) = self.assignments.iter().position(|item| item.control == pad) else {
             return Ok(None);
         };
         let assignment = &self.assignments[index];
         let active = match assignment.behavior {
-            Behavior::Hold => pressed,
+            Behavior::Trigger => return Ok(pressed.then_some((pad, true))),
+            Behavior::Hold | Behavior::Pulse => pressed,
             Behavior::Toggle if pressed => !assignment.active,
             Behavior::Toggle => return Ok(None),
         };
@@ -115,7 +147,7 @@ impl Keyboard {
             keys.reverse();
         }
         for key in keys {
-            // ponytail: scan at most 16 assignments; use counts if the supported control set grows.
+            // ponytail: scan active assignments; use counts if large setups make this measurable.
             let shared = self
                 .assignments
                 .iter()
@@ -136,6 +168,121 @@ impl Keyboard {
         Ok(Some((pad, active)))
     }
 
+    pub(crate) fn pause(
+        &mut self,
+        emit: &mut impl FnMut(KeyCode, bool) -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.running = false;
+        self.clear(emit)
+    }
+
+    pub(crate) fn clear(
+        &mut self,
+        emit: &mut impl FnMut(KeyCode, bool) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let down = self
+            .down
+            .iter()
+            .filter(|c| c.message == crate::Message::Note)
+            .copied()
+            .collect();
+        let blocked = self.blocked.clone();
+        let result = self.cleanup(emit);
+        self.down = down;
+        self.blocked = blocked; // repeats cannot reacquire keys until a real release
+        result
+    }
+
+    pub(crate) fn replace(&mut self, mappings: &[Mapping]) -> Result<()> {
+        if self.running || !self.held.is_empty() {
+            return Err("pause and release keys before editing mappings".into());
+        }
+        let mut next = Self::new(mappings)?;
+        next.down = self.down.clone();
+        next.blocked.extend(&self.blocked);
+        next.running = false;
+        *self = next;
+        Ok(())
+    }
+
+    pub(crate) fn resume(&mut self) {
+        self.running = true;
+    }
+
+    pub(crate) fn block_down(&mut self, down: &HashSet<Control>) {
+        self.down = down.clone();
+        self.blocked.extend(down);
+    }
+
+    pub(crate) fn prepare_connection(
+        &mut self,
+        mappings: &[Mapping],
+        down: &HashSet<Control>,
+        reconnected: &mut bool,
+    ) -> Result<bool> {
+        self.replace(mappings)?;
+        self.block_down(down);
+        let fresh = std::mem::take(reconnected);
+        if fresh {
+            self.block_reconnected();
+        }
+        Ok(fresh)
+    }
+
+    pub(crate) fn block_reconnected(&mut self) {
+        // ponytail: no verified held-pad snapshot; require an observed release for
+        // every pad after reconnect. Replace with a verified snapshot when available.
+        self.blocked = self
+            .assignments
+            .iter()
+            .filter(|a| a.control.message == crate::Message::Note)
+            .map(|a| a.control)
+            .collect();
+    }
+
+    pub(crate) fn active(&self, control: Control) -> bool {
+        self.assignments
+            .iter()
+            .any(|assignment| assignment.control == control && assignment.active)
+    }
+
+    pub(crate) fn status(&self) -> String {
+        let active = self
+            .assignments
+            .iter()
+            .filter(|a| a.active)
+            .map(|a| a.label.clone())
+            .collect::<Vec<_>>();
+        let mut down = self
+            .down
+            .iter()
+            .map(|p| {
+                self.assignments
+                    .iter()
+                    .find(|a| a.control == *p)
+                    .map(|a| a.label.clone())
+                    .unwrap_or_else(|| p.label())
+            })
+            .collect::<Vec<_>>();
+        down.sort();
+        format!(
+            "{} | {} saved (/list shows keys/modes) | {} await release\nActive holds/toggles: {}\nPhysically down: {}",
+            if self.running { "RUNNING" } else { "PAUSED" },
+            self.assignments.len(),
+            self.blocked.len(),
+            if active.is_empty() {
+                "none".into()
+            } else {
+                active.join(", ")
+            },
+            if down.is_empty() {
+                "none".into()
+            } else {
+                down.join(", ")
+            }
+        )
+    }
+
     fn cleanup(
         &mut self,
         emit: &mut impl FnMut(KeyCode, bool) -> io::Result<()>,
@@ -154,6 +301,7 @@ impl Keyboard {
             }
         }
         self.down.clear();
+        self.blocked.clear();
         for assignment in &mut self.assignments {
             assignment.active = false;
         }
@@ -161,45 +309,13 @@ impl Keyboard {
     }
 }
 
-pub fn run(mappings: &[Mapping]) -> Result<()> {
-    let mut keyboard = Keyboard::new(mappings)?;
-    if mappings.is_empty() {
-        return Err("no mappings to run; use keyai configure first".into());
-    }
-    let port = input_port()?;
-    println!(
-        "Desktop session: {} / {}",
-        std::env::var("XDG_SESSION_TYPE").unwrap_or_default(),
-        std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default()
-    );
-    let stop = Arc::new(AtomicBool::new(false));
-    for signal in [
-        signal_hook::consts::SIGINT,
-        signal_hook::consts::SIGTERM,
-        signal_hook::consts::SIGHUP,
-        signal_hook::consts::SIGQUIT,
-    ] {
-        signal_hook::flag::register(signal, Arc::clone(&stop))?;
-    }
-    // MIDI node identity also catches unplug/replug when amidi hasn't reported EOF yet.
-    let fields: Vec<_> = port
-        .strip_prefix("hw:")
-        .ok_or("unexpected ALSA port")?
-        .split(',')
-        .collect();
-    let [card, device, _] = fields.as_slice() else {
-        return Err("unexpected ALSA port".into());
-    };
-    let node = format!("/dev/snd/midiC{card}D{device}");
-    let metadata = std::fs::metadata(&node)?;
-    let identity = (metadata.dev(), metadata.ino(), metadata.rdev());
-
+fn create_output() -> Result<VirtualDevice> {
     // Advertise a standard keyboard range so modifier-only mappings are classified as keyboards.
     let mut supported = AttributeSet::<KeyCode>::new();
     for code in 1..=KeyCode::KEY_RIGHTMETA.0 {
         supported.insert(KeyCode(code));
     }
-    let mut output = VirtualDevice::builder()
+    let output = VirtualDevice::builder()
         .and_then(|builder| {
             builder
                 .name("KeyAI virtual keyboard")
@@ -211,114 +327,457 @@ pub fn run(mappings: &[Mapping]) -> Result<()> {
                 "cannot create keyboard through /dev/uinput: {error}; see README.md for permissions"
             )
         })?;
-    // ponytail: allow one second for desktop device discovery; replace with readiness detection if needed.
-    thread::sleep(Duration::from_secs(1));
-    let mut command = midi::command(&port);
-    let parent = std::process::id();
-    // SAFETY: only async-signal-safe Linux syscalls run between fork and exec.
-    unsafe {
-        command.pre_exec(move || {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            if libc::getppid() as u32 != parent {
-                return Err(io::Error::from_raw_os_error(libc::ESRCH));
-            }
-            Ok(())
-        });
-    }
-    let mut child = command.spawn()?;
-    let stdout = child.stdout.take().expect("piped MIDI input");
-    let (sender, receiver) = mpsc::channel();
-    let reader = thread::spawn(move || {
-        for message in midi::messages(stdout) {
-            let failed = message.is_err();
-            if sender.send(message).is_err() || failed {
-                break;
-            }
-        }
-    });
-    let mut emit = |key: KeyCode, down: bool| {
-        output.emit(&[InputEvent::new(EventType::KEY.0, key.0, i32::from(down))])
-    };
-    let result = (|| -> Result<()> {
-        let mut detector = Detector::default();
-        println!(
-            "Ready: all mappings inactive. Hold pads release on lift; toggles release on the next press."
-        );
-        println!(
-            "Active means synthetic keys held, not application listening. LED control inconclusive; terminal feedback only. Ctrl+C exits."
-        );
-        loop {
-            if stop.load(Ordering::Relaxed) {
-                return Ok(());
-            }
-            let connected = std::fs::metadata(&node)
-                .is_ok_and(|meta| (meta.dev(), meta.ino(), meta.rdev()) == identity);
-            if !connected {
-                return Err("MIDI device disconnected; restart after reconnecting".into());
-            }
-            let incoming = receiver.recv_timeout(Duration::from_millis(100));
-            // Ctrl+C can close amidi's pipe while we wait; requested shutdown wins over EOF.
-            if stop.load(Ordering::Relaxed) {
-                return Ok(());
-            }
-            match incoming {
-                Ok(message) => {
-                    if let Some(event) = detector.observe(message?) {
-                        if let Some((pad, active)) = keyboard.observe(event, &mut emit)? {
-                            use std::io::Write;
-                            writeln!(
-                                io::stdout().lock(),
-                                "Bank {} Pad {} | {}",
-                                pad.bank,
-                                pad.number,
-                                if active {
-                                    "ACTIVE: keys held"
-                                } else {
-                                    "INACTIVE: ownership released"
-                                }
-                            )?;
+    Ok(output)
+}
+
+pub(crate) struct Output {
+    pub(crate) keyboard: Keyboard,
+    device: VirtualDevice,
+    pub(crate) node: std::path::PathBuf,
+}
+
+impl Output {
+    pub(crate) fn new(mappings: &[Mapping]) -> Result<Self> {
+        let mut keyboard = Keyboard::new(mappings)?;
+        keyboard.running = false;
+        let mut device = create_output()?;
+        let started = std::time::Instant::now();
+        let node = loop {
+            match device.enumerate_dev_nodes_blocking() {
+                Ok(mut nodes) => {
+                    if let Some(path) = nodes.next().transpose()? {
+                        if path.exists() {
+                            break path;
                         }
                     }
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err("MIDI input ended; restart after checking the device/port".into());
-                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
             }
-        }
-    })();
-    // Release before waiting for any child/thread, even on read/output failures.
-    let cleanup = keyboard.cleanup(&mut emit);
-    if let Err(error) = &cleanup {
-        eprintln!(
-            "Key release failed: {error}; destroying the virtual keyboard. Desktop recovery is unverified."
-        );
-    } else {
-        println!("Stopped: all synthetic keys released; pad state cleared.");
+            if started.elapsed() > Duration::from_secs(2) {
+                return Err("keyboard registration timed out".into());
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        Ok(Self {
+            keyboard,
+            device,
+            node,
+        })
     }
-    drop(output);
-    let _ = child.kill();
-    let waited = child.wait();
-    let joined = reader.join();
-    result?;
-    cleanup?;
-    waited?;
-    joined.map_err(|_| "MIDI reader stopped unexpectedly")?;
-    Ok(())
+    pub(crate) fn observe(&mut self, event: Event) -> Result<Option<(Control, bool)>> {
+        let device = &mut self.device;
+        Ok(self.keyboard.observe(event, &mut |key, down| {
+            device.emit(&[InputEvent::new(EventType::KEY.0, key.0, i32::from(down))])
+        })?)
+    }
+    pub(crate) fn pause(&mut self) -> Result<()> {
+        let device = &mut self.device;
+        self.keyboard.pause(&mut |key, down| {
+            device.emit(&[InputEvent::new(EventType::KEY.0, key.0, i32::from(down))])
+        })?;
+        Ok(())
+    }
+    pub(crate) fn clear(&mut self) -> Result<()> {
+        let device = &mut self.device;
+        self.keyboard.clear(&mut |key, down| {
+            device.emit(&[InputEvent::new(EventType::KEY.0, key.0, i32::from(down))])
+        })?;
+        Ok(())
+    }
+}
+impl Drop for Output {
+    fn drop(&mut self) {
+        if let Err(error) = self.pause() {
+            eprintln!("Key release failed: {error}; desktop recovery is unverified.");
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ReleaseType;
+    use crate::{Detector, ReleaseType};
+    use std::sync::mpsc;
+
+    #[test]
+    fn trigger_pad_piano_knob_duplicates_pause_and_slow_action_never_delay_key_up() {
+        use crate::{
+            actions::{Action, Dispatcher},
+            mappings::Input,
+        };
+        let hold = Control::from_note(10, 36).unwrap();
+        let pad = Control::from_note(10, 37).unwrap();
+        let piano = Control::note(1, 48).unwrap();
+        let knob = Control {
+            channel: 1,
+            id: 70,
+            message: crate::Message::Cc,
+            direction: 1,
+        };
+        let maps = vec![
+            Mapping::new(hold, "Shift", "hold").unwrap(),
+            Mapping::new_action(
+                pad,
+                Input::Pad,
+                Action::Application("/test/one.desktop".into()),
+            )
+            .unwrap(),
+            Mapping::new_action(piano, Input::Piano, Action::OutputMute).unwrap(),
+            Mapping::new_action(
+                knob,
+                Input::Knob { step: 4 },
+                Action::Volume { up: true, step: 5 },
+            )
+            .unwrap(),
+        ];
+        let mut keyboard = Keyboard::new(&maps).unwrap();
+        let mut emitted = Vec::new();
+        let mut emit = |k, d| {
+            emitted.push((k, d));
+            Ok(())
+        };
+        assert_eq!(
+            keyboard.observe(Event::Press(pad), &mut emit).unwrap(),
+            None
+        ); // first startup tap only arms
+        keyboard
+            .observe(Event::Release(pad, ReleaseType::NoteOff), &mut emit)
+            .unwrap();
+        assert_eq!(
+            keyboard.observe(Event::Press(pad), &mut emit).unwrap(),
+            Some((pad, true))
+        );
+        for event in [
+            Event::Press(pad),
+            Event::DuplicatePress(pad),
+            Event::Pressure(pad),
+        ] {
+            assert_eq!(keyboard.observe(event, &mut emit).unwrap(), None);
+        }
+        keyboard
+            .observe(Event::Release(pad, ReleaseType::NoteOff), &mut emit)
+            .unwrap();
+        keyboard
+            .observe(Event::UnmatchedRelease(piano), &mut emit)
+            .unwrap();
+        assert_eq!(
+            keyboard.observe(Event::Press(piano), &mut emit).unwrap(),
+            Some((piano, true))
+        );
+        assert_eq!(
+            keyboard.observe(Event::Press(piano), &mut emit).unwrap(),
+            None
+        );
+        let mut motion = crate::motion::Motion::new(&maps).unwrap();
+        assert!(motion.observe([0xb0, 70, 0]).unwrap().is_empty());
+        let pulse = motion.observe([0xb0, 70, 4]).unwrap().pop().unwrap();
+        assert_eq!(
+            keyboard.observe(pulse, &mut emit).unwrap(),
+            Some((knob, true))
+        );
+        assert!(motion.observe([0xb0, 70, 4]).unwrap().is_empty());
+        let (started, rx) = mpsc::channel();
+        let (completed, done) = mpsc::channel();
+        let dispatch = Dispatcher::with(move |action, _, cancelled| {
+            started.send(action.clone()).unwrap();
+            while !cancelled() {
+                thread::sleep(Duration::from_millis(1));
+            }
+            completed.send(()).unwrap();
+            Err("slow launch cancelled".into())
+        });
+        keyboard.observe(Event::Press(hold), &mut emit).unwrap();
+        dispatch.submit(maps[1].action.clone(), None).unwrap();
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        dispatch.submit(Action::OutputMute, None).unwrap();
+        let start = std::time::Instant::now();
+        keyboard
+            .observe(Event::Release(hold, ReleaseType::NoteOff), &mut emit)
+            .unwrap();
+        assert!(start.elapsed() < Duration::from_millis(100));
+        keyboard.pause(&mut emit).unwrap();
+        dispatch.cancel();
+        done.recv_timeout(Duration::from_secs(1)).unwrap();
+        keyboard
+            .observe(Event::Release(piano, ReleaseType::NoteOff), &mut emit)
+            .unwrap();
+        assert_eq!(
+            keyboard.observe(Event::Press(pad), &mut emit).unwrap(),
+            None
+        );
+        keyboard.resume();
+        assert_eq!(
+            keyboard.observe(Event::Press(pad), &mut emit).unwrap(),
+            None
+        );
+        keyboard
+            .observe(Event::Release(pad, ReleaseType::NoteOff), &mut emit)
+            .unwrap();
+        assert_eq!(
+            keyboard.observe(Event::Press(pad), &mut emit).unwrap(),
+            Some((pad, true))
+        );
+        keyboard.pause(&mut emit).unwrap();
+        assert!(rx.recv_timeout(Duration::from_millis(30)).is_err()); // queued mute cancelled
+        assert_eq!(
+            emitted,
+            [
+                (KeyCode::KEY_LEFTSHIFT, true),
+                (KeyCode::KEY_LEFTSHIFT, false)
+            ]
+        );
+    }
+
+    #[test]
+    fn toggle_bulbs_follow_real_latches_and_cleanup_without_desktop_output() {
+        let control = Control::from_note(10, 36).unwrap();
+        let mapping = Mapping::new(control, "Shift", "toggle").unwrap();
+        let mut keyboard = Keyboard::new(&[mapping.clone()]).unwrap();
+        let mut emit = |_, _| Ok(());
+        let view = |keyboard: &Keyboard| {
+            crate::screen::lights(
+                &[(
+                    format!("{}\n{}", mapping.label, mapping.action_label()),
+                    keyboard.active(control),
+                )],
+                34,
+            )
+            .join("\n")
+        };
+        assert!(view(&keyboard).contains(crate::screen::bulb(false)));
+        keyboard.observe(Event::Press(control), &mut emit).unwrap();
+        keyboard
+            .observe(
+                Event::Release(control, crate::ReleaseType::NoteOff),
+                &mut emit,
+            )
+            .unwrap();
+        assert!(view(&keyboard).contains(crate::screen::bulb(true)));
+        assert!(view(&keyboard).contains("Shift"));
+        keyboard.observe(Event::Press(control), &mut emit).unwrap();
+        assert!(view(&keyboard).contains(crate::screen::bulb(false)));
+        keyboard
+            .observe(
+                Event::Release(control, crate::ReleaseType::NoteOnVelocityZero),
+                &mut emit,
+            )
+            .unwrap();
+        keyboard.observe(Event::Press(control), &mut emit).unwrap();
+        keyboard.pause(&mut emit).unwrap();
+        assert!(view(&keyboard).contains(crate::screen::bulb(false)));
+        keyboard.replace(&[mapping.clone()]).unwrap();
+        assert!(view(&keyboard).contains(crate::screen::bulb(false)));
+    }
+
+    #[test]
+    fn observed_piano_note_release_and_pad_share_keys_and_cleanup() {
+        // 2026-10-07 passive capture: 90 30 7f, 80 30 00; emitted pitch is the identity.
+        let piano = Control::note(1, 48).unwrap();
+        let pad = Control::from_note(10, 36).unwrap();
+        let mut mapping = Mapping::new(piano, "Shift+K", "hold").unwrap();
+        mapping.input = crate::mappings::Input::Piano;
+        let mut keyboard =
+            Keyboard::new(&[Mapping::new(pad, "Shift", "toggle").unwrap(), mapping]).unwrap();
+        let mut detector = Detector::default();
+        let mut recorded = Vec::new();
+        let mut emit = |key, down| {
+            recorded.push((key, down));
+            Ok(())
+        };
+        for bytes in [
+            [0x99, 36, 127],
+            [0x90, 48, 127],
+            [0x90, 48, 64],
+            [0x80, 48, 0],
+        ] {
+            if let Some(event) = detector.observe(bytes) {
+                keyboard.observe(event, &mut emit).unwrap();
+            }
+        }
+        keyboard.pause(&mut emit).unwrap();
+        assert_eq!(
+            recorded,
+            [
+                (KeyCode::KEY_LEFTSHIFT, true),
+                (KeyCode::KEY_K, true),
+                (KeyCode::KEY_K, false),
+                (KeyCode::KEY_LEFTSHIFT, false)
+            ]
+        );
+        assert!(keyboard.held.is_empty());
+    }
+
+    #[test]
+    fn context_switch_releases_latch_and_requires_new_context_release() {
+        let old = Control::from_note(10, 36).unwrap();
+        let new = Control::note(3, 60).unwrap();
+        let mut keyboard = Keyboard::new(&[Mapping::new(old, "Shift", "toggle").unwrap()]).unwrap();
+        let mut recorded = Vec::new();
+        let mut emit = |key, down| {
+            recorded.push((key, down));
+            Ok(())
+        };
+        keyboard.observe(Event::Press(old), &mut emit).unwrap();
+        keyboard.pause(&mut emit).unwrap();
+        keyboard
+            .replace(&[Mapping::new(new, "Ctrl", "hold").unwrap()])
+            .unwrap();
+        keyboard.block_reconnected();
+        keyboard.resume();
+        keyboard.observe(Event::Press(new), &mut emit).unwrap();
+        keyboard
+            .observe(Event::UnmatchedRelease(new), &mut emit)
+            .unwrap();
+        keyboard.observe(Event::Press(new), &mut emit).unwrap();
+        keyboard.pause(&mut emit).unwrap();
+        assert_eq!(
+            recorded,
+            [
+                (KeyCode::KEY_LEFTSHIFT, true),
+                (KeyCode::KEY_LEFTSHIFT, false),
+                (KeyCode::KEY_LEFTCTRL, true),
+                (KeyCode::KEY_LEFTCTRL, false)
+            ]
+        );
+    }
+
+    #[test]
+    fn disconnect_reconnect_is_inactive_and_waits_for_release_without_replaying_toggles() {
+        let a = Control::from_note(10, 36).unwrap();
+        let b = Control::from_note(10, 44).unwrap();
+        let mappings = [
+            Mapping::new(a, "Shift", "toggle").unwrap(),
+            Mapping::new(b, "Ctrl", "hold").unwrap(),
+        ];
+        let mut keyboard = Keyboard::new(&mappings).unwrap();
+        let mut recorded = Vec::new();
+        let mut emit = |key, down| {
+            recorded.push((key, down));
+            Ok(())
+        };
+        keyboard.observe(Event::Press(a), &mut emit).unwrap();
+        keyboard.pause(&mut emit).unwrap();
+        let mut reconnected = true;
+        assert!(
+            keyboard
+                .prepare_connection(&mappings, &HashSet::new(), &mut reconnected)
+                .unwrap()
+        );
+        keyboard.resume();
+        // Unknown already-held pads and repeats after reconnect cannot reactivate.
+        keyboard.observe(Event::Press(a), &mut emit).unwrap();
+        keyboard.observe(Event::Press(a), &mut emit).unwrap();
+        keyboard
+            .observe(Event::Release(a, ReleaseType::NoteOff), &mut emit)
+            .unwrap();
+        keyboard
+            .observe(Event::UnmatchedRelease(b), &mut emit)
+            .unwrap(); // observed release arms a pad even without a received press
+        keyboard.observe(Event::Press(a), &mut emit).unwrap();
+        keyboard.observe(Event::Press(b), &mut emit).unwrap();
+        keyboard.pause(&mut emit).unwrap();
+        // Ordinary resume must not guard already-armed, released pads again.
+        keyboard
+            .observe(Event::Release(a, ReleaseType::NoteOff), &mut emit)
+            .unwrap();
+        keyboard
+            .observe(Event::Release(b, ReleaseType::NoteOff), &mut emit)
+            .unwrap();
+        assert!(
+            !keyboard
+                .prepare_connection(&mappings, &HashSet::new(), &mut reconnected)
+                .unwrap()
+        );
+        keyboard.resume();
+        keyboard.observe(Event::Press(b), &mut emit).unwrap();
+        keyboard.pause(&mut emit).unwrap();
+        assert_eq!(
+            recorded,
+            [
+                (KeyCode::KEY_LEFTSHIFT, true),
+                (KeyCode::KEY_LEFTSHIFT, false),
+                (KeyCode::KEY_LEFTSHIFT, true),
+                (KeyCode::KEY_LEFTCTRL, true),
+                (KeyCode::KEY_LEFTCTRL, false),
+                (KeyCode::KEY_LEFTSHIFT, false),
+                (KeyCode::KEY_LEFTCTRL, true),
+                (KeyCode::KEY_LEFTCTRL, false)
+            ]
+        );
+        assert!(!keyboard.assignments.iter().any(|a| a.active));
+    }
+
+    #[test]
+    fn session_toggle_pause_edit_resume_and_release_all_wait_for_fresh_presses() {
+        let a = Control::from_note(10, 36).unwrap();
+        let b = Control::from_note(10, 44).unwrap();
+        let mut keyboard = Keyboard::new(&[Mapping::new(a, "Shift", "toggle").unwrap()]).unwrap();
+        let mut recorded = Vec::new();
+        let mut emit = |key, down| {
+            recorded.push((key, down));
+            Ok(())
+        };
+        keyboard.observe(Event::Press(a), &mut emit).unwrap();
+        keyboard.pause(&mut emit).unwrap();
+        assert!(!keyboard.assignments[0].active);
+        // Configuration occurs while paused and tracks controls pressed during editing.
+        keyboard.observe(Event::Press(b), &mut emit).unwrap();
+        keyboard
+            .replace(&[
+                Mapping::new(a, "Ctrl+K", "hold").unwrap(),
+                Mapping::new(b, "Shift", "toggle").unwrap(),
+            ])
+            .unwrap();
+        keyboard.resume();
+        keyboard.observe(Event::Press(a), &mut emit).unwrap();
+        keyboard.observe(Event::Press(b), &mut emit).unwrap();
+        keyboard
+            .observe(Event::Release(a, crate::ReleaseType::NoteOff), &mut emit)
+            .unwrap();
+        keyboard
+            .observe(Event::Release(b, crate::ReleaseType::NoteOff), &mut emit)
+            .unwrap();
+        keyboard.observe(Event::Press(a), &mut emit).unwrap();
+        keyboard.observe(Event::Press(b), &mut emit).unwrap();
+        keyboard.clear(&mut emit).unwrap();
+        keyboard.observe(Event::Press(a), &mut emit).unwrap();
+        keyboard.observe(Event::Press(b), &mut emit).unwrap();
+        keyboard
+            .observe(Event::Release(a, crate::ReleaseType::NoteOff), &mut emit)
+            .unwrap();
+        keyboard
+            .observe(Event::Release(b, crate::ReleaseType::NoteOff), &mut emit)
+            .unwrap();
+        keyboard.observe(Event::Press(b), &mut emit).unwrap();
+        keyboard.pause(&mut emit).unwrap();
+        assert_eq!(
+            recorded,
+            [
+                (KeyCode::KEY_LEFTSHIFT, true),
+                (KeyCode::KEY_LEFTSHIFT, false),
+                (KeyCode::KEY_LEFTCTRL, true),
+                (KeyCode::KEY_K, true),
+                (KeyCode::KEY_LEFTSHIFT, true),
+                (KeyCode::KEY_K, false),
+                (KeyCode::KEY_LEFTCTRL, false),
+                (KeyCode::KEY_LEFTSHIFT, false),
+                (KeyCode::KEY_LEFTSHIFT, true),
+                (KeyCode::KEY_LEFTSHIFT, false),
+            ]
+        );
+        let previous = keyboard.assignments.len();
+        let mut invalid = Mapping::new(a, "Shift", "hold").unwrap();
+        invalid.keys = vec!["Unknown".into()];
+        assert!(keyboard.replace(&[invalid]).is_err());
+        assert_eq!(keyboard.assignments.len(), previous);
+    }
 
     #[test]
     fn stream_release_arrives_during_silence_before_eof() {
         use std::io::Write;
         use std::os::unix::net::UnixStream;
-        let pad = Pad::from_note(10, 36).unwrap();
+        let pad = Control::from_note(10, 36).unwrap();
         let mut keyboard = Keyboard::new(&[Mapping::new(pad, "Shift", "hold").unwrap()]).unwrap();
         let (mut writer, reader) = UnixStream::pair().unwrap();
         let (sender, receiver) = mpsc::channel();
@@ -335,7 +794,9 @@ mod tests {
             }
         });
         writer
-            .write_all(&[0x99, 36, 32, 0xA9, 36, 64, 0x89, 36, 0])
+            .write_all(&[
+                0x99, 36, 32, 0xA9, 36, 64, 0xF0, 0x47, 0, 0x49, 0x67, 1, 0xF8, 0xF7, 0x89, 36, 0,
+            ])
             .unwrap();
         let press = receiver.recv_timeout(Duration::from_secs(1));
         let release = receiver.recv_timeout(Duration::from_secs(1));
@@ -351,9 +812,9 @@ mod tests {
 
     #[test]
     fn holds_toggles_overlap_order_cleanup_and_failed_output() {
-        let a = Pad::from_note(10, 36).unwrap();
-        let b = Pad::from_note(10, 37).unwrap();
-        let c = Pad::from_note(10, 44).unwrap();
+        let a = Control::from_note(10, 36).unwrap();
+        let b = Control::from_note(10, 37).unwrap();
+        let c = Control::from_note(10, 44).unwrap();
         let mappings = vec![
             Mapping::new(a, "Ctrl", "hold").unwrap(),
             Mapping::new(b, "C+Ctrl", "toggle").unwrap(),
