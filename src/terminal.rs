@@ -1711,6 +1711,24 @@ fn choose_at(
         }
     }
 }
+/// Appends `[x] (saved)` to the saved option; the mark stays put while the cursor moves.
+fn mark_saved(mut options: Vec<String>, saved: Option<usize>) -> Vec<String> {
+    if let Some(option) = saved.and_then(|i| options.get_mut(i)) {
+        option.push_str("  [x] (saved)");
+    }
+    options
+}
+
+/// Opens on the saved option and marks it. With nothing saved (a new mapping) this is `choose`.
+fn choose_saved(
+    ui: &mut impl Ui,
+    title: &str,
+    options: Vec<String>,
+    saved: Option<usize>,
+) -> Result<Option<usize>> {
+    choose_at(ui, title, &mark_saved(options, saved), saved.unwrap_or(0))
+}
+
 fn options(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| s.to_string()).collect()
 }
@@ -1731,9 +1749,9 @@ fn number(ui: &mut impl Ui, title: &str, initial: i32, min: i32, max: i32) -> Re
     }
 }
 
-fn select_keys(ui: &mut impl Ui) -> Result<Option<Vec<String>>> {
+fn select_keys(ui: &mut impl Ui, saved: &[String]) -> Result<Option<Vec<String>>> {
     let groups = mappings::key_groups();
-    let mut selected: Vec<String> = Vec::new();
+    let mut selected = saved.to_vec();
     loop {
         let mut menu: Vec<_> = groups.iter().map(|(name, _)| name.to_string()).collect();
         menu.push("Done selecting".into());
@@ -1758,9 +1776,10 @@ fn select_keys(ui: &mut impl Ui) -> Result<Option<Vec<String>>> {
                 .take(visible)
                 .map(|(i, k)| {
                     format!(
-                        "{} [{}] {k}",
+                        "{} [{}] {k}{}",
                         if i == cursor { ">" } else { " " },
-                        if selected.contains(k) { "x" } else { " " }
+                        if selected.contains(k) { "x" } else { " " },
+                        if saved.contains(k) { " (saved)" } else { "" }
                     )
                 })
                 .collect::<Vec<_>>()
@@ -1787,14 +1806,19 @@ fn select_keys(ui: &mut impl Ui) -> Result<Option<Vec<String>>> {
     }
 }
 
-fn shortcut(ui: &mut impl Ui) -> Result<Option<Vec<String>>> {
+fn shortcut(ui: &mut impl Ui, saved: &[String]) -> Result<Option<Vec<String>>> {
+    let saved_line = if saved.is_empty() {
+        String::new()
+    } else {
+        format!("\nSaved: {}  [x] (saved)", saved.join("+"))
+    };
     loop {
         match choose(
             ui,
-            "Shortcut input",
+            &format!("Shortcut input{saved_line}"),
             &options(&["Select keys", "Record shortcut", "Cancel"]),
         )? {
-            Some(0) => return select_keys(ui),
+            Some(0) => return select_keys(ui, saved),
             Some(1) => loop {
                 let keys = match ui.record() {
                     Ok(keys) => keys,
@@ -1811,7 +1835,7 @@ fn shortcut(ui: &mut impl Ui) -> Result<Option<Vec<String>>> {
                 };
                 match choose(
                     ui,
-                    &format!("Captured: {}", keys.join("+")),
+                    &format!("Captured: {}{saved_line}", keys.join("+")),
                     &options(&["Use", "Record again", "Cancel"]),
                 )? {
                     Some(0) => return Ok(Some(keys)),
@@ -1827,10 +1851,13 @@ fn shortcut(ui: &mut impl Ui) -> Result<Option<Vec<String>>> {
 fn feedback_menu(
     ui: &mut impl Ui,
     initial: crate::feedback::Feedback,
+    saved: bool,
     idle: bool,
 ) -> Result<Option<crate::feedback::Feedback>> {
     use crate::feedback::{Feedback, Octave};
     let mut feedback = initial;
+    // Marks always show the saved value; the cursor follows the working value.
+    let mark = |index: usize| saved.then_some(index);
     let mut cursor = if feedback.octave.is_some() {
         1
     } else if feedback.tempo.is_some() {
@@ -1849,20 +1876,16 @@ fn feedback_menu(
                 "Optional hardware feedback"
             }
         );
-        let Some(choice) = choose_at(
-            ui,
-            &title,
-            &options(&[
-                "No hardware feedback",
-                "Octave",
-                "Tempo",
-                "Arpeggiator",
-                "Done",
-                "Cancel",
-            ]),
-            cursor,
-        )?
-        else {
+        let items = options(&[
+            "No hardware feedback",
+            "Octave",
+            "Tempo",
+            "Arpeggiator",
+            "Done",
+            "Cancel",
+        ]);
+        let items = mark_saved(items, mark(0).filter(|_| !initial.enabled()));
+        let Some(choice) = choose_at(ui, &title, &items, cursor)? else {
             return Ok(None);
         };
         cursor = choice;
@@ -1878,12 +1901,13 @@ fn feedback_menu(
                         "Offset from session baseline (not accumulated)",
                     ])
                 };
-                let selected = match feedback.octave {
+                let index = |octave| match octave {
                     None => 0,
                     Some(Octave::Absolute(_)) => 1,
                     Some(Octave::Offset(_)) => 2,
                 };
-                match choose_at(ui, "Octave mode", &modes, selected)? {
+                let modes = mark_saved(modes, mark(index(initial.octave)));
+                match choose_at(ui, "Octave mode", &modes, index(feedback.octave))? {
                     Some(0) => feedback.octave = None,
                     Some(mode) => {
                         let current = match feedback.octave {
@@ -1904,7 +1928,10 @@ fn feedback_menu(
             2 => match choose_at(
                 ui,
                 "Tempo",
-                &options(&["Unchanged", "Set BPM (enables arpeggiator)"]),
+                &mark_saved(
+                    options(&["Unchanged", "Set BPM (enables arpeggiator)"]),
+                    mark(usize::from(initial.tempo.is_some())),
+                ),
                 usize::from(feedback.tempo.is_some()),
             )? {
                 Some(0) => feedback.tempo = None,
@@ -1923,11 +1950,15 @@ fn feedback_menu(
                 _ => {}
             },
             3 => {
+                let index = |arp: Option<bool>| arp.map(|on| usize::from(on) + 1).unwrap_or(0);
                 if let Some(choice) = choose_at(
                     ui,
                     "Arpeggiator",
-                    &options(&["Unchanged", "Off", "On"]),
-                    feedback.arp.map(|on| usize::from(on) + 1).unwrap_or(0),
+                    &mark_saved(
+                        options(&["Unchanged", "Off", "On"]),
+                        mark(index(initial.arp)),
+                    ),
+                    index(feedback.arp),
                 )? {
                     if !idle && choice == 1 && feedback.tempo.is_some() {
                         choose(
@@ -2132,6 +2163,7 @@ fn action_menu(
     ui: &mut impl Ui,
     family: usize,
     input: mappings::Input,
+    saved: Option<&crate::actions::Action>,
 ) -> Result<Option<crate::actions::Action>> {
     use crate::actions::Action;
     if matches!(input, mappings::Input::Joystick { .. })
@@ -2157,10 +2189,17 @@ fn action_menu(
             "Start Wispr Flow (ordered)",
             "Repair/reopen Wispr Flow (explicit graceful quit)",
         ]));
-        let Some(i) = choose(
+        let saved = match saved {
+            Some(Action::Application(path)) => apps.iter().position(|(_, p)| p == path),
+            Some(Action::FlowStart) => Some(apps.len()),
+            Some(Action::FlowRepair) => Some(apps.len() + 1),
+            _ => None,
+        };
+        let Some(i) = choose_saved(
             ui,
             "Installed visible applications (one native launch request per press)",
-            &names,
+            names,
+            saved,
         )?
         else {
             return Ok(None);
@@ -2173,16 +2212,23 @@ fn action_menu(
             Action::FlowRepair
         }));
     }
-    let Some(i) = choose(
+    let (saved, saved_step) = match saved {
+        Some(Action::Volume { up, step }) => (Some(usize::from(!up)), Some(*step)),
+        Some(Action::OutputMute) => (Some(2), None),
+        Some(Action::MicrophoneMute) => (Some(3), None),
+        _ => (None, None),
+    };
+    let Some(i) = choose_saved(
         ui,
         "Native audio actions; default device resolved at activation.
 Requires wpctl in your desktop session. Brightness/media/lock and absolute volume are not enabled.",
-        &options(&[
+        options(&[
             "Output volume up",
             "Output volume down",
             "Output mute",
             "Microphone mute",
         ]),
+        saved,
     )?
     else {
         return Ok(None);
@@ -2191,7 +2237,7 @@ Requires wpctl in your desktop session. Brightness/media/lock and absolute volum
         let Some(step) = number(
             ui,
             "Volume step (%) per activation; ordinary volume capped at 100%",
-            5,
+            saved_step.unwrap_or(5).into(),
             1,
             100,
         )?
@@ -2415,10 +2461,10 @@ fn configure(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) -> Resul
         {
             continue;
         }
-        let selected_behavior = current
+        let saved = current
             .iter()
             .find(|m| m.context == ui.context() && m.control == pad)
-            .is_some_and(|m| m.behavior == mappings::Behavior::Toggle);
+            .cloned();
         let input = motion
             .as_ref()
             .map(|(_, input, _)| *input)
@@ -2438,31 +2484,42 @@ fn configure(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) -> Resul
         {
             return Err("pad/piano source collision; this emitted note is already assigned as another control family".into());
         }
-        let Some(family) = choose(
+        let saved_family = saved.as_ref().map(|m| match &m.action {
+            crate::actions::Action::Shortcut => 0,
+            action if action.audio() => 2,
+            _ => 1,
+        });
+        let Some(family) = choose_saved(
             ui,
             "Action family",
-            &options(&[
+            options(&[
                 "Keyboard shortcut",
                 "Launch application",
                 "Fedora system action",
             ]),
+            saved_family,
         )?
         else {
             continue;
         };
         let mut mapping = if family == 0 {
-            let Some(keys) = shortcut(ui)? else {
+            let Some(keys) = shortcut(ui, saved.as_ref().map_or(&[], |m| &m.keys))? else {
                 continue;
             };
             let behavior = match input {
                 mappings::Input::Knob { .. } => "pulse",
                 mappings::Input::Joystick { .. } => "hold",
                 _ => {
-                    let Some(b) = choose_at(
+                    let saved_behavior = saved.as_ref().and_then(|m| match m.behavior {
+                        mappings::Behavior::Hold => Some(0),
+                        mappings::Behavior::Toggle => Some(1),
+                        _ => None,
+                    });
+                    let Some(b) = choose_saved(
                         ui,
                         "Activation behavior",
-                        &options(&["hold", "toggle"]),
-                        usize::from(selected_behavior),
+                        options(&["hold", "toggle"]),
+                        saved_behavior,
                     )?
                     else {
                         continue;
@@ -2472,7 +2529,8 @@ fn configure(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) -> Resul
             };
             Mapping::new(pad, &keys.join("+"), behavior)?
         } else {
-            let Some(action) = action_menu(ui, family, input)? else {
+            let Some(action) = action_menu(ui, family, input, saved.as_ref().map(|m| &m.action))?
+            else {
                 continue;
             };
             Mapping::new_action(pad, input, action)?
@@ -2520,7 +2578,7 @@ fn configure(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) -> Resul
         {
             Some(crate::feedback::Feedback::default())
         } else {
-            feedback_menu(ui, previous, false)?
+            feedback_menu(ui, previous, saved.is_some(), false)?
         }) else {
             continue;
         };
@@ -2850,7 +2908,7 @@ pub fn start(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()
                     tempo: ui.idle.tempo,
                     arp: ui.idle.arp,
                 };
-                let Some(feedback) = feedback_menu(&mut ui, initial, true)? else {
+                let Some(feedback) = feedback_menu(&mut ui, initial, true, true)? else {
                     return Ok(());
                 };
                 let idle = crate::feedback::Settings {
@@ -3349,7 +3407,7 @@ mod tests {
             screens: Vec::new(),
         };
         assert_eq!(
-            feedback_menu(&mut ui, initial, false).unwrap(),
+            feedback_menu(&mut ui, initial, true, false).unwrap(),
             Some(initial)
         );
         assert!(ui.keys.is_empty());
@@ -3380,14 +3438,16 @@ mod tests {
             recordings: VecDeque::new(),
             screens: Vec::new(),
         };
-        let feedback = feedback_menu(&mut ui, crate::feedback::Feedback::default(), false)
+        let feedback = feedback_menu(&mut ui, crate::feedback::Feedback::default(), false, false)
             .unwrap()
             .unwrap();
         assert_eq!(feedback.tempo, Some(121));
         assert_eq!(feedback.arp, Some(true));
         assert!(ui.keys.is_empty());
         ui.keys = [Down, Enter, Up, Enter, Down, Enter].into();
-        let idle = feedback_menu(&mut ui, feedback, true).unwrap().unwrap();
+        let idle = feedback_menu(&mut ui, feedback, false, true)
+            .unwrap()
+            .unwrap();
         assert_eq!(idle.tempo, Some(121));
         assert_eq!(idle.arp, Some(false));
         ui.keys = [
@@ -3395,14 +3455,18 @@ mod tests {
         ]
         .into();
         assert_eq!(
-            feedback_menu(&mut ui, crate::feedback::Feedback::default(), false)
+            feedback_menu(&mut ui, crate::feedback::Feedback::default(), false, false)
                 .unwrap()
                 .unwrap()
                 .octave,
             Some(crate::feedback::Octave::Offset(1))
         );
         ui.keys = [Escape].into();
-        assert!(feedback_menu(&mut ui, feedback, false).unwrap().is_none());
+        assert!(
+            feedback_menu(&mut ui, feedback, false, false)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -3418,22 +3482,66 @@ mod tests {
             .into(),
             screens: Vec::new(),
         };
-        assert_eq!(shortcut(&mut ui).unwrap().unwrap(), ["Shift"]);
+        assert_eq!(shortcut(&mut ui, &[]).unwrap().unwrap(), ["Shift"]);
         assert!(ui.recordings.is_empty());
         assert!(ui.keys.is_empty());
         ui.keys = [Down, Enter, Escape].into();
         ui.recordings = [Ok(vec!["Escape".into()])].into();
-        assert!(shortcut(&mut ui).unwrap().is_none());
+        assert!(shortcut(&mut ui, &[]).unwrap().is_none());
         assert!(ui.keys.is_empty());
         ui.keys = [Down, Enter, Enter, Enter, Escape].into();
         ui.recordings = [Err("permission denied".into())].into();
-        assert!(shortcut(&mut ui).unwrap().is_none());
+        assert!(shortcut(&mut ui, &[]).unwrap().is_none());
         assert!(ui.keys.is_empty());
         assert!(
             ui.screens
                 .iter()
                 .any(|s| s.contains("Select keys remains available"))
         );
+    }
+
+    #[test]
+    fn editing_marks_saved_choices_without_moving_the_mark_and_new_mappings_have_none() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("keyai-saved-mark-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let a = Control::from_note(10, 36).unwrap();
+        let mut current = vec![Mapping::new(a, "Shift", "hold").unwrap()];
+        mappings::save(&path, &current).unwrap();
+        let saved = std::fs::read(&path).unwrap();
+        let mut ui = Script {
+            keys: [
+                Tab, Enter, Enter, Enter, // Edit -> saved pad -> Assign / replace
+                Down, Up, Enter, // family: mark stays while the cursor moves
+                Enter, Enter, Enter, Up, Enter,  // Select keys -> Modifiers -> back -> Done
+                Enter,  // behavior: saved hold
+                Escape, // cancel at feedback
+                Escape, // leave configure
+            ]
+            .into(),
+            ..Default::default()
+        };
+        configure(&mut ui, &path, &mut current).unwrap();
+        assert!(ui.keys.is_empty());
+        let shown = |text: &str| ui.screens.iter().any(|s| s.contains(text));
+        assert!(shown("> Keyboard shortcut  [x] (saved)")); // opens on the saved value
+        assert!(shown(
+            "  Keyboard shortcut  [x] (saved)\n> Launch application"
+        ));
+        assert!(shown("Saved: Shift  [x] (saved)"));
+        assert!(shown("[x] Shift (saved)")); // key picker starts on the saved chord
+        assert!(shown("> hold  [x] (saved)"));
+        assert!(shown("> No hardware feedback  [x] (saved)"));
+        assert_eq!(std::fs::read(&path).unwrap(), saved); // cancel changes nothing
+
+        ui.screens.clear();
+        ui.pads = [Control::from_note(10, 37).unwrap()].into();
+        ui.keys = [Enter, Enter, Escape, Escape].into(); // learn new pad -> assign -> cancel
+        configure(&mut ui, &path, &mut current).unwrap();
+        assert!(ui.screens.iter().any(|s| s.contains("Action family")));
+        assert!(!ui.screens.iter().any(|s| s.contains("(saved)")));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -3460,15 +3568,29 @@ mod tests {
         );
         assert!(current[1].keys.is_empty());
         assert_eq!(current[1].behavior, mappings::Behavior::Trigger);
+        // Editing opens the family menu on the saved "Launch application"; one Down reaches system.
         ui.keys = [
-            Tab, Enter, Down, Enter, Enter, Down, Down, Enter, Enter, Enter, Down, Enter,
+            Tab, Enter, Down, Enter, Enter, Down, Enter, Enter, Enter, Down, Enter,
         ]
         .into();
         configure(&mut ui, &path, &mut current).unwrap();
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains("> Launch application  [x] (saved)"))
+        );
         assert_eq!(current[1].action, Action::Volume { up: true, step: 5 });
         assert_eq!(current, mappings::load(&path).unwrap());
         assert_eq!(current[0].keys, ["Shift"]);
-        assert!(action_menu(&mut Script::default(), 1, mappings::Input::Knob { step: 4 }).is_err());
+        assert!(
+            action_menu(
+                &mut Script::default(),
+                1,
+                mappings::Input::Knob { step: 4 },
+                None
+            )
+            .is_err()
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
