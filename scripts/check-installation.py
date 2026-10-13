@@ -4,7 +4,9 @@ import fcntl
 import os
 from pathlib import Path
 import subprocess
+import signal
 import tempfile
+import time
 
 binary = Path(__file__).resolve().parents[1] / "target/debug/vibeconsole"
 with tempfile.TemporaryDirectory(prefix="vibeconsole-install-") as directory:
@@ -15,9 +17,12 @@ with tempfile.TemporaryDirectory(prefix="vibeconsole-install-") as directory:
     systemctl = fake / "systemctl"
     systemctl.write_text("#!/usr/bin/python3\nimport os,sys\nwith open(os.environ['VIBECONSOLE_CHECK_LOG'],'a') as f: f.write(' '.join(sys.argv[1:])+'\\n')\n")
     systemctl.chmod(0o755)
+    lsusb = fake / "lsusb"
+    lsusb.write_text("#!/bin/sh\nexit 1\n")
+    lsusb.chmod(0o755)
     env = dict(os.environ, HOME=str(root), XDG_CONFIG_HOME=str(root / "config"),
                XDG_RUNTIME_DIR=str(root), PATH=str(fake) + ":" + os.environ["PATH"],
-               VIBECONSOLE_CHECK_LOG=str(log))
+               XDG_DATA_HOME=str(root), XDG_DATA_DIRS=str(root), VIBECONSOLE_CHECK_LOG=str(log))
     path = root / "config/vibeconsole/mappings.tsv"
     path.parent.mkdir(parents=True)
     saved = b"vibeconsole-mappings-v1\n09e8:1049\tnote\t10\t36\thold\tShift\n"
@@ -42,15 +47,29 @@ with tempfile.TemporaryDirectory(prefix="vibeconsole-install-") as directory:
     with (root / "vibeconsole.lock").open("r+") as owner:
         fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
         assert b"another VibeConsole session" in run("configure", ok=False).stderr
-    run("startup-enable", "--feedback", "--start-flow")
-    assert 'daemon --feedback --start-flow' in unit.read_text()
+    legacy = run("startup-enable", "--feedback", "--start-flow")
+    assert b"Legacy startup-enable flags ignored" in legacy.stdout
+    assert 'daemon\n' in unit.read_text()
+    assert '--feedback' not in unit.read_text() and '--start-flow' not in unit.read_text()
+    daemon = subprocess.Popen([binary, "daemon", "--feedback", "--start-flow"], env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        time.sleep(0.1)
+        daemon.send_signal(signal.SIGTERM)
+        _, journal = daemon.communicate(timeout=3)
+        assert b"Legacy daemon flags ignored" in journal
+    finally:
+        if daemon.poll() is None:
+            daemon.kill()
+            daemon.wait(timeout=3)
     assert log.read_text().splitlines() == ["--user daemon-reload", "--user enable vibeconsole.service"]
     for cmd in ("startup-start", "startup-status", "startup-stop", "startup-disable"):
         run(cmd)
     managed = unit.read_text()
     verification = root / "vibeconsole.service"
     verification.write_text(managed.replace('%h/.local/bin/vibeconsole', str(binary)))
-    subprocess.run(["systemd-analyze", "--user", "verify", verification], check=True, capture_output=True, timeout=5)
+    verified = subprocess.run(["systemd-analyze", "--user", "verify", verification], capture_output=True, timeout=5)
+    assert verified.returncode == 0, verified.stderr
     unit.write_text("[Unit]\nDescription=Unmanaged\n")
     run("startup-enable", ok=False)
     run("uninstall", ok=False)

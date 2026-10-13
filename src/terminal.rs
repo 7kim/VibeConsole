@@ -5,6 +5,7 @@ use crate::{
 };
 use std::collections::BTreeMap;
 use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -28,9 +29,69 @@ enum Key {
     InvalidInput,
 }
 
+fn csi_key(sequence: &[u8]) -> Key {
+    let (code, modifier) = match sequence {
+        [code @ (b'A' | b'B' | b'C' | b'D')] => (*code, 1),
+        [
+            b'1',
+            b';',
+            modifier @ b'2'..=b'8',
+            code @ (b'A' | b'B' | b'C' | b'D'),
+        ] => (*code, *modifier - b'0'),
+        _ => {
+            let Some((&final_byte, params)) = sequence.split_last() else {
+                return Key::Other;
+            };
+            let Ok(params) = std::str::from_utf8(params) else {
+                return Key::Other;
+            };
+            let mut fields = params.split(';');
+            let (Some(code), Some(modifier)) = (fields.next(), fields.next()) else {
+                return Key::Other;
+            };
+            let Ok(code) = code.parse::<u8>() else {
+                return Key::Other;
+            };
+            let Ok(modifier) = modifier.parse::<u8>() else {
+                return Key::Other;
+            };
+            if !(2..=8).contains(&modifier) {
+                return Key::Other;
+            }
+            let code = match final_byte {
+                b'u' if fields.next().is_none() => code,
+                b'~' if code == 27 => match fields.next().and_then(|s| s.parse::<u8>().ok()) {
+                    Some(code) if fields.next().is_none() => code,
+                    _ => return Key::Other,
+                },
+                _ => return Key::Other,
+            };
+            return match code {
+                13 => Key::Enter,
+                27 => Key::Escape,
+                32 => Key::Space,
+                _ => Key::Other,
+            };
+        }
+    };
+    if !(1..=8).contains(&modifier) {
+        return Key::Other;
+    }
+    match code {
+        b'A' => Key::Up,
+        b'B' => Key::Down,
+        b'C' => Key::Right,
+        b'D' => Key::Left,
+        _ => Key::Other,
+    }
+}
+
 trait Ui {
     fn draw(&mut self, text: &str) -> Result<()>;
     fn key(&mut self) -> Result<Option<Key>>;
+    fn edit_file(&mut self, _path: &Path) -> Result<()> {
+        Err("editor unavailable".into())
+    }
     fn height(&self) -> usize {
         24
     }
@@ -81,7 +142,12 @@ struct Terminal {
     output: Option<crate::keyboard::Output>,
     actions: crate::actions::Dispatcher,
     flow_pending: bool,
+    /// (agent, tmux window, state), refreshed every `STATUS_EVERY`.
+    agent_states: Vec<(String, String, &'static str)>,
+    status_at: Instant,
     flow_failed: bool,
+    start_flow_enabled: bool,
+    flow_missing: bool,
     controller: Option<crate::feedback::Controller>,
     resolver: Option<crate::feedback::Resolver>,
     idle: crate::feedback::Settings,
@@ -123,7 +189,8 @@ impl Terminal {
             .output
             .as_ref()
             .map(|o| o.keyboard.status(|control| self.name(control)))
-            .unwrap_or_else(|| format!("PAUSED | {} saved assignments", self.run_mappings.len()));
+            .unwrap_or_else(|| format!("PAUSED | {} saved assignments", self.run_mappings.len()))
+            + &agent_line(&self.agent_states);
         let state = if self.wanted_run {
             let label = if !self.context_verified {
                 "RUNNING (detecting program; actions inactive)"
@@ -161,13 +228,23 @@ impl Terminal {
         };
         let connection_line = if size.0 < 75 {
             format!(
-                "VibeConsole | MIDI {} | Input {}",
+                "{} | MIDI {} | Input {}",
+                if self.flow_missing {
+                    "Flow not installed"
+                } else {
+                    "VibeConsole"
+                },
                 crate::screen::bulb(self.input.is_some()),
                 crate::screen::bulb(input_on)
             )
         } else {
             format!(
-                "VibeConsole | MIDI {} {midi_status} | Input {}",
+                "{} | MIDI {} {midi_status} | Input {}",
+                if self.flow_missing {
+                    "VibeConsole: Wispr Flow not installed"
+                } else {
+                    "VibeConsole"
+                },
                 crate::screen::bulb(self.input.is_some()),
                 crate::screen::bulb(input_on)
             )
@@ -214,7 +291,7 @@ impl Terminal {
             live: Vec::new(),
             hints: hints.into(),
         };
-        for (index, (name, command)) in command_rows().iter().enumerate() {
+        for (index, (name, command)) in command_rows(self.wanted_run).iter().enumerate() {
             screen.commands.push(match command {
                 None => format!("── {name}"),
                 Some(_) if index == self.menu && self.at_menu => format!("> {name}"),
@@ -499,7 +576,11 @@ impl Terminal {
             output: None,
             actions: crate::actions::Dispatcher::new(),
             flow_pending: false,
+            agent_states: Vec::new(),
+            status_at: Instant::now(),
             flow_failed: false,
+            start_flow_enabled: true,
+            flow_missing: false,
             controller: None,
             resolver: None,
             idle: crate::feedback::Settings::default(),
@@ -553,16 +634,92 @@ impl Terminal {
         Ok(terminal)
     }
 
+    fn refresh_agent_states(&mut self) {
+        let Ok(config) = mappings::load_config(&self.path) else {
+            return;
+        };
+        self.agent_states = config
+            .agents
+            .into_iter()
+            .map(|a| {
+                let state = crate::status::read(&a.name);
+                (a.name, a.window, state)
+            })
+            .collect();
+        // Only ask tmux when something could be cleared.
+        if self.agent_states.iter().any(|(_, _, s)| *s == "finished") {
+            let attended =
+                crate::status::attended(&self.agent_states, crate::status::tmux_active())
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+            self.clear_finished(&attended);
+        }
+    }
+    /// Attending to an agent (its tmux window, or a mapping sent to it) clears its finished state.
+    fn clear_finished(&mut self, agents: &[String]) {
+        for (name, _, state) in &mut self.agent_states {
+            if *state == "finished" && agents.contains(name) {
+                match crate::status::write(name, "idle") {
+                    Ok(()) => *state = "idle",
+                    Err(error) => self.error = format!("Agent status not cleared: {error}"),
+                }
+            }
+        }
+    }
+    fn dialed(&mut self, dialed: crate::motion::Dialed) {
+        match dialed {
+            crate::motion::Dialed::Send(action, zone, count) => {
+                self.notice = format!("Choice {}/{count}: {}", zone + 1, action.description());
+                if let Err(error) = self.actions.submit(action, None) {
+                    self.error = format!("Choice not sent: {error}");
+                }
+            }
+            crate::motion::Dialed::Write(path, text) => {
+                if let Err(error) = crate::actions::write_atomic(Path::new(&path), &text) {
+                    self.error = format!("Value not written to {path}: {error}");
+                } else {
+                    self.notice = format!("Value {} → {path}", text.trim_end());
+                }
+            }
+        }
+    }
+    fn tap(&mut self, keys: &[evdev::KeyCode]) -> Result<()> {
+        self.output
+            .as_mut()
+            .ok_or("virtual keyboard unavailable")?
+            .tap(keys)
+    }
     fn cancel_actions(&mut self) {
         self.actions.cancel();
         if self.flow_pending {
-            self.error = "Flow work cancelled; output remains paused. If Flow was already quit, reopen it manually after VibeConsole's keyboard is ready, test physical Shift, then /resume.".into();
+            self.error = "Flow work cancelled; output remains paused. If Flow was already quit, reopen it manually after VibeConsole's keyboard is ready, test physical Shift, then Run.".into();
         }
         self.flow_pending = false;
     }
     fn pause(&mut self) -> Result<()> {
         self.wanted_run = false;
         self.suspend()
+    }
+    fn reset_confirmed(&mut self, current: &mut Vec<Mapping>) -> Result<PathBuf> {
+        self.pause()?;
+        if let Some(mut controller) = self.controller.take() {
+            self.resolver = None;
+            controller.finish()?;
+            self.input = None;
+            self.reconnected = true;
+        }
+        let backup = reset_file(&self.path)?;
+        self.output = None;
+        self.run_mappings.clear();
+        current.clear();
+        self.idle = crate::feedback::Settings::default();
+        self.start_flow_enabled = true;
+        self.retry = None;
+        self.connecting = false;
+        self.error.clear();
+        self.notice = format!("Settings reset. Backup: {}", backup.display());
+        Ok(backup)
     }
     fn suspend(&mut self) -> Result<()> {
         self.suspended = true;
@@ -622,6 +779,31 @@ impl Terminal {
             "Flow operation pending; output stays paused. Esc/pause cancels pending work.".into();
         Ok(())
     }
+    fn startup_flow(&mut self) -> Result<()> {
+        if !self.start_flow_enabled {
+            return Ok(());
+        }
+        if !crate::actions::flow_installed()? {
+            self.flow_missing = true;
+            self.notice = "Wispr Flow not installed; automatic startup skipped.".into();
+            return Ok(());
+        }
+        self.start_flow(true)?;
+        while self.flow_pending && !self.stop.load(Ordering::Relaxed) {
+            self.tick()?;
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if self.stop.load(Ordering::Relaxed) {
+            return Err("session stopped during Flow startup".into());
+        }
+        if self.flow_failed {
+            return Err(self.error.clone().into());
+        }
+        self.error.clear();
+        self.notice =
+            "Flow helper opened the current keyboard; dictation remains unverified.".into();
+        Ok(())
+    }
     fn transition(&mut self, pad: Control, active: bool) -> Result<()> {
         if let Some(action) = self
             .run_mappings
@@ -631,6 +813,12 @@ impl Terminal {
         {
             if action != crate::actions::Action::Shortcut {
                 if active {
+                    let agents = action
+                        .agents()
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>();
+                    self.clear_finished(&agents);
                     if action.flow() {
                         return self.start_flow(action == crate::actions::Action::FlowRepair);
                     }
@@ -806,6 +994,7 @@ impl Terminal {
                         "Set absolute octave",
                         "Set tempo (enables arpeggiator)",
                         "Set arpeggiator",
+                        "Alternate octave (V5 status-light gate probe)",
                         "Finish and restore",
                     ]),
                     cursor,
@@ -864,6 +1053,53 @@ impl Terminal {
                             arp: Some(index == 1),
                             ..trial
                         }
+                    }
+                    3 => {
+                        let Some(step) = number(self, "Alternate octave 0 ↔ this value", 1, -4, 4)?
+                        else {
+                            continue;
+                        };
+                        let Some(ms) = number(
+                            self,
+                            "Interval between changes (ms); runs 10 s",
+                            1000,
+                            100,
+                            3000,
+                        )?
+                        else {
+                            continue;
+                        };
+                        // Same bounded octave writes as above; Finish/Esc restores as usual.
+                        let started = Instant::now();
+                        let mut next = started;
+                        let mut requests = 0;
+                        while started.elapsed() < Duration::from_secs(10) {
+                            if Instant::now() >= next {
+                                requests += 1;
+                                let octave = if requests % 2 == 1 { step as i8 } else { 0 };
+                                trial = Settings {
+                                    octave: Some(octave),
+                                    ..trial
+                                };
+                                self.controller
+                                    .as_mut()
+                                    .ok_or_else(|| self.error.clone())?
+                                    .set(trial)?;
+                                next += Duration::from_millis(ms as u64);
+                            }
+                            let status = self
+                                .controller
+                                .as_ref()
+                                .map_or(String::new(), |c| c.status.clone());
+                            self.draw(&format!(
+                                "Alternating octave 0 ↔ {step:+} every {ms} ms: {requests} requests in {:.1} s.\nCount the octave light changes; note any skipped or late ones. Esc stops.\nStatus: {status}",
+                                started.elapsed().as_secs_f32()
+                            ))?;
+                            if self.key()? == Some(Key::Escape) {
+                                break;
+                            }
+                        }
+                        continue;
                     }
                     _ => break,
                 };
@@ -987,7 +1223,11 @@ impl Terminal {
                     self.context_verified = false;
                     self.feedback_allowed = false;
                     self.program_snapshot = None;
-                    self.notice = "Current RAM has no unique stored-program match. Select /prog-select; output stays inactive.".into();
+                    self.notice = if self.original.is_none() {
+                        "Current RAM has no unique stored-program match; service output stays inactive."
+                    } else {
+                        "Current RAM has no unique stored-program match. Select /prog-select; output stays inactive."
+                    }.into();
                     return Ok(());
                 };
                 self.context = context;
@@ -1003,15 +1243,20 @@ impl Terminal {
                     .filter(|m| m.context == context)
                     .collect();
                 // Piano safety confirmation still needs an explicit Run; never prompt recursively from draw/tick.
-                if self
+                let piano = self
                     .run_mappings
                     .iter()
-                    .any(|m| m.input == mappings::Input::Piano)
-                {
+                    .any(|m| m.input == mappings::Input::Piano);
+                let service_piano = piano && self.original.is_none();
+                if piano && !service_piano {
                     self.wanted_run = false;
                 }
-                self.suspended = !self.wanted_run;
-                if self.output.is_none() && self.wanted_run && !self.run_mappings.is_empty() {
+                self.suspended = !self.wanted_run || service_piano;
+                if self.output.is_none()
+                    && self.wanted_run
+                    && !self.suspended
+                    && !self.run_mappings.is_empty()
+                {
                     self.output = Some(crate::keyboard::Output::new(&self.run_mappings)?);
                 }
                 if let Some(output) = &mut self.output {
@@ -1043,7 +1288,11 @@ impl Terminal {
                         .iter()
                         .any(|m| m.input == mappings::Input::Piano)
                     {
-                        " Piano mappings: confirm arpeggiator Off and intended octave through /run."
+                        if self.original.is_none() {
+                            " Piano mappings inactive: interactive Run confirmation required."
+                        } else {
+                            " Piano mappings: confirm arpeggiator Off and intended octave through Run."
+                        }
                     } else {
                         " Fresh release arms each Note control."
                     }
@@ -1073,10 +1322,18 @@ impl Terminal {
             self.connecting = false;
             self.error = error.to_string();
         }
-        while let Some((flow, notice)) = self.actions.notice() {
-            if flow {
+        if self.status_at.elapsed() >= STATUS_EVERY {
+            self.status_at = Instant::now();
+            self.refresh_agent_states();
+        }
+        // Prompt pastes and sequence shortcuts: the worker waits for each answer.
+        for (keys, reply) in self.actions.tap_requests() {
+            let _ = reply.send(self.tap(&keys).map_err(|e| e.to_string()));
+        }
+        while let Some((action, ok, notice)) = self.actions.notice() {
+            if action.flow() {
                 self.flow_pending = false;
-                self.flow_failed = notice.starts_with("Action failed:");
+                self.flow_failed = !ok;
             }
             self.error = notice
                 .chars()
@@ -1180,6 +1437,9 @@ impl Terminal {
                 }
                 self.error = "Program Change observed: preset transition unverified; select matching /prog-select to continue; no release inferred.".into();
             }
+            for dialed in self.motion.dial(message, Instant::now()) {
+                self.dialed(dialed);
+            }
             let mut events = match self.motion.observe(message) {
                 Ok(events) => events,
                 Err(error) => {
@@ -1215,6 +1475,26 @@ impl Terminal {
                     }
                 }
             }
+        }
+        for dialed in self.motion.settle(Instant::now()) {
+            self.dialed(dialed);
+        }
+        let fired = self.output.as_mut().map(|output| output.fire_due());
+        match fired {
+            Some(Ok(fired)) => {
+                for (pad, active) in fired {
+                    if let Err(error) = self.transition(pad, active) {
+                        self.pause()?;
+                        self.error = format!("Action/feedback rejected: {error}; paused");
+                    }
+                }
+            }
+            Some(Err(error)) => {
+                self.error = format!("Keyboard output failed: {error}");
+                self.output = None;
+                self.pause()?;
+            }
+            None => {}
         }
         if let Some(controller) = &mut self.controller {
             if let Err(error) = controller.poll() {
@@ -1441,6 +1721,17 @@ Changing musical settings while running is unsupported.",
 
     fn learn_motion(&mut self, knob: bool) -> Result<Option<(Control, mappings::Input, String)>> {
         self.suspend()?;
+        let relative = if knob {
+            match choose(self, "Knob mode", &options(&["Absolute", "Relative"]))? {
+                Some(mode) => mode == 1,
+                None => return Ok(None),
+            }
+        } else {
+            false
+        };
+        if relative && self.program().is_none() {
+            return Err("select a verified program before changing knob mode".into());
+        }
         if self.input.is_none() {
             self.input = Some(midi::Input::open()?);
         }
@@ -1451,7 +1742,11 @@ Changing musical settings while running is unsupported.",
                 self.draw(&format!(
                     "{}\n{}\nEnter finishes observation; Esc cancels. Shortcuts remain paused.",
                     if knob {
-                        "Turn ONE knob slowly both ways to its stops."
+                        if relative {
+                            "Turn ONE knob both ways to identify it."
+                        } else {
+                            "Turn ONE knob slowly both ways to its stops."
+                        }
                     } else {
                         "Move ONE joystick axis to BOTH endpoints, then let it center."
                     },
@@ -1467,10 +1762,135 @@ Changing musical settings while running is unsupported.",
                 }
             }
             let samples = self.capture.take().unwrap();
-            calibrate_motion(self, samples, knob)
+            if relative {
+                self.learn_relative_knob(samples)
+            } else {
+                calibrate_motion(self, samples, knob)
+            }
         })();
         self.capture = None;
         result
+    }
+
+    fn learn_relative_knob(
+        &mut self,
+        samples: Vec<[u8; 3]>,
+    ) -> Result<Option<(Control, mappings::Input, String)>> {
+        let (context, payload) = self
+            .program()
+            .ok_or("select a verified program before changing knob mode")?;
+        let (channel, cc) = relative_source(&samples)?;
+        let knobs = (0..8)
+            .filter(|k| payload[0x55 + 20 * k] == cc)
+            .collect::<Vec<_>>();
+        let [index] = knobs.as_slice() else {
+            return Err("captured CC does not identify exactly one knob in this program".into());
+        };
+        let knob = *index as u8 + 1;
+        let old_relative = payload[0x54 + 20 * index] == 1;
+        if payload[0x54 + 20 * index] > 1 {
+            return Err("unknown knob mode; no controller write attempted".into());
+        }
+        if choose(
+            self,
+            &format!(
+                "Switch Program {} Knob {knob} (CC {cc}) to Relative?",
+                context + 1
+            ),
+            &options(&["Cancel", "Switch and capture ticks"]),
+        )? != Some(1)
+        {
+            return Ok(None);
+        }
+        self.program_connection()?;
+        let next = crate::feedback::set_knob_mode(
+            self.input.as_mut().ok_or("MIDI disconnected")?,
+            context,
+            knob,
+            cc,
+            true,
+        )
+        .map_err(|error| {
+            self.context_verified = false;
+            self.feedback_allowed = false;
+            self.program_snapshot = None;
+            error
+        })?;
+        self.program_snapshot = Some(next);
+        while self
+            .input
+            .as_ref()
+            .ok_or("MIDI disconnected")?
+            .next()?
+            .is_some()
+        {}
+        self.capture = Some(Vec::new());
+        let learned = (|| -> Result<Option<(Control, mappings::Input, String)>> {
+            loop {
+                self.draw("Turn the same knob slowly and quickly in BOTH directions. Enter confirms capture; Esc restores its former mode.")?;
+                match self.key()? {
+                    Some(Key::Escape) => return Ok(None),
+                    Some(Key::Enter) => break,
+                    _ => {}
+                }
+            }
+            let ticks = self.capture.take().unwrap();
+            confirm_relative_ticks(&ticks, channel, cc)?;
+            let Some(direction) = choose(
+                self,
+                "Physical direction for this assignment",
+                &options(&[
+                    "Clockwise / positive ticks",
+                    "Counterclockwise / negative ticks",
+                ]),
+            )?
+            else {
+                return Ok(None);
+            };
+            Ok(Some((
+                Control {
+                    message: crate::Message::Cc,
+                    channel,
+                    id: cc,
+                    direction: if direction == 0 { 1 } else { -1 },
+                },
+                mappings::Input::RelativeKnob { step: 1 },
+                format!(
+                    "Knob {knob} {}",
+                    if direction == 0 {
+                        "increase"
+                    } else {
+                        "decrease"
+                    }
+                ),
+            )))
+        })();
+        self.capture = None;
+        if !matches!(learned, Ok(Some(_))) && !old_relative {
+            let restored = (|| -> Result<_> {
+                self.program_connection()?;
+                crate::feedback::set_knob_mode(
+                    self.input.as_mut().ok_or("MIDI disconnected")?,
+                    context,
+                    knob,
+                    cc,
+                    false,
+                )
+            })();
+            match restored {
+                Ok(payload) => self.program_snapshot = Some(payload),
+                Err(error) => {
+                    self.context_verified = false;
+                    self.feedback_allowed = false;
+                    self.program_snapshot = None;
+                    return Err(format!(
+                        "relative capture ended; former knob mode restoration unverified: {error}"
+                    )
+                    .into());
+                }
+            }
+        }
+        learned
     }
 
     fn learn_note(&mut self, piano: bool) -> Result<Option<Control>> {
@@ -1582,6 +2002,45 @@ impl Drop for Terminal {
 }
 
 impl Ui for Terminal {
+    fn edit_file(&mut self, path: &Path) -> Result<()> {
+        self.suspend()?;
+        let original = self
+            .original
+            .ok_or("editor needs an interactive terminal")?;
+        // SAFETY: restore the saved terminal state only while the editor owns it.
+        if unsafe { libc::tcsetattr(0, libc::TCSANOW, &original) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        write!(io::stdout(), "\x1b[0m\x1b[?25h\x1b[?1049l")?;
+        io::stdout().flush()?;
+        let editor = std::env::var_os("VISUAL")
+            .filter(|v| !v.is_empty())
+            .or_else(|| std::env::var_os("EDITOR").filter(|v| !v.is_empty()))
+            .unwrap_or_else(|| "nano".into());
+        let editor = editor.to_string_lossy();
+        let mut parts = editor.split_whitespace();
+        let program = parts.next().ok_or("editor command is empty")?;
+        let result = std::process::Command::new(program)
+            .args(parts)
+            .arg(path)
+            .status();
+        let mut raw = original;
+        raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+        raw.c_iflag &= !(libc::IXON | libc::ICRNL);
+        raw.c_oflag &= !libc::OPOST;
+        raw.c_cc[libc::VMIN] = 1;
+        raw.c_cc[libc::VTIME] = 0;
+        if unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        write!(io::stdout(), "\x1b[?1049h\x1b[?25l\x1b[2J")?;
+        io::stdout().flush()?;
+        self.rendered.clear();
+        if !result?.success() {
+            return Err("editor exited unsuccessfully".into());
+        }
+        Ok(())
+    }
     fn draw(&mut self, text: &str) -> Result<()> {
         self.tick()?;
         let size = self.size();
@@ -1624,19 +2083,23 @@ impl Ui for Terminal {
             Some(b'\n' | b'\r') => Some(Key::Enter),
             Some(b' ') => Some(Key::Space),
             Some(b'\t') => Some(Key::Tab),
-            Some(27) => {
-                if self.byte(30)? == Some(b'[') {
-                    Some(match self.byte(30)? {
-                        Some(b'A') => Key::Up,
-                        Some(b'B') => Key::Down,
-                        Some(b'C') => Key::Right,
-                        Some(b'D') => Key::Left,
-                        _ => Key::Other,
-                    })
-                } else {
-                    Some(Key::Escape)
+            Some(27) => Some(match self.byte(30)? {
+                Some(b'[') => {
+                    let mut sequence = Vec::new();
+                    for _ in 0..16 {
+                        let Some(byte) = self.byte(30)? else { break };
+                        sequence.push(byte);
+                        if byte.is_ascii_alphabetic() || byte == b'~' {
+                            break;
+                        }
+                    }
+                    csi_key(&sequence)
                 }
-            }
+                Some(b'\r' | b'\n') => Key::Enter,
+                Some(b' ') => Key::Space,
+                Some(27) | None => Key::Escape,
+                Some(_) => Key::Escape,
+            }),
             Some(8 | 127) => Some(Key::Backspace),
             Some(byte @ 33..=126) => Some(Key::Character(byte)),
             Some(_) => Some(Key::InvalidInput),
@@ -1755,6 +2218,522 @@ fn program_name_prompt(ui: &mut impl Ui, label: &str) -> Result<Option<String>> 
             return Err("Program name exceeds 16 bytes; nothing written".into());
         }
     }
+}
+
+fn reset_confirmation(ui: &mut impl Ui) -> Result<bool> {
+    let mut answer = String::new();
+    loop {
+        ui.draw(&format!("Reset all eight programs' mappings and idle feedback?\nType reset and press Enter to confirm; Esc cancels.\n> {answer}"))?;
+        match ui.key()? {
+            Some(Key::Escape) => return Ok(false),
+            Some(Key::Enter) => return Ok(answer == "reset"),
+            Some(Key::Backspace) => {
+                answer.pop();
+            }
+            Some(Key::Character(byte)) if answer.len() < 32 => answer.push(char::from(byte)),
+            Some(Key::Space) if answer.len() < 32 => answer.push(' '),
+            _ => {}
+        }
+    }
+}
+
+fn text_entry(ui: &mut impl Ui, title: &str, initial: &str) -> Result<Option<String>> {
+    let mut value = initial.to_owned();
+    loop {
+        ui.draw(&format!("{title}\n> {value}\nEnter: accept | Esc: cancel"))?;
+        match ui.key()? {
+            Some(Key::Escape) => return Ok(None),
+            Some(Key::Enter) => return Ok(Some(value)),
+            Some(Key::Backspace) => {
+                value.pop();
+            }
+            Some(Key::Character(b)) if value.len() < 4096 => value.push(char::from(b)),
+            Some(Key::Space) if value.len() < 4096 => value.push(' '),
+            _ => {}
+        }
+    }
+}
+
+fn command_action(
+    ui: &mut impl Ui,
+    saved: Option<&crate::actions::Action>,
+) -> Result<Option<crate::actions::Action>> {
+    let (line, dir) = match saved {
+        Some(crate::actions::Action::Command { line, dir, .. }) => (line.clone(), dir.clone()),
+        _ => (
+            String::new(),
+            std::env::var("HOME").unwrap_or_else(|_| "/".into()),
+        ),
+    };
+    let Some(line) = text_entry(
+        ui,
+        "Command line (runs with sh -c in a new tmux window of session vibe)",
+        &line,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(dir) = text_entry(ui, "Working directory (absolute path)", &dir)? else {
+        return Ok(None);
+    };
+    // The window is renamed after the mapping once its label is known.
+    let action = crate::actions::Action::Command {
+        window: "command".into(),
+        dir,
+        line,
+    };
+    action.validate()?;
+    Ok(Some(action))
+}
+
+/// 2–16 prompts, one per equal knob zone from the knob's low end.
+fn choice_menu(
+    ui: &mut impl Ui,
+    path: &Path,
+    saved: Option<&crate::actions::Action>,
+) -> Result<Option<crate::actions::Action>> {
+    use crate::actions::Action;
+    let mut choices = match saved {
+        Some(Action::Choice(choices)) => choices.clone(),
+        _ => Vec::new(),
+    };
+    loop {
+        let mut rows = choices
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("Zone {}: {}", i + 1, c.description()))
+            .collect::<Vec<_>>();
+        rows.extend(options(&["Add choice", "Done", "Cancel"]));
+        let Some(index) = choose(
+            ui,
+            "Choice knob: the knob range is split into equal zones; resting 300 ms in a new zone sends its prompt",
+            &rows,
+        )?
+        else {
+            return Ok(None);
+        };
+        match index.checked_sub(choices.len()) {
+            Some(0) if choices.len() < 16 => {
+                if let Some(prompt) = prompt_action(ui, path, None)? {
+                    choices.push(prompt);
+                }
+            }
+            Some(0) => return Err("a choice knob holds at most 16 prompts".into()),
+            Some(1) => {
+                let action = Action::Choice(choices);
+                action.validate()?;
+                return Ok(Some(action));
+            }
+            Some(_) => return Ok(None),
+            None => match choose(
+                ui,
+                &format!("Zone {}: {}", index + 1, choices[index].description()),
+                &options(&["Move up", "Move down", "Remove", "Back"]),
+            )? {
+                Some(0) if index > 0 => choices.swap(index, index - 1),
+                Some(1) if index + 1 < choices.len() => choices.swap(index, index + 1),
+                Some(2) => {
+                    choices.remove(index);
+                }
+                _ => {}
+            },
+        }
+    }
+}
+
+fn value_menu(
+    ui: &mut impl Ui,
+    saved: Option<&crate::actions::Action>,
+) -> Result<Option<crate::actions::Action>> {
+    use crate::actions::{Action, fixed};
+    let (path, min, max, decimals) = match saved {
+        Some(Action::Value {
+            path,
+            min,
+            max,
+            decimals,
+        }) => (
+            path.clone(),
+            fixed(*min, *decimals),
+            fixed(*max, *decimals),
+            *decimals,
+        ),
+        _ => (String::new(), "0.0".into(), "1.0".into(), 2),
+    };
+    let Some(path) = text_entry(
+        ui,
+        "Value file (absolute path; written as `0.42` + newline)",
+        &path,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(min) = text_entry(ui, "Minimum (knob low end)", &min)? else {
+        return Ok(None);
+    };
+    let Some(max) = text_entry(ui, "Maximum (knob high end)", &max)? else {
+        return Ok(None);
+    };
+    let Some(decimals) = number(ui, "Decimal places", i32::from(decimals), 0, 6)? else {
+        return Ok(None);
+    };
+    let scale = |text: &str| -> Result<i64> {
+        let value: f64 = text.trim().parse()?;
+        let scaled = (value * 10f64.powi(decimals)).round();
+        if !scaled.is_finite() || scaled.abs() > 1e12 {
+            return Err("value out of range".into());
+        }
+        Ok(scaled as i64)
+    };
+    let action = Action::Value {
+        path,
+        min: scale(&min)?,
+        max: scale(&max)?,
+        decimals: decimals as u8,
+    };
+    action.validate()?;
+    Ok(Some(action))
+}
+
+/// Edit an ordered step list: add, move, remove. Returns None when cancelled.
+fn sequence_menu(
+    ui: &mut impl Ui,
+    path: &Path,
+    mut steps: Vec<crate::actions::Step>,
+) -> Result<Option<Vec<crate::actions::Step>>> {
+    use crate::actions::{Action, Step};
+    loop {
+        let mut rows = steps
+            .iter()
+            .enumerate()
+            .map(|(i, step)| format!("{}. {}", i + 1, step.description()))
+            .collect::<Vec<_>>();
+        rows.extend(options(&["Add step", "Done", "Cancel"]));
+        let Some(index) = choose(
+            ui,
+            "Sequence steps (run in order; a failing step stops the rest)",
+            &rows,
+        )?
+        else {
+            return Ok(None);
+        };
+        match index.checked_sub(steps.len()) {
+            Some(0) if steps.len() < 32 => {
+                let Some(kind) = choose(
+                    ui,
+                    "Step",
+                    &options(&[
+                        "Ensure agent running",
+                        "Prompt",
+                        "Command",
+                        "Launch application",
+                        "Shortcut",
+                        "Wait",
+                    ]),
+                )?
+                else {
+                    continue;
+                };
+                let step = match kind {
+                    0 => {
+                        let names = mappings::load_config(path)?
+                            .agents
+                            .into_iter()
+                            .map(|a| a.name)
+                            .collect::<Vec<_>>();
+                        choose(ui, "Agent", &names)?.map(|i| Step::Agent(names[i].clone()))
+                    }
+                    1 => prompt_action(ui, path, None)?.map(Step::Do),
+                    2 => command_action(ui, None)?.map(Step::Do),
+                    3 => action_menu(ui, 1, mappings::Input::Pad, None)?.map(Step::Do),
+                    4 => shortcut(ui, &[])?.map(Step::Keys),
+                    _ => number(ui, "Wait (milliseconds)", 1000, 100, 60000)?
+                        .map(|ms| Step::Wait(ms as u16)),
+                };
+                if let Some(step) = step {
+                    Action::Sequence(vec![step.clone()]).validate()?;
+                    steps.push(step);
+                }
+            }
+            Some(0) => return Err("a sequence holds at most 32 steps".into()),
+            Some(1) if steps.is_empty() => return Err("add at least one step".into()),
+            Some(1) => return Ok(Some(steps)),
+            Some(_) => return Ok(None),
+            None => match choose(
+                ui,
+                &format!("Step {}: {}", index + 1, steps[index].description()),
+                &options(&["Move up", "Move down", "Remove", "Back"]),
+            )? {
+                Some(0) if index > 0 => steps.swap(index, index - 1),
+                Some(1) if index + 1 < steps.len() => steps.swap(index, index + 1),
+                Some(2) => {
+                    steps.remove(index);
+                }
+                _ => {}
+            },
+        }
+    }
+}
+
+/// A tmux window name made from a mapping's display name, e.g. "Bank A Pad 1" → "Bank-A-Pad-1".
+fn window_name(name: &str) -> String {
+    let name: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(80)
+        .collect();
+    if name.is_empty() {
+        "command".into()
+    } else {
+        name
+    }
+}
+
+const STATUS_EVERY: Duration = Duration::from_millis(500);
+
+/// "\nAgents: claude thinking · codex FINISHED", or nothing without agents.
+fn agent_line(states: &[(String, String, &'static str)]) -> String {
+    if states.is_empty() {
+        return String::new();
+    }
+    let parts = states
+        .iter()
+        .map(|(name, _, state)| match *state {
+            "finished" => format!("{name} FINISHED"),
+            "needs-input" => format!("{name} NEEDS INPUT"),
+            state => format!("{name} {state}"),
+        })
+        .collect::<Vec<_>>();
+    format!("\nAgents: {}", parts.join(" · "))
+}
+
+fn agents_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
+    loop {
+        let mut config = mappings::load_config(path)?;
+        let mut choices = config
+            .agents
+            .iter()
+            .map(|a| {
+                format!(
+                    "{} | {} | tmux {} | {}",
+                    a.name,
+                    a.launch,
+                    a.window,
+                    crate::status::read(&a.name)
+                )
+            })
+            .collect::<Vec<_>>();
+        choices.extend(options(&[
+            "Add agent",
+            "Claude Code status hooks",
+            "Codex status hooks",
+        ]));
+        let Some(index) = choose(ui, "Agents | tmux attach -t vibe", &choices)? else {
+            return Ok(());
+        };
+        if let Some(which @ (1 | 2)) = index.checked_sub(config.agents.len()) {
+            let (file, hooks) = if which == 1 {
+                ("~/.claude/settings.json", crate::status::claude_hooks())
+            } else {
+                ("~/.codex/hooks.json", crate::status::codex_hooks())
+            };
+            let text = format!(
+                "Merge into {file} (VibeConsole does not edit it). Hooks report only for agents VibeConsole started in tmux; `vibeconsole` must be on PATH.\n\n{hooks}"
+            );
+            if choose(ui, &text, &options(&["Copy with wl-copy", "Back"]))? == Some(0) {
+                crate::actions::copy_text(&hooks)?;
+            }
+            continue;
+        }
+        let existing = config.agents.get(index).cloned();
+        let operation = if existing.is_some() {
+            choose(ui, "Agent", &options(&["Edit", "Remove", "Back"]))?
+        } else {
+            Some(0)
+        };
+        if operation == Some(1) {
+            if choose(
+                ui,
+                "Remove this agent? Its prompt mappings become invalid.",
+                &options(&["Cancel", "Remove"]),
+            )? == Some(1)
+            {
+                config.agents.remove(index);
+                mappings::save_config(path, &config)?;
+            }
+            continue;
+        }
+        if operation != Some(0) {
+            continue;
+        }
+        let Some(name) = text_entry(ui, "Agent name", existing.as_ref().map_or("", |a| &a.name))?
+        else {
+            continue;
+        };
+        let Some(launch) = text_entry(
+            ui,
+            "Launch command",
+            existing.as_ref().map_or("", |a| &a.launch),
+        )?
+        else {
+            continue;
+        };
+        let Some(window) = text_entry(
+            ui,
+            "tmux window name",
+            existing.as_ref().map_or("", |a| &a.window),
+        )?
+        else {
+            continue;
+        };
+        let agent = mappings::Agent::new(&name, &launch, &window)?;
+        if existing.is_some() {
+            config.agents[index] = agent;
+        } else {
+            config.agents.push(agent);
+        }
+        mappings::save_config(path, &config)?;
+    }
+}
+
+fn prompt_action(
+    ui: &mut impl Ui,
+    path: &Path,
+    saved: Option<&crate::actions::Action>,
+) -> Result<Option<crate::actions::Action>> {
+    let dir = crate::actions::prompts_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    let mut files = std::fs::read_dir(&dir)?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|name| mappings::simple_name(name) && dir.join(name).is_file())
+        .collect::<Vec<_>>();
+    files.sort();
+    files.push("New prompt".into());
+    let saved_file = match saved {
+        Some(crate::actions::Action::Prompt { file, .. }) => Some(file),
+        _ => None,
+    };
+    let Some(index) = choose_saved(
+        ui,
+        "Prompt file",
+        files.clone(),
+        saved_file.and_then(|f| files.iter().position(|s| s == f)),
+    )?
+    else {
+        return Ok(None);
+    };
+    let file = if index == files.len() - 1 {
+        let Some(name) = text_entry(
+            ui,
+            "New prompt file name (simple name, no extension required)",
+            "",
+        )?
+        else {
+            return Ok(None);
+        };
+        if !mappings::simple_name(&name) {
+            return Err("invalid prompt file name".into());
+        }
+        name
+    } else {
+        files[index].clone()
+    };
+    let prompt_path = dir.join(&file);
+    if index == files.len() - 1
+        || choose(
+            ui,
+            "Edit prompt in external editor?",
+            &options(&["Use existing", "Edit"]),
+        )? == Some(1)
+    {
+        ui.edit_file(&prompt_path)?;
+    }
+    use crate::actions::Target;
+    let mut targets = mappings::load_config(path)?
+        .agents
+        .into_iter()
+        .map(|a| Target::Agent(a.name))
+        .collect::<Vec<_>>();
+    targets.push(Target::Focused { shift: false });
+    targets.push(Target::Focused { shift: true });
+    let saved_target = match saved {
+        Some(crate::actions::Action::Prompt { target, .. }) => {
+            targets.iter().position(|t| t == target)
+        }
+        _ => None,
+    };
+    let Some(target_index) = choose_saved(
+        ui,
+        "Target: tmux agent, or the focused window (Ctrl+V browser/Claude app, Ctrl+Shift+V terminals; lands wherever focus is)",
+        targets.iter().map(Target::description).collect(),
+        saved_target,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(mode) = choose(
+        ui,
+        "Submit prompt?",
+        &options(&["Paste only", "Paste and Enter"]),
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(crate::actions::Action::Prompt {
+        file,
+        target: targets.swap_remove(target_index),
+        enter: mode == 1,
+    }))
+}
+
+fn reset_file(path: &Path) -> Result<PathBuf> {
+    let mut now = 0;
+    // SAFETY: localtime_r writes to the provided tm; strftime writes within the fixed buffer.
+    let stamp = unsafe {
+        libc::time(&mut now);
+        let mut date = std::mem::zeroed::<libc::tm>();
+        if libc::localtime_r(&now, &mut date).is_null() {
+            return Err("Cannot create reset backup timestamp".into());
+        }
+        let mut buffer = [0u8; 16];
+        if libc::strftime(
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            c"%Y%m%d-%H%M%S".as_ptr(),
+            &date,
+        ) == 0
+        {
+            return Err("Cannot format reset backup timestamp".into());
+        }
+        std::ffi::CStr::from_ptr(buffer.as_ptr().cast())
+            .to_str()?
+            .to_owned()
+    };
+    let backup = path.with_file_name(format!(
+        "{}.bak-{stamp}",
+        path.file_name()
+            .ok_or("Invalid configuration path")?
+            .to_string_lossy()
+    ));
+    let mut source = std::fs::File::open(path)?;
+    let mut target = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&backup)?;
+    if let Err(error) = io::copy(&mut source, &mut target).and_then(|_| target.sync_all()) {
+        let _ = std::fs::remove_file(&backup);
+        return Err(error.into());
+    }
+    mappings::save_config(path, &mappings::Config::default())?;
+    Ok(backup)
 }
 
 fn pad_labels(control: Control, current: &[Mapping], context: u8) -> Vec<String> {
@@ -2086,6 +3065,38 @@ fn feedback_menu(
     }
 }
 
+fn relative_source(samples: &[[u8; 3]]) -> Result<(u8, u8)> {
+    let mut source = None;
+    for [status, cc, _] in samples {
+        if status & 0xf0 != 0xb0 {
+            continue;
+        }
+        let current = ((status & 15) + 1, *cc);
+        if source.is_some_and(|old| old != current) {
+            return Err("multiple CC sources captured; retry moving only one knob".into());
+        }
+        source = Some(current);
+    }
+    source.ok_or_else(|| "no knob CC captured".into())
+}
+
+fn confirm_relative_ticks(samples: &[[u8; 3]], channel: u8, cc: u8) -> Result<()> {
+    if relative_source(samples)? != (channel, cc)
+        || samples.iter().any(|[status, id, raw]| {
+            status & 0xf0 == 0xb0 && (*id != cc || *raw == 0 || *raw == 64)
+        })
+        || !samples
+            .iter()
+            .any(|[status, id, raw]| status & 0xf0 == 0xb0 && *id == cc && (1..=63).contains(raw))
+        || !samples
+            .iter()
+            .any(|[status, id, raw]| status & 0xf0 == 0xb0 && *id == cc && (65..=127).contains(raw))
+    {
+        return Err("relative ticks not confirmed in both directions".into());
+    }
+    Ok(())
+}
+
 fn calibrate_motion(
     ui: &mut impl Ui,
     samples: Vec<[u8; 3]>,
@@ -2272,7 +3283,11 @@ fn action_menu(
 ) -> Result<Option<crate::actions::Action>> {
     use crate::actions::Action;
     if matches!(input, mappings::Input::Joystick { .. })
-        || (family == 1 && matches!(input, mappings::Input::Knob { .. }))
+        || (family == 1
+            && matches!(
+                input,
+                mappings::Input::Knob { .. } | mappings::Input::RelativeKnob { .. }
+            ))
     {
         return Err("launch actions require a pad/piano press; joystick actions remain keyboard holds; knobs support audio steps".into());
     }
@@ -2363,12 +3378,31 @@ Requires wpctl in your desktop session. Brightness/media/lock and absolute volum
 }
 
 fn mapping_label(mapping: &Mapping, program: Option<&(u8, crate::feedback::Payload)>) -> String {
+    let invalid = match &mapping.action {
+        crate::actions::Action::Prompt {
+            target: crate::actions::Target::Agent(agent),
+            ..
+        } => mappings::config_path()
+            .and_then(|p| mappings::load_config(&p))
+            .is_ok_and(|c| !c.agents.iter().any(|a| &a.name == agent)),
+        _ => false,
+    };
     format!(
-        "{} | {} | {} | {} | {} | Feedback: {}",
+        "{} | {} | {} | {}{}{} | {} | Feedback: {}",
         mappings::program_label(mapping.context),
         mapping.name(program),
         mapping.input.description(),
         mapping.action_label(),
+        if invalid {
+            " [INVALID: agent removed]"
+        } else {
+            ""
+        },
+        if mapping.risky {
+            " | RISKY: hold 1 s"
+        } else {
+            ""
+        },
         mapping.behavior,
         mapping.feedback
     )
@@ -2387,7 +3421,9 @@ fn commit(
     if let Some(mapping) = &replacement {
         if matches!(
             mapping.input,
-            mappings::Input::Knob { .. } | mappings::Input::Joystick { .. }
+            mappings::Input::Knob { .. }
+                | mappings::Input::RelativeKnob { .. }
+                | mappings::Input::Joystick { .. }
         ) {
             for other in &mut next {
                 if other.context == context
@@ -2591,6 +3627,11 @@ fn configure(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) -> Resul
         }
         let saved_family = saved.as_ref().map(|m| match &m.action {
             crate::actions::Action::Shortcut => 0,
+            crate::actions::Action::Prompt { .. } => 3,
+            crate::actions::Action::Command { .. } => 4,
+            crate::actions::Action::Sequence(_) => 5,
+            crate::actions::Action::Choice(_) => 6,
+            crate::actions::Action::Value { .. } => 7,
             action if action.audio() => 2,
             _ => 1,
         });
@@ -2601,6 +3642,11 @@ fn configure(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) -> Resul
                 "Keyboard shortcut",
                 "Launch application",
                 "Fedora system action",
+                "Prompt",
+                "Run command in tmux",
+                "Sequence of steps",
+                "Choice knob (one prompt per zone)",
+                "Value knob (number written to a file)",
             ]),
             saved_family,
         )?
@@ -2612,7 +3658,7 @@ fn configure(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) -> Resul
                 continue;
             };
             let behavior = match input {
-                mappings::Input::Knob { .. } => "pulse",
+                mappings::Input::Knob { .. } | mappings::Input::RelativeKnob { .. } => "pulse",
                 mappings::Input::Joystick { .. } => "hold",
                 _ => {
                     let saved_behavior = saved.as_ref().and_then(|m| match m.behavior {
@@ -2633,6 +3679,47 @@ fn configure(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) -> Resul
                 }
             };
             Mapping::new(pad, &keys.join("+"), behavior)?
+        } else if family == 3 {
+            if !matches!(input, mappings::Input::Pad | mappings::Input::Piano) {
+                return Err("prompts require a pad or piano press".into());
+            }
+            let Some(action) = prompt_action(ui, path, saved.as_ref().map(|m| &m.action))? else {
+                continue;
+            };
+            Mapping::new_action(pad, input, action)?
+        } else if family == 4 {
+            if !matches!(input, mappings::Input::Pad | mappings::Input::Piano) {
+                return Err("commands require a pad or piano press".into());
+            }
+            let Some(action) = command_action(ui, saved.as_ref().map(|m| &m.action))? else {
+                continue;
+            };
+            Mapping::new_action(pad, input, action)?
+        } else if family == 5 {
+            if !matches!(input, mappings::Input::Pad | mappings::Input::Piano) {
+                return Err("sequences require a pad or piano press".into());
+            }
+            let steps = match saved.as_ref().map(|m| &m.action) {
+                Some(crate::actions::Action::Sequence(steps)) => steps.clone(),
+                _ => Vec::new(),
+            };
+            let Some(steps) = sequence_menu(ui, path, steps)? else {
+                continue;
+            };
+            Mapping::new_action(pad, input, crate::actions::Action::Sequence(steps))?
+        } else if family >= 6 {
+            if !matches!(input, mappings::Input::Knob { .. }) {
+                return Err("choice and value actions need an absolute knob".into());
+            }
+            let saved_action = saved.as_ref().map(|m| &m.action);
+            let Some(action) = (if family == 6 {
+                choice_menu(ui, path, saved_action)?
+            } else {
+                value_menu(ui, saved_action)?
+            }) else {
+                continue;
+            };
+            Mapping::new_action(pad, input, action)?
         } else {
             let Some(action) = action_menu(ui, family, input, saved.as_ref().map(|m| &m.action))?
             else {
@@ -2642,7 +3729,7 @@ fn configure(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) -> Resul
         };
         mapping.context = ui.context();
         mapping.input = input;
-        if let mappings::Input::Knob { step } = input {
+        if let (mappings::Input::Knob { step }, false) = (input, mapping.action.dial()) {
             let Some(step) = number(
                 ui,
                 "Absolute knob movement step (one pulse maximum per MIDI sample)",
@@ -2654,6 +3741,13 @@ fn configure(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) -> Resul
                 continue;
             };
             mapping.input = mappings::Input::Knob { step: step as u8 };
+        }
+        if let mappings::Input::RelativeKnob { step } = input {
+            let Some(step) = number(ui, "Relative knob pulses per tick", i32::from(step), 1, 8)?
+            else {
+                continue;
+            };
+            mapping.input = mappings::Input::RelativeKnob { step: step as u8 };
         }
         mapping.label = if let Some((_, _, label)) = &motion {
             label.clone()
@@ -2688,6 +3782,37 @@ fn configure(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) -> Resul
             continue;
         };
         mapping.feedback = feedback;
+        let name = window_name(&mapping.name(ui.program().as_ref()));
+        match &mut mapping.action {
+            crate::actions::Action::Command { window, .. } => *window = name,
+            crate::actions::Action::Sequence(steps) => {
+                for step in steps {
+                    if let crate::actions::Step::Do(crate::actions::Action::Command {
+                        window,
+                        ..
+                    }) = step
+                    {
+                        *window = name.clone();
+                    }
+                }
+            }
+            _ => {}
+        }
+        if matches!(mapping.input, mappings::Input::Pad | mappings::Input::Piano) {
+            let Some(risky) = choose_saved(
+                ui,
+                "Fire when",
+                options(&[
+                    "Pressed",
+                    "Held for 1 second (risky; early release sends nothing)",
+                ]),
+                saved.as_ref().map(|m| usize::from(m.risky)),
+            )?
+            else {
+                continue;
+            };
+            mapping.risky = risky == 1;
+        }
         mapping.validate()?;
         match choose(
             ui,
@@ -2705,37 +3830,30 @@ fn configure(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) -> Resul
     }
 }
 
-pub fn daemon(path: &Path, current: Vec<Mapping>, feedback: bool, flow: bool) -> Result<()> {
+pub fn daemon(path: &Path, current: Vec<Mapping>) -> Result<()> {
     let mut ui = Terminal::open_mode(path, true)?;
-    ui.idle = mappings::load_config(path)?.idle;
-    ui.feedback_allowed = feedback;
-    let mappings = current
-        .into_iter()
-        .filter(|m| m.context == 0)
-        .collect::<Vec<_>>();
-    if flow {
-        ui.start_flow(false)?;
-        while ui.flow_pending && !ui.stop.load(Ordering::Relaxed) {
-            if let Err(error) = ui.tick() {
-                if ui.stop.load(Ordering::Relaxed) {
-                    break;
-                }
-                return Err(error);
-            }
-            std::thread::sleep(Duration::from_millis(20));
+    let config = mappings::load_config(path)?;
+    ui.idle = config.idle;
+    ui.start_flow_enabled = config.start_flow;
+    ui.run_mappings = current.into_iter().filter(|m| m.context == 0).collect();
+    ui.context_verified = false;
+    ui.follow_programs = true;
+    let flow_ready = match ui.startup_flow() {
+        Ok(()) => true,
+        Err(error) => {
+            ui.pause()?;
+            ui.error = format!("Automatic Flow startup failed: {error}");
+            eprintln!("{}", ui.error);
+            false
         }
-        eprintln!("{}", ui.error);
-        if ui.flow_failed {
-            return Err(ui.error.clone().into());
-        }
-        if ui.stop.load(Ordering::Relaxed) {
-            return ui.pause();
-        }
-        eprintln!(
-            "Ordered Flow helper capture verified; dictation remains unverified. Continuing with inactive mappings and release arming."
-        );
+    };
+    if ui.flow_missing {
+        eprintln!("Wispr Flow not installed; automatic startup skipped.");
     }
-    ui.run(&mappings)?;
+    if flow_ready {
+        ui.wanted_run = true;
+    }
+    ui.at_menu = true;
     let mut previous = String::new();
     while !ui.stop.load(Ordering::Relaxed) {
         if let Err(error) = ui.tick() {
@@ -2745,12 +3863,19 @@ pub fn daemon(path: &Path, current: Vec<Mapping>, feedback: bool, flow: bool) ->
             return Err(error);
         }
         let status = format!(
-            "{} | {}",
+            "Program {} {} | {} | {} | {}",
+            ui.context + 1,
+            if ui.context_verified {
+                "verified"
+            } else {
+                "unverified"
+            },
             ui.output
                 .as_ref()
                 .map(|o| o.keyboard.status(|control| ui.name(control)))
                 .unwrap_or_default(),
-            ui.error
+            ui.notice,
+            ui.error,
         );
         if status != previous {
             eprintln!("{status}");
@@ -2768,18 +3893,13 @@ const COMMANDS: &[(&str, &[(usize, &str, &str)])] = &[
         &[
             (
                 1,
-                "/run",
+                "Run",
                 "Enable the verified program's mappings; retain applicable safety confirmations.",
             ),
             (
                 3,
                 "/pause",
                 "Release synthetic keys, cancel pending mapped actions, and remain paused.",
-            ),
-            (
-                4,
-                "/resume",
-                "Resume paused output with fresh-activation guards.",
             ),
             (
                 5,
@@ -2802,6 +3922,16 @@ const COMMANDS: &[(&str, &[(usize, &str, &str)])] = &[
                 "Learn controls; edit, save, or explicitly remove assignments.",
             ),
             (2, "/list", "Inspect saved mappings and toggle states."),
+            (
+                17,
+                "Agents",
+                "Add, edit, or remove tmux agents; attach with tmux attach -t vibe.",
+            ),
+            (
+                15,
+                "Reset settings",
+                "Back up and clear every program's mappings and idle feedback.",
+            ),
         ],
     ),
     (
@@ -2838,6 +3968,11 @@ const COMMANDS: &[(&str, &[(usize, &str, &str)])] = &[
         "Wispr Flow",
         &[
             (
+                16,
+                "Start Wispr Flow with VibeConsole",
+                "Toggle automatic Flow startup for interactive sessions and the login service.",
+            ),
+            (
                 12,
                 "/start-flow",
                 "Prepare the virtual keyboard, start Flow if absent, and check helper capture.",
@@ -2867,32 +4002,47 @@ const COMMANDS: &[(&str, &[(usize, &str, &str)])] = &[
 ];
 
 /// Command pane rows: a heading has no command; others carry (id, description).
-fn command_rows() -> Vec<(&'static str, Option<(usize, &'static str)>)> {
+fn command_rows(running: bool) -> Vec<(&'static str, Option<(usize, &'static str)>)> {
     let mut rows = Vec::new();
     for (heading, commands) in COMMANDS {
         rows.push((*heading, None));
-        rows.extend(
-            commands
-                .iter()
-                .map(|(id, name, about)| (*name, Some((*id, *about)))),
-        );
+        rows.extend(commands.iter().map(|(id, name, about)| {
+            if *id == 1 && running {
+                (
+                    "Pause",
+                    Some((*id, "Release synthetic keys and pause output.")),
+                )
+            } else {
+                (*name, Some((*id, *about)))
+            }
+        }));
     }
     rows
 }
 
 /// Highlighted command row; Up/Down skip headings and wrap. Esc quits as before.
 fn command_menu(ui: &mut Terminal) -> Result<Option<usize>> {
-    let rows = command_rows();
     loop {
+        let running = ui.wanted_run;
+        let rows = command_rows(running);
         let Some((command, about)) = rows[ui.menu].1 else {
             ui.menu = (ui.menu + 1) % rows.len();
             continue;
+        };
+        let about = if command == 16 {
+            if ui.start_flow_enabled {
+                "On. Enter to turn off automatic Flow startup on the next launch."
+            } else {
+                "Off. Enter to turn on automatic Flow startup on the next launch."
+            }
+        } else {
+            about
         };
         ui.draw(&format!("{}\n\n{about}\n\nEnter: open", rows[ui.menu].0))?;
         let step = match ui.key()? {
             Some(Key::Up) => rows.len() - 1,
             Some(Key::Down) => 1,
-            Some(Key::Enter) => return Ok(Some(command)),
+            Some(Key::Enter) if ui.wanted_run == running => return Ok(Some(command)),
             Some(Key::Escape) => return Ok(None),
             _ => continue,
         };
@@ -2907,7 +4057,9 @@ fn command_menu(ui: &mut Terminal) -> Result<Option<usize>> {
 
 pub fn start(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> {
     let mut ui = Terminal::open(path)?;
-    ui.idle = mappings::load_config(path)?.idle;
+    let config = mappings::load_config(path)?;
+    ui.idle = config.idle;
+    ui.start_flow_enabled = config.start_flow;
     ui.run_mappings = current
         .iter()
         .filter(|mapping| mapping.context == ui.context)
@@ -2921,18 +4073,17 @@ pub fn start(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()
     }
     ui.context_verified = false;
     ui.follow_programs = true;
-    if (initial == "run" || initial == "session") && !ui.context_verified {
+    let flow_ready = match ui.startup_flow() {
+        Ok(()) => true,
+        Err(error) => {
+            ui.pause()?;
+            ui.error = format!("Automatic Flow startup failed: {error}");
+            false
+        }
+    };
+    if (initial == "run" || initial == "session") && flow_ready {
         ui.wanted_run = true;
         ui.notice = "Detecting the controller’s current program before enabling actions.".into();
-    } else if initial == "run" || initial == "session" {
-        ui.run_mode(
-            &current
-                .iter()
-                .filter(|m| m.context == ui.context)
-                .cloned()
-                .collect::<Vec<_>>(),
-            initial == "run",
-        )?;
     }
     loop {
         ui.run_mappings = current
@@ -2960,12 +4111,13 @@ pub fn start(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()
                 }
                 Ok(())
             })(),
-            1 | 4 if !ui.context_verified => choose(
+            1 if ui.wanted_run => ui.pause(),
+            1 if !ui.context_verified => choose(
                 &mut ui,
-                "Select /prog-select before running.\nChoose the matching hardware program, then run or resume. No mapped actions are enabled yet.",
+                "Select /prog-select before running.\nChoose the matching hardware program, then select Run. No mapped actions are enabled yet.",
                 &options(&["Back"]),
             ).map(|_| ()),
-            1 | 4 => ui.run(
+            1 => ui.run(
                 &current
                     .iter()
                     .filter(|m| m.context == ui.context)
@@ -3106,10 +4258,33 @@ Running/paused mode is retained; held keys and toggles start inactive.",
             12 => ui.start_flow(false),
             13 => ui.start_flow(true),
             14 => ui.rename_program(),
+            15 => (|| {
+                if !reset_confirmation(&mut ui)? {
+                    return Ok(());
+                }
+                ui.reset_confirmed(&mut current)?;
+                let notice = ui.notice.clone();
+                choose(&mut ui, &notice, &options(&["Continue"]))?;
+                Ok(())
+            })(),
+            16 => (|| {
+                let mut config = mappings::load_config(path)?;
+                config.start_flow = !config.start_flow;
+                mappings::save_config(path, &config)?;
+                ui.start_flow_enabled = config.start_flow;
+                ui.notice = format!(
+                    "Start Wispr Flow with VibeConsole: {} (takes effect next launch).",
+                    if config.start_flow { "On" } else { "Off" }
+                );
+                Ok(())
+            })(),
+            17 => (|| { ui.suspend()?; agents_menu(&mut ui, path) })(),
             _ => return Ok(()),
         };
         let result = result.and_then(|()| {
-            if ui.context_verified && was_running && matches!(command, 0 | 6 | 7 | 8 | 9 | 10 | 14)
+            if ui.context_verified
+                && was_running
+                && matches!(command, 0 | 6 | 7 | 8 | 9 | 10 | 14 | 17)
             {
                 ui.run_mode(
                     &current
@@ -3144,7 +4319,7 @@ Running/paused mode is retained; held keys and toggles start inactive.",
             );
             choose(
                 &mut ui,
-                "Operation failed; mappings preserved. Resume explicitly after resolving the error.",
+                "Operation failed; saved configuration preserved. Resume explicitly after resolving the error.",
                 &options(&["Back"]),
             )?;
         }
@@ -3154,7 +4329,87 @@ Running/paused mode is retained; held keys and toggles start inactive.",
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captured_relative_knob_requires_one_source_and_both_signed_directions() {
+        let ticks = [
+            [0xb0, 16, 1],
+            [0xb0, 16, 2],
+            [0xb0, 16, 127],
+            [0xb0, 16, 126],
+        ];
+        assert_eq!(relative_source(&ticks).unwrap(), (1, 16));
+        confirm_relative_ticks(&ticks, 1, 16).unwrap();
+        assert!(confirm_relative_ticks(&ticks[..2], 1, 16).is_err());
+        assert!(confirm_relative_ticks(&[[0xb0, 16, 1], [0xb0, 17, 127]], 1, 16).is_err());
+        assert!(
+            confirm_relative_ticks(&[[0xb0, 16, 1], [0xb0, 16, 64], [0xb0, 16, 127]], 1, 16)
+                .is_err()
+        );
+    }
     use std::collections::VecDeque;
+    #[test]
+    fn service_follows_verified_programs_and_leaves_unmatched_or_piano_inactive() {
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-service-follow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        ui.at_menu = true;
+        ui.follow_programs = true;
+        ui.context_verified = false;
+        ui.wanted_run = true;
+        let observation = |context| crate::feedback::ProgramObservation::Detected {
+            context,
+            payload: [0; 245],
+            names: (1..=8).map(|i| format!("Program {i}")).collect(),
+        };
+        assert!(!ui.feedback_allowed);
+        ui.observe_program(observation(Some(0))).unwrap();
+        assert_eq!(ui.context, 0);
+        assert!(ui.context_verified && ui.feedback_allowed && ui.wanted_run);
+        ui.observe_program(observation(Some(2))).unwrap();
+        assert_eq!(ui.context, 2);
+        assert!(ui.context_verified && ui.feedback_allowed && ui.wanted_run);
+        ui.observe_program(observation(None)).unwrap();
+        assert!(!ui.context_verified && !ui.feedback_allowed);
+        assert!(ui.notice.contains("service output stays inactive"));
+
+        let mut piano = Mapping::new(Control::note(1, 60).unwrap(), "Shift", "hold").unwrap();
+        piano.context = 1;
+        piano.input = mappings::Input::Piano;
+        mappings::save(&path, &[piano]).unwrap();
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        ui.at_menu = true;
+        ui.follow_programs = true;
+        ui.context_verified = false;
+        ui.wanted_run = true;
+        ui.observe_program(observation(Some(1))).unwrap();
+        assert!(ui.wanted_run && ui.suspended && ui.output.is_none());
+        assert!(ui.notice.contains("interactive Run confirmation required"));
+        ui.observe_program(observation(Some(0))).unwrap();
+        assert!(ui.wanted_run && !ui.suspended && ui.context_verified);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn modified_navigation_keys_decode_without_changing_text_keys() {
+        for (sequence, key) in [
+            (&b"1;2A"[..], Key::Up),
+            (&b"1;5B"[..], Key::Down),
+            (&b"1;3C"[..], Key::Right),
+            (&b"13;5u"[..], Key::Enter),
+            (&b"32;3u"[..], Key::Space),
+            (&b"27;2u"[..], Key::Escape),
+            (&b"27;5;13~"[..], Key::Enter),
+            (&b"27;3;32~"[..], Key::Space),
+            (&b"27;2;27~"[..], Key::Escape),
+        ] {
+            assert_eq!(csi_key(sequence), key);
+        }
+        assert_eq!(csi_key(b"65;2u"), Key::Other); // printable text is not rewritten
+        assert_eq!(csi_key(b"1;9A"), Key::Other);
+    }
     #[derive(Default)]
     struct Script {
         keys: VecDeque<Key>,
@@ -3730,7 +4985,7 @@ mod tests {
         let mut current = vec![Mapping::new(a, "Shift", "hold").unwrap()];
         mappings::save(&path, &current).unwrap();
         let mut ui = Script {
-            keys: [Enter, Enter, Down, Enter, Enter, Down, Enter].into(),
+            keys: [Enter, Enter, Down, Enter, Enter, Enter, Down, Enter].into(),
             pads: [b].into(),
             ..Default::default()
         };
@@ -3744,7 +4999,7 @@ mod tests {
         assert_eq!(current[1].behavior, mappings::Behavior::Trigger);
         // Editing opens the family menu on the saved "Launch application"; one Down reaches system.
         ui.keys = [
-            Tab, Enter, Down, Enter, Enter, Down, Enter, Enter, Enter, Down, Enter,
+            Tab, Enter, Down, Enter, Enter, Down, Enter, Enter, Enter, Enter, Down, Enter,
         ]
         .into();
         configure(&mut ui, &path, &mut current).unwrap();
@@ -3769,13 +5024,17 @@ mod tests {
     }
     #[test]
     fn grouped_commands_reach_every_command_once_and_headings_are_not_commands() {
-        let rows = command_rows();
+        let rows = command_rows(false);
         let mut ids = rows
             .iter()
             .filter_map(|(_, command)| command.map(|(id, _)| id))
             .collect::<Vec<_>>();
         ids.sort();
-        assert_eq!(ids, (0..=14).collect::<Vec<_>>());
+        assert_eq!(ids, (0..=17).filter(|id| *id != 4).collect::<Vec<_>>());
+        assert!(
+            rows.iter()
+                .any(|(name, command)| *name == "Reset settings" && command.is_some())
+        );
         let headings = rows.iter().filter(|(_, c)| c.is_none()).map(|(h, _)| *h);
         assert!(headings.eq([
             "Run",
@@ -3785,7 +5044,130 @@ mod tests {
             "Wispr Flow",
             "Inspect"
         ]));
-        assert!(rows[0].1.is_none() && rows[1].0 == "/run"); // the cursor starts on /run
+        assert!(rows[0].1.is_none() && rows[1].0 == "Run");
+        let running = command_rows(true);
+        assert_eq!(running[1].0, "Pause");
+        assert!(
+            running
+                .iter()
+                .any(|(name, command)| *name == "/pause" && command.is_some())
+        );
+        assert!(!running.iter().any(|(name, _)| *name == "/resume"));
+    }
+
+    #[test]
+    fn reset_requires_exact_confirmation_and_preserves_file_on_failed_save() {
+        use Key::*;
+        for (keys, confirmed) in [
+            (vec![Escape], false),
+            (vec![Character(b'n'), Character(b'o'), Enter], false),
+            (
+                vec![
+                    Character(b'r'),
+                    Character(b'e'),
+                    Character(b's'),
+                    Character(b'e'),
+                    Character(b't'),
+                    Enter,
+                ],
+                true,
+            ),
+        ] {
+            let mut ui = Script {
+                keys: keys.into(),
+                ..Default::default()
+            };
+            assert_eq!(reset_confirmation(&mut ui).unwrap(), confirmed);
+        }
+        let dir = std::env::temp_dir().join(format!("vibeconsole-reset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let mut config = mappings::Config::default();
+        let mut mapping = Mapping::new(Control::note(10, 36).unwrap(), "Shift", "hold").unwrap();
+        mapping.context = 7;
+        config.mappings.push(mapping);
+        config
+            .set_idle(
+                0,
+                crate::feedback::Settings {
+                    octave: Some(1),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        config
+            .set_idle(
+                7,
+                crate::feedback::Settings {
+                    tempo: Some(90),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        mappings::save_config(&path, &config).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let backup = reset_file(&path).unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), before);
+        assert!(
+            backup
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("mappings.tsv.bak-")
+        );
+        assert_eq!(
+            mappings::load_config(&path).unwrap(),
+            mappings::Config::default()
+        );
+        mappings::save_config(&path, &config).unwrap();
+        assert!(reset_file(&path).is_err()); // existing timestamped backup is never overwritten
+        assert_eq!(mappings::load_config(&path).unwrap(), config);
+
+        let failed = dir.join("failed");
+        std::fs::create_dir(&failed).unwrap();
+        let failed_path = failed.join("mappings.tsv");
+        mappings::save_config(&failed_path, &config).unwrap();
+        std::fs::write(failed_path.with_extension("tmp"), "occupied").unwrap();
+        assert!(reset_file(&failed_path).is_err());
+        assert_eq!(mappings::load_config(&failed_path).unwrap(), config);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reset_pauses_and_makes_no_fake_controller_write() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibeconsole-reset-controller-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let mapping = Mapping::new(Control::note(10, 36).unwrap(), "Shift", "hold").unwrap();
+        mappings::save(&path, &[mapping.clone()]).unwrap();
+        let mut current = vec![mapping];
+        let writes = Arc::new(std::sync::Mutex::new(0));
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        ui.controller = Some(crate::feedback::Controller::fake_for_reset(Arc::clone(
+            &writes,
+        )));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while ui.controller.as_ref().unwrap().baseline.is_none() {
+            ui.controller.as_mut().unwrap().poll().unwrap();
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        ui.wanted_run = true;
+        ui.run_mappings = current.clone();
+        let backup = ui.reset_confirmed(&mut current).unwrap();
+        assert!(!ui.wanted_run && ui.suspended && current.is_empty());
+        assert_eq!(*writes.lock().unwrap(), 0);
+        assert_eq!(
+            mappings::load_config(&path).unwrap(),
+            mappings::Config::default()
+        );
+        assert!(backup.exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -3804,7 +5186,7 @@ mod tests {
             keys.extend(std::iter::repeat_n(Down, which));
             keys.extend([Space, Enter]);
             keys.extend(std::iter::repeat_n(Down, 7));
-            keys.extend([Enter, Enter, Enter]); // done, hold, no feedback
+            keys.extend([Enter, Enter, Enter, Enter]); // done, hold, no feedback, fire when pressed
             keys.extend(std::iter::repeat_n(Down, save_choice));
             keys.push(Enter);
         }

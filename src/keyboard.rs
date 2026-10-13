@@ -1,10 +1,13 @@
 use crate::mappings::{Behavior, Mapping};
 use crate::{Control, Event, Result};
 use evdev::{AttributeSet, EventType, InputEvent, KeyCode, uinput::VirtualDevice};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// How long a risky control must be held before it fires.
+pub(crate) const ARM: Duration = Duration::from_secs(1);
 
 pub fn key_code(name: &str) -> Result<KeyCode> {
     let linux_name = match name {
@@ -21,6 +24,15 @@ pub fn key_code(name: &str) -> Result<KeyCode> {
     format!("KEY_{linux_name}")
         .parse()
         .map_err(|_| format!("key {name:?} is unsupported by the Linux input backend").into())
+}
+
+pub(crate) fn paste_keys(shift: bool) -> Vec<KeyCode> {
+    let mut keys = vec![KeyCode::KEY_LEFTCTRL];
+    if shift {
+        keys.push(KeyCode::KEY_LEFTSHIFT);
+    }
+    keys.push(KeyCode::KEY_V);
+    keys
 }
 
 fn modifier(key: KeyCode) -> bool {
@@ -42,6 +54,7 @@ struct Assignment {
     keys: Vec<KeyCode>,
     behavior: Behavior,
     active: bool,
+    risky: bool,
 }
 
 pub(crate) struct Keyboard {
@@ -51,6 +64,8 @@ pub(crate) struct Keyboard {
     // Includes attempted key-downs: emit can fail after the kernel received the key.
     held: HashSet<KeyCode>,
     running: bool,
+    /// Risky controls held but not yet fired, with their press time.
+    armed: HashMap<Control, Instant>,
 }
 
 impl Keyboard {
@@ -72,6 +87,7 @@ impl Keyboard {
                 keys,
                 behavior: mapping.behavior.clone(),
                 active: false,
+                risky: mapping.risky,
             });
         }
         Ok(Self {
@@ -86,12 +102,22 @@ impl Keyboard {
                 .collect(),
             held: HashSet::new(),
             running: true,
+            armed: HashMap::new(),
         })
     }
 
     pub(crate) fn observe(
         &mut self,
         event: Event,
+        emit: &mut impl FnMut(KeyCode, bool) -> io::Result<()>,
+    ) -> io::Result<Option<(Control, bool)>> {
+        self.observe_at(event, Instant::now(), emit)
+    }
+
+    pub(crate) fn observe_at(
+        &mut self,
+        event: Event,
+        now: Instant,
         emit: &mut impl FnMut(KeyCode, bool) -> io::Result<()>,
     ) -> io::Result<Option<(Control, bool)>> {
         if let Event::Pulse(control) = event {
@@ -130,7 +156,49 @@ impl Keyboard {
         let Some(index) = self.assignments.iter().position(|item| item.control == pad) else {
             return Ok(None);
         };
+        if self.assignments[index].risky {
+            if pressed {
+                self.armed.insert(pad, now);
+                return Ok(None);
+            }
+            if self.armed.remove(&pad).is_some() {
+                return Ok(None); // released before ARM: nothing was sent
+            }
+        }
+        self.activate(index, pressed, emit)
+    }
+
+    /// Fire risky controls held for at least `ARM` by `now`.
+    pub(crate) fn fire_due(
+        &mut self,
+        now: Instant,
+        emit: &mut impl FnMut(KeyCode, bool) -> io::Result<()>,
+    ) -> io::Result<Vec<(Control, bool)>> {
+        let due: Vec<_> = self
+            .armed
+            .iter()
+            .filter(|(_, at)| now.saturating_duration_since(**at) >= ARM)
+            .map(|(pad, _)| *pad)
+            .collect();
+        let mut fired = Vec::new();
+        for pad in due {
+            self.armed.remove(&pad);
+            let index = self.assignments.iter().position(|a| a.control == pad);
+            if let (true, Some(index)) = (self.running, index) {
+                fired.extend(self.activate(index, true, emit)?);
+            }
+        }
+        Ok(fired)
+    }
+
+    fn activate(
+        &mut self,
+        index: usize,
+        pressed: bool,
+        emit: &mut impl FnMut(KeyCode, bool) -> io::Result<()>,
+    ) -> io::Result<Option<(Control, bool)>> {
         let assignment = &self.assignments[index];
+        let pad = assignment.control;
         let active = match assignment.behavior {
             Behavior::Trigger => return Ok(pressed.then_some((pad, true))),
             Behavior::Hold | Behavior::Pulse => pressed,
@@ -203,6 +271,31 @@ impl Keyboard {
         Ok(())
     }
 
+    /// Press then release `keys` once. Keys already held by an active mapping stay held.
+    pub(crate) fn tap(
+        &mut self,
+        keys: &[KeyCode],
+        emit: &mut impl FnMut(KeyCode, bool) -> io::Result<()>,
+    ) -> io::Result<()> {
+        if !self.running {
+            return Err(io::Error::other("output paused; keys not sent"));
+        }
+        let pressed: Vec<_> = keys
+            .iter()
+            .copied()
+            .filter(|k| !self.held.contains(k))
+            .collect();
+        for &key in &pressed {
+            self.held.insert(key);
+            emit(key, true)?;
+        }
+        for &key in pressed.iter().rev() {
+            emit(key, false)?;
+            self.held.remove(&key);
+        }
+        Ok(())
+    }
+
     pub(crate) fn resume(&mut self) {
         self.running = true;
     }
@@ -253,8 +346,17 @@ impl Keyboard {
             .collect::<Vec<_>>();
         let mut down = self.down.iter().map(|p| name(*p)).collect::<Vec<_>>();
         down.sort();
+        let mut arming = self
+            .armed
+            .iter()
+            .map(|(pad, at)| {
+                let done = at.elapsed().as_millis().min(ARM.as_millis()) * 100 / ARM.as_millis();
+                format!("{} {done}%", name(*pad))
+            })
+            .collect::<Vec<_>>();
+        arming.sort();
         format!(
-            "{} | {} saved (/list shows keys/modes) | {} await release\nActive holds/toggles: {}\nPhysically down: {}",
+            "{} | {} saved (/list shows keys/modes) | {} await release\nActive holds/toggles: {}\nPhysically down: {}{}",
             if self.running { "RUNNING" } else { "PAUSED" },
             self.assignments.len(),
             self.blocked.len(),
@@ -267,6 +369,11 @@ impl Keyboard {
                 "none".into()
             } else {
                 down.join(", ")
+            },
+            if arming.is_empty() {
+                String::new()
+            } else {
+                format!("\nArming risky (hold 1 s): {}", arming.join(", "))
             }
         )
     }
@@ -290,6 +397,7 @@ impl Keyboard {
         }
         self.down.clear();
         self.blocked.clear();
+        self.armed.clear();
         for assignment in &mut self.assignments {
             assignment.active = false;
         }
@@ -353,9 +461,21 @@ impl Output {
             node,
         })
     }
+    pub(crate) fn fire_due(&mut self) -> Result<Vec<(Control, bool)>> {
+        let device = &mut self.device;
+        Ok(self.keyboard.fire_due(Instant::now(), &mut |key, down| {
+            device.emit(&[InputEvent::new(EventType::KEY.0, key.0, i32::from(down))])
+        })?)
+    }
     pub(crate) fn observe(&mut self, event: Event) -> Result<Option<(Control, bool)>> {
         let device = &mut self.device;
         Ok(self.keyboard.observe(event, &mut |key, down| {
+            device.emit(&[InputEvent::new(EventType::KEY.0, key.0, i32::from(down))])
+        })?)
+    }
+    pub(crate) fn tap(&mut self, keys: &[KeyCode]) -> Result<()> {
+        let device = &mut self.device;
+        Ok(self.keyboard.tap(keys, &mut |key, down| {
             device.emit(&[InputEvent::new(EventType::KEY.0, key.0, i32::from(down))])
         })?)
     }
@@ -943,5 +1063,142 @@ mod tests {
         assert_eq!(attempts, [KeyCode::KEY_C, KeyCode::KEY_LEFTCTRL]);
         assert_eq!(keyboard.held, HashSet::from([KeyCode::KEY_C]));
         keyboard.cleanup(&mut |_, _| Ok(())).unwrap();
+    }
+
+    #[test]
+    fn focused_paste_taps_shortcut_then_enter_keeps_held_keys_and_stops_when_paused() {
+        let hold = Control::from_note(10, 36).unwrap();
+        let mut keyboard = Keyboard::new(&[Mapping::new(hold, "Ctrl", "hold").unwrap()]).unwrap();
+        let mut sent = Vec::new();
+        let mut emit = |key, down| {
+            sent.push((key, down));
+            Ok(())
+        };
+        keyboard.tap(&paste_keys(false), &mut emit).unwrap();
+        keyboard.tap(&[KeyCode::KEY_ENTER], &mut emit).unwrap();
+        use KeyCode as K;
+        assert_eq!(
+            sent,
+            [
+                (K::KEY_LEFTCTRL, true),
+                (K::KEY_V, true),
+                (K::KEY_V, false),
+                (K::KEY_LEFTCTRL, false),
+                (K::KEY_ENTER, true),
+                (K::KEY_ENTER, false),
+            ]
+        );
+        sent.clear();
+        let mut emit = |key, down| {
+            sent.push((key, down));
+            Ok(())
+        };
+        keyboard.observe(Event::Press(hold), &mut emit).unwrap();
+        keyboard.tap(&paste_keys(true), &mut emit).unwrap();
+        keyboard.pause(&mut emit).unwrap();
+        assert!(keyboard.tap(&[KeyCode::KEY_ENTER], &mut emit).is_err());
+        assert_eq!(
+            sent,
+            [
+                (K::KEY_LEFTCTRL, true), // the hold mapping's Ctrl stays down through the paste
+                (K::KEY_LEFTSHIFT, true),
+                (K::KEY_V, true),
+                (K::KEY_V, false),
+                (K::KEY_LEFTSHIFT, false),
+                (K::KEY_LEFTCTRL, false), // released by pause; paused tap sends nothing
+            ]
+        );
+        assert!(keyboard.held.is_empty());
+    }
+
+    #[test]
+    fn risky_controls_fire_after_one_second_and_cancel_on_release_pause_or_clear() {
+        let hold = Control::from_note(10, 36).unwrap();
+        let trigger = Control::from_note(10, 37).unwrap();
+        let mut shift = Mapping::new(hold, "Shift", "hold").unwrap();
+        shift.risky = true;
+        let mut command = Mapping::new_action(
+            trigger,
+            crate::mappings::Input::Pad,
+            crate::actions::Action::OutputMute,
+        )
+        .unwrap();
+        command.risky = true;
+        let mut keyboard = Keyboard::new(&[shift, command]).unwrap();
+        keyboard.blocked.clear(); // as after the first real release
+        let mut sent = Vec::new();
+        let mut emit = |key, down| {
+            sent.push((key, down));
+            Ok(())
+        };
+        let t = Instant::now();
+        let ms = |n| t + Duration::from_millis(n);
+        // Hold-shortcut: nothing until 1 s, then key down; key up on release.
+        assert_eq!(
+            keyboard
+                .observe_at(Event::Press(hold), t, &mut emit)
+                .unwrap(),
+            None
+        );
+        assert!(keyboard.fire_due(ms(999), &mut emit).unwrap().is_empty());
+        assert_eq!(
+            keyboard.fire_due(ms(1000), &mut emit).unwrap(),
+            [(hold, true)]
+        );
+        assert!(keyboard.fire_due(ms(5000), &mut emit).unwrap().is_empty()); // fires once
+        let release = Event::Release(hold, crate::ReleaseType::NoteOff);
+        assert_eq!(
+            keyboard.observe_at(release, ms(1500), &mut emit).unwrap(),
+            Some((hold, false))
+        );
+        // Trigger: early release sends nothing, even later.
+        keyboard
+            .observe_at(Event::Press(trigger), ms(2000), &mut emit)
+            .unwrap();
+        let early = Event::Release(trigger, crate::ReleaseType::NoteOff);
+        assert_eq!(
+            keyboard.observe_at(early, ms(2500), &mut emit).unwrap(),
+            None
+        );
+        assert!(keyboard.fire_due(ms(9000), &mut emit).unwrap().is_empty());
+        // Trigger held: fires once at 1 s.
+        keyboard
+            .observe_at(Event::Press(trigger), ms(3000), &mut emit)
+            .unwrap();
+        assert_eq!(
+            keyboard.fire_due(ms(4000), &mut emit).unwrap(),
+            [(trigger, true)]
+        );
+        let late = Event::Release(trigger, crate::ReleaseType::NoteOff);
+        assert_eq!(
+            keyboard.observe_at(late, ms(4100), &mut emit).unwrap(),
+            None
+        );
+        // Clear (program change) and pause both drop an armed press.
+        keyboard
+            .observe_at(Event::Press(trigger), ms(5000), &mut emit)
+            .unwrap();
+        keyboard.clear(&mut emit).unwrap();
+        assert!(keyboard.fire_due(ms(9000), &mut emit).unwrap().is_empty());
+        keyboard
+            .observe_at(
+                Event::Release(trigger, crate::ReleaseType::NoteOff),
+                ms(5100),
+                &mut emit,
+            )
+            .unwrap();
+        keyboard
+            .observe_at(Event::Press(trigger), ms(6000), &mut emit)
+            .unwrap();
+        keyboard.pause(&mut emit).unwrap();
+        assert!(keyboard.fire_due(ms(9000), &mut emit).unwrap().is_empty());
+        assert!(keyboard.armed.is_empty());
+        assert_eq!(
+            sent,
+            [
+                (KeyCode::KEY_LEFTSHIFT, true),
+                (KeyCode::KEY_LEFTSHIFT, false)
+            ]
+        );
     }
 }

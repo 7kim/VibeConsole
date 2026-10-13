@@ -61,12 +61,8 @@ fn unit() -> Result<PathBuf> {
     }
     Ok(base.join("systemd/user/vibeconsole.service"))
 }
-fn service(feedback: bool, flow: bool) -> String {
-    format!(
-        "# Managed by VibeConsole\n[Unit]\nDescription=VibeConsole controller shortcuts\nAfter=graphical-session-pre.target pipewire.service wireplumber.service\nPartOf=graphical-session.target\n\n[Service]\nType=simple\nExecStart=\"%h/.local/bin/vibeconsole\" daemon{}{}\nRestart=no\n# amidi must outlive SIGTERM so handled shutdown can restore controller feedback\nKillMode=mixed\nTimeoutStopSec=15\n\n[Install]\nWantedBy=graphical-session.target\n",
-        if feedback { " --feedback" } else { "" },
-        if flow { " --start-flow" } else { "" }
-    )
+fn service() -> &'static str {
+    "# Managed by VibeConsole\n[Unit]\nDescription=VibeConsole controller shortcuts\nAfter=graphical-session-pre.target pipewire.service wireplumber.service\nPartOf=graphical-session.target\n\n[Service]\nType=simple\nExecStart=\"%h/.local/bin/vibeconsole\" daemon\nRestart=no\n# amidi must outlive SIGTERM so handled shutdown can restore controller feedback\nKillMode=mixed\nTimeoutStopSec=15\n\n[Install]\nWantedBy=graphical-session.target\n"
 }
 fn managed(path: &Path) -> Result<()> {
     if path.exists() && !fs::read_to_string(path)?.starts_with("# Managed by VibeConsole\n") {
@@ -129,18 +125,17 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
             let path = unit()?;
             managed(&path)?;
             fs::create_dir_all(path.parent().unwrap())?;
-            fs::write(
-                &path,
-                service(
-                    flags.iter().any(|s| s == "--feedback"),
-                    flags.iter().any(|s| s == "--start-flow"),
-                ),
-            )?;
+            fs::write(&path, service())?;
             systemctl(&["daemon-reload"])?;
             systemctl(&["enable", "vibeconsole.service"])?;
             println!(
-                "Login startup enabled. Start explicitly with vibeconsole startup-start; journalctl --user -u vibeconsole.service shows errors. --feedback explicitly confirms the original Program 1 setup; --start-flow opts into ordered Flow startup."
+                "Login startup enabled. Start explicitly with vibeconsole startup-start; journalctl --user -u vibeconsole.service shows program, Flow, and output status."
             );
+            if !flags.is_empty() {
+                println!(
+                    "Legacy startup-enable flags ignored; saved Flow setting and verified program now control startup."
+                );
+            }
         }
         "startup-start" => systemctl(&["start", "vibeconsole.service"])?,
         "startup-stop" => systemctl(&["stop", "vibeconsole.service"])?,
@@ -186,7 +181,7 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                 }
                 Err(e) => println!("Recording unavailable: {e}; Select keys remains available"),
             }
-            for program in ["gio", "wpctl", "systemctl"] {
+            for program in ["gio", "wpctl", "systemctl", "tmux", "wl-copy"] {
                 let present = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
                     .any(|p| p.join(program).is_file());
                 println!(
@@ -206,6 +201,7 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                 "Configuration: {} valid mappings",
                 crate::mappings::load(&crate::mappings::config_path()?)?.len()
             );
+            println!("Agent terminals: tmux attach -t vibe");
         }
         _ => return Err("unknown setup command".into()),
     }
@@ -223,9 +219,9 @@ mod tests {
         drop(owner);
         drop(Owner::at(&path).unwrap());
         fs::remove_file(path).unwrap();
-        assert!(!service(false, false).contains("--start-flow"));
-        assert!(service(true, true).contains("daemon --feedback --start-flow"));
-        assert!(service(false, false).contains("Restart=no"));
-        assert!(service(false, false).contains("KillMode=mixed"));
+        assert!(service().contains("\" daemon\n"));
+        assert!(!service().contains("--feedback") && !service().contains("--start-flow"));
+        assert!(service().contains("Restart=no"));
+        assert!(service().contains("KillMode=mixed"));
     }
 }

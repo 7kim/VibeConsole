@@ -72,6 +72,9 @@ pub enum Input {
     Knob {
         step: u8,
     },
+    RelativeKnob {
+        step: u8,
+    },
     Joystick {
         center: u16,
         min: u16,
@@ -86,6 +89,7 @@ impl Input {
             Self::Pad => "Pad Note press/release".into(),
             Self::Piano => "Piano emitted note".into(),
             Self::Knob { step } => format!("Absolute knob, step {step}"),
+            Self::RelativeKnob { step } => format!("Relative knob, step {step}"),
             Self::Joystick {
                 center,
                 deadzone,
@@ -101,6 +105,7 @@ impl fmt::Display for Input {
             Self::Pad => f.write_str("pad"),
             Self::Piano => f.write_str("piano"),
             Self::Knob { step } => write!(f, "knob:{step}"),
+            Self::RelativeKnob { step } => write!(f, "relative-knob:{step}"),
             Self::Joystick {
                 center,
                 min,
@@ -119,6 +124,9 @@ impl std::str::FromStr for Input {
             ["pad"] => Self::Pad,
             ["piano"] => Self::Piano,
             ["knob", step] => Self::Knob {
+                step: step.parse()?,
+            },
+            ["relative-knob", step] => Self::RelativeKnob {
                 step: step.parse()?,
             },
             ["joystick", center, min, max, deadzone, hysteresis] => Self::Joystick {
@@ -143,6 +151,8 @@ pub struct Mapping {
     pub keys: Vec<String>,
     pub behavior: Behavior,
     pub feedback: Feedback,
+    /// Fires only after the control is held for `keyboard::ARM`.
+    pub risky: bool,
 }
 
 pub fn program_label(context: u8) -> String {
@@ -247,6 +257,7 @@ impl Mapping {
             keys: parse_shortcut(shortcut)?,
             behavior,
             feedback: Feedback::default(),
+            risky: false,
         })
     }
     pub fn new_action(
@@ -298,11 +309,19 @@ impl Mapping {
             Input::Pad | Input::Piano => {
                 self.control.message == Message::Note && self.behavior != Behavior::Pulse
             }
-            Input::Knob { step } => {
+            Input::Knob { step } | Input::RelativeKnob { step } => {
                 self.control.message == Message::Cc
-                    && (1..=127).contains(&step)
+                    && (1..=if matches!(self.input, Input::RelativeKnob { .. }) {
+                        8
+                    } else {
+                        127
+                    })
+                        .contains(&step)
                     && (self.behavior == Behavior::Pulse
-                        || (self.behavior == Behavior::Trigger && self.action.audio()))
+                        || (self.behavior == Behavior::Trigger
+                            && (self.action.audio()
+                                || (self.action.dial()
+                                    && matches!(self.input, Input::Knob { .. })))))
                     && !self.feedback.enabled()
             }
             Input::Joystick {
@@ -334,6 +353,12 @@ impl Mapping {
                         .is_some_and(|threshold| threshold < reach)
             }
         };
+        if self.action.dial() && !matches!(self.input, Input::Knob { .. }) {
+            return Err("choice and value actions need an absolute knob".into());
+        }
+        if self.risky && !matches!(self.input, Input::Pad | Input::Piano) {
+            return Err("only pad and piano presses can be risky".into());
+        }
         if !valid || ((self.input != Input::Pad || self.context > 7) && self.feedback.enabled()) {
             return Err("unsupported control/profile/behavior/feedback combination".into());
         }
@@ -463,11 +488,74 @@ pub fn config_path() -> Result<PathBuf> {
     Ok(path)
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
     pub mappings: Vec<Mapping>,
+    pub agents: Vec<Agent>,
     pub idle: Settings,
     pub program_idle: std::collections::BTreeMap<u8, Settings>,
+    pub start_flow: bool,
+}
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            mappings: Vec::new(),
+            agents: vec![
+                Agent::new("claude", "claude", "claude").unwrap(),
+                Agent::new("codex", "codex", "codex").unwrap(),
+            ],
+            idle: Settings::default(),
+            program_idle: std::collections::BTreeMap::new(),
+            start_flow: true,
+        }
+    }
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Agent {
+    pub name: String,
+    pub launch: String,
+    pub window: String,
+}
+impl Agent {
+    pub fn new(name: &str, launch: &str, window: &str) -> Result<Self> {
+        if !simple_name(name)
+            || !simple_name(window)
+            || launch.trim().is_empty()
+            || launch.len() > 4096
+            || launch.chars().any(char::is_control)
+        {
+            return Err(
+                "agent name/window must be simple names; launch must be one nonempty line".into(),
+            );
+        }
+        Ok(Self {
+            name: name.into(),
+            launch: launch.into(),
+            window: window.into(),
+        })
+    }
+}
+pub fn simple_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 80
+        && !value.starts_with('.')
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+}
+fn validate_agents(agents: &[Agent]) -> Result<()> {
+    if agents.len() > 64 {
+        return Err("too many agents".into());
+    }
+    let mut names = HashSet::new();
+    let mut windows = HashSet::new();
+    for agent in agents {
+        Agent::new(&agent.name, &agent.launch, &agent.window)?;
+        if !names.insert(&agent.name) || !windows.insert(&agent.window) {
+            return Err("agent names and tmux windows must be unique".into());
+        }
+    }
+    Ok(())
 }
 impl Config {
     pub fn idle_for(&self, context: u8) -> Settings {
@@ -536,9 +624,13 @@ fn parse_config(contents: &str) -> Result<Config> {
         Some("3") => 3,
         Some("4") => 4,
         Some("5") => 5,
+        Some("6") => 6,
+        Some("7") => 7,
+        Some("8") => 8,
+        Some("9") => 9,
         _ => {
             return Err(
-                "invalid configuration header; expected vibeconsole-mappings-v1/v2/v3/v4/v5".into(),
+                "invalid configuration header; expected vibeconsole-mappings-v1..v9".into(),
             );
         }
     };
@@ -585,6 +677,38 @@ fn parse_config(contents: &str) -> Result<Config> {
             }
         }
     }
+    let start_flow = if version >= 6 {
+        match lines.next().ok_or("missing Flow startup setting")? {
+            "start-flow\ton" => true,
+            "start-flow\toff" => false,
+            _ => return Err("expected start-flow on/off setting".into()),
+        }
+    } else {
+        true
+    };
+    let agents = if version >= 8 {
+        let count: usize = lines
+            .next()
+            .ok_or("missing agent count")?
+            .strip_prefix("agents\t")
+            .ok_or("expected agents count")?
+            .parse()?;
+        if count > 64 {
+            return Err("too many agents".into());
+        }
+        let mut agents = Vec::new();
+        for _ in 0..count {
+            let fields: Vec<_> = lines.next().ok_or("missing agent")?.split('\t').collect();
+            let ["agent", name, launch, window] = fields.as_slice() else {
+                return Err("invalid agent record".into());
+            };
+            agents.push(Agent::new(name, launch, window)?);
+        }
+        agents
+    } else {
+        Config::default().agents
+    };
+    validate_agents(&agents)?;
     let mut mappings = Vec::new();
     let mut seen = HashSet::new();
     let mut labels = HashSet::new();
@@ -596,7 +720,8 @@ fn parse_config(contents: &str) -> Result<Config> {
                     1 => 6,
                     2 => 9,
                     3 => 13,
-                    _ => 14,
+                    4..=8 => 14,
+                    _ => 15,
                 }
             {
                 return Err("wrong mapping field count".into());
@@ -647,6 +772,11 @@ fn parse_config(contents: &str) -> Result<Config> {
                 Mapping::new_action(pad, line.split('\t').nth(2).unwrap().parse()?, action)?
             };
             mapping.context = context;
+            mapping.risky = match fields.get(11).filter(|_| version >= 9) {
+                None | Some(&"-") => false,
+                Some(&"risky") => true,
+                Some(_) => return Err("expected risky or -".into()),
+            };
             if version >= 3 {
                 mapping.input = line.split('\t').nth(2).unwrap().parse()?;
             }
@@ -714,8 +844,10 @@ fn parse_config(contents: &str) -> Result<Config> {
     mappings.sort_by_key(|mapping| (mapping.context, mapping.control));
     Ok(Config {
         mappings,
+        agents,
         idle,
         program_idle,
+        start_flow,
     })
 }
 
@@ -740,8 +872,9 @@ pub fn save(path: &Path, mappings: &[Mapping]) -> Result<()> {
 
 pub fn save_config(path: &Path, config: &Config) -> Result<()> {
     config.idle.validate()?;
+    validate_agents(&config.agents)?;
     let mut contents = format!(
-        "vibeconsole-mappings-v5\nidle\t{}\t{}\t{}\n",
+        "vibeconsole-mappings-v9\nidle\t{}\t{}\t{}\n",
         opt_text(config.idle.octave),
         opt_text(config.idle.tempo),
         arp_text(config.idle.arp)
@@ -758,6 +891,18 @@ pub fn save_config(path: &Path, config: &Config) -> Result<()> {
             arp_text(idle.arp)
         ));
     }
+    contents.push_str(if config.start_flow {
+        "start-flow\ton\n"
+    } else {
+        "start-flow\toff\n"
+    });
+    contents.push_str(&format!("agents\t{}\n", config.agents.len()));
+    for agent in &config.agents {
+        contents.push_str(&format!(
+            "agent\t{}\t{}\t{}\n",
+            agent.name, agent.launch, agent.window
+        ));
+    }
     for mapping in &config.mappings {
         mapping.validate()?;
         let feedback = mapping.feedback;
@@ -767,7 +912,7 @@ pub fn save_config(path: &Path, config: &Config) -> Result<()> {
             Some(Octave::Absolute(n)) => format!("absolute:{n}"),
         };
         contents.push_str(&format!(
-            "{}\t{}\t{}\t{DEVICE}\t{}\t{}\t{}\t{}\t{}\t{}\t{octave}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{DEVICE}\t{}\t{}\t{}\t{}\t{}\t{}\t{octave}\t{}\t{}\t{}\t{}\n",
             mapping.context,
             mapping.label,
             mapping.input,
@@ -783,7 +928,8 @@ pub fn save_config(path: &Path, config: &Config) -> Result<()> {
             },
             opt_text(feedback.tempo),
             arp_text(feedback.arp),
-            mapping.action.encode()
+            mapping.action.encode(),
+            if mapping.risky { "risky" } else { "-" }
         ));
     }
     parse_config(&contents)?;
@@ -816,7 +962,98 @@ pub fn save_config(path: &Path, config: &Config) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agents_and_prompt_mapping_round_trip_while_old_config_migrates() {
+        use super::*;
+        let mut config = parse_config("vibeconsole-mappings-v7\nidle\t-\t-\t-\nprogram-idle\t1\t-\t-\t-\nprogram-idle\t2\t-\t-\t-\nprogram-idle\t3\t-\t-\t-\nprogram-idle\t4\t-\t-\t-\nprogram-idle\t5\t-\t-\t-\nprogram-idle\t6\t-\t-\t-\nprogram-idle\t7\t-\t-\t-\nstart-flow\ton\n").unwrap();
+        assert_eq!(
+            config
+                .agents
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>(),
+            ["claude", "codex"]
+        );
+        config.agents.push(
+            Agent::new(
+                "claude-yolo",
+                "claude --dangerously-skip-permissions",
+                "claude-yolo",
+            )
+            .unwrap(),
+        );
+        config.mappings.push(
+            Mapping::new_action(
+                Control::from_note(10, 36).unwrap(),
+                Input::Pad,
+                crate::actions::Action::Prompt {
+                    file: "review".into(),
+                    target: crate::actions::Target::Agent("claude-yolo".into()),
+                    enter: true,
+                },
+            )
+            .unwrap(),
+        );
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-agents-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        save_config(&path, &config).unwrap();
+        assert_eq!(load_config(&path).unwrap(), config);
+        config.mappings.push(
+            Mapping::new_action(
+                Control::from_note(10, 37).unwrap(),
+                Input::Pad,
+                crate::actions::Action::Sequence(vec![
+                    crate::actions::Step::Agent("claude".into()),
+                    crate::actions::Step::Wait(3000),
+                    crate::actions::Step::Keys(vec!["Enter".into()]),
+                ]),
+            )
+            .unwrap(),
+        );
+        config.mappings[0].risky = true;
+        save_config(&path, &config).unwrap();
+        assert!(fs::read_to_string(&path).unwrap().contains("\trisky\n"));
+        assert_eq!(load_config(&path).unwrap(), config);
+        let cc = Control {
+            channel: 1,
+            id: 70,
+            message: crate::Message::Cc,
+            direction: 1,
+        };
+        let mut knob = Mapping::new(cc, "Shift", "pulse").unwrap();
+        knob.input = Input::Knob { step: 4 };
+        knob.validate().unwrap();
+        knob.risky = true;
+        assert!(knob.validate().is_err());
+        config.agents[2].window = "claude".into();
+        assert!(save_config(&path, &config).is_err());
+        assert_ne!(load_config(&path).unwrap(), config);
+        fs::remove_dir_all(dir).unwrap();
+    }
     use super::*;
+
+    #[test]
+    fn flow_startup_defaults_on_and_round_trips_off() {
+        let mut old = "vibeconsole-mappings-v5\nidle\t-\t-\t-\n".to_owned();
+        for context in 1..8 {
+            old.push_str(&format!("program-idle\t{context}\t-\t-\t-\n"));
+        }
+        assert!(parse_config(&old).unwrap().start_flow);
+        let mut config = Config::default();
+        config.start_flow = false;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-flow-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        save_config(&path, &config).unwrap();
+        assert_eq!(load_config(&path).unwrap(), config);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("start-flow\toff\n"));
+        assert!(parse_config(&text.replace("start-flow\toff", "start-flow\tmaybe")).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn captured_programs_name_pads_knobs_and_fall_back_to_raw_identity() {
@@ -1039,6 +1276,22 @@ mod tests {
         let mut expected = valid.clone();
         expected.mappings.sort_by_key(|m| (m.context, m.control));
         assert_eq!(load_config(&path).unwrap(), expected);
+        let mut relative = valid.clone();
+        relative.mappings[1].input = Input::RelativeKnob { step: 2 };
+        save_config(&path, &relative).unwrap();
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .starts_with("vibeconsole-mappings-v9\n")
+        );
+        assert!(
+            load_config(&path)
+                .unwrap()
+                .mappings
+                .iter()
+                .any(|m| m.input == Input::RelativeKnob { step: 2 })
+        );
+        save_config(&path, &valid).unwrap();
         let before = fs::read(&path).unwrap();
         for input in [
             Input::Knob { step: 0 },
