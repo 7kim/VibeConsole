@@ -18,13 +18,13 @@ binary = Path(__file__).resolve().parents[1] / "target/debug/vibeconsole"
 # Grouped command order (headings are skipped); the cursor starts on Run/Pause.
 ORDER = ["Run", "/pause", "/release-all", "/quit", "/configure", "/list", "Agents", "Reset settings",
          "/prog-select", "/program-name", "/feedback-idle", "/feedback-check",
-         "Start Wispr Flow with VibeConsole", "/start-flow", "/repair-flow", "/detect", "/get"]
+         "Start Wispr Flow with VibeConsole", "Start or repair Wispr Flow", "/detect", "/get"]
 
 
 def go(master, source, target):
     """Move from the highlighted command to the target by name; Enter only once it is highlighted.
     Flow commands would launch the real application, so no scenario may open them."""
-    assert target not in ("/start-flow", "/repair-flow"), target
+    assert target != "Start or repair Wispr Flow", target
     if source != target:  # otherwise the target is already highlighted
         index = lambda name: 0 if name == "Pause" else ORDER.index(name)
         os.write(master, b"\x1b[B" * ((index(target) - index(source)) % len(ORDER)))

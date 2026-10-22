@@ -96,8 +96,7 @@ impl Step {
                 | Action::Sequence(_)
                 | Action::Choice(_)
                 | Action::Value { .. }
-                | Action::FlowStart
-                | Action::FlowRepair,
+                | Action::Flow,
             ) => Err("a step cannot be a mapping shortcut, sequence, knob, or Flow action".into()),
             Self::Do(action) => action.validate(),
             _ => Ok(()),
@@ -147,12 +146,12 @@ pub enum Action {
     },
     OutputMute,
     MicrophoneMute,
-    FlowStart,
-    FlowRepair,
+    /// Start Wispr Flow when it is not running; repair (quit and reopen) it once when it is.
+    Flow,
 }
 impl Action {
     pub fn flow(&self) -> bool {
-        matches!(self, Self::FlowStart | Self::FlowRepair)
+        *self == Self::Flow
     }
     /// Agents this action sends to or starts (for clearing their finished state).
     pub fn agents(&self) -> Vec<&str> {
@@ -285,8 +284,7 @@ impl Action {
             }
             Self::OutputMute => "output-mute".into(),
             Self::MicrophoneMute => "microphone-mute".into(),
-            Self::FlowStart => "flow-start".into(),
-            Self::FlowRepair => "flow-repair".into(),
+            Self::Flow => "flow".into(),
         }
     }
     pub fn parse(value: &str) -> Result<Self> {
@@ -349,8 +347,8 @@ impl Action {
             }
             "output-mute" => Self::OutputMute,
             "microphone-mute" => Self::MicrophoneMute,
-            "flow-start" => Self::FlowStart,
-            "flow-repair" => Self::FlowRepair,
+            // Mappings saved before the merge used separate start and repair actions.
+            "flow" | "flow-start" | "flow-repair" => Self::Flow,
             _ if value.starts_with("app:") => Self::Application(value[4..].into()),
             _ if value.starts_with("volume-up:") => Self::Volume {
                 up: true,
@@ -423,8 +421,7 @@ impl Action {
             ),
             Self::OutputMute => "Toggle default output mute".into(),
             Self::MicrophoneMute => "Toggle default microphone mute".into(),
-            Self::FlowStart => "Start Wispr Flow after keyboard registration".into(),
-            Self::FlowRepair => "Repair/reopen Wispr Flow; pause and release first".into(),
+            Self::Flow => "Start or repair Wispr Flow".into(),
             Self::Shortcut => "Keyboard shortcut".into(),
         }
     }
@@ -697,7 +694,11 @@ fn launch(path: &str, cancelled: &impl Fn() -> bool) -> Result<String> {
 }
 
 pub fn prompts_dir() -> Result<PathBuf> {
-    Ok(crate::mappings::config_path()?
+    prompts_dir_for(&crate::mappings::config_path()?)
+}
+/// Saved prompts live in `prompts/` beside the configuration file.
+pub fn prompts_dir_for(config: &Path) -> Result<PathBuf> {
+    Ok(config
         .parent()
         .ok_or("configuration directory missing")?
         .join("prompts"))
@@ -1142,11 +1143,7 @@ fn perform(
         }
         Action::Command { window, dir, line } => run_command(window, dir, line),
         Action::Application(path) => launch(path, &cancelled),
-        Action::FlowStart | Action::FlowRepair => flow(
-            action,
-            node.ok_or("keyboard has not been registered")?,
-            &cancelled,
-        ),
+        Action::Flow => flow(node.ok_or("keyboard has not been registered")?, &cancelled),
         Action::Shortcut => Err("shortcut belongs to keyboard output".into()),
         Action::Choice(_) | Action::Value { .. } => Err("knob actions run in the session".into()),
         _ => audio(action, |args| command("wpctl", args, &cancelled)),
@@ -1264,59 +1261,58 @@ enum FlowStep {
     Launch,
     Capture,
 }
+/// Not running: launch, then confirm capture. Running: one graceful quit and reopen, then
+/// confirm capture. No retry loop.
 fn flow_lifecycle(
-    repair: bool,
+    installed: bool,
     running: bool,
     registered: bool,
     mut stage: impl FnMut(FlowStep) -> Result<()>,
 ) -> Result<()> {
+    if !installed {
+        return Err("Wispr Flow is not installed (no visible wispr-flow.desktop)".into());
+    }
     if !registered {
         return Err("current keyboard device is unavailable".into());
     }
-    if repair && running {
+    if running {
         stage(FlowStep::Quit).map_err(|e| format!("Flow graceful quit request: {e}"))?;
         stage(FlowStep::WaitStopped).map_err(|e| format!("Flow wait for app/helper exit: {e}"))?;
     }
-    if repair || !running {
-        stage(FlowStep::Launch).map_err(|e| format!("Flow launch request: {e}"))?;
-    }
+    stage(FlowStep::Launch).map_err(|e| format!("Flow launch request: {e}"))?;
     stage(FlowStep::Capture).map_err(|e| format!("Flow current keyboard capture: {e}"))?;
     Ok(())
 }
-fn flow(action: &Action, node: &Path, cancelled: &impl Fn() -> bool) -> Result<String> {
+fn flow(node: &Path, cancelled: &impl Fn() -> bool) -> Result<String> {
     let result = (|| -> Result<String> {
-        let path = flow_launcher()?.ok_or("installed Flow desktop launcher is unavailable")?;
+        let path = flow_launcher()?;
         let (main, helper) = flow_processes()?;
-        if *action == Action::FlowStart && main.is_empty() && !helper.is_empty() {
-            return Err("stale Flow helper; select explicit repair or resolve manually".into());
+        if main.is_empty() && !helper.is_empty() {
+            // --quit-app needs a running app; never guess what a lone helper belongs to.
+            return Err("stale Flow helper is running without the app; log out and in (or end it), then retry".into());
         }
-        flow_lifecycle(
-            *action == Action::FlowRepair,
-            !main.is_empty() || !helper.is_empty(),
-            node.exists(),
-            |stage| {
-                match stage {
-                    FlowStep::Quit => {
-                        // Installed Electron second-instance handler supports app.quit via --quit-app.
-                        // ponytail: exact inspected package paths; recheck adapter when Flow packaging changes.
-                        command("/usr/bin/wispr-flow", &strings(&["--quit-app"]), cancelled)?;
-                    }
-                    FlowStep::WaitStopped => wait_until(cancelled, || {
-                        let (m, h) = flow_processes()?;
-                        Ok(m.is_empty() && h.is_empty())
-                    })?,
-                    FlowStep::Launch => {
-                        launch(&path, cancelled)?;
-                    }
-                    FlowStep::Capture => wait_until(cancelled, || {
-                        let (_, h) = flow_processes()?;
-                        capture(node, &h)
-                    })?,
+        flow_lifecycle(path.is_some(), !main.is_empty(), node.exists(), |stage| {
+            match stage {
+                FlowStep::Quit => {
+                    // Installed Electron second-instance handler supports app.quit via --quit-app.
+                    // ponytail: exact inspected package paths; recheck adapter when Flow packaging changes.
+                    command("/usr/bin/wispr-flow", &strings(&["--quit-app"]), cancelled)?;
                 }
-                Ok(())
-            },
-        )?;
-        Ok("Flow helper opened the current keyboard; dictation remains unverified. Output is paused: test physical Shift, then select Run.".into())
+                FlowStep::WaitStopped => wait_until(cancelled, || {
+                    let (m, h) = flow_processes()?;
+                    Ok(m.is_empty() && h.is_empty())
+                })?,
+                FlowStep::Launch => {
+                    launch(path.as_deref().ok_or("Flow launcher missing")?, cancelled)?;
+                }
+                FlowStep::Capture => wait_until(cancelled, || {
+                    let (_, h) = flow_processes()?;
+                    capture(node, &h)
+                })?,
+            }
+            Ok(())
+        })?;
+        Ok("Flow helper opened the current keyboard; dictation remains unverified.".into())
     })();
     result.map_err(|e| format!("{e}. Manual recovery: fully Quit Wispr Flow from its tray; keep VibeConsole's keyboard ready; reopen Wispr Flow; test physical Shift; then select Run. No forced stop or settings reset was attempted.").into())
 }
@@ -1483,77 +1479,42 @@ mod tests {
                 (evdev::KeyCode::KEY_LEFTSHIFT, false)
             ]
         );
-        let mut stages = Vec::new();
-        flow_lifecycle(false, false, true, |s| {
-            stages.push(s);
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(stages, [FlowStep::Launch, FlowStep::Capture]);
-        stages.clear();
-        flow_lifecycle(true, false, true, |s| {
-            stages.push(s);
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(stages, [FlowStep::Launch, FlowStep::Capture]);
-        stages.clear();
-        flow_lifecycle(false, true, true, |s| {
-            stages.push(s);
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(stages, [FlowStep::Capture]); // no implicit restart
-        stages.clear();
-        flow_lifecycle(true, true, true, |s| {
-            stages.push(s);
-            Ok(())
-        })
-        .unwrap();
+        // One command: start when Flow is not running, exactly one repair when it is.
+        let run = |installed, running, registered, fail: Option<FlowStep>| {
+            let mut stages = Vec::new();
+            let result = flow_lifecycle(installed, running, registered, |s| {
+                stages.push(s);
+                if Some(s) == fail {
+                    Err("stage failed".into())
+                } else {
+                    Ok(())
+                }
+            });
+            (result.map_err(|e| e.to_string()), stages)
+        };
+        use FlowStep::*;
         assert_eq!(
-            stages,
-            [
-                FlowStep::Quit,
-                FlowStep::WaitStopped,
-                FlowStep::Launch,
-                FlowStep::Capture
-            ]
+            run(true, false, true, None),
+            (Ok(()), vec![Launch, Capture])
         );
-        stages.clear();
-        assert!(
-            flow_lifecycle(true, true, false, |s| {
-                stages.push(s);
-                Ok(())
-            })
-            .is_err()
+        assert_eq!(
+            run(true, true, true, None),
+            (Ok(()), vec![Quit, WaitStopped, Launch, Capture])
         );
+        let (result, stages) = run(false, true, true, None);
+        assert!(result.unwrap_err().contains("not installed"));
         assert!(stages.is_empty());
-        assert!(
-            flow_lifecycle(true, true, true, |s| {
-                stages.push(s);
-                if s == FlowStep::WaitStopped {
-                    Err("timeout".into())
-                } else {
-                    Ok(())
-                }
-            })
-            .unwrap_err()
-            .to_string()
-            .contains("wait for app/helper exit")
-        );
-        assert_eq!(stages, [FlowStep::Quit, FlowStep::WaitStopped]); // no reopen after stop failure
-        assert!(
-            flow_lifecycle(true, false, true, |s| {
-                if s == FlowStep::Capture {
-                    Err("no capture".into())
-                } else {
-                    Ok(())
-                }
-            })
-            .unwrap_err()
-            .to_string()
-            .contains("current keyboard capture")
-        );
+        let (result, stages) = run(true, true, false, None);
+        assert!(result.is_err() && stages.is_empty());
+        let (result, stages) = run(true, true, true, Some(WaitStopped));
+        assert!(result.unwrap_err().contains("wait for app/helper exit"));
+        assert_eq!(stages, [Quit, WaitStopped]); // no reopen after stop failure
+        let (result, stages) = run(true, false, true, Some(Capture));
+        assert!(result.unwrap_err().contains("current keyboard capture"));
+        assert_eq!(stages, [Launch, Capture]); // capture failed: no retry loop
+        assert_eq!(Action::parse("flow-start").unwrap(), Action::Flow);
+        assert_eq!(Action::parse("flow-repair").unwrap(), Action::Flow);
+        assert_eq!(Action::parse(&Action::Flow.encode()).unwrap(), Action::Flow);
         assert!(flow_main_args(
             b"/usr/lib/wispr-flow/wispr-flow --class=Wispr Flow\0"
         ));
@@ -1670,7 +1631,7 @@ mod tests {
             Action::Sequence(vec![Step::Wait(99)]),
             Action::Sequence(vec![Step::Wait(60001)]),
             Action::Sequence(vec![Step::Do(Action::Sequence(vec![Step::Wait(100)]))]),
-            Action::Sequence(vec![Step::Do(Action::FlowStart)]),
+            Action::Sequence(vec![Step::Do(Action::Flow)]),
             Action::Sequence(vec![Step::Do(Action::Shortcut)]),
             Action::Sequence(vec![Step::Agent("bad name".into())]),
             Action::Sequence(vec![Step::Wait(100); 33]),

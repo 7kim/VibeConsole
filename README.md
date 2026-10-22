@@ -112,7 +112,7 @@ Highlight commands with Up/Down and press Enter. These are menu entries, not she
 | Menu command | Purpose |
 |---|---|
 | `/configure` | Learn controls; edit, save, or explicitly remove assignments |
-| Run / Pause | One entry: Run when paused, Pause when running; Run verifies the program, keeps piano confirmation, and requires a fresh press before activation |
+| Run / Pause | One entry: Run when paused, Pause when running; Run verifies the program, keeps piano confirmation; the first press after Run fires |
 | `/pause` | Direct pause command: release synthetic keys, cancel pending mapped actions, and remain paused |
 | `/release-all` | Clear holds/toggles while retaining running mode |
 | `/list` | Inspect saved mappings and toggle states |
@@ -123,8 +123,7 @@ Highlight commands with Up/Down and press Enter. These are menu entries, not she
 | `/feedback-idle` | Configure the selected program's idle musical settings |
 | `/feedback-check` | Run the bounded original-program feedback/restoration trial |
 | Start Wispr Flow with VibeConsole | Toggle automatic startup for interactive sessions and the login service; default On |
-| `/start-flow` | Prepare the virtual keyboard, start Flow if absent, and check helper capture |
-| `/repair-flow` | Pause output and explicitly request targeted graceful Flow reopening |
+| Start or repair Wispr Flow | Start Flow if it is not running, or quit and reopen it once if it is; check helper capture; resume on success |
 | `/quit` | Release keys, attempt owned-feedback restoration, and restore the terminal |
 
 Esc cancels/returns; Ctrl+C performs handled shutdown. Configuration has learning and saved-assignment panes, with Tab/Left/Right navigation. The interface supports narrow layouts, a minimum 40×16 terminal size, and `NO_COLOR=1`. Only changed screen rows are redrawn.
@@ -156,7 +155,7 @@ Absolute knobs emit at most one immediate shortcut pulse per sample crossing a c
 | Hold | Hold assigned keys | Release this control's ownership | Hold again |
 | Toggle | Latch assigned keys | Keep them held | Release the latch |
 
-Shared keys remain down until their final owner releases them. Modifiers go down before other chord keys and come up afterward. Pressure and duplicate presses do not acquire extra ownership. Startup/resume/program transitions/reconnect never replay old toggles; an initial press/release may only arm a Note control.
+Shared keys remain down until their final owner releases them. Modifiers go down before other chord keys and come up afterward. Pressure and duplicate presses do not acquire extra ownership. Startup/resume/program transitions/reconnect never replay old toggles or earlier presses. The first press after a transition fires; a pad held through the transition fires only when pressed again.
 
 Recording reads physical keyboard devices only for the capture step, excludes virtual keyboards, and keeps no keystroke log. Release all keys before recording, then press/release one chord. Use, Retry, and Cancel happen after capture closes; unfinished capture times out after 60 seconds. Recording **does not suppress real desktop shortcuts**. Escape can be recorded; choose Ctrl+C through menus because it exits the session.
 
@@ -224,11 +223,11 @@ These are **real musical settings**, not independent pad LEDs. Temporary feedbac
 
 ## 🎙️ Wispr Flow
 
-Use a pad mapped to **Shift / hold** with Flow's Shift push-to-talk binding. `/start-flow` creates/retains the paused virtual keyboard, starts Flow if absent, and checks whether its helper opened the current device. Starting an already-running Flow is not a repair.
+Use a pad mapped to **Shift / hold** with Flow's Shift push-to-talk binding. **Start or repair Wispr Flow** (menu or pad action) creates/retains the virtual keyboard, releases keys and pauses output, starts Flow if it is not running or performs one graceful quit/reopen if it is, and checks whether its helper opened the current device. On confirmed capture the session returns to running if it was running; on failure it stays paused and shows the failed stage. Mappings saved with the old separate start/repair actions load as this command.
 
 Automatic Flow startup is On by default. VibeConsole creates its keyboard first, starts Flow if closed, or performs one graceful quit/reopen if Flow is already running. Output waits for helper capture; `--paused` stays paused. If Flow is not installed, startup continues and the header reports it. The menu setting controls both interactive and service startup.
 
-`/repair-flow` first releases synthetic keys and pauses, then requests the intended app's graceful quit, waits boundedly for the app/helper to stop, and launches it again. It does not force-kill processes, reset settings, modify third-party files, or restart unrelated apps. Both commands finish paused; check physical Shift and actual dictation before explicitly resuming.
+The repair path requests the intended app's graceful quit, waits boundedly for the app/helper to stop, and launches it again. It does not force-kill processes, reset settings, modify third-party files, or restart unrelated apps, and it never retries in a loop.
 
 Ordinary configuration, pause/run, context changes, and MIDI reconnect retain the virtual keyboard without another automatic Flow repair. If startup recovery fails, its stage and manual fallback are reported and output stays paused: fully quit Flow, keep VibeConsole's keyboard ready, reopen Flow, test physical Shift, then select Run. Helper capture is not proof of listening or dictated text. The inspected adapter targets the installed `/usr/lib/wispr-flow` package; application updates may require rechecking it. Manual Start/Repair and ordinary continuity passed V2 user acceptance in guides 13–15; automatic startup awaits its V3 live guide.
 
@@ -305,11 +304,11 @@ Do not concurrently edit an active configuration. If an interrupted save leaves 
 |---|---|
 | No controller / busy port | Check USB and `amidi --list-devices`; close competing MIDI readers/editors |
 | Current program unresolved | Wait for detection; identical presets or edited RAM may require explicit `/prog-select` |
-| First tap does nothing | It may only arm the Note control; release, then press again |
+| First tap does nothing | Check the header says `RUNNING` and the program is verified; a pad held through Run/resume fires only when pressed again |
 | Unexpected pad identity | Inspect emitted channel/note/release; do not assume the original bank labels apply to every preset |
 | Cannot create keyboard | Check `/dev/uinput` access; do not run the full application as root |
 | Cannot record shortcut | Check the named physical keyboard node's read permission or select keys through menus |
-| Shift works in an editor but not Flow | Test `/start-flow` or explicit `/repair-flow`; verify actual push-to-talk separately |
+| Shift works in an editor but not Flow | Use **Start or repair Wispr Flow**; verify actual push-to-talk separately |
 | Installed command behaves differently | Rebuild, quit VibeConsole, then install the new local executable |
 | Program changes feel delayed | Allow polling plus response/re-identification time; check the verified header before playing mapped controls |
 

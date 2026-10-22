@@ -628,9 +628,10 @@ fn parse_config(contents: &str) -> Result<Config> {
         Some("7") => 7,
         Some("8") => 8,
         Some("9") => 9,
+        Some("10") => 10,
         _ => {
             return Err(
-                "invalid configuration header; expected vibeconsole-mappings-v1..v9".into(),
+                "invalid configuration header; expected vibeconsole-mappings-v1..v10".into(),
             );
         }
     };
@@ -874,7 +875,7 @@ pub fn save_config(path: &Path, config: &Config) -> Result<()> {
     config.idle.validate()?;
     validate_agents(&config.agents)?;
     let mut contents = format!(
-        "vibeconsole-mappings-v9\nidle\t{}\t{}\t{}\n",
+        "vibeconsole-mappings-v10\nidle\t{}\t{}\t{}\n",
         opt_text(config.idle.octave),
         opt_text(config.idle.tempo),
         arp_text(config.idle.arp)
@@ -1203,7 +1204,7 @@ mod tests {
             Mapping::new_action(
                 Control::from_note(10, 38).unwrap(),
                 Input::Pad,
-                Action::FlowRepair,
+                Action::Flow,
             )
             .unwrap(),
         );
@@ -1282,7 +1283,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v9\n")
+                .starts_with("vibeconsole-mappings-v10\n")
         );
         assert!(
             load_config(&path)
@@ -1477,5 +1478,37 @@ mod tests {
             assert!(load(&path).is_err());
         }
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn old_flow_start_and_repair_mappings_load_as_the_merged_command() {
+        let mut text = "vibeconsole-mappings-v9\nidle\t-\t-\t-\n".to_owned();
+        for context in 1..8 {
+            text.push_str(&format!("program-idle\t{context}\t-\t-\t-\n"));
+        }
+        text.push_str("start-flow\ton\nagents\t0\n");
+        for (note, action) in [(36, "flow-start"), (37, "flow-repair")] {
+            text.push_str(&format!(
+                "0\tBank A Pad {}\tpad\t09e8:1049\tnote\t10\t{note}\t0\ttrigger\t-\t-\t-\t-\t{action}\t-\n",
+                note - 35
+            ));
+        }
+        let config = parse_config(&text).unwrap();
+        assert!(
+            config
+                .mappings
+                .iter()
+                .all(|m| m.action == crate::actions::Action::Flow)
+        );
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-flow-merge-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        save_config(&path, &config).unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.starts_with("vibeconsole-mappings-v10\n"));
+        assert!(saved.contains("\tflow\t") && !saved.contains("flow-start"));
+        assert_eq!(load_config(&path).unwrap(), config);
+        fs::remove_dir_all(dir).unwrap();
     }
 }
