@@ -205,6 +205,17 @@ Prompts are plain UTF-8 files in `$XDG_CONFIG_HOME/vibeconsole/prompts/` (defaul
 
 Any pad or piano mapping can fire **Held for 1 second (risky)**: an earlier release sends nothing, the screen shows arming progress, and pause, program change, disconnect, and exit cancel it. Prompt, command, and sequence actions fire once per press; pause cancels work not yet sent.
 
+**Settings** (Configure → **Settings**) holds:
+
+- **Default agent directory**: agents start there. Each agent can override it in Agents (**Working directory**). Override, else default, else tmux's own default. A directory must exist when you save it.
+- **Start Wispr Flow with VibeConsole** (the same toggle as in the Wispr Flow group).
+- **Startup variables** (`NAME=value`): exported with `tmux -e` into every agent and command VibeConsole starts.
+- **User variables**: `${NAME}` in a command's directory or an agent directory is replaced by the user variable, else the startup variable; an unknown name is refused when you save. Both lists are also exported into every agent's and command's environment, so command lines use them as ordinary shell variables (`"$NAME"`, quoted as you need). VibeConsole never rewrites a command line, so shell variables like `${f}` in a loop keep working.
+
+Names are letters, digits and `_`, not starting with a digit; values are one line. Every save is atomic. An invalid entry shows **Not saved: …** and changes nothing.
+
+**Prompts** (Agents → **Prompts**) lists the saved prompts. **Read** shows one, **New** and **Edit** open your editor on a hidden copy that replaces the prompt only when the editor succeeds and the text is not empty, and **Delete** asks first and names every mapping or sequence that uses the prompt. Names cannot contain `/` or start with `.`.
+
 **Status feedback.** Commands, prompts to an agent, sequences, launchers and Wispr Flow can show their state in the live pane (`Status Bank A Pad 5: running`). Turn it on per mapping in `/configure` (after **Fire when**). States: **sent** (press accepted, worker not done), **running** (the command's or agent's tmux pane is alive, the sequence is still queued or running, the app has windows per the window extension, or Flow's app process runs), **stopped** (none of that, e.g. after `tmux kill-server`), **failed** (the last press failed), **unavailable** (state cannot be read, e.g. launcher without the window extension). Running is re-read every 500 ms, never stored. Shortcuts, focused-window prompts, audio actions and knob dials have no observable state, so the option is not offered for them.
 
 **Agent status.** Agents → **Claude Code status hooks** / **Codex status hooks** shows hook settings and copies them with `wl-copy`; merge them into `~/.claude/settings.json` and `~/.codex/hooks.json` yourself (VibeConsole never edits them). Hooks call `vibeconsole agent-status - <state>`, which only reports for windows VibeConsole started (they carry `VIBECONSOLE_AGENT`), so other Claude/Codex sessions do not change status. The screen shows `Agents: claude thinking · codex FINISHED`; finished clears when the attached `vibe` session shows that agent's window or a mapping sends to that agent. Status lights on the controller are not implemented yet (they await a hardware gate).

@@ -196,6 +196,35 @@ impl Action {
                 | Self::Flow
         )
     }
+    /// Saved prompt files this action sends, including choice zones and sequence steps.
+    pub fn prompt_files(&self) -> Vec<&str> {
+        match self {
+            Self::Prompt { file, .. } => vec![file],
+            Self::Choice(choices) => choices.iter().flat_map(Self::prompt_files).collect(),
+            Self::Sequence(steps) => steps
+                .iter()
+                .flat_map(|step| match step {
+                    Step::Do(action) => action.prompt_files(),
+                    _ => Vec::new(),
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+    /// (command line, directory) of each tmux command this action runs, sequence steps included.
+    pub fn commands(&self) -> Vec<(&str, &str)> {
+        match self {
+            Self::Command { line, dir, .. } => vec![(line, dir)],
+            Self::Sequence(steps) => steps
+                .iter()
+                .flat_map(|step| match step {
+                    Step::Do(action) => action.commands(),
+                    _ => Vec::new(),
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
     /// Knob actions driven by absolute position rather than pulses.
     pub fn dial(&self) -> bool {
         matches!(self, Self::Choice(_) | Self::Value { .. })
@@ -241,9 +270,11 @@ impl Action {
             {
                 Err("prompt file and agent must be simple names".into())
             }
+            // A directory may start with a `${NAME}` user variable; saving checks it expands
+            // to an absolute path.
             Self::Command { window, dir, line }
                 if !crate::mappings::simple_name(window)
-                    || !Path::new(dir).is_absolute()
+                    || !(Path::new(dir).is_absolute() || dir.starts_with("${"))
                     || dir.contains(':')
                     || dir.len() > 4096
                     || dir.chars().any(char::is_control)
@@ -977,6 +1008,7 @@ fn command_tmux_args<'a>(
     window: &'a str,
     dir: &'a str,
     line: &'a str,
+    env: &'a [String],
 ) -> Vec<&'a str> {
     let mut args = if session {
         vec!["new-window", "-t", "=vibe:"]
@@ -985,11 +1017,11 @@ fn command_tmux_args<'a>(
     };
     // Not detached: the new window must be current so the chained set-option targets it
     // before tmux can process the command's exit (verified with tmux 3.7c).
+    args.extend(["-n", window, "-c", dir]);
+    for variable in env {
+        args.extend(["-e", variable.as_str()]);
+    }
     args.extend([
-        "-n",
-        window,
-        "-c",
-        dir,
         "sh",
         "-c",
         line,
@@ -1002,11 +1034,25 @@ fn command_tmux_args<'a>(
     args
 }
 
+/// Startup and user variables as tmux `-e` values: the shell of every agent and command sees
+/// them, and expands `${NAME}` itself with its own quoting rules.
+fn startup_env(config: &crate::mappings::Config) -> Vec<String> {
+    config
+        .env
+        .iter()
+        .chain(&config.vars)
+        .map(|(n, v)| format!("{n}={v}"))
+        .collect()
+}
+
 fn run_command(window: &str, dir: &str, line: &str) -> Result<String> {
+    let config = crate::mappings::load_config(&crate::mappings::config_path()?)?;
+    let dir = crate::mappings::absolute_directory(dir, &config)?;
     show_command(
         window,
-        dir,
+        &dir,
         line,
+        &startup_env(&config),
         &mut |args| {
             let output = tmux(args)?;
             // Success: stdout; failure: stderr, for the error message.
@@ -1030,6 +1076,7 @@ fn show_command(
     window: &str,
     dir: &str,
     line: &str,
+    env: &[String],
     tmux: &mut dyn FnMut(&[&str]) -> Result<(bool, String)>,
     open: &mut dyn FnMut() -> Result<()>,
 ) -> Result<String> {
@@ -1037,7 +1084,7 @@ fn show_command(
         return Err(format!("working directory {dir} is missing").into());
     }
     let (session, _) = tmux(&["has-session", "-t", "=vibe"])?;
-    let args = command_tmux_args(session, window, dir, line);
+    let args = command_tmux_args(session, window, dir, line, env);
     let (ok, output) = tmux(&args)?;
     if !ok {
         return Err(format!("tmux {}: {output}", args.join(" ")).into());
@@ -1170,18 +1217,30 @@ fn ensure_agent(agent_name: &str, cancelled: &dyn Fn() -> bool) -> Result<String
         .ok_or("target agent was removed; edit this mapping")?;
     // Lets `agent-status -` hooks know which agent they run in.
     let tag = format!("{}={}", crate::status::AGENT_ENV, agent.name);
-    let started = if !tmux(&["has-session", "-t", "=vibe"])?.status.success() {
-        tmux_ok(&[
-            "new-session",
-            "-d",
-            "-s",
-            "vibe",
-            "-n",
+    let env = startup_env(&config);
+    // The directory matters only when a window starts; a running agent ignores it.
+    let start = |session: bool| -> Result<()> {
+        let dir = config.agent_directory(agent)?;
+        if let Some(dir) = &dir {
+            if !Path::new(dir).is_dir() {
+                return Err(format!(
+                    "agent directory {dir} is missing; fix it in Settings or Agents"
+                )
+                .into());
+            }
+        }
+        let args = agent_tmux_args(
+            session,
             &agent.window,
-            "-e",
             &tag,
             &agent.launch,
-        ])?;
+            dir.as_deref(),
+            &env,
+        );
+        tmux_ok(&args.iter().map(String::as_str).collect::<Vec<_>>())
+    };
+    let started = if !tmux(&["has-session", "-t", "=vibe"])?.status.success() {
+        start(false)?;
         true
     } else {
         let windows = tmux(&["list-windows", "-t", "=vibe", "-F", "#{window_name}"])?;
@@ -1192,16 +1251,7 @@ fn ensure_agent(agent_name: &str, cancelled: &dyn Fn() -> bool) -> Result<String
             .lines()
             .any(|name| name == agent.window);
         if missing {
-            tmux_ok(&[
-                "new-window",
-                "-t",
-                "=vibe:",
-                "-n",
-                &agent.window,
-                "-e",
-                &tag,
-                &agent.launch,
-            ])?;
+            start(true)?;
         }
         missing
     };
@@ -1209,6 +1259,32 @@ fn ensure_agent(agent_name: &str, cancelled: &dyn Fn() -> bool) -> Result<String
         wait(AGENT_START, cancelled)?;
     }
     Ok(agent.window.clone())
+}
+
+/// tmux argv starting an agent: a new `vibe` session, or a window in it when `session` exists.
+fn agent_tmux_args(
+    session: bool,
+    window: &str,
+    tag: &str,
+    launch: &str,
+    dir: Option<&str>,
+    env: &[String],
+) -> Vec<String> {
+    let mut args = if session {
+        strings(&["new-window", "-t", "=vibe:"])
+    } else {
+        strings(&["new-session", "-d", "-s", "vibe"])
+    };
+    args.extend(strings(&["-n", window]));
+    if let Some(dir) = dir {
+        args.extend(strings(&["-c", dir]));
+    }
+    args.extend(strings(&["-e", tag]));
+    for variable in env {
+        args.extend(strings(&["-e", variable]));
+    }
+    args.push(launch.into());
+    args
 }
 
 fn send_prompt(
@@ -1716,6 +1792,7 @@ mod tests {
             "Bank-A-Pad-1",
             "/home/u/repo",
             "gh pr create; echo done",
+            &[],
         );
         assert_eq!(args[..3], ["new-window", "-t", "=vibe:"]);
         assert_eq!(args[3..], tail);
@@ -1724,6 +1801,7 @@ mod tests {
             "Bank-A-Pad-1",
             "/home/u/repo",
             "gh pr create; echo done",
+            &[],
         );
         assert_eq!(args[..4], ["new-session", "-d", "-s", "vibe"]);
         assert_eq!(args[4..], tail);
@@ -2189,6 +2267,7 @@ mod tests {
                 "Bank-A-Pad-5",
                 dir,
                 "claude",
+                &[],
                 &mut |args| {
                     tmux_calls.push(args[0].to_string());
                     match args[0] {
@@ -2289,5 +2368,50 @@ mod tests {
                 "tmux"
             ]
         );
+    }
+
+    /// Tickets 11–12: agents start in their override, else the Settings default, else tmux's
+    /// default; startup variables reach every agent and command tmux starts.
+    #[test]
+    fn agents_and_commands_get_their_directory_and_startup_variables() {
+        let env = vec!["ANTHROPIC_MODEL=opus".to_string()];
+        let tag = "VIBECONSOLE_AGENT=claude";
+        let args = agent_tmux_args(false, "claude", tag, "claude", Some("/work/override"), &env);
+        assert_eq!(
+            args,
+            [
+                "new-session",
+                "-d",
+                "-s",
+                "vibe",
+                "-n",
+                "claude",
+                "-c",
+                "/work/override",
+                "-e",
+                tag,
+                "-e",
+                "ANTHROPIC_MODEL=opus",
+                "claude"
+            ]
+        );
+        let args = agent_tmux_args(true, "claude", tag, "claude", None, &[]);
+        assert_eq!(
+            args,
+            [
+                "new-window",
+                "-t",
+                "=vibe:",
+                "-n",
+                "claude",
+                "-e",
+                tag,
+                "claude"
+            ]
+        );
+        let args = command_tmux_args(true, "w", "/tmp", "echo $ANTHROPIC_MODEL", &env);
+        let at = args.iter().position(|a| *a == "-e").unwrap();
+        assert_eq!(args[at + 1], "ANTHROPIC_MODEL=opus");
+        assert!(at < args.iter().position(|a| *a == "sh").unwrap()); // options before the command
     }
 }

@@ -2702,10 +2702,15 @@ fn agents_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
             "Add agent",
             "Claude Code status hooks",
             "Codex status hooks",
+            "Prompts",
         ]));
         let Some(index) = choose(ui, "Agents | tmux attach -t vibe", &choices)? else {
             return Ok(());
         };
+        if index == config.agents.len() + 3 {
+            prompts_menu(ui, path)?;
+            continue;
+        }
         if let Some(which @ (1 | 2)) = index.checked_sub(config.agents.len()) {
             let (file, hooks) = if which == 1 {
                 ("~/.claude/settings.json", crate::status::claude_hooks())
@@ -2734,7 +2739,9 @@ fn agents_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
             )? == Some(1)
             {
                 config.agents.remove(index);
-                mappings::save_config(path, &config)?;
+                if let Err(error) = mappings::save_config(path, &config) {
+                    not_saved(ui, &error)?;
+                }
             }
             continue;
         }
@@ -2761,13 +2768,278 @@ fn agents_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
         else {
             continue;
         };
-        let agent = mappings::Agent::new(&name, &launch, &window)?;
-        if existing.is_some() {
-            config.agents[index] = agent;
-        } else {
-            config.agents.push(agent);
+        let Some(dir) = text_entry(
+            ui,
+            "Working directory (absolute path or ${NAME}; empty uses the Settings default)",
+            existing
+                .as_ref()
+                .and_then(|a| a.dir.as_deref())
+                .unwrap_or(""),
+        )?
+        else {
+            continue;
+        };
+        let saved = (|| -> Result<()> {
+            let mut agent = mappings::Agent::new(&name, &launch, &window)?;
+            if !dir.trim().is_empty() {
+                existing_directory(&dir, &config)?;
+                agent.dir = Some(dir.clone());
+            }
+            if existing.is_some() {
+                config.agents[index] = agent;
+            } else {
+                config.agents.push(agent);
+            }
+            mappings::save_config(path, &config)
+        })();
+        if let Err(error) = saved {
+            not_saved(ui, &error)?;
         }
-        mappings::save_config(path, &config)?;
+    }
+}
+
+/// A rejected Settings/Agents/Prompts entry: nothing changed, so a note, not a failure that pauses.
+fn not_saved(ui: &mut impl Ui, error: &dyn std::fmt::Display) -> Result<()> {
+    choose(ui, &format!("Not saved: {error}"), &options(&["Back"]))?;
+    Ok(())
+}
+
+/// A directory field that must exist now (checked before saving).
+fn existing_directory(dir: &str, config: &mappings::Config) -> Result<String> {
+    let expanded = mappings::absolute_directory(dir, config)?;
+    if !Path::new(&expanded).is_dir() {
+        return Err(format!("directory {expanded} is missing").into());
+    }
+    Ok(expanded)
+}
+
+/// Settings (Configure group): default agent directory, Flow at launch, variables.
+fn settings_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
+    loop {
+        let mut config = mappings::load_config(path)?;
+        let rows = vec![
+            format!(
+                "Default agent directory: {}",
+                config
+                    .agent_dir
+                    .as_deref()
+                    .unwrap_or("not set (tmux default)")
+            ),
+            format!(
+                "Start Wispr Flow with VibeConsole: {} (takes effect next launch)",
+                if config.start_flow { "On" } else { "Off" }
+            ),
+            format!(
+                "Startup variables ({}): exported into tmux sessions and commands",
+                config.env.len()
+            ),
+            format!(
+                "User variables ({}): ${{NAME}} in commands and directories",
+                config.vars.len()
+            ),
+        ];
+        let Some(choice) = choose(ui, "Settings", &rows)? else {
+            return Ok(());
+        };
+        let result = match choice {
+            0 => {
+                let Some(dir) = text_entry(
+                    ui,
+                    "Default agent directory (absolute path or ${NAME}; empty clears)",
+                    config.agent_dir.as_deref().unwrap_or(""),
+                )?
+                else {
+                    continue;
+                };
+                (|| {
+                    config.agent_dir = if dir.trim().is_empty() {
+                        None
+                    } else {
+                        existing_directory(&dir, &config)?;
+                        Some(dir)
+                    };
+                    mappings::save_config(path, &config)
+                })()
+            }
+            1 => {
+                config.start_flow = !config.start_flow;
+                mappings::save_config(path, &config)
+            }
+            _ => variables_menu(ui, path, choice == 3),
+        };
+        if let Err(error) = result {
+            not_saved(ui, &error)?;
+        }
+    }
+}
+
+/// Add, edit or remove startup (`user` false) or user variables. Saving validates names,
+/// values and every `${NAME}` the configuration uses.
+fn variables_menu(ui: &mut impl Ui, path: &Path, user: bool) -> Result<()> {
+    loop {
+        let mut config = mappings::load_config(path)?;
+        let list = if user { &config.vars } else { &config.env };
+        let mut rows = list
+            .iter()
+            .map(|(n, v)| format!("{n}={v}"))
+            .collect::<Vec<_>>();
+        let count = rows.len();
+        rows.push("Add variable".into());
+        let title = if user {
+            "User variables (${NAME} in command lines, command and agent directories)"
+        } else {
+            "Startup variables (exported into every tmux session and command VibeConsole starts)"
+        };
+        let Some(index) = choose(ui, title, &rows)? else {
+            return Ok(());
+        };
+        let current = (index < count).then(|| list[index].clone());
+        if current.is_some() {
+            match choose(ui, &rows[index], &options(&["Edit", "Remove", "Back"]))? {
+                Some(0) => {}
+                Some(1) => {
+                    let list = if user {
+                        &mut config.vars
+                    } else {
+                        &mut config.env
+                    };
+                    list.remove(index);
+                    if let Err(error) = mappings::save_config(path, &config) {
+                        not_saved(ui, &error)?;
+                    }
+                    continue;
+                }
+                _ => continue,
+            }
+        }
+        let (name, value) = current.unwrap_or_default();
+        let Some(name) = text_entry(ui, "Variable name (letters, digits, _)", &name)? else {
+            continue;
+        };
+        let Some(value) = text_entry(ui, &format!("Value of {name} (one line)"), &value)? else {
+            continue;
+        };
+        let list = if user {
+            &mut config.vars
+        } else {
+            &mut config.env
+        };
+        if index < count {
+            list[index] = (name, value);
+        } else {
+            list.push((name, value));
+        }
+        if let Err(error) = mappings::save_config(path, &config) {
+            not_saved(ui, &error)?;
+        }
+    }
+}
+
+/// Saved prompts beside the configuration, sorted; editor scratch files are hidden.
+fn prompt_files(dir: &Path) -> Result<Vec<String>> {
+    std::fs::create_dir_all(dir).map_err(stage("file I/O"))?;
+    let mut files = std::fs::read_dir(dir)
+        .map_err(stage("file I/O"))?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|name| mappings::simple_name(name) && dir.join(name).is_file())
+        .collect::<Vec<_>>();
+    files.sort();
+    Ok(files)
+}
+
+/// Edit (or create) prompt `name` on a hidden copy, then rename it into place: a failed or
+/// empty edit keeps the old prompt.
+fn edit_prompt(ui: &mut impl Ui, dir: &Path, name: &str) -> Result<()> {
+    if !mappings::simple_name(name) {
+        return Err(
+            "prompt names are letters, digits, '-', '_' and '.', not starting with '.'".into(),
+        );
+    }
+    let target = dir.join(name);
+    let scratch = dir.join(format!(".{name}.edit"));
+    let result = (|| -> Result<()> {
+        // A new prompt starts empty; an existing one that cannot be read is never replaced.
+        let old = match std::fs::read(&target) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            other => other?,
+        };
+        std::fs::write(&scratch, old)?;
+        ui.edit_file(&scratch)?;
+        if std::fs::read(&scratch)?.iter().all(u8::is_ascii_whitespace) {
+            return Err("prompt is empty; nothing saved".into());
+        }
+        std::fs::rename(&scratch, &target)?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&scratch);
+    result.map_err(stage("file I/O"))
+}
+
+/// Agents → Prompts: list, read, create, edit, delete (ticket 13).
+fn prompts_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
+    let dir = crate::actions::prompts_dir_for(path)?;
+    loop {
+        let files = prompt_files(&dir)?;
+        let mut rows = files.clone();
+        rows.push("New prompt".into());
+        let Some(index) = choose(ui, &format!("Prompts in {}", dir.display()), &rows)? else {
+            return Ok(());
+        };
+        let result = if index == files.len() {
+            match text_entry(ui, "New prompt name", "")? {
+                Some(name) if files.contains(&name) => {
+                    Err(format!("prompt {name} already exists").into())
+                }
+                Some(name) => edit_prompt(ui, &dir, &name),
+                None => Ok(()),
+            }
+        } else {
+            let name = &files[index];
+            match choose(
+                ui,
+                &format!("Prompt {name}"),
+                &options(&["Read", "Edit", "Delete", "Back"]),
+            )? {
+                Some(0) => {
+                    let text = std::fs::read_to_string(dir.join(name))
+                        .unwrap_or_else(|e| format!("(unreadable: {e})"));
+                    choose(ui, &format!("{name}\n\n{text}"), &options(&["Back"])).map(drop)
+                }
+                Some(1) => edit_prompt(ui, &dir, name),
+                Some(2) => {
+                    let config = mappings::load_config(path)?;
+                    let users = config
+                        .mappings
+                        .iter()
+                        .filter(|m| m.action.prompt_files().contains(&name.as_str()))
+                        .map(|m| format!("{} {}", mappings::program_label(m.context), m.name(None)))
+                        .collect::<Vec<_>>();
+                    let warning = if users.is_empty() {
+                        "No mapping uses it.".to_string()
+                    } else {
+                        format!(
+                            "Used by: {}. Those pads will report a missing prompt.",
+                            users.join(", ")
+                        )
+                    };
+                    if choose(
+                        ui,
+                        &format!("Delete prompt {name}?\n{warning}"),
+                        &options(&["Cancel", "Delete"]),
+                    )? == Some(1)
+                    {
+                        std::fs::remove_file(dir.join(name)).map_err(stage("file I/O"))
+                    } else {
+                        Ok(())
+                    }
+                }
+                _ => Ok(()),
+            }
+        };
+        if let Err(error) = result {
+            not_saved(ui, &error)?;
+        }
     }
 }
 
@@ -2777,14 +3049,7 @@ fn prompt_action(
     saved: Option<&crate::actions::Action>,
 ) -> Result<Option<crate::actions::Action>> {
     let dir = crate::actions::prompts_dir_for(path)?;
-    std::fs::create_dir_all(&dir).map_err(stage("file I/O"))?;
-    let mut files = std::fs::read_dir(&dir)
-        .map_err(stage("file I/O"))?
-        .filter_map(|e| e.ok())
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|name| mappings::simple_name(name) && dir.join(name).is_file())
-        .collect::<Vec<_>>();
-    files.sort();
+    let mut files = prompt_files(&dir)?;
     files.push("New prompt".into());
     let saved_file = match saved {
         Some(crate::actions::Action::Prompt { file, .. }) => Some(file),
@@ -2815,7 +3080,6 @@ fn prompt_action(
     } else {
         files[index].clone()
     };
-    let prompt_path = dir.join(&file);
     if index == files.len() - 1
         || choose(
             ui,
@@ -2823,7 +3087,10 @@ fn prompt_action(
             &options(&["Use existing", "Edit"]),
         )? == Some(1)
     {
-        ui.edit_file(&prompt_path).map_err(stage("file I/O"))?;
+        if let Err(error) = edit_prompt(ui, &dir, &file) {
+            not_saved(ui, &error)?;
+            return Ok(None); // back to the menu that asked; nothing else is lost
+        }
     }
     use crate::actions::Target;
     let mut targets = mappings::load_config(path)
@@ -4098,6 +4365,11 @@ fn configure_steps(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) ->
             mapping.status = status == 1;
         }
         mapping.validate()?;
+        // A directory's ${NAME} must resolve now, not when the pad is pressed (ticket 12).
+        let config = mappings::load_config(path).map_err(stage("file I/O"))?;
+        for (_, dir) in mapping.action.commands() {
+            mappings::absolute_directory(dir, &config)?;
+        }
         match choose(
             ui,
             &format!("Review: {}", mapping_label(&mapping, ui.program().as_ref())),
@@ -4211,6 +4483,11 @@ const COMMANDS: &[(&str, &[(usize, &str, &str)])] = &[
                 "Learn controls; edit, save, or explicitly remove assignments.",
             ),
             (2, "/list", "Inspect saved mappings and toggle states."),
+            (
+                18,
+                "Settings",
+                "Default agent directory, Flow at launch, startup and user variables.",
+            ),
             (
                 17,
                 "Agents",
@@ -4564,12 +4841,18 @@ Running/paused mode is retained; held keys and toggles start inactive.",
                 Ok(())
             })(),
             17 => (|| { ui.suspend()?; agents_menu(&mut ui, path) })(),
+            18 => (|| {
+                ui.suspend()?;
+                settings_menu(&mut ui, path)?;
+                ui.start_flow_enabled = mappings::load_config(path)?.start_flow;
+                Ok(())
+            })(),
             _ => return Ok(()),
         };
         let result = result.and_then(|()| {
             if ui.context_verified
                 && was_running
-                && matches!(command, 0 | 6 | 7 | 8 | 9 | 10 | 14 | 17)
+                && matches!(command, 0 | 6 | 7 | 8 | 9 | 10 | 14 | 17 | 18)
             {
                 ui.run_mode(
                     &current
@@ -4703,6 +4986,8 @@ mod tests {
         screens: Vec<String>,
         /// Knob/joystick learning results, in order; empty means learning fails.
         motions: VecDeque<(Control, mappings::Input, String)>,
+        /// The editor fails after writing part of the file.
+        edit_fails: bool,
     }
     impl Ui for Script {
         fn applications(&self) -> Result<Vec<(String, String)>> {
@@ -4739,6 +5024,10 @@ mod tests {
             self.learn_knob()
         }
         fn edit_file(&mut self, path: &Path) -> Result<()> {
+            if self.edit_fails {
+                std::fs::write(path, "half-written")?;
+                return Err("editor exited unsuccessfully".into());
+            }
             Ok(std::fs::write(path, "Review this change.\n")?)
         }
     }
@@ -5350,7 +5639,7 @@ mod tests {
         ids.sort();
         assert_eq!(
             ids,
-            (0..=17)
+            (0..=18)
                 .filter(|id| ![4, 13].contains(id))
                 .collect::<Vec<_>>()
         );
@@ -5925,6 +6214,175 @@ mod tests {
                 "{lines:?}"
             );
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn typed(text: &str) -> Vec<Key> {
+        text.bytes().map(Key::Character).collect()
+    }
+
+    /// Ticket 11–12: Settings saves a default agent directory, the Flow startup toggle and both
+    /// variable lists; invalid input shows "Not saved" and leaves the file alone.
+    #[test]
+    fn settings_save_directory_flow_and_variables_and_refuse_bad_input() {
+        use Key::*;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-settings-ui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("work")).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let work = dir.join("work").to_str().unwrap().to_owned();
+        let mut keys = vec![Enter];
+        keys.extend(typed("relative"));
+        keys.extend([Enter, Enter]); // refused: Not saved -> Back
+        keys.push(Enter);
+        keys.extend(typed(&format!("{work}/missing")));
+        keys.extend([Enter, Enter]); // refused: missing directory
+        let refused = keys.len();
+        keys.push(Enter);
+        keys.extend(typed(&work));
+        keys.push(Enter); // saved
+        keys.extend([Down, Enter]); // Flow at launch: Off
+        keys.extend([Down, Down, Enter, Enter]); // startup variables -> Add
+        keys.extend(typed("9X"));
+        keys.extend([Enter, Enter, Enter]); // name, value (empty), refused -> Back
+        keys.push(Enter); // Add
+        keys.extend(typed("API_MODEL"));
+        keys.push(Enter);
+        keys.extend(typed("opus"));
+        keys.extend([Enter, Escape]);
+        keys.extend([Down, Down, Down, Enter, Enter]); // user variables -> Add
+        keys.extend(typed("WORK"));
+        keys.push(Enter);
+        keys.extend(typed(&work));
+        keys.extend([Enter, Escape, Escape]);
+        let mut ui = Script {
+            keys: keys.into(),
+            ..Default::default()
+        };
+        let before = std::fs::read(&path).unwrap();
+        settings_menu(&mut ui, &path).unwrap();
+        assert!(ui.keys.is_empty());
+        let notes = ui
+            .screens
+            .iter()
+            .filter(|s| s.starts_with("Not saved:"))
+            .count();
+        assert!(notes >= 3, "{notes}");
+        assert!(refused > 0 && before.len() > 0);
+        let config = mappings::load_config(&path).unwrap();
+        assert_eq!(config.agent_dir.as_deref(), Some(work.as_str()));
+        assert!(!config.start_flow);
+        assert_eq!(config.env, [("API_MODEL".to_string(), "opus".to_string())]);
+        assert_eq!(config.vars, [("WORK".to_string(), work.clone())]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Ticket 11: an agent's own directory overrides the default; empty keeps the default.
+    #[test]
+    fn agents_take_a_directory_override_and_refuse_a_missing_one() {
+        use Key::*;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-agent-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("repo")).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let repo = dir.join("repo").to_str().unwrap().to_owned();
+        let mut keys = vec![Enter, Enter, Enter, Enter, Enter]; // claude -> Edit -> name, launch, window
+        keys.extend(typed("/definitely/not/here"));
+        keys.extend([Enter, Enter]); // refused -> Back
+        keys.extend([Enter, Enter, Enter, Enter, Enter]);
+        keys.extend(typed(&repo));
+        keys.extend([Enter, Escape]);
+        let mut ui = Script {
+            keys: keys.into(),
+            ..Default::default()
+        };
+        agents_menu(&mut ui, &path).unwrap();
+        assert!(ui.keys.is_empty());
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.starts_with("Not saved:") && s.contains("missing"))
+        );
+        let config = mappings::load_config(&path).unwrap();
+        assert_eq!(config.agents[0].dir.as_deref(), Some(repo.as_str()));
+        assert_eq!(config.agents[1].dir, None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Ticket 13: the Prompts list reads, creates, edits and deletes; deleting a used prompt
+    /// names its users; names that would leave the directory and failed edits change nothing.
+    #[test]
+    fn prompts_pane_lists_reads_creates_edits_and_deletes_safely() {
+        use Key::*;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-prompts-pane-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("prompts")).unwrap();
+        let path = dir.join("mappings.tsv");
+        let used = Mapping::new_action(
+            Control::from_note(10, 36).unwrap(),
+            mappings::Input::Pad,
+            crate::actions::Action::Sequence(vec![crate::actions::Step::Do(
+                crate::actions::Action::Prompt {
+                    file: "review".into(),
+                    target: crate::actions::Target::Agent("claude".into()),
+                    enter: false,
+                },
+            )]),
+        )
+        .unwrap();
+        mappings::save(&path, &[used]).unwrap();
+        let prompts = dir.join("prompts");
+        std::fs::write(prompts.join("review"), "Old review text\n").unwrap();
+        // Prompts is the last Agents row: Up from the top reaches it.
+        let mut keys = vec![Up, Enter];
+        keys.extend([Enter, Enter, Enter]); // review -> Read -> Back
+        keys.extend([Down, Enter]); // New prompt
+        keys.extend(typed("../escape"));
+        keys.extend([Enter, Enter]); // refused -> Back
+        keys.extend([Down, Enter]); // New prompt
+        keys.extend(typed("plan"));
+        keys.push(Enter); // created through the editor; list is now plan, review
+        keys.extend([Down, Enter, Down, Down, Enter, Enter]); // review -> Delete -> Cancel
+        keys.extend([Escape, Escape]);
+        let mut ui = Script {
+            keys: keys.into(),
+            ..Default::default()
+        };
+        agents_menu(&mut ui, &path).unwrap();
+        assert!(ui.keys.is_empty());
+        let shown = |ui: &Script, text: &str| ui.screens.iter().any(|s| s.contains(text));
+        assert!(shown(&ui, "Old review text")); // read
+        assert!(shown(&ui, "Not saved:")); // ../escape
+        assert!(!dir.join("escape").exists());
+        assert_eq!(
+            std::fs::read_to_string(prompts.join("plan")).unwrap(),
+            "Review this change.\n"
+        );
+        assert!(shown(&ui, "Used by: Program 1")); // delete warning names the sequence
+        assert!(prompts.join("review").exists()); // cancelled
+        // A failed edit keeps the old prompt and leaves no partial file behind.
+        ui.edit_fails = true;
+        ui.keys = vec![Up, Enter, Down, Enter, Down, Enter, Enter, Escape, Escape].into();
+        agents_menu(&mut ui, &path).unwrap();
+        assert!(ui.keys.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(prompts.join("review")).unwrap(),
+            "Old review text\n"
+        );
+        assert_eq!(std::fs::read_dir(&prompts).unwrap().count(), 2);
+        // Delete for real.
+        ui.keys = vec![
+            Up, Enter, Down, Enter, Down, Down, Enter, Down, Enter, Escape, Escape,
+        ]
+        .into();
+        agents_menu(&mut ui, &path).unwrap();
+        assert!(ui.keys.is_empty());
+        assert!(!prompts.join("review").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

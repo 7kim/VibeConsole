@@ -16,7 +16,7 @@ import time
 
 binary = Path(__file__).resolve().parents[1] / "target/debug/vibeconsole"
 # Grouped command order (headings are skipped); the cursor starts on Run/Pause.
-ORDER = ["Run", "/pause", "/release-all", "/quit", "/configure", "/list", "Agents", "Reset settings",
+ORDER = ["Run", "/pause", "/release-all", "/quit", "/configure", "/list", "Settings", "Agents", "Reset settings",
          "/prog-select", "/program-name", "/feedback-idle", "/feedback-check",
          "Start Wispr Flow with VibeConsole", "Start or repair Wispr Flow", "/detect", "/get"]
 

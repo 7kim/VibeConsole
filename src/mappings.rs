@@ -501,6 +501,13 @@ pub struct Config {
     pub idle: Settings,
     pub program_idle: std::collections::BTreeMap<u8, Settings>,
     pub start_flow: bool,
+    /// Default working directory for agents (Settings); `${NAME}` allowed.
+    pub agent_dir: Option<String>,
+    /// Startup variables: exported into every tmux session and command VibeConsole starts.
+    pub env: Vec<(String, String)>,
+    /// User variables: expanded as `${NAME}` in command and agent directories, and exported
+    /// (with the startup variables) into commands, whose shell expands them.
+    pub vars: Vec<(String, String)>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -513,6 +520,9 @@ impl Default for Config {
             idle: Settings::default(),
             program_idle: std::collections::BTreeMap::new(),
             start_flow: true,
+            agent_dir: None,
+            env: Vec::new(),
+            vars: Vec::new(),
         }
     }
 }
@@ -521,6 +531,8 @@ pub struct Agent {
     pub name: String,
     pub launch: String,
     pub window: String,
+    /// Working directory overriding the Settings default; `${NAME}` allowed.
+    pub dir: Option<String>,
 }
 impl Agent {
     pub fn new(name: &str, launch: &str, window: &str) -> Result<Self> {
@@ -538,6 +550,7 @@ impl Agent {
             name: name.into(),
             launch: launch.into(),
             window: window.into(),
+            dir: None,
         })
     }
 }
@@ -549,6 +562,82 @@ pub fn simple_name(value: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
 }
+/// Environment-variable name rules: a letter or `_`, then letters, digits or `_`.
+pub fn variable_name(name: &str) -> bool {
+    name.len() <= 64
+        && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+fn validate_variables(list: &[(String, String)], kind: &str) -> Result<()> {
+    if list.len() > 64 {
+        return Err(format!("too many {kind} variables").into());
+    }
+    let mut names = HashSet::new();
+    for (name, value) in list {
+        if !variable_name(name) {
+            return Err(format!("{kind} variable name {name:?} must be letters, digits and _, not starting with a digit").into());
+        }
+        if value.len() > 4096 || value.chars().any(char::is_control) {
+            return Err(format!(
+                "{kind} variable {name} must be one line without control characters"
+            )
+            .into());
+        }
+        if !names.insert(name) {
+            return Err(format!("duplicate {kind} variable {name}").into());
+        }
+    }
+    Ok(())
+}
+/// A directory field before expansion: one nonempty line.
+fn directory_syntax(dir: &str) -> Result<()> {
+    if dir.trim().is_empty() || dir.len() > 4096 || dir.chars().any(char::is_control) {
+        return Err("directory must be one nonempty line without control characters".into());
+    }
+    Ok(())
+}
+/// Replace each `${NAME}` in a directory field with the user variable, else the startup
+/// variable. Unknown names are an error (the same answer in every process: no environment
+/// fallback); `$X` and `${…}` that is not a plain name stay as written.
+pub fn expand(text: &str, config: &Config) -> Result<String> {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find('}').map(|end| &after[..end]) {
+            Some(name) if variable_name(name) => {
+                let value = config
+                    .vars
+                    .iter()
+                    .chain(&config.env)
+                    .find(|(n, _)| n == name)
+                    .map(|(_, v)| v.clone())
+                    .ok_or_else(|| format!("unknown variable ${{{name}}}; add it in Settings"))?;
+                out.push_str(&value);
+                rest = &after[name.len() + 1..];
+            }
+            _ => {
+                out.push_str("${");
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+/// Expanded directory field; must be an absolute path (existence is checked where it is used).
+pub fn absolute_directory(dir: &str, config: &Config) -> Result<String> {
+    directory_syntax(dir)?;
+    let expanded = expand(dir, config)?;
+    if !Path::new(&expanded).is_absolute()
+        || expanded.len() > 4096
+        || expanded.chars().any(char::is_control)
+    {
+        return Err(format!("directory {dir:?} must be an absolute path").into());
+    }
+    Ok(expanded)
+}
 fn validate_agents(agents: &[Agent]) -> Result<()> {
     if agents.len() > 64 {
         return Err("too many agents".into());
@@ -557,6 +646,7 @@ fn validate_agents(agents: &[Agent]) -> Result<()> {
     let mut windows = HashSet::new();
     for agent in agents {
         Agent::new(&agent.name, &agent.launch, &agent.window)?;
+        agent.dir.as_deref().map(directory_syntax).transpose()?;
         if !names.insert(&agent.name) || !windows.insert(&agent.window) {
             return Err("agent names and tmux windows must be unique".into());
         }
@@ -564,6 +654,33 @@ fn validate_agents(agents: &[Agent]) -> Result<()> {
     Ok(())
 }
 impl Config {
+    /// The agent's working directory: its override, else the Settings default, expanded and
+    /// absolute. None keeps the earlier behavior (tmux's own default).
+    pub fn agent_directory(&self, agent: &Agent) -> Result<Option<String>> {
+        agent
+            .dir
+            .as_ref()
+            .or(self.agent_dir.as_ref())
+            .map(|dir| absolute_directory(dir, self))
+            .transpose()
+    }
+    /// Every directory field must expand to an absolute path. Command lines are shell lines:
+    /// their `${NAME}` is the shell's (user variables are exported to it), so not checked here.
+    fn validate_references(&self) -> Result<()> {
+        for dir in self
+            .agent_dir
+            .iter()
+            .chain(self.agents.iter().filter_map(|a| a.dir.as_ref()))
+        {
+            absolute_directory(dir, self)?;
+        }
+        for mapping in &self.mappings {
+            for (_, dir) in mapping.action.commands() {
+                absolute_directory(dir, self)?;
+            }
+        }
+        Ok(())
+    }
     pub fn idle_for(&self, context: u8) -> Settings {
         if context == 0 {
             self.idle
@@ -636,9 +753,10 @@ fn parse_config(contents: &str) -> Result<Config> {
         Some("9") => 9,
         Some("10") => 10,
         Some("11") => 11,
+        Some("12") => 12,
         _ => {
             return Err(
-                "invalid configuration header; expected vibeconsole-mappings-v1..v11".into(),
+                "invalid configuration header; expected vibeconsole-mappings-v1..v12".into(),
             );
         }
     };
@@ -694,6 +812,47 @@ fn parse_config(contents: &str) -> Result<Config> {
     } else {
         true
     };
+    let mut agent_dir = None;
+    let mut env = Vec::new();
+    let mut vars = Vec::new();
+    if version >= 12 {
+        agent_dir = match lines
+            .next()
+            .ok_or("missing agent-dir setting")?
+            .split_once('\t')
+        {
+            Some(("agent-dir", "-")) => None,
+            Some(("agent-dir", dir)) => Some(dir.to_owned()),
+            _ => return Err("expected agent-dir setting".into()),
+        };
+        for (list, header, record) in [
+            (&mut env, "env", "env-var"),
+            (&mut vars, "vars", "user-var"),
+        ] {
+            let count: usize = lines
+                .next()
+                .and_then(|l| l.strip_prefix(&format!("{header}\t")))
+                .ok_or(format!("expected {header} count"))?
+                .parse()?;
+            for _ in 0..count.min(65) {
+                let fields: Vec<_> = lines
+                    .next()
+                    .ok_or("missing variable")?
+                    .split('\t')
+                    .collect();
+                let [kind, name, value] = fields.as_slice() else {
+                    return Err("invalid variable record".into());
+                };
+                if *kind != record {
+                    return Err(format!("expected {record} record").into());
+                }
+                list.push((name.to_string(), value.to_string()));
+            }
+        }
+        validate_variables(&env, "startup")?;
+        validate_variables(&vars, "user")?;
+        agent_dir.as_deref().map(directory_syntax).transpose()?;
+    }
     let agents = if version >= 8 {
         let count: usize = lines
             .next()
@@ -707,10 +866,16 @@ fn parse_config(contents: &str) -> Result<Config> {
         let mut agents = Vec::new();
         for _ in 0..count {
             let fields: Vec<_> = lines.next().ok_or("missing agent")?.split('\t').collect();
-            let ["agent", name, launch, window] = fields.as_slice() else {
-                return Err("invalid agent record".into());
+            let (name, launch, window, dir) = match fields.as_slice() {
+                ["agent", name, launch, window] if version < 12 => (name, launch, window, None),
+                ["agent", name, launch, window, dir] if version >= 12 => {
+                    (name, launch, window, (*dir != "-").then(|| dir.to_string()))
+                }
+                _ => return Err("invalid agent record".into()),
             };
-            agents.push(Agent::new(name, launch, window)?);
+            let mut agent = Agent::new(name, launch, window)?;
+            agent.dir = dir;
+            agents.push(agent);
         }
         agents
     } else {
@@ -862,6 +1027,9 @@ fn parse_config(contents: &str) -> Result<Config> {
         idle,
         program_idle,
         start_flow,
+        agent_dir,
+        env,
+        vars,
     })
 }
 
@@ -887,8 +1055,11 @@ pub fn save(path: &Path, mappings: &[Mapping]) -> Result<()> {
 pub fn save_config(path: &Path, config: &Config) -> Result<()> {
     config.idle.validate()?;
     validate_agents(&config.agents)?;
+    validate_variables(&config.env, "startup")?;
+    validate_variables(&config.vars, "user")?;
+    config.validate_references()?;
     let mut contents = format!(
-        "vibeconsole-mappings-v11\nidle\t{}\t{}\t{}\n",
+        "vibeconsole-mappings-v12\nidle\t{}\t{}\t{}\n",
         opt_text(config.idle.octave),
         opt_text(config.idle.tempo),
         arp_text(config.idle.arp)
@@ -910,11 +1081,27 @@ pub fn save_config(path: &Path, config: &Config) -> Result<()> {
     } else {
         "start-flow\toff\n"
     });
+    contents.push_str(&format!(
+        "agent-dir\t{}\n",
+        config.agent_dir.as_deref().unwrap_or("-")
+    ));
+    for (list, header, record) in [
+        (&config.env, "env", "env-var"),
+        (&config.vars, "vars", "user-var"),
+    ] {
+        contents.push_str(&format!("{header}\t{}\n", list.len()));
+        for (name, value) in list {
+            contents.push_str(&format!("{record}\t{name}\t{value}\n"));
+        }
+    }
     contents.push_str(&format!("agents\t{}\n", config.agents.len()));
     for agent in &config.agents {
         contents.push_str(&format!(
-            "agent\t{}\t{}\t{}\n",
-            agent.name, agent.launch, agent.window
+            "agent\t{}\t{}\t{}\t{}\n",
+            agent.name,
+            agent.launch,
+            agent.window,
+            agent.dir.as_deref().unwrap_or("-")
         ));
     }
     for mapping in &config.mappings {
@@ -1297,7 +1484,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v11\n")
+                .starts_with("vibeconsole-mappings-v12\n")
         );
         assert!(
             load_config(&path)
@@ -1520,7 +1707,7 @@ mod tests {
         let path = dir.join("mappings.tsv");
         save_config(&path, &config).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
-        assert!(saved.starts_with("vibeconsole-mappings-v11\n"));
+        assert!(saved.starts_with("vibeconsole-mappings-v12\n"));
         assert!(saved.contains("\tflow\t") && !saved.contains("flow-start"));
         assert_eq!(load_config(&path).unwrap(), config);
         fs::remove_dir_all(dir).unwrap();
@@ -1546,7 +1733,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v11\n")
+                .starts_with("vibeconsole-mappings-v12\n")
         );
         assert_eq!(load_config(&path).unwrap(), config);
         fs::remove_dir_all(dir).unwrap();
@@ -1561,12 +1748,13 @@ mod tests {
         let mut config = parse_config(old).unwrap();
         assert!(!config.mappings[0].status);
         config.mappings[0].status = true;
-        let dir = std::env::temp_dir().join(format!("vibeconsole-status-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-status-option-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mappings.tsv");
         save_config(&path, &config).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v11\n") && text.contains("\tstatus\n"));
+        assert!(text.starts_with("vibeconsole-mappings-v12\n") && text.contains("\tstatus\n"));
         assert_eq!(load_config(&path).unwrap(), config);
         let pad = Control::from_note(10, 37).unwrap();
         for (action, observable) in [
@@ -1606,6 +1794,84 @@ mod tests {
         let mut shortcut = Mapping::new(pad, "Shift", "hold").unwrap();
         shortcut.status = true;
         assert!(shortcut.validate().is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Tickets 11–12: Settings data. Old configs load with no default directory, no agent
+    /// overrides and empty variable lists; everything round-trips; bad input never saves.
+    #[test]
+    fn settings_directories_and_variables_migrate_round_trip_and_validate() {
+        let old = "vibeconsole-mappings-v11\nidle\t-\t-\t-\nprogram-idle\t1\t-\t-\t-\nprogram-idle\t2\t-\t-\t-\nprogram-idle\t3\t-\t-\t-\nprogram-idle\t4\t-\t-\t-\nprogram-idle\t5\t-\t-\t-\nprogram-idle\t6\t-\t-\t-\nprogram-idle\t7\t-\t-\t-\nstart-flow\ton\nagents\t1\nagent\tclaude\tclaude\tclaude\n";
+        let mut config = parse_config(old).unwrap();
+        assert_eq!(config.agent_dir, None);
+        assert_eq!(config.agents[0].dir, None);
+        assert!(config.env.is_empty() && config.vars.is_empty());
+        let dir = std::env::temp_dir().join(format!("vibeconsole-settings-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("work")).unwrap();
+        let path = dir.join("mappings.tsv");
+        let work = dir.join("work").to_str().unwrap().to_owned();
+        config.vars.push(("WORK".into(), work.clone()));
+        config.env.push(("ANTHROPIC_MODEL".into(), "opus".into()));
+        config.agent_dir = Some("${WORK}".into());
+        config.agents[0].dir = Some(format!("{work}/../work"));
+        config.mappings.push(
+            Mapping::new_action(
+                Control::from_note(10, 36).unwrap(),
+                Input::Pad,
+                crate::actions::Action::Command {
+                    window: "w".into(),
+                    dir: "${WORK}".into(),
+                    line: "for f in *; do echo ${f} ${WORK}; done".into(), // the shell's
+                },
+            )
+            .unwrap(),
+        );
+        save_config(&path, &config).unwrap();
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .starts_with("vibeconsole-mappings-v12\n")
+        );
+        assert_eq!(load_config(&path).unwrap(), config);
+        // ${NAME}: user variable, then startup variable; other text stays; no environment.
+        assert!(expand("${HOME}", &config).is_err());
+        assert_eq!(
+            expand("${WORK}/a $X ${1:-x}", &config).unwrap(),
+            format!("{work}/a $X ${{1:-x}}")
+        );
+        assert_eq!(expand("${ANTHROPIC_MODEL}", &config).unwrap(), "opus");
+        assert!(
+            expand("${NOPE_NOT_SET_ANYWHERE}", &config)
+                .unwrap_err()
+                .to_string()
+                .contains("NOPE_NOT_SET_ANYWHERE")
+        );
+        assert_eq!(
+            config.agent_directory(&config.agents[0]).unwrap(),
+            Some(format!("{work}/../work"))
+        );
+        let mut plain = config.agents[0].clone();
+        plain.dir = None;
+        assert_eq!(config.agent_directory(&plain).unwrap(), Some(work.clone()));
+        // Invalid input is rejected before save; the file keeps its bytes.
+        let before = fs::read(&path).unwrap();
+        for bad in [
+            |c: &mut Config| c.vars.push(("9BAD".into(), "x".into())),
+            |c: &mut Config| c.env.push(("OK".into(), "two\nlines".into())),
+            |c: &mut Config| c.vars.push(("WORK".into(), "dup".into())),
+            |c: &mut Config| c.agent_dir = Some("relative/dir".into()),
+            |c: &mut Config| c.agent_dir = Some(String::new()),
+            |c: &mut Config| c.agents[0].dir = Some("${MISSING_VARIABLE_X}".into()),
+            |c: &mut Config| {
+                c.vars.clear(); // the command still says ${WORK}
+            },
+        ] {
+            let mut changed = config.clone();
+            bad(&mut changed);
+            assert!(save_config(&path, &changed).is_err());
+            assert_eq!(fs::read(&path).unwrap(), before);
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 }
