@@ -1,6 +1,7 @@
 archive/
 /target
 tickets/
+tests/
 notes.md
 SPEC-BEHAVIOR.md
 SPEC-UI.md
@@ -9,3 +10,4 @@ v5/
 tests-to-do/
 testing-later/
 v6 ideas.md
+how-to-do-tests/
