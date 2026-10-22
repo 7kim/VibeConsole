@@ -288,6 +288,8 @@ vibeconsole startup-disable
 
 Only opt in when this scope matches your setup. Live login behavior remains unverified. Service configuration is inspectable/removable, unmanaged units are not overwritten, and mappings survive uninstall. Stop the service before starting a foreground owner; a new process creates a new keyboard and may require Flow discovery/recovery.
 
+**Running in the background.** The service has no screen: notices, errors and status feedback lines (`Status Bank A Pad 5: running`) go to `journalctl --user -u vibeconsole.service`. When it starts the `vibe` tmux server or opens a terminal, it does so in its own systemd scope (`systemd-run --user --scope`), because stopping a service kills everything left in its group. Agents, commands and opened terminals therefore survive `vibeconsole startup-stop`. Apps launched from pads get their own scope from GLib anyway. After a Flow pad's capture, the service resumes output for any detected non-piano program.
+
 ---
 
 ## 💾 Saved configuration

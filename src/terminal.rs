@@ -1454,6 +1454,20 @@ impl Terminal {
                 .any(|m| m.input == mappings::Input::Piano)
             {
                 self.notice = format!("{notice} Piano mappings: select Run to confirm.");
+            } else if self.original.is_none() {
+                // Service: resume as program detection does; run_mode's interactive-only
+                // guards would keep every program but Program 1 paused.
+                self.wanted_run = true;
+                self.suspended = false;
+                self.connecting = true;
+                match self.prepare_connection() {
+                    Ok(()) => self.notice = notice,
+                    Err(error) => {
+                        self.pause()?;
+                        self.connecting = false;
+                        self.error = format!("Flow ready, but output stays paused: {error}");
+                    }
+                }
             } else if let Err(error) = self.run_mode(&self.run_mappings.clone(), false) {
                 self.error = format!("Flow ready, but output stays paused: {error}");
             } else {
@@ -4147,7 +4161,11 @@ pub fn daemon(path: &Path, current: Vec<Mapping>) -> Result<()> {
                 .unwrap_or_default(),
             ui.notice,
             ui.error,
-        );
+        ) + &ui
+            .status_lines()
+            .iter()
+            .map(|line| format!(" | {line}"))
+            .collect::<String>(); // no screen in the service: status feedback goes to the journal
         if status != previous {
             eprintln!("{status}");
             previous = status;
@@ -5813,6 +5831,7 @@ mod tests {
                 }
             });
             ui.wanted_run = was_running;
+            ui.context = 2; // headless = service: Program 3 must resume too (run_mode refuses it)
             ui.begin_flow(None).unwrap();
             assert!(!ui.wanted_run && ui.flow_pending); // keys released, output paused meanwhile
             let deadline = Instant::now() + Duration::from_secs(2);

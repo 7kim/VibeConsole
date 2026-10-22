@@ -873,8 +873,26 @@ pub fn prompts_dir_for(config: &Path) -> Result<PathBuf> {
         .join("prompts"))
 }
 
+/// `program`, in its own transient scope when `in_unit` (VibeConsole runs as a systemd
+/// service): stopping the service kills its whole group, which must not take the tmux
+/// server, agents or opened terminals with it.
+fn scoped(program: &str, in_unit: bool) -> Command {
+    if !in_unit {
+        return Command::new(program);
+    }
+    let mut command = Command::new("systemd-run");
+    command.args(["--user", "--scope", "--quiet", "--collect", "--", program]);
+    command
+}
+/// systemd sets INVOCATION_ID for every unit it starts.
+fn in_unit() -> bool {
+    std::env::var_os("INVOCATION_ID").is_some()
+}
+
 fn tmux(args: &[&str]) -> Result<std::process::Output> {
-    Ok(Command::new("tmux").args(args).output()?)
+    // Only new-session can start the server; every other call talks to it.
+    let server = args.first() == Some(&"new-session");
+    Ok(scoped("tmux", server && in_unit()).args(args).output()?)
 }
 
 fn tmux_ok(args: &[&str]) -> Result<()> {
@@ -1097,7 +1115,7 @@ fn open_terminal() -> Result<()> {
     let argv = terminal_argv(&texts.iter().map(String::as_str).collect::<Vec<_>>())
         .ok_or("no terminal emulator desktop entry installed")?;
     use std::os::unix::process::CommandExt;
-    let mut child = Command::new(&argv[0])
+    let mut child = scoped(&argv[0], in_unit())
         .args(&argv[1..])
         .process_group(0) // Ctrl+C in VibeConsole's own terminal must not reach it
         .stdin(Stdio::null())
@@ -2246,5 +2264,30 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         assert!(!dispatcher.sequence_running(&sequence));
+    }
+
+    /// As a systemd service, anything that must outlive VibeConsole (the tmux server, the
+    /// terminal it opens) starts in its own scope; systemd kills the service's group on stop.
+    #[test]
+    fn long_lived_children_get_their_own_scope_only_inside_a_unit() {
+        let argv = |c: &Command| {
+            std::iter::once(c.get_program())
+                .chain(c.get_args())
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(argv(&scoped("tmux", false)), ["tmux"]);
+        assert_eq!(
+            argv(&scoped("tmux", true)),
+            [
+                "systemd-run",
+                "--user",
+                "--scope",
+                "--quiet",
+                "--collect",
+                "--",
+                "tmux"
+            ]
+        );
     }
 }
