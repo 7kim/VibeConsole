@@ -177,7 +177,9 @@ Names represent physical keyboard keys; the desktop layout determines the result
 
 ## 🔊 Application and audio actions
 
-Launch application lists installed visible desktop entries by name and saves their exact identifier/path. GIO performs native desktop launching; VibeConsole does not run a parsed `Exec` line as a shell command. A successful launch request is separate from an observed window or application readiness. Start/Repair Wispr Flow are also selectable application actions.
+Launch application lists installed visible desktop entries by name and saves their exact identifier/path. GIO performs native desktop launching; VibeConsole does not run a parsed `Exec` line as a shell command. A successful launch request is separate from an observed window or application readiness. A failed launch says whether the entry is **missing** (file gone), **rejected** (hidden, NoDisplay, not for this desktop, or its TryExec program is missing) or **failed to start** (GIO's error). **Start or repair Wispr Flow** is also selectable here.
+
+**Second press (window control).** A launcher pad also chooses **Minimize** or **Close**. Each press asks the VibeConsole GNOME Shell extension about the app's windows: none → launch; minimized or behind other windows → restore and raise; focused → minimize or close (a polite close; the app may ask to save). GNOME on Wayland lets no ordinary app do this, so the extension does it inside GNOME Shell and offers it on the session bus as `org.vibeconsole.Windows`. `vibeconsole install` copies it to `~/.local/share/gnome-shell/extensions/vibeconsole@vibeconsole.local`; log out and in once, then run `gnome-extensions enable vibeconsole@vibeconsole.local`. `vibeconsole doctor` reports whether it answers. Without it, a launcher pad still launches and reports that minimize/close is unavailable. Windows are matched to the app by GNOME's own app tracking, so a press acts on all of that app's windows, including ones you opened yourself. Sequence steps only launch.
 
 Audio choices are **Output volume up**, **Output volume down**, **Output mute**, and **Microphone mute**. Volume steps are selectable from 1–100%; ordinary output volume is capped at 100%. `wpctl` resolves the current default sink/source at activation, changes that exact object, and reads it back. Calibrated knob directions support audio actions per movement step.
 
@@ -187,14 +189,14 @@ These actions use **Trigger**, not synthetic hold/toggle semantics. A fresh pad/
 
 ## 🤖 AI coding controls (V5)
 
-**Agents** (Configure → **Agents**) have a name, a launch command, and a tmux window name; defaults are `claude` and `codex`. All agents run in one tmux session, `vibe`, which VibeConsole creates as needed but never attaches: watch it with `tmux attach -t vibe`.
+**Agents** (Configure → **Agents**) have a name, a launch command, and a tmux window name; defaults are `claude` and `codex`. All agents run in one tmux session, `vibe`, which VibeConsole creates as needed: watch it with `tmux attach -t vibe`.
 
 New actions in `/configure` → **Action family**:
 
 | Action | What a press does |
 |---|---|
 | **Prompt** | Sends a saved prompt file. Target an agent (starts its window if missing, pastes with tmux bracketed paste, then optional Enter) or the **focused window** (copies with `wl-copy`, presses Ctrl+V or Ctrl+Shift+V on VibeConsole's keyboard, then optional Enter). Focus decides where a focused-window prompt lands; the previous clipboard is not restored. |
-| **Run command in tmux** | Runs one command line with `sh -c` in a new `vibe` window named after the pad, in a chosen absolute directory. The window stays open after it exits. |
+| **Run command in tmux** | Runs one command line with `sh -c` in a new `vibe` window named after the pad, in a chosen absolute directory. The window stays open after it exits. If no terminal is attached to `vibe`, VibeConsole opens one (Ptyxis, else the first installed terminal entry) running `tmux attach-session -t =vibe`; if that fails the notice says **sent to tmux, not shown**. |
 | **Sequence of steps** | Runs up to 32 steps in order: ensure agent, prompt, command, launch application, shortcut, wait 100–60000 ms. A failing step stops the rest; a re-press while running is ignored. |
 | **Choice knob** | Splits an absolute knob into 2–16 zones, one prompt each (e.g. `/model opus`). Resting 300 ms in a new zone sends that prompt once; sweeping sends nothing. |
 | **Value knob** | Writes the knob position, scaled to min–max with chosen decimals, to a file as `0.42` plus newline (atomic replace), for your own scripts. |
@@ -202,6 +204,8 @@ New actions in `/configure` → **Action family**:
 Prompts are plain UTF-8 files in `$XDG_CONFIG_HOME/vibeconsole/prompts/` (default `~/.config/vibeconsole/prompts/`); **New/Edit** opens `$VISUAL`, `$EDITOR`, or `nano`. Content is read at press time; empty or missing files show an error and send nothing.
 
 Any pad or piano mapping can fire **Held for 1 second (risky)**: an earlier release sends nothing, the screen shows arming progress, and pause, program change, disconnect, and exit cancel it. Prompt, command, and sequence actions fire once per press; pause cancels work not yet sent.
+
+**Status feedback.** Commands, prompts to an agent, sequences, launchers and Wispr Flow can show their state in the live pane (`Status Bank A Pad 5: running`). Turn it on per mapping in `/configure` (after **Fire when**). States: **sent** (press accepted, worker not done), **running** (the command's or agent's tmux pane is alive, the sequence is still queued or running, the app has windows per the window extension, or Flow's app process runs), **stopped** (none of that, e.g. after `tmux kill-server`), **failed** (the last press failed), **unavailable** (state cannot be read, e.g. launcher without the window extension). Running is re-read every 500 ms, never stored. Shortcuts, focused-window prompts, audio actions and knob dials have no observable state, so the option is not offered for them.
 
 **Agent status.** Agents → **Claude Code status hooks** / **Codex status hooks** shows hook settings and copies them with `wl-copy`; merge them into `~/.claude/settings.json` and `~/.codex/hooks.json` yourself (VibeConsole never edits them). Hooks call `vibeconsole agent-status - <state>`, which only reports for windows VibeConsole started (they carry `VIBECONSOLE_AGENT`), so other Claude/Codex sessions do not change status. The screen shows `Agents: claude thinking · codex FINISHED`; finished clears when the attached `vibe` session shows that agent's window or a mapping sends to that agent. Status lights on the controller are not implemented yet (they await a hardware gate).
 

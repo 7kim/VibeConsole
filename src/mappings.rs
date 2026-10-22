@@ -153,6 +153,8 @@ pub struct Mapping {
     pub feedback: Feedback,
     /// Fires only after the control is held for `keyboard::ARM`.
     pub risky: bool,
+    /// Show sent/running/stopped/failed in the live pane (observable actions only).
+    pub status: bool,
 }
 
 pub fn program_label(context: u8) -> String {
@@ -258,6 +260,7 @@ impl Mapping {
             behavior,
             feedback: Feedback::default(),
             risky: false,
+            status: false,
         })
     }
     pub fn new_action(
@@ -355,6 +358,9 @@ impl Mapping {
         };
         if self.action.dial() && !matches!(self.input, Input::Knob { .. }) {
             return Err("choice and value actions need an absolute knob".into());
+        }
+        if self.status && !self.action.observable() {
+            return Err("status feedback needs an action with observable state".into());
         }
         if self.risky && !matches!(self.input, Input::Pad | Input::Piano) {
             return Err("only pad and piano presses can be risky".into());
@@ -629,9 +635,10 @@ fn parse_config(contents: &str) -> Result<Config> {
         Some("8") => 8,
         Some("9") => 9,
         Some("10") => 10,
+        Some("11") => 11,
         _ => {
             return Err(
-                "invalid configuration header; expected vibeconsole-mappings-v1..v10".into(),
+                "invalid configuration header; expected vibeconsole-mappings-v1..v11".into(),
             );
         }
     };
@@ -722,7 +729,8 @@ fn parse_config(contents: &str) -> Result<Config> {
                     2 => 9,
                     3 => 13,
                     4..=8 => 14,
-                    _ => 15,
+                    9 | 10 => 15,
+                    _ => 16,
                 }
             {
                 return Err("wrong mapping field count".into());
@@ -777,6 +785,11 @@ fn parse_config(contents: &str) -> Result<Config> {
                 None | Some(&"-") => false,
                 Some(&"risky") => true,
                 Some(_) => return Err("expected risky or -".into()),
+            };
+            mapping.status = match fields.get(12).filter(|_| version >= 11) {
+                None | Some(&"-") => false,
+                Some(&"status") => true,
+                Some(_) => return Err("expected status or -".into()),
             };
             if version >= 3 {
                 mapping.input = line.split('\t').nth(2).unwrap().parse()?;
@@ -875,7 +888,7 @@ pub fn save_config(path: &Path, config: &Config) -> Result<()> {
     config.idle.validate()?;
     validate_agents(&config.agents)?;
     let mut contents = format!(
-        "vibeconsole-mappings-v10\nidle\t{}\t{}\t{}\n",
+        "vibeconsole-mappings-v11\nidle\t{}\t{}\t{}\n",
         opt_text(config.idle.octave),
         opt_text(config.idle.tempo),
         arp_text(config.idle.arp)
@@ -913,7 +926,7 @@ pub fn save_config(path: &Path, config: &Config) -> Result<()> {
             Some(Octave::Absolute(n)) => format!("absolute:{n}"),
         };
         contents.push_str(&format!(
-            "{}\t{}\t{}\t{DEVICE}\t{}\t{}\t{}\t{}\t{}\t{}\t{octave}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{DEVICE}\t{}\t{}\t{}\t{}\t{}\t{}\t{octave}\t{}\t{}\t{}\t{}\t{}\n",
             mapping.context,
             mapping.label,
             mapping.input,
@@ -930,7 +943,8 @@ pub fn save_config(path: &Path, config: &Config) -> Result<()> {
             opt_text(feedback.tempo),
             arp_text(feedback.arp),
             mapping.action.encode(),
-            if mapping.risky { "risky" } else { "-" }
+            if mapping.risky { "risky" } else { "-" },
+            if mapping.status { "status" } else { "-" }
         ));
     }
     parse_config(&contents)?;
@@ -1015,7 +1029,7 @@ mod tests {
         );
         config.mappings[0].risky = true;
         save_config(&path, &config).unwrap();
-        assert!(fs::read_to_string(&path).unwrap().contains("\trisky\n"));
+        assert!(fs::read_to_string(&path).unwrap().contains("\trisky\t-\n"));
         assert_eq!(load_config(&path).unwrap(), config);
         let cc = Control {
             channel: 1,
@@ -1283,7 +1297,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v10\n")
+                .starts_with("vibeconsole-mappings-v11\n")
         );
         assert!(
             load_config(&path)
@@ -1506,9 +1520,92 @@ mod tests {
         let path = dir.join("mappings.tsv");
         save_config(&path, &config).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
-        assert!(saved.starts_with("vibeconsole-mappings-v10\n"));
+        assert!(saved.starts_with("vibeconsole-mappings-v11\n"));
         assert!(saved.contains("\tflow\t") && !saved.contains("flow-start"));
         assert_eq!(load_config(&path).unwrap(), config);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn launcher_toggle_round_trips_and_old_launchers_keep_no_second_press() {
+        use crate::actions::Action;
+        let old = "vibeconsole-mappings-v10\nidle\t-\t-\t-\nprogram-idle\t1\t-\t-\t-\nprogram-idle\t2\t-\t-\t-\nprogram-idle\t3\t-\t-\t-\nprogram-idle\t4\t-\t-\t-\nprogram-idle\t5\t-\t-\t-\nprogram-idle\t6\t-\t-\t-\nprogram-idle\t7\t-\t-\t-\nstart-flow\ton\nagents\t0\n0\tBank A Pad 1\tpad\t09e8:1049\tnote\t10\t36\t0\ttrigger\t-\t-\t-\t-\tapp:/usr/share/applications/org.gnome.Ptyxis.desktop\t-\n";
+        let mut config = parse_config(old).unwrap();
+        assert_eq!(
+            config.mappings[0].action,
+            Action::Application("/usr/share/applications/org.gnome.Ptyxis.desktop".into())
+        );
+        config.mappings[0].action = Action::AppToggle {
+            path: "/usr/share/applications/org.gnome.Ptyxis.desktop".into(),
+            close: false,
+        };
+        let dir = std::env::temp_dir().join(format!("vibeconsole-toggle-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        save_config(&path, &config).unwrap();
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .starts_with("vibeconsole-mappings-v11\n")
+        );
+        assert_eq!(load_config(&path).unwrap(), config);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Tickets 09–10: status feedback is a saved per-mapping option, off by default, and only
+    /// for actions with observable state.
+    #[test]
+    fn status_feedback_is_saved_off_by_default_and_only_for_observable_actions() {
+        use crate::actions::{Action, Target};
+        let old = "vibeconsole-mappings-v10\nidle\t-\t-\t-\nprogram-idle\t1\t-\t-\t-\nprogram-idle\t2\t-\t-\t-\nprogram-idle\t3\t-\t-\t-\nprogram-idle\t4\t-\t-\t-\nprogram-idle\t5\t-\t-\t-\nprogram-idle\t6\t-\t-\t-\nprogram-idle\t7\t-\t-\t-\nstart-flow\ton\nagents\t0\n0\tBank A Pad 1\tpad\t09e8:1049\tnote\t10\t36\t0\ttrigger\t-\t-\t-\t-\tcommand:Bank-A-Pad-1:/tmp:claude\t-\n";
+        let mut config = parse_config(old).unwrap();
+        assert!(!config.mappings[0].status);
+        config.mappings[0].status = true;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-status-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        save_config(&path, &config).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("vibeconsole-mappings-v11\n") && text.contains("\tstatus\n"));
+        assert_eq!(load_config(&path).unwrap(), config);
+        let pad = Control::from_note(10, 37).unwrap();
+        for (action, observable) in [
+            (Action::Flow, true),
+            (
+                Action::Sequence(vec![crate::actions::Step::Wait(100)]),
+                true,
+            ),
+            (Action::Application("/a/b.desktop".into()), true),
+            (
+                Action::Prompt {
+                    file: "p".into(),
+                    target: Target::Agent("claude".into()),
+                    enter: true,
+                },
+                true,
+            ),
+            (
+                Action::Prompt {
+                    file: "p".into(),
+                    target: Target::Focused { shift: false },
+                    enter: true,
+                },
+                false,
+            ),
+            (Action::OutputMute, false),
+        ] {
+            let mut mapping = Mapping::new_action(pad, Input::Pad, action).unwrap();
+            mapping.status = true;
+            assert_eq!(
+                mapping.validate().is_ok(),
+                observable,
+                "{}",
+                mapping.action_label()
+            );
+        }
+        let mut shortcut = Mapping::new(pad, "Shift", "hold").unwrap();
+        shortcut.status = true;
+        assert!(shortcut.validate().is_err());
         fs::remove_dir_all(dir).unwrap();
     }
 }

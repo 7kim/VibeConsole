@@ -1,0 +1,7 @@
+{
+    "uuid": "vibeconsole@vibeconsole.local",
+    "name": "VibeConsole window control",
+    "description": "Lets VibeConsole's launcher pads minimize, close or restore the windows of the app they launch (D-Bus org.vibeconsole.Windows, session bus only).",
+    "shell-version": ["48", "49", "50"],
+    "url": "https://github.com/7kim/VibeConsole"
+}

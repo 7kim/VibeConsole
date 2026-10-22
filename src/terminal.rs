@@ -142,6 +142,11 @@ struct Terminal {
     output: Option<crate::keyboard::Output>,
     actions: crate::actions::Dispatcher,
     flow_pending: bool,
+    /// Status-feedback pads: what the last press did, and the derived running state.
+    phases: BTreeMap<Control, Phase>,
+    probed: BTreeMap<Control, Option<bool>>,
+    /// A background status probe in flight: tmux/gdbus/proc never block the session loop.
+    probe: Option<std::sync::mpsc::Receiver<BTreeMap<Control, Option<bool>>>>,
     /// Return to running once the Flow capture is confirmed and the command list is shown.
     flow_resume: bool,
     /// (agent, tmux window, state), refreshed every `STATUS_EVERY`.
@@ -302,6 +307,7 @@ impl Terminal {
             });
         }
         let (width, height) = screen.live_size(size.0, size.1);
+        live.extend(self.status_lines());
         live.extend(self.toggle_preview(width, height.saturating_sub(live.len())));
         screen.live = live;
         screen
@@ -579,6 +585,9 @@ impl Terminal {
             actions: crate::actions::Dispatcher::new(),
             flow_pending: false,
             flow_resume: false,
+            phases: BTreeMap::new(),
+            probed: BTreeMap::new(),
+            probe: None,
             agent_states: Vec::new(),
             status_at: Instant::now(),
             flow_failed: false,
@@ -637,6 +646,61 @@ impl Terminal {
         Ok(terminal)
     }
 
+    /// Re-derive running state for status pads; never stored across presses (SPEC). The
+    /// probes run on a thread, one at a time; results land on a later tick.
+    fn probe_status(&mut self) {
+        if let Some(probe) = &self.probe {
+            match probe.try_recv() {
+                Ok(probed) => self.probed = probed,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+            }
+            self.probe = None;
+        }
+        let pads = self
+            .run_mappings
+            .iter()
+            .filter(|m| m.status)
+            .map(|m| (m.control, m.action.clone()))
+            .collect::<Vec<_>>();
+        if pads.is_empty() {
+            return;
+        }
+        // Sequences are answered here: the dispatcher knows what it has queued.
+        let sequences = pads
+            .iter()
+            .filter(|(_, action)| matches!(action, crate::actions::Action::Sequence(_)))
+            .map(|(pad, action)| (*pad, Some(self.actions.sequence_running(action))))
+            .collect::<BTreeMap<_, _>>();
+        let agents = self
+            .agent_states
+            .iter()
+            .map(|(name, window, _)| (name.clone(), window.clone()))
+            .collect::<Vec<_>>();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut probed = sequences;
+            for (pad, action) in pads {
+                probed
+                    .entry(pad)
+                    .or_insert_with(|| crate::actions::running(&action, &agents));
+            }
+            let _ = sender.send(probed);
+        });
+        self.probe = Some(receiver);
+    }
+    /// `Status <pad>: <word>` per status pad, for the live pane.
+    fn status_lines(&self) -> Vec<String> {
+        self.run_mappings
+            .iter()
+            .filter(|m| m.status)
+            .map(|m| {
+                let probed = self.probed.get(&m.control).copied().flatten();
+                let word = status_word(self.phases.get(&m.control).copied(), probed);
+                format!("Status {}: {word}", self.name(m.control))
+            })
+            .collect()
+    }
     fn refresh_agent_states(&mut self) {
         let Ok(config) = mappings::load_config(&self.path) else {
             return;
@@ -700,6 +764,8 @@ impl Terminal {
         }
         self.flow_pending = false;
         self.flow_resume = false;
+        // Cancelled work never answers: let the derived state show instead of a stale "sent".
+        self.phases.retain(|_, phase| *phase != Phase::Sent);
     }
     fn pause(&mut self) -> Result<()> {
         self.wanted_run = false;
@@ -826,10 +892,24 @@ impl Terminal {
                         .map(str::to_owned)
                         .collect::<Vec<_>>();
                     self.clear_finished(&agents);
-                    if action.flow() {
-                        return self.start_flow();
+                    let status = self
+                        .run_mappings
+                        .iter()
+                        .any(|m| m.control == pad && m.status);
+                    let submitted = if action.flow() {
+                        self.start_flow()
+                    } else {
+                        self.actions.submit(action, None)
+                    };
+                    if status {
+                        let phase = if submitted.is_ok() {
+                            Phase::Sent
+                        } else {
+                            Phase::Failed
+                        };
+                        self.phases.insert(pad, phase);
                     }
-                    self.actions.submit(action, None)?;
+                    return submitted;
                 }
                 return Ok(());
             }
@@ -1331,12 +1411,21 @@ impl Terminal {
         if self.status_at.elapsed() >= STATUS_EVERY {
             self.status_at = Instant::now();
             self.refresh_agent_states();
+            self.probe_status();
         }
         // Prompt pastes and sequence shortcuts: the worker waits for each answer.
         for (keys, reply) in self.actions.tap_requests() {
             let _ = reply.send(self.tap(&keys).map_err(|e| e.to_string()));
         }
         while let Some((action, ok, notice)) = self.actions.notice() {
+            for mapping in self
+                .run_mappings
+                .iter()
+                .filter(|m| m.status && m.action == action)
+            {
+                let phase = if ok { Phase::Done } else { Phase::Failed };
+                self.phases.insert(mapping.control, phase);
+            }
             let notice = notice
                 .chars()
                 .filter(|c| !c.is_control())
@@ -2491,7 +2580,7 @@ fn sequence_menu(
                     }
                     1 => prompt_action(ui, path, None)?.map(Step::Do),
                     2 => command_action(ui, None)?.map(Step::Do),
-                    3 => action_menu(ui, 1, mappings::Input::Pad, None)?.map(Step::Do),
+                    3 => action_menu(ui, 1, mappings::Input::Pad, None, false)?.map(Step::Do),
                     4 => shortcut(ui, &[])?.map(Step::Keys),
                     _ => number(ui, "Wait (milliseconds)", 1000, 100, 60000)?
                         .map(|ms| Step::Wait(ms as u16)),
@@ -2542,6 +2631,26 @@ fn window_name(name: &str) -> String {
 }
 
 const STATUS_EVERY: Duration = Duration::from_millis(500);
+
+/// What a status pad's last press did: sent until the worker answers, then done or failed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Phase {
+    Sent,
+    Done,
+    Failed,
+}
+
+/// A failed press stays failed until the next press; otherwise the derived state wins, so a
+/// stopped process or killed server never shows a stale "running".
+fn status_word(phase: Option<Phase>, running: Option<bool>) -> &'static str {
+    match (phase, running) {
+        (Some(Phase::Failed), _) => "failed",
+        (_, Some(true)) => "running",
+        (Some(Phase::Sent), _) => "sent",
+        (_, None) => "unavailable",
+        _ => "stopped",
+    }
+}
 
 /// "\nAgents: claude thinking · codex FINISHED", or nothing without agents.
 fn agent_line(states: &[(String, String, &'static str)]) -> String {
@@ -3342,11 +3451,13 @@ fn calibrate_motion(
     )))
 }
 
+/// `second_press`: a launcher pad (not a sequence step) also chooses minimize or close.
 fn action_menu(
     ui: &mut impl Ui,
     family: usize,
     input: mappings::Input,
     saved: Option<&crate::actions::Action>,
+    second_press: bool,
 ) -> Result<Option<crate::actions::Action>> {
     use crate::actions::Action;
     if matches!(input, mappings::Input::Joystick { .. })
@@ -3373,8 +3484,11 @@ fn action_menu(
             })
             .collect::<Vec<_>>();
         names.push("Start or repair Wispr Flow".into());
+        let saved_action = saved;
         let saved = match saved {
-            Some(Action::Application(path)) => apps.iter().position(|(_, p)| p == path),
+            Some(Action::Application(path) | Action::AppToggle { path, .. }) => {
+                apps.iter().position(|(_, p)| p == path)
+            }
             Some(Action::Flow) => Some(apps.len()),
             _ => None,
         };
@@ -3387,10 +3501,29 @@ fn action_menu(
         else {
             return Ok(None);
         };
-        return Ok(Some(if i < apps.len() {
-            Action::Application(apps[i].1.clone())
-        } else {
-            Action::Flow
+        if i == apps.len() {
+            return Ok(Some(Action::Flow));
+        }
+        let path = apps[i].1.clone();
+        if !second_press {
+            return Ok(Some(Action::Application(path)));
+        }
+        let saved_close = match saved_action {
+            Some(Action::AppToggle { close, .. }) => Some(usize::from(*close)),
+            _ => None,
+        };
+        let Some(close) = choose_saved(
+            ui,
+            "Second press while the app is focused (needs the VibeConsole window extension; see README)",
+            options(&["Minimize", "Close"]),
+            saved_close,
+        )?
+        else {
+            return Ok(None);
+        };
+        return Ok(Some(Action::AppToggle {
+            path,
+            close: close == 1,
         }));
     }
     let (saved, saved_step) = match saved {
@@ -3449,7 +3582,7 @@ fn mapping_label(mapping: &Mapping, program: Option<&(u8, crate::feedback::Paylo
         _ => false,
     };
     format!(
-        "{} | {} | {} | {}{}{} | {} | Feedback: {}",
+        "{} | {} | {} | {}{}{}{} | {} | Feedback: {}",
         mappings::program_label(mapping.context),
         mapping.name(program),
         mapping.input.description(),
@@ -3461,6 +3594,11 @@ fn mapping_label(mapping: &Mapping, program: Option<&(u8, crate::feedback::Paylo
         },
         if mapping.risky {
             " | RISKY: hold 1 s"
+        } else {
+            ""
+        },
+        if mapping.status {
+            " | Status feedback"
         } else {
             ""
         },
@@ -3840,7 +3978,8 @@ fn configure_steps(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) ->
             };
             Mapping::new_action(pad, input, action)?
         } else {
-            let Some(action) = action_menu(ui, family, input, saved.as_ref().map(|m| &m.action))?
+            let Some(action) =
+                action_menu(ui, family, input, saved.as_ref().map(|m| &m.action), true)?
             else {
                 continue;
             };
@@ -3931,6 +4070,18 @@ fn configure_steps(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) ->
                 continue;
             };
             mapping.risky = risky == 1;
+        }
+        if mapping.action.observable() {
+            let Some(status) = choose_saved(
+                ui,
+                "Status feedback in the live pane (sent, running, stopped, failed)",
+                options(&["Off", "On"]),
+                saved.as_ref().map(|m| usize::from(m.status)),
+            )?
+            else {
+                continue;
+            };
+            mapping.status = status == 1;
         }
         mapping.validate()?;
         match choose(
@@ -4216,6 +4367,9 @@ pub fn start(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()
             0 => (|| {
                 ui.suspend()?;
                 configure(&mut ui, path, &mut current)?;
+                // A reassigned pad must not keep its old action's status.
+                ui.phases.clear();
+                ui.probed.clear();
                 ui.run_mappings = current
                     .iter()
                     .filter(|mapping| mapping.context == ui.context)
@@ -5113,7 +5267,11 @@ mod tests {
         let mut current = vec![Mapping::new(a, "Shift", "hold").unwrap()];
         mappings::save(&path, &current).unwrap();
         let mut ui = Script {
-            keys: [Enter, Down, Enter, Enter, Enter, Down, Enter].into(),
+            // learn, Launch application, the app, second press Close, fire when pressed, save and finish
+            keys: [
+                Enter, Down, Enter, Enter, Down, Enter, Enter, Enter, Down, Enter,
+            ]
+            .into(),
             pads: [b].into(),
             ..Default::default()
         };
@@ -5121,7 +5279,20 @@ mod tests {
         assert!(ui.keys.is_empty());
         assert_eq!(
             current[1].action,
-            Action::Application("/nonexistent/recorded.desktop".into())
+            Action::AppToggle {
+                path: "/nonexistent/recorded.desktop".into(),
+                close: true
+            }
+        );
+        assert!(ui.screens.iter().any(|s| s.starts_with("Second press")));
+        // A sequence step launches only; it never asks for a second press.
+        let mut step = Script {
+            keys: [Enter].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            action_menu(&mut step, 1, mappings::Input::Pad, None, false).unwrap(),
+            Some(Action::Application("/nonexistent/recorded.desktop".into()))
         );
         assert!(current[1].keys.is_empty());
         assert_eq!(current[1].behavior, mappings::Behavior::Trigger);
@@ -5144,7 +5315,8 @@ mod tests {
                 &mut Script::default(),
                 1,
                 mappings::Input::Knob { step: 4 },
-                None
+                None,
+                true
             )
             .is_err()
         );
@@ -5431,6 +5603,8 @@ mod tests {
                 .iter()
                 .any(|m| m.input == Input::Piano && m.keys == ["Ctrl"])
         );
+        // Shortcuts and audio steps have no observable state: no status option (ticket 10).
+        assert!(!ui.screens.iter().any(|s| s.starts_with("Status feedback")));
 
         // Failures name their stage and leave the file byte-for-byte unchanged.
         let before = std::fs::read(&path).unwrap();
@@ -5574,12 +5748,12 @@ mod tests {
         };
         let mut keys = vec![Enter, Down, Down, Down, Enter]; // learn A -> Prompt
         keys.extend(new_prompt(b"review"));
-        keys.extend([Enter, Enter]); // fire when pressed, save (Script labels the pad itself)
+        keys.extend([Enter, Down, Enter, Enter]); // fire when pressed, status On, save (Script labels the pad itself)
         keys.extend([Enter, Down, Down, Down, Down, Down, Enter]); // learn B -> sequence
         keys.extend([Enter, Down, Enter]); // add step -> prompt
         keys.extend([Enter, Enter, Enter, Enter]); // review, use existing, claude, paste only
         keys.extend([Down, Down, Enter]); // done
-        keys.extend([Enter, Down, Enter]); // fire when pressed, save and finish
+        keys.extend([Enter, Enter, Down, Enter]); // fire when pressed, status Off, save and finish
         let mut ui = Script {
             keys: keys.into(),
             pads: [a, b].into(),
@@ -5595,6 +5769,7 @@ mod tests {
         };
         assert_eq!(current, mappings::load(&path).unwrap());
         assert_eq!(current[0].action, prompt);
+        assert!(current[0].status && !current[1].status);
         assert_eq!(current[1].action, Action::Sequence(vec![Step::Do(prompt)]));
         assert_eq!(
             std::fs::read_to_string(dir.join("prompts/review")).unwrap(),
@@ -5603,7 +5778,7 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
         std::fs::write(path.with_extension("tmp"), "occupied").unwrap();
         ui.keys = [
-            Enter, Down, Down, Down, Enter, Enter, Enter, Enter, Enter, Enter, Enter,
+            Enter, Down, Down, Down, Enter, Enter, Enter, Enter, Enter, Enter, Enter, Enter,
         ]
         .into();
         ui.pads = [Control::from_note(10, 38).unwrap()].into();
@@ -5666,6 +5841,70 @@ mod tests {
                     ui.error.contains("keyboard capture") && ui.error.contains("Manual recovery")
                 );
             }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Tickets 09–10: a status pad shows sent until the worker answers, then the derived state:
+    /// running while its process lives, stopped once it exits or the server is killed, failed
+    /// when the action failed. Nothing is shown for pads with the option off.
+    #[test]
+    fn status_feedback_follows_sent_running_stopped_and_failed() {
+        assert_eq!(status_word(Some(Phase::Sent), Some(false)), "sent");
+        assert_eq!(status_word(Some(Phase::Done), Some(true)), "running");
+        assert_eq!(status_word(Some(Phase::Done), Some(false)), "stopped"); // exited or server killed
+        assert_eq!(status_word(None, Some(true)), "running"); // started before this session
+        assert_eq!(status_word(Some(Phase::Failed), Some(true)), "failed");
+        assert_eq!(status_word(Some(Phase::Done), None), "unavailable");
+        assert!(crate::actions::pane_alive(true, "1\n0\n"));
+        assert!(!crate::actions::pane_alive(true, "1\n")); // remain-on-exit: dead pane
+        assert!(!crate::actions::pane_alive(false, "")); // no server or window
+
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-status-ui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let (on, off) = (
+            Control::from_note(10, 36).unwrap(),
+            Control::from_note(10, 37).unwrap(),
+        );
+        let command = |line: &str| crate::actions::Action::Command {
+            window: "w".into(),
+            dir: "/tmp".into(),
+            line: line.into(),
+        };
+        let mut shown = Mapping::new_action(on, mappings::Input::Pad, command("ok")).unwrap();
+        shown.status = true;
+        let hidden = Mapping::new_action(off, mappings::Input::Pad, command("quiet")).unwrap();
+        mappings::save(&path, &[shown.clone(), hidden.clone()]).unwrap();
+        for ok in [true, false] {
+            let mut ui = Terminal::open_mode(&path, true).unwrap();
+            ui.actions = crate::actions::Dispatcher::with(move |_, _, _| {
+                if ok {
+                    Ok("started".into())
+                } else {
+                    Err("tmux: no server".into())
+                }
+            });
+            ui.run_mappings = vec![shown.clone(), hidden.clone()];
+            ui.transition(on, true).unwrap();
+            ui.transition(off, true).unwrap();
+            assert_eq!(ui.phases.get(&on), Some(&Phase::Sent));
+            assert!(!ui.phases.contains_key(&off)); // option off: nothing tracked or shown
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while ui.phases.get(&on) == Some(&Phase::Sent) {
+                ui.tick().unwrap();
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(ui.phases[&on], if ok { Phase::Done } else { Phase::Failed });
+            let lines = ui.status_lines();
+            assert_eq!(lines.len(), 1);
+            assert!(
+                lines[0].contains(if ok { "" } else { "failed" }),
+                "{lines:?}"
+            );
         }
         std::fs::remove_dir_all(dir).unwrap();
     }

@@ -96,8 +96,9 @@ impl Step {
                 | Action::Sequence(_)
                 | Action::Choice(_)
                 | Action::Value { .. }
-                | Action::Flow,
-            ) => Err("a step cannot be a mapping shortcut, sequence, knob, or Flow action".into()),
+                | Action::Flow
+                | Action::AppToggle { .. },
+            ) => Err("a step cannot be a mapping shortcut, sequence, knob, launcher toggle, or Flow action".into()),
             Self::Do(action) => action.validate(),
             _ => Ok(()),
         }
@@ -140,6 +141,12 @@ pub enum Action {
         line: String,
     },
     Application(String),
+    /// Launcher pad: launch, or restore/raise its windows, or on a press while focused
+    /// minimize (or `close`) them through the VibeConsole Shell extension.
+    AppToggle {
+        path: String,
+        close: bool,
+    },
     Volume {
         up: bool,
         step: u8,
@@ -171,6 +178,23 @@ impl Action {
             Self::Choice(choices) => choices.iter().flat_map(Self::agents).collect(),
             _ => Vec::new(),
         }
+    }
+    /// Actions with state the live pane can observe (tickets 09–10): a tmux window or agent,
+    /// a queued sequence, an app's windows, or Flow's process. Shortcuts, focused-window
+    /// pastes, audio steps and knob dials have none.
+    pub fn observable(&self) -> bool {
+        matches!(
+            self,
+            Self::Command { .. }
+                | Self::Prompt {
+                    target: Target::Agent(_),
+                    ..
+                }
+                | Self::Sequence(_)
+                | Self::Application(_)
+                | Self::AppToggle { .. }
+                | Self::Flow
+        )
     }
     /// Knob actions driven by absolute position rather than pulses.
     pub fn dial(&self) -> bool {
@@ -229,7 +253,7 @@ impl Action {
             {
                 Err("command must be one nonempty line without control characters, run in an absolute directory without ':'".into())
             }
-            Self::Application(path)
+            Self::Application(path) | Self::AppToggle { path, .. }
                 if !Path::new(path).is_absolute()
                     || !path.ends_with(".desktop")
                     || path.chars().any(char::is_control)
@@ -279,6 +303,10 @@ impl Action {
             ),
             Self::Command { window, dir, line } => format!("command:{window}:{dir}:{line}"),
             Self::Application(path) => format!("app:{path}"),
+            Self::AppToggle { path, close } => format!(
+                "app-toggle:{}:{path}",
+                if *close { "close" } else { "minimize" }
+            ),
             Self::Volume { up, step } => {
                 format!("volume-{}:{step}", if *up { "up" } else { "down" })
             }
@@ -350,6 +378,19 @@ impl Action {
             // Mappings saved before the merge used separate start and repair actions.
             "flow" | "flow-start" | "flow-repair" => Self::Flow,
             _ if value.starts_with("app:") => Self::Application(value[4..].into()),
+            _ if value.starts_with("app-toggle:") => {
+                let (policy, path) = value["app-toggle:".len()..]
+                    .split_once(':')
+                    .ok_or("invalid app toggle")?;
+                Self::AppToggle {
+                    path: path.into(),
+                    close: match policy {
+                        "close" => true,
+                        "minimize" => false,
+                        _ => return Err("app toggle second press must be minimize or close".into()),
+                    },
+                }
+            }
             _ if value.starts_with("volume-up:") => Self::Volume {
                 up: true,
                 step: value[10..].parse()?,
@@ -415,6 +456,14 @@ impl Action {
                     .unwrap_or_default()
                     .to_string_lossy()
             ),
+            Self::AppToggle { path, close } => format!(
+                "Launch {}; pressed while focused it {}",
+                Path::new(path)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy(),
+                if *close { "closes" } else { "minimizes" }
+            ),
             Self::Volume { up, step } => format!(
                 "Default output volume {} {step}% (100% limit)",
                 if *up { "up" } else { "down" }
@@ -442,17 +491,7 @@ fn roots() -> Vec<PathBuf> {
         .collect()
 }
 fn desktop(text: &str, desktops: &[&str]) -> Option<String> {
-    let mut entry = false;
-    let mut values = std::collections::HashMap::new();
-    for line in text.lines().map(str::trim) {
-        if line.starts_with('[') {
-            entry = line == "[Desktop Entry]";
-        } else if entry && !line.starts_with('#') {
-            if let Some((k, v)) = line.split_once('=') {
-                values.insert(k.trim(), v.trim());
-            }
-        }
-    }
+    let values = entry_fields(text);
     let get = |key| values.get(key).copied().unwrap_or("");
     let matches = |value: &str| {
         value
@@ -677,12 +716,18 @@ fn launch_request(
     mut run: impl FnMut(&[String]) -> Result<String>,
 ) -> Result<String> {
     if !apps.iter().any(|(_, p)| p == path) {
-        return Err(format!("saved application is missing or no longer visible: {path}; reselect it in configuration").into());
+        return Err(if Path::new(path).exists() {
+            format!("launcher rejected: {path} is hidden, NoDisplay, not for this desktop, or its TryExec program is missing")
+        } else {
+            format!("launcher missing: {path} no longer exists; reselect the application in configuration")
+        }
+        .into());
     }
     if !session {
-        return Err("desktop session unavailable for launch".into());
+        return Err("launcher failed to start: desktop session unavailable".into());
     }
-    run(&strings(&["launch", path]))?;
+    // The desktop entry path is an identifier for gio, never a shell command.
+    run(&strings(&["launch", path])).map_err(|e| format!("launcher failed to start: {e}"))?;
     Ok("Native launch request accepted; window/readiness not verified".into())
 }
 fn launch(path: &str, cancelled: &impl Fn() -> bool) -> Result<String> {
@@ -691,6 +736,130 @@ fn launch(path: &str, cancelled: &impl Fn() -> bool) -> Result<String> {
     launch_request(path, &catalog()?, session, |args| {
         command("gio", args, cancelled)
     })
+}
+
+/// Desktop ID of an installed entry path, as the catalog and GNOME derive it: the path below
+/// its `applications/` directory with `/` turned into `-` (e.g. `kde4-foo.desktop`).
+pub fn desktop_id(path: &str) -> Option<String> {
+    let (_, below) = path.rsplit_once("/applications/")?;
+    Some(below.replace('/', "-"))
+}
+
+/// `gdbus call` argv for the window extension's `method` (2 s timeout: never hang a caller).
+fn windows_call(method: &str, args: &[&str]) -> Vec<String> {
+    let mut argv = strings(&[
+        "call",
+        "--session",
+        "--timeout",
+        "2",
+        "--dest",
+        "org.vibeconsole.Windows",
+        "--object-path",
+        "/org/vibeconsole/Windows",
+        "--method",
+    ]);
+    argv.push(format!("org.vibeconsole.Windows.{method}"));
+    argv.extend(args.iter().map(|a| a.to_string()));
+    argv
+}
+
+/// A live pane in `list-panes -F '#{pane_dead}'` output (remain-on-exit keeps dead ones).
+pub fn pane_alive(ok: bool, output: &str) -> bool {
+    ok && output.lines().any(|line| line.trim() == "0")
+}
+
+/// Whether the action's observable process runs now (tickets 09–10); None when unknowable.
+/// Sequences are answered by the dispatcher instead.
+/// `agents` are (name, tmux window) pairs.
+pub fn running(action: &Action, agents: &[(String, String)]) -> Option<bool> {
+    let window = |name: &str| {
+        let output = tmux(&[
+            "list-panes",
+            "-t",
+            &format!("=vibe:={name}"),
+            "-F",
+            "#{pane_dead}",
+        ])
+        .ok()?;
+        Some(pane_alive(
+            output.status.success(),
+            &String::from_utf8_lossy(&output.stdout),
+        ))
+    };
+    match action {
+        Action::Command { window: name, .. } => window(name),
+        Action::Prompt {
+            target: Target::Agent(agent),
+            ..
+        } => window(&agents.iter().find(|(name, _)| name == agent)?.1),
+        Action::Application(path) | Action::AppToggle { path, .. } => {
+            let id = desktop_id(path)?;
+            let output = Command::new("gdbus")
+                .args(windows_call("State", &[&id]))
+                .output()
+                .ok()
+                .filter(|o| o.status.success())?;
+            Some(!String::from_utf8_lossy(&output.stdout).contains("'none'"))
+        }
+        Action::Flow => flow_processes().ok().map(|(main, _)| !main.is_empty()),
+        _ => None,
+    }
+}
+
+/// One launcher-pad press, decided by the Shell extension's view of the app's windows.
+fn app_toggle(
+    path: &str,
+    close: bool,
+    mut gdbus: impl FnMut(&[String]) -> Result<String>,
+    mut launch: impl FnMut() -> Result<String>,
+) -> Result<String> {
+    let id = desktop_id(path).ok_or("launcher path is not under an applications directory")?;
+    let id = id.as_str();
+    let mut call = |method: &str, args: &[&str]| gdbus(&windows_call(method, args));
+    let state = match call("State", &[id]) {
+        Ok(state) => state,
+        Err(error) => {
+            launch()?;
+            let missing = ["ServiceUnknown", "not provided", "NameHasNoOwner"]
+                .iter()
+                .any(|s| error.to_string().contains(s));
+            return Ok(if missing {
+                format!(
+                    "Launched {id}; minimize/close unavailable: VibeConsole window extension not enabled. See README, Window control."
+                )
+            } else {
+                format!(
+                    "Launched {id}; minimize/close unavailable: window extension cannot identify {id} ({error})"
+                )
+            });
+        }
+    };
+    let mut apply = |action| -> Result<String> { call("Apply", &[id, action]) };
+    match state
+        .trim()
+        .trim_start_matches("('")
+        .trim_end_matches("',)")
+    {
+        "none" => {
+            launch()?;
+            Ok(format!("Launched {id}"))
+        }
+        "minimized" | "background" => {
+            apply("restore")?;
+            Ok(format!("Restored {id}"))
+        }
+        "focused" if close => {
+            apply("close")?;
+            Ok(format!("Asked {id} to close"))
+        }
+        "focused" => {
+            apply("minimize")?;
+            Ok(format!("Minimized {id}"))
+        }
+        other => {
+            Err(format!("minimize/close unavailable: unexpected window state {other:?}").into())
+        }
+    }
 }
 
 pub fn prompts_dir() -> Result<PathBuf> {
@@ -816,14 +985,136 @@ fn command_tmux_args<'a>(
 }
 
 fn run_command(window: &str, dir: &str, line: &str) -> Result<String> {
+    show_command(
+        window,
+        dir,
+        line,
+        &mut |args| {
+            let output = tmux(args)?;
+            // Success: stdout; failure: stderr, for the error message.
+            let text = if output.status.success() {
+                &output.stdout
+            } else {
+                &output.stderr
+            };
+            Ok((
+                output.status.success(),
+                String::from_utf8_lossy(text).trim().to_string(),
+            ))
+        },
+        &mut open_terminal,
+    )
+}
+
+/// Send the command to tmux, then show the session: open a terminal attached to it unless a
+/// client already is. Only a successful open is reported as shown.
+fn show_command(
+    window: &str,
+    dir: &str,
+    line: &str,
+    tmux: &mut dyn FnMut(&[&str]) -> Result<(bool, String)>,
+    open: &mut dyn FnMut() -> Result<()>,
+) -> Result<String> {
     if !Path::new(dir).is_dir() {
         return Err(format!("working directory {dir} is missing").into());
     }
-    let session = tmux(&["has-session", "-t", "=vibe"])?.status.success();
-    tmux_ok(&command_tmux_args(session, window, dir, line))?;
-    Ok(format!(
-        "Command started in tmux window {window}; tmux attach -t vibe"
-    ))
+    let (session, _) = tmux(&["has-session", "-t", "=vibe"])?;
+    let args = command_tmux_args(session, window, dir, line);
+    let (ok, output) = tmux(&args)?;
+    if !ok {
+        return Err(format!("tmux {}: {output}", args.join(" ")).into());
+    }
+    let (listed, clients) = tmux(&["list-clients", "-t", "=vibe", "-F", "#{client_name}"])?;
+    if listed && !clients.trim().is_empty() {
+        return Ok(format!(
+            "Command started in tmux window {window}; session vibe already attached"
+        ));
+    }
+    Ok(match open() {
+        Ok(()) => {
+            format!("Command started in tmux window {window}; terminal opened on session vibe")
+        }
+        Err(error) => format!(
+            "Command sent to tmux window {window}, sent to tmux, not shown: {error}. Run: tmux attach -t vibe"
+        ),
+    })
+}
+
+/// Key/value pairs of a desktop entry's [Desktop Entry] group.
+fn entry_fields(text: &str) -> std::collections::HashMap<&str, &str> {
+    let mut entry = false;
+    let mut values = std::collections::HashMap::new();
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('[') {
+            entry = line == "[Desktop Entry]";
+        } else if entry && !line.starts_with('#') {
+            if let Some((k, v)) = line.split_once('=') {
+                values.insert(k.trim(), v.trim());
+            }
+        }
+    }
+    values
+}
+
+/// argv attaching to the `vibe` session in the first terminal entry of `texts`: the entry's Exec
+/// program run directly (no shell), then its X-ExecArg (default `-e`), then tmux.
+fn terminal_argv(texts: &[&str]) -> Option<Vec<String>> {
+    texts.iter().find_map(|text| {
+        let fields = entry_fields(text);
+        if !fields
+            .get("Categories")
+            .is_some_and(|c| c.split(';').any(|c| c == "TerminalEmulator"))
+        {
+            return None;
+        }
+        let program = fields.get("Exec")?.split_whitespace().next()?;
+        // Wrapped or quoted launchers (flatpak, env, "…") cannot reach the host tmux reliably.
+        if program.contains(['=', '"', '\''])
+            || program.starts_with('%')
+            || ["env", "flatpak"].contains(&program.rsplit('/').next()?)
+        {
+            return None;
+        }
+        let mut argv = vec![program.to_string()];
+        match fields.get("X-ExecArg") {
+            Some(arg) if arg.is_empty() => {}
+            Some(arg) => argv.push(arg.to_string()),
+            None => argv.push("-e".into()),
+        }
+        argv.extend(strings(&["tmux", "attach-session", "-t", "=vibe"]));
+        Some(argv)
+    })
+}
+
+/// Open the installed terminal (Ptyxis first) attached to the `vibe` session, detached from us.
+fn open_terminal() -> Result<()> {
+    let mut paths = catalog()?.into_iter().map(|(_, p)| p).collect::<Vec<_>>();
+    paths.sort_by_key(|p| !p.ends_with("/org.gnome.Ptyxis.desktop"));
+    let texts = paths
+        .iter()
+        .filter_map(|p| fs::read_to_string(p).ok())
+        .collect::<Vec<_>>();
+    let argv = terminal_argv(&texts.iter().map(String::as_str).collect::<Vec<_>>())
+        .ok_or("no terminal emulator desktop entry installed")?;
+    use std::os::unix::process::CommandExt;
+    let mut child = Command::new(&argv[0])
+        .args(&argv[1..])
+        .process_group(0) // Ctrl+C in VibeConsole's own terminal must not reach it
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("{}: {e}", argv[0]))?;
+    // A terminal that fails at once is reported; one that stays open is reaped when it exits.
+    thread::sleep(Duration::from_millis(300));
+    if let Some(status) = child.try_wait()? {
+        if !status.success() {
+            return Err(format!("{} exited: {status}", argv[0]).into());
+        }
+    } else {
+        thread::spawn(move || child.wait());
+    }
+    Ok(())
 }
 
 fn read_prompt(path: &Path) -> Result<Vec<u8>> {
@@ -1064,6 +1355,10 @@ impl Dispatcher {
             .map(|taps| taps.try_iter().collect())
             .unwrap_or_default()
     }
+    /// A sequence is queued or running (its re-press is ignored meanwhile).
+    pub fn sequence_running(&self, action: &Action) -> bool {
+        self.sequences.lock().unwrap().contains(&action.encode())
+    }
     pub fn notice(&self) -> Option<(Action, bool, String)> {
         while let Ok((epoch, action, ok, notice)) = self.notices.try_recv() {
             if epoch == self.epoch.load(Ordering::Acquire) {
@@ -1143,6 +1438,12 @@ fn perform(
         }
         Action::Command { window, dir, line } => run_command(window, dir, line),
         Action::Application(path) => launch(path, &cancelled),
+        Action::AppToggle { path, close } => app_toggle(
+            path,
+            *close,
+            |args| command("gdbus", args, &cancelled),
+            || launch(path, &cancelled),
+        ),
         Action::Flow => flow(node.ok_or("keyboard has not been registered")?, &cancelled),
         Action::Shortcut => Err("shortcut belongs to keyboard output".into()),
         Action::Choice(_) | Action::Value { .. } => Err("knob actions run in the session".into()),
@@ -1742,5 +2043,208 @@ mod tests {
                 .load(Ordering::Acquire))
             .is_err()
         );
+    }
+
+    /// Ticket 06: a desktop ID is passed to gio as an identifier; missing, rejected and
+    /// failed-to-start launches say which.
+    #[test]
+    fn launcher_passes_desktop_ids_and_names_missing_rejected_and_failed_to_start() {
+        let dir = std::env::temp_dir().join(format!("vibeconsole-launch-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let apps_dir = dir.join("applications");
+        fs::create_dir_all(&apps_dir).unwrap();
+        let ptyxis = apps_dir.join("org.gnome.Ptyxis.desktop");
+        fs::write(
+            &ptyxis,
+            "[Desktop Entry]\nType=Application\nName=Terminal\nExec=ptyxis\nDBusActivatable=true\n",
+        )
+        .unwrap();
+        let hidden = apps_dir.join("hidden.desktop");
+        fs::write(
+            &hidden,
+            "[Desktop Entry]\nType=Application\nName=Hidden\nExec=x\nNoDisplay=true\n",
+        )
+        .unwrap();
+        let apps = catalog_at(&[apps_dir.clone()], &["GNOME"]).unwrap();
+        let path = ptyxis.to_str().unwrap();
+        let mut sent = Vec::new();
+        launch_request(path, &apps, true, |args| {
+            sent.push(args.to_vec());
+            Ok(String::new())
+        })
+        .unwrap();
+        assert_eq!(sent, [vec!["launch".to_string(), path.to_string()]]);
+        let error = |path: &Path, run: &dyn Fn() -> Result<String>| {
+            launch_request(path.to_str().unwrap(), &apps, true, |_| run())
+                .unwrap_err()
+                .to_string()
+        };
+        let ok = || Ok(String::new());
+        assert!(error(&apps_dir.join("gone.desktop"), &ok).starts_with("launcher missing:"));
+        assert!(error(&hidden, &ok).starts_with("launcher rejected:"));
+        let failing = || Err("gio: exit status: 2: Failed to launch".into());
+        assert!(error(&ptyxis, &failing).starts_with("launcher failed to start:"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Ticket 07: a launcher pad asks the Shell extension for its app's windows. None: launch.
+    /// Minimized or behind: restore. Focused: the saved second-press action. No extension: launch.
+    #[test]
+    fn app_toggle_launches_restores_minimizes_or_closes_and_reports_unavailable() {
+        let path = "/usr/share/applications/org.gnome.Ptyxis.desktop";
+        let run = |close: bool, state: Result<&'static str>| {
+            let calls = std::cell::RefCell::new(Vec::new());
+            let state = std::cell::RefCell::new(Some(state));
+            let result = app_toggle(
+                path,
+                close,
+                |args| {
+                    calls.borrow_mut().push(args[9..].join(" "));
+                    if args[9].ends_with(".State") {
+                        state
+                            .borrow_mut()
+                            .take()
+                            .unwrap()
+                            .map(|s| format!("('{s}',)"))
+                    } else {
+                        Ok("(uint32 2,)".into())
+                    }
+                },
+                || {
+                    calls.borrow_mut().push("launch".into());
+                    Ok("accepted".into())
+                },
+            );
+            (result.map_err(|e| e.to_string()), calls.into_inner())
+        };
+        let state = "org.vibeconsole.Windows.State org.gnome.Ptyxis.desktop";
+        let apply =
+            |action| format!("org.vibeconsole.Windows.Apply org.gnome.Ptyxis.desktop {action}");
+        let (result, calls) = run(false, Ok("none"));
+        assert!(result.unwrap().starts_with("Launched"));
+        assert_eq!(calls, [state.into(), "launch".to_string()]);
+        let (result, calls) = run(false, Ok("focused"));
+        assert!(result.unwrap().starts_with("Minimized"));
+        assert_eq!(calls, [state.into(), apply("minimize")]);
+        let (result, calls) = run(true, Ok("focused"));
+        assert!(result.unwrap().starts_with("Asked"));
+        assert_eq!(calls, [state.into(), apply("close")]);
+        for hidden in ["minimized", "background"] {
+            let (result, calls) = run(true, Ok(hidden));
+            assert!(result.unwrap().starts_with("Restored"));
+            assert_eq!(calls, [state.into(), apply("restore")]);
+        }
+        let (result, calls) = run(
+            false,
+            Err("The name org.vibeconsole.Windows was not provided".into()),
+        );
+        let text = result.unwrap();
+        assert!(text.contains("minimize/close unavailable") && text.contains("not enabled"));
+        assert_eq!(calls, [state.into(), "launch".to_string()]);
+        let unknown = Err("GDBus.Error: unknown application org.gnome.Ptyxis.desktop".into());
+        assert!(run(false, unknown).0.unwrap().contains("cannot identify")); // not blamed on install
+        assert_eq!(
+            desktop_id("/usr/share/applications/kde4/foo.desktop").unwrap(),
+            "kde4-foo.desktop"
+        );
+        assert!(desktop_id("/opt/foo.desktop").is_none());
+        let (result, _) = run(false, Ok("sideways"));
+        assert!(result.unwrap_err().contains("unavailable"));
+        let toggle = Action::AppToggle {
+            path: path.into(),
+            close: true,
+        };
+        assert_eq!(Action::parse(&toggle.encode()).unwrap(), toggle);
+        assert!(Action::parse("app-toggle:close:relative.desktop").is_err());
+    }
+
+    /// Ticket 08: after tmux takes the command, a terminal attaches unless one already is;
+    /// a terminal failure says "sent to tmux, not shown"; a tmux failure opens nothing.
+    #[test]
+    fn command_opens_one_attached_terminal_and_never_claims_an_unshown_session() {
+        let dir = std::env::temp_dir();
+        let dir = dir.to_str().unwrap();
+        let run = |clients: &str, tmux_fails: bool, open_fails: bool| {
+            let mut tmux_calls = Vec::new();
+            let mut opened = 0;
+            let result = show_command(
+                "Bank-A-Pad-5",
+                dir,
+                "claude",
+                &mut |args| {
+                    tmux_calls.push(args[0].to_string());
+                    match args[0] {
+                        "has-session" => Ok((true, String::new())),
+                        "list-clients" => Ok((clients != "ERR", clients.to_string())),
+                        _ if tmux_fails => Ok((false, "no server running".into())),
+                        _ => Ok((true, String::new())),
+                    }
+                },
+                &mut || {
+                    opened += 1;
+                    if open_fails {
+                        Err("no terminal emulator installed".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            (result.map_err(|e| e.to_string()), tmux_calls, opened)
+        };
+        let (result, calls, opened) = run("", false, false);
+        assert!(result.unwrap().contains("terminal opened"));
+        assert_eq!(calls, ["has-session", "new-window", "list-clients"]);
+        assert_eq!(opened, 1);
+        let (result, _, opened) = run("/dev/pts/3\n", false, false);
+        assert!(result.unwrap().contains("already attached"));
+        assert_eq!(opened, 0);
+        let (result, _, opened) = run("ERR", false, false); // failed listing is not a client
+        assert!(result.unwrap().contains("terminal opened"));
+        assert_eq!(opened, 1);
+        let (result, _, _) = run("", false, true);
+        let text = result.unwrap();
+        assert!(text.contains("sent to tmux, not shown") && !text.contains("terminal opened"));
+        let (result, _, opened) = run("", true, false);
+        assert!(result.unwrap_err().contains("no server running"));
+        assert_eq!(opened, 0);
+        // The terminal comes from its desktop entry: program plus X-ExecArg, never a shell line.
+        let ptyxis = "[Desktop Entry]\nType=Application\nName=Terminal\nExec=ptyxis\nX-ExecArg=--\nCategories=GNOME;System;TerminalEmulator;\n";
+        let xterm = "[Desktop Entry]\nType=Application\nName=XTerm\nExec=xterm %u\nCategories=System;TerminalEmulator;\n";
+        let editor =
+            "[Desktop Entry]\nType=Application\nName=Editor\nExec=gedit\nCategories=Utility;\n";
+        let attach = ["tmux", "attach-session", "-t", "=vibe"];
+        assert_eq!(
+            terminal_argv(&[editor, ptyxis]).unwrap()[..2],
+            ["ptyxis", "--"]
+        );
+        assert_eq!(
+            terminal_argv(&[xterm]).unwrap(),
+            ["xterm", "-e", attach[0], attach[1], attach[2], attach[3]]
+        );
+        let flatpak = "[Desktop Entry]\nType=Application\nName=T\nExec=/usr/bin/flatpak run org.x.T\nCategories=TerminalEmulator;\n";
+        assert_eq!(terminal_argv(&[flatpak, xterm]).unwrap()[0], "xterm"); // wrappers skipped
+        assert!(terminal_argv(&[editor]).is_none());
+    }
+
+    /// Ticket 10: a status sequence is running while queued or running, stopped after.
+    #[test]
+    fn sequence_status_is_running_until_its_worker_finishes() {
+        let (release, wait) = mpsc::channel::<()>();
+        let wait = std::sync::Mutex::new(wait);
+        let dispatcher = Dispatcher::with(move |_, _, _| {
+            wait.lock().unwrap().recv().unwrap();
+            Ok("done".into())
+        });
+        let sequence = Action::Sequence(vec![Step::Wait(100)]);
+        assert!(!dispatcher.sequence_running(&sequence));
+        dispatcher.submit(sequence.clone(), None).unwrap();
+        assert!(dispatcher.sequence_running(&sequence));
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while dispatcher.notice().is_none() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!dispatcher.sequence_running(&sequence));
     }
 }
