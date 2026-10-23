@@ -99,9 +99,19 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
         let mut used = 0;
         for (c, size) in cells(line) {
             if used + size > width {
-                rows.push(row);
-                row = String::new();
-                used = 0;
+                // Break after the last space so words stay whole; a longer word still splits.
+                let tail = match row.rfind(' ') {
+                    Some(at) if c != ' ' && !row[..at].trim_end().is_empty() => {
+                        row.split_off(at + 1)
+                    }
+                    _ => String::new(),
+                };
+                rows.push(row.trim_end().to_owned());
+                used = cells(&tail).iter().map(|(_, size)| size).sum();
+                row = tail;
+                if c == ' ' {
+                    continue;
+                }
             }
             row.push(c);
             used += size;
@@ -385,6 +395,25 @@ impl Screen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v6/01: dialogs split words at the column ("P│rogram"). Rows now break at spaces.
+    #[test]
+    fn wrap_keeps_words_whole_and_still_splits_overlong_words() {
+        let text = "Not saved: validation: piano keys cannot be mapped in Program 1: octave/tempo/arpeggiator feedback comes from Bank A Pad 1, Bank A Pad 2.";
+        let rows = wrap(text, 56);
+        assert!(rows.iter().all(|row| width_of(row) <= 56), "{rows:?}");
+        assert_eq!(rows.join(" "), text); // only spaces were consumed at breaks
+        assert_eq!(
+            rows,
+            [
+                "Not saved: validation: piano keys cannot be mapped in",
+                "Program 1: octave/tempo/arpeggiator feedback comes from",
+                "Bank A Pad 1, Bank A Pad 2.",
+            ]
+        );
+        assert_eq!(wrap("abcdefgh", 3), ["abc", "def", "gh"]);
+        assert_eq!(wrap("ab  cd", 3), ["ab", "cd"]);
+    }
 
     #[test]
     fn bounded_unicode_layout_and_plain_color_fallback() {

@@ -3,6 +3,7 @@
 import Gio from 'gi://Gio';
 import Shell from 'gi://Shell';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 const IFACE = `<node>
   <interface name="org.vibeconsole.Windows">
@@ -39,14 +40,17 @@ class Windows {
 
     // minimize | close | restore; returns how many windows it acted on.
     Apply(app, action) {
-        const [shellApp, windows] = this._windows(app);
+        const [, windows] = this._windows(app);
         const time = global.get_current_time();
         if (action === 'minimize')
             windows.forEach(w => w.minimize());
         else if (action === 'close')
             windows.forEach(w => w.delete(time));
-        else if (action === 'restore' && windows.length > 0)
-            shellApp.activate();
+        else if (action === 'restore' && windows.length > 0) {
+            // Shell.App.activate() leaves minimized windows minimized (GNOME 50).
+            windows.filter(w => w.minimized).forEach(w => w.unminimize());
+            Main.activateWindow(windows[0], time);
+        }
         else if (action !== 'restore')
             throw new Error(`unknown action ${action}`);
         return windows.length;

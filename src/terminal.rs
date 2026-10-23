@@ -901,6 +901,24 @@ impl Terminal {
                     } else {
                         self.actions.submit(action, None)
                     };
+                    let knob = self.run_mappings.iter().any(|m| {
+                        m.control == pad
+                            && matches!(
+                                m.input,
+                                mappings::Input::Knob { .. } | mappings::Input::RelativeKnob { .. }
+                            )
+                    });
+                    // A fast turn sends steps faster than the worker runs them; drop the
+                    // extra steps instead of pausing. A rejected pad press still pauses.
+                    if knob
+                        && submitted
+                            .as_ref()
+                            .is_err_and(|e| e.to_string() == crate::actions::QUEUE_FULL)
+                    {
+                        self.notice =
+                            "Knob turned faster than its action runs; extra steps skipped".into();
+                        return Ok(());
+                    }
                     if status {
                         let phase = if submitted.is_ok() {
                             Phase::Sent
@@ -4141,17 +4159,23 @@ fn configure_steps(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) ->
         }
         if input == mappings::Input::Piano {
             let config = mappings::load_config(path).map_err(stage("file I/O"))?;
-            if config.idle_for(ui.context()).enabled()
-                || current
-                    .iter()
-                    .any(|m| m.context == ui.context() && m.feedback.enabled())
-            {
+            // Name what carries the octave/tempo/arpeggiator feedback, so the user knows what to change.
+            let mut fed = current
+                .iter()
+                .filter(|m| m.context == ui.context() && m.feedback.enabled())
+                .map(|m| m.label.clone())
+                .collect::<Vec<_>>();
+            if config.idle_for(ui.context()).enabled() {
+                fed.insert(0, "the idle settings".into());
+            }
+            if !fed.is_empty() {
                 // Refused before any change: a note, not an operation failure that pauses.
                 choose(
                     ui,
                     &format!(
-                        "Not saved: validation: piano keys cannot be mapped in {}: it has idle or pad feedback (octave/tempo/arpeggiator). Remove that feedback or use another program.",
-                        mappings::program_label(ui.context())
+                        "Not saved: validation: piano keys cannot be mapped in {}: octave/tempo/arpeggiator feedback comes from {}. Remove that feedback or use another program.",
+                        mappings::program_label(ui.context()),
+                        fed.join(", ")
                     ),
                     &options(&["Back"]),
                 )?;
@@ -5939,7 +5963,7 @@ mod tests {
             ui.screens
                 .iter()
                 .any(|s| s.starts_with("Not saved: validation: piano keys")
-                    && s.contains("feedback"))
+                    && s.contains("feedback comes from the idle settings"))
         );
         assert!(!ui.screens.iter().any(|s| s.starts_with("Action family"))); // refused before any choice
         assert_eq!(std::fs::read(&path).unwrap(), before_piano);
@@ -6094,6 +6118,43 @@ mod tests {
             .to_string();
         assert!(error.starts_with("file I/O: "), "{error}");
         assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A fast knob turn overflows the action queue: extra steps are skipped without pausing,
+    /// while a pad press that cannot be queued is still an error (the caller pauses).
+    #[test]
+    fn knob_steps_beyond_a_full_queue_are_skipped_but_pad_presses_still_fail() {
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-knob-queue-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let knob = Control {
+            channel: 1,
+            id: 70,
+            message: crate::Message::Cc,
+            direction: 1,
+        };
+        let pad = Control::from_note(10, 36).unwrap();
+        let volume = crate::actions::Action::Volume { up: true, step: 5 };
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        ui.actions = crate::actions::Dispatcher::with(move |_, _, _| {
+            let _ = held.recv(); // every request waits until the test ends
+            Ok("done".into())
+        });
+        ui.run_mappings = vec![
+            Mapping::new_action(knob, mappings::Input::Knob { step: 4 }, volume.clone()).unwrap(),
+            Mapping::new_action(pad, mappings::Input::Pad, volume).unwrap(),
+        ];
+        for _ in 0..20 {
+            ui.transition(knob, true).unwrap();
+        }
+        assert!(ui.notice.contains("extra steps skipped"), "{}", ui.notice);
+        assert!(ui.transition(pad, true).is_err());
+        drop(release);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

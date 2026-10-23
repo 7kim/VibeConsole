@@ -1350,6 +1350,9 @@ pub type TapRequest = (
     Vec<evdev::KeyCode>,
     mpsc::SyncSender<std::result::Result<(), String>>,
 );
+/// `Dispatcher::submit` error when earlier requests are still waiting.
+pub const QUEUE_FULL: &str = "action queue full; request skipped";
+
 pub struct Dispatcher {
     requests: mpsc::SyncSender<Job>,
     notices: mpsc::Receiver<(u64, Action, bool, String)>,
@@ -1435,11 +1438,17 @@ impl Dispatcher {
                 node,
                 epoch: self.epoch.load(Ordering::Acquire),
             })
-            .map_err(|_| {
+            .map_err(|error| {
                 if let Some(key) = &sequence {
                     self.sequences.lock().unwrap().remove(key);
                 }
-                "action queue full/unavailable; request skipped".into()
+                match error {
+                    mpsc::TrySendError::Full(_) => QUEUE_FULL,
+                    mpsc::TrySendError::Disconnected(_) => {
+                        "action worker unavailable; request skipped"
+                    }
+                }
+                .into()
             })
     }
     /// Key taps the worker is waiting on; the session answers each on its keyboard.
@@ -1988,7 +1997,8 @@ mod tests {
         for _ in 0..8 {
             dispatch.submit(Action::OutputMute, None).unwrap();
         }
-        assert!(dispatch.submit(Action::OutputMute, None).is_err());
+        let full = dispatch.submit(Action::OutputMute, None).unwrap_err();
+        assert_eq!(full.to_string(), QUEUE_FULL);
         let started = Instant::now();
         dispatch.cancel();
         drop(dispatch);
