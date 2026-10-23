@@ -26,6 +26,8 @@ VibeConsole is a Rust terminal application with saved per-program mappings, hold
 - Launch installed applications and request native output-volume, output-mute, or microphone-mute changes from supported controls.
 - Start Wispr Flow after the virtual keyboard is ready, or explicitly request targeted graceful repair/reopening.
 - Drive AI coding agents (V5): send saved prompts to Claude Code/Codex in tmux or to the focused window, run commands in tmux, chain steps into sequences, mark risky pads hold-to-fire, switch prompts with a choice knob, write a number to a file with a value knob, and show each agent's thinking / needs-input / finished status.
+- Work faster day to day (V6): launcher pads minimize, close or bring back their app on the next press (GNOME Shell extension); command pads open a terminal on the `vibe` tmux session; per-pad status feedback (sent, running, stopped, failed); a Settings pane with default agent directories and variables; a Prompts pane to read, create, edit and delete prompts.
+- Status lights: while an agent thinks, needs input or has finished, the controller's tempo, arpeggiator and octave lights show it.
 - Inspect MIDI/input activity and toggle state, retain the virtual keyboard through ordinary editing/reconnection, and install a command with optional login startup.
 
 Implemented features and user-approved hardware/application behavior are distinguished in [Verification and acceptance](#-verification-and-acceptance).
@@ -218,7 +220,19 @@ Names are letters, digits and `_`, not starting with a digit; values are one lin
 
 **Status feedback.** Commands, prompts to an agent, sequences, launchers and Wispr Flow can show their state in the live pane (`Status Bank A Pad 5: running`). Turn it on per mapping in `/configure` (after **Fire when**). States: **sent** (press accepted, worker not done), **running** (the command's or agent's tmux pane is alive, the sequence is still queued or running, the app has windows per the window extension, or Flow's app process runs), **stopped** (none of that, e.g. after `tmux kill-server`), **failed** (the last press failed), **unavailable** (state cannot be read, e.g. launcher without the window extension). Running is re-read every 500 ms, never stored. Shortcuts, focused-window prompts, audio actions and knob dials have no observable state, so the option is not offered for them.
 
-**Agent status.** Agents → **Claude Code status hooks** / **Codex status hooks** shows hook settings and copies them with `wl-copy`; merge them into `~/.claude/settings.json` and `~/.codex/hooks.json` yourself (VibeConsole never edits them). Hooks call `vibeconsole agent-status - <state>`, which only reports for windows VibeConsole started (they carry `VIBECONSOLE_AGENT`), so other Claude/Codex sessions do not change status. The screen shows `Agents: claude thinking · codex FINISHED`; finished clears when the attached `vibe` session shows that agent's window or a mapping sends to that agent. Status lights on the controller are not implemented yet (they await a hardware gate).
+**Agent status.** Agents → **Claude Code status hooks** / **Codex status hooks** shows whether the hooks are installed and offers **Install (merge, with backup)**: it adds only VibeConsole's missing entries to `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`) and `~/.codex/hooks.json` (or `$CODEX_HOME/hooks.json`), keeps every other setting and hook, writes `<file>.bak-vibeconsole-<time>` first, and refuses a file that is not valid JSON. **Copy with wl-copy** is still there if you prefer to merge by hand. `vibeconsole doctor` reports both, so a reinstall that wiped `~/.claude` shows up as missing hooks. Codex runs new hooks only after you trust them in Codex; restart running agents after installing. Hooks call `vibeconsole agent-status - <state>`, which only reports from a live pane in that agent's own `vibe` window (VibeConsole sets `VIBECONSOLE_AGENT` there), so other Claude/Codex sessions, and processes that outlive the window such as Codex's shared app-server daemon, do not change status. A busy agent whose window is gone (it exited, or `tmux kill-server`) goes back to idle. The screen shows `Agents: claude thinking · codex FINISHED`; finished clears when the attached `vibe` session shows that agent's window or a mapping sends to that agent.
+
+**Status lights** (Agents → **Status lights**, default On): while any agent is not idle, the controller's tempo, arpeggiator and octave lights show it, as in the table below. Each agent's octave (±1..±4; Claude +1, Codex −1) and its two tempos are set when you edit the agent. When every agent is idle, the program's own idle/pad feedback comes back; pausing, changing program and quitting restore the controller as usual. Status lights stay off in programs with piano mappings and in the login service, which show status on screen only. Every agent is edited the same way; with more than two agents, the octave cycles through each busy agent's value. The blink rates and the one-second alternation are the spec defaults and have not been checked on the controller yet.
+
+| Agent state | Tempo light (arpeggiator) | Octave light |
+|---|---|---|
+| Thinking | slow blink (thinking tempo, 50 BPM) | — |
+| Needs input | fast blink (needs-input tempo, 240 BPM) | that agent's octave, steady |
+| Finished | off | that agent's octave blinking against 0 |
+| Two need input, or two finished | as above | alternates between their octaves |
+| All idle | the program's own feedback | the program's own feedback |
+
+Needs input wins over thinking for the tempo, and a steady needs-input octave wins over a finished blink.
 
 ---
 
@@ -263,7 +277,7 @@ Use `./target/debug/vibeconsole` for the current local build. After installation
 | `vibeconsole configure` | Direct configuration menus; use the interactive session for program-aware setup |
 | `vibeconsole feedback-read` | Read/validate current RAM musical settings without changing them |
 | `vibeconsole agent-status <agent\|-> <state>` | Record `idle`, `thinking`, `needs-input`, or `finished` for an agent (called by hooks; opens no MIDI or keyboard) |
-| `vibeconsole doctor` | Inspect session, device, configuration, and prerequisite availability |
+| `vibeconsole doctor` | Inspect session, device, configuration, prerequisite availability, the window extension, and the Claude Code / Codex status hooks |
 | `vibeconsole install` | Copy the invoking executable to `~/.local/bin/vibeconsole` |
 | `vibeconsole uninstall` | Remove managed installation/service; preserve mappings |
 | `vibeconsole startup-enable` | Opt into the managed user service without starting it immediately; old flags are accepted and ignored |
@@ -309,7 +323,7 @@ Mappings live at `$XDG_CONFIG_HOME/vibeconsole/mappings.tsv`, or `~/.config/vibe
 
 VibeConsole was previously named **KeyAI**. On first start, an existing `keyai/mappings.tsv` is copied to the new location (the old file stays as a backup) and old `keyai-mappings-v*` headers remain readable. An earlier install is replaced with `keyai uninstall`, then `vibeconsole install`.
 
-Versions 1–8 remain readable; successful saves use **version 9 TSV**: agents, the risky flag, and the V5 actions, on top of relative-knob mode, the automatic Flow startup setting (default On), per-program idle preferences, numeric contexts, labels, input calibration, actions, shortcuts, and feedback. Older files load with the default agents and nothing risky. Agent status lives in `$XDG_RUNTIME_DIR/vibeconsole/agent-<name>`, not in the configuration. Validation precedes saving; a private temporary file is written/synced before replacing the previous configuration. Failed saves preserve the prior valid file. Active holds and toggle states are never saved.
+Versions 1–12 remain readable; successful saves use **version 13 TSV**: the Status lights setting and each agent's status-light octave and tempos (V5 ticket 14), on top of the Settings pane's agent directories and variables, the launcher second-press choice and status-feedback column (V6), agents, the risky flag, the V5 actions, relative-knob mode, the automatic Flow startup setting (default On), per-program idle preferences, numeric contexts, labels, input calibration, actions, shortcuts, and feedback. Older files load with the default agents, nothing risky, Status lights On and Claude +1 / Codex −1 at 50/240 BPM. Builds older than the file's version cannot read it, so keep a copy before trying an older build. Agent status lives in `$XDG_RUNTIME_DIR/vibeconsole/agent-<name>`, not in the configuration. Validation precedes saving; a private temporary file is written/synced before replacing the previous configuration. Failed saves preserve the prior valid file. Active holds and toggle states are never saved.
 
 Do not concurrently edit an active configuration. If an interrupted save leaves `mappings.tmp`, inspect it and confirm no editor is saving before removing that staging file. Power-loss recovery is not established. The [manual test setup](archive/V2.0/tests-to-do/README.md) uses a separate configuration copy so test assignments do not overwrite everyday mappings.
 
@@ -328,8 +342,11 @@ Do not concurrently edit an active configuration. If an interrupted save leaves 
 | Shift works in an editor but not Flow | Use **Start or repair Wispr Flow**; verify actual push-to-talk separately |
 | Installed command behaves differently | Rebuild, quit VibeConsole, then install the new local executable |
 | Program changes feel delayed | Allow polling plus response/re-identification time; check the verified header before playing mapped controls |
+| "Knob turned faster than its action runs; extra steps skipped" | A fast knob turn sent more steps than the action queue holds; the extra steps were dropped and output keeps running. Turn more slowly for exact steps |
+| A launcher pad does not minimize, close or restore | Check `vibeconsole doctor` says the window extension is answering; after installing or updating it, log out and in once |
+| Status lights do not show | Agents → **Status lights** must be On, the header `RUNNING` on a verified program without piano mappings, and VibeConsole interactive (not the login service) |
 
-Unsupported or unverified areas include live relative-knob editor acceptance, wrapping absolute knobs, absolute-volume mapping, CC/Program Change pad holds, joystick system actions, indistinguishable joystick directions, pedals, brightness/media/lock actions, shell commands outside tmux, controller status lights, readiness detection for agents (sequence waits are fixed), independent pad LED control, and direct Flow listening-state integration. There is no GUI. Other desktop environments/controller models have not been verified.
+Unsupported or unverified areas include live relative-knob editor acceptance, wrapping absolute knobs, absolute-volume mapping, CC/Program Change pad holds, joystick system actions, indistinguishable joystick directions, pedals, brightness/media/lock actions, shell commands outside tmux, hardware-verified status-light blink rates, readiness detection for agents (sequence waits are fixed), independent pad LED control, and direct Flow listening-state integration. There is no GUI. Other desktop environments/controller models have not been verified.
 
 Suspend/resume, forced-kill recovery, real output-backend failure recovery, and full daily-use acceptance remain open. Exact program matching also means externally transposed/edited RAM may need deliberate recovery; do not treat the older piano-transposition procedure as approved under the new monitor.
 
@@ -337,7 +354,7 @@ Suspend/resume, forced-kill recovery, real output-backend failure recovery, and 
 
 ## ✅ Verification and acceptance
 
-Latest recorded software checks passed: **68 Rust tests, 17 isolated terminal checks, installation checks, formatting, check, and build**. Reproduce with:
+Latest recorded software checks passed (2026-10-24): **94 Rust tests, 17 isolated terminal checks, installation checks, formatting, check, and build**. Reproduce with:
 
 ```bash
 cargo fmt --check
@@ -359,6 +376,8 @@ Rust checks use recorded/simulated MIDI, keyboard, feedback, application/audio, 
 | Automatic following while running, offline switch/restart, and held cleanup in the new flow | **Guide 23B/C approved** |
 | Knobs, app launching, output audio, microphone mute, Flow start/repair/continuity, and installed startup/ownership | V2 guides 08 and 10–16 approved; V3 automatic Flow startup and multi-program service await live guides |
 | V5 AI coding controls (agents/tmux prompts, focused-window prompts, commands and risky hold, sequences, choice/value knobs, agent status) | Implemented and simulated only; live checks pending. tmux command forms were exercised on a separate tmux server, and `agent-status` was run for real |
+| V6 (stage-named errors, first-press pads, one Flow command, replace warning, launcher errors and window control, command terminals, status feedback, Settings, variables, Prompts pane) | **All 13 V6 live tests passed** (2026-10-23/24) on the MPK mini 3 under GNOME 50.5 Wayland, including the knob-queue, launcher-restore and dialog-wrap fixes found during testing |
+| Status lights (V5 ticket 14) | Implemented and simulated only; the hardware gate was skipped and the live check is pending |
 | Joystick, transposition, final integration, controlled failures, forced termination, suspend and remaining persistence | Joystick guide 09 partially observed; USB reconnect fix awaits live retest. Others unperformed or blocked; optional login guide 17 deferred |
 
 ➡️ Use [tests-to-do](archive/V2.0/tests-to-do/README.md) for individual procedures and approval checkboxes, [the ticket audit](archive/V2.0/tests-to-do/TICKET-AUDIT.md) for dependencies, and [acceptance.md](archive/V2.0/tests-to-do/acceptance.md) for evidence. Only update acceptance checkboxes after the user's approval. Current behavior and boundaries are in [SPEC.md](archive/V2.0/SPEC.md) and the [ticket index](archive/V2.0/tickets/README.md); earlier MVP evidence remains in [archive/SPEC.md](archive/SPEC.md).

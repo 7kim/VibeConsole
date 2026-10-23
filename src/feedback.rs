@@ -653,6 +653,10 @@ pub struct Controller {
     pub baseline: Option<State>,
     pub program: Option<ProgramObservation>,
     pub status: String,
+    /// The program's idle/per-pad feedback, last asked for through `set`.
+    feedback: Settings,
+    /// Status lights (ticket 14) own the fields while Some; `feedback` waits meanwhile.
+    lights: Option<Settings>,
 }
 impl Controller {
     pub fn start(input: &mut midi::Input) -> Result<Self> {
@@ -863,10 +867,29 @@ impl Controller {
             baseline: None,
             program: None,
             status: "Reading validated Program 0 snapshot; no writes yet".into(),
+            feedback: Settings::default(),
+            lights: None,
         }
     }
+    /// The program's own feedback. Held back, not written, while status lights are on.
     pub fn set(&mut self, settings: Settings) -> Result<()> {
         settings.validate()?;
+        self.feedback = settings;
+        if self.lights.is_some() {
+            return Ok(());
+        }
+        self.send(settings)
+    }
+    /// Status lights replace the program's feedback while Some; None writes it back.
+    pub fn light(&mut self, lights: Option<Settings>) -> Result<()> {
+        if lights == self.lights {
+            return Ok(());
+        }
+        let settings = lights.unwrap_or(self.feedback).validate()?;
+        self.lights = lights;
+        self.send(settings)
+    }
+    fn send(&mut self, settings: Settings) -> Result<()> {
         let (lock, wake) = &*self.work;
         let mut work = lock.lock().unwrap();
         work.revision += 1;
@@ -1154,6 +1177,61 @@ mod tests {
         assert_eq!(listed.len(), 8);
         assert!(listed[3].contains("name unavailable"));
         assert!(listed[0].starts_with("Program 1 —"));
+    }
+
+    /// Ticket 14: status lights replace program feedback, hold back feedback changes while
+    /// lit, write the feedback back when they end, and are restored on finish.
+    #[test]
+    fn status_lights_own_feedback_fields_until_released_and_restore_on_finish() {
+        struct Device(Arc<Mutex<Payload>>);
+        impl Transport for Device {
+            fn read(&mut self) -> Result<Payload> {
+                Ok(*self.0.lock().unwrap())
+            }
+            fn write(&mut self, payload: &Payload) -> Result<()> {
+                *self.0.lock().unwrap() = *payload;
+                Ok(())
+            }
+        }
+        let ram = Arc::new(Mutex::new(payload()));
+        let mut controller = Controller::spawn(Device(ram.clone()));
+        let fields = || {
+            let p = *ram.lock().unwrap();
+            (
+                p[0x13] as i8 - 4,
+                (p[0x1B] as u16) << 7 | p[0x1C] as u16,
+                p[0x14] == 1,
+            )
+        };
+        let wait = |want: (i8, u16, bool)| {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while fields() != want {
+                assert!(Instant::now() < deadline, "{:?} != {want:?}", fields());
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let octave = |n| Settings {
+            octave: Some(n),
+            ..Settings::default()
+        };
+        controller.set(octave(-1)).unwrap(); // idle feedback
+        wait((-1, 120, false));
+        let busy = Settings {
+            octave: Some(1),
+            tempo: Some(240),
+            arp: Some(true),
+        };
+        controller.light(Some(busy)).unwrap();
+        wait((1, 240, true));
+        controller.set(octave(2)).unwrap(); // a pad press while lit: held back
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(fields(), (1, 240, true));
+        controller.light(None).unwrap(); // all agents idle: the pad's feedback comes back
+        wait((2, 120, false));
+        controller.light(Some(busy)).unwrap();
+        wait((1, 240, true));
+        controller.finish().unwrap(); // pause/program change/exit
+        assert_eq!(*ram.lock().unwrap(), payload());
     }
 
     #[test]

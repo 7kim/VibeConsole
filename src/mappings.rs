@@ -508,6 +508,8 @@ pub struct Config {
     /// User variables: expanded as `${NAME}` in command and agent directories, and exported
     /// (with the startup variables) into commands, whose shell expands them.
     pub vars: Vec<(String, String)>,
+    /// Status lights on the controller follow agent status (ticket 14); default On.
+    pub status_lights: bool,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -523,6 +525,7 @@ impl Default for Config {
             agent_dir: None,
             env: Vec::new(),
             vars: Vec::new(),
+            status_lights: true,
         }
     }
 }
@@ -533,6 +536,10 @@ pub struct Agent {
     pub window: String,
     /// Working directory overriding the Settings default; `${NAME}` allowed.
     pub dir: Option<String>,
+    /// Status lights: this agent's octave light (±1..±4) and its tempo blinks (1–300 BPM).
+    pub octave: i8,
+    pub thinking_bpm: u16,
+    pub input_bpm: u16,
 }
 impl Agent {
     pub fn new(name: &str, launch: &str, window: &str) -> Result<Self> {
@@ -551,7 +558,21 @@ impl Agent {
             launch: launch.into(),
             window: window.into(),
             dir: None,
+            // Spec defaults: Claude +1, Codex −1, slow blink thinking, fast blink needs input.
+            octave: if name == "codex" { -1 } else { 1 },
+            thinking_bpm: 50,
+            input_bpm: 240,
         })
+    }
+    pub fn validate_lights(&self) -> Result<()> {
+        if self.octave == 0
+            || !(-4..=4).contains(&self.octave)
+            || !(1..=300).contains(&self.thinking_bpm)
+            || !(1..=300).contains(&self.input_bpm)
+        {
+            return Err("status light octave must be ±1..±4 and tempos 1–300 BPM".into());
+        }
+        Ok(())
     }
 }
 pub fn simple_name(value: &str) -> bool {
@@ -647,6 +668,7 @@ fn validate_agents(agents: &[Agent]) -> Result<()> {
     for agent in agents {
         Agent::new(&agent.name, &agent.launch, &agent.window)?;
         agent.dir.as_deref().map(directory_syntax).transpose()?;
+        agent.validate_lights()?;
         if !names.insert(&agent.name) || !windows.insert(&agent.window) {
             return Err("agent names and tmux windows must be unique".into());
         }
@@ -754,9 +776,10 @@ fn parse_config(contents: &str) -> Result<Config> {
         Some("10") => 10,
         Some("11") => 11,
         Some("12") => 12,
+        Some("13") => 13,
         _ => {
             return Err(
-                "invalid configuration header; expected vibeconsole-mappings-v1..v12".into(),
+                "invalid configuration header; expected vibeconsole-mappings-v1..v13".into(),
             );
         }
     };
@@ -853,6 +876,15 @@ fn parse_config(contents: &str) -> Result<Config> {
         validate_variables(&vars, "user")?;
         agent_dir.as_deref().map(directory_syntax).transpose()?;
     }
+    let status_lights = if version >= 13 {
+        match lines.next().ok_or("missing status-lights setting")? {
+            "status-lights\ton" => true,
+            "status-lights\toff" => false,
+            _ => return Err("expected status-lights on/off setting".into()),
+        }
+    } else {
+        true
+    };
     let agents = if version >= 8 {
         let count: usize = lines
             .next()
@@ -866,15 +898,29 @@ fn parse_config(contents: &str) -> Result<Config> {
         let mut agents = Vec::new();
         for _ in 0..count {
             let fields: Vec<_> = lines.next().ok_or("missing agent")?.split('\t').collect();
-            let (name, launch, window, dir) = match fields.as_slice() {
-                ["agent", name, launch, window] if version < 12 => (name, launch, window, None),
-                ["agent", name, launch, window, dir] if version >= 12 => {
-                    (name, launch, window, (*dir != "-").then(|| dir.to_string()))
+            let (name, launch, window, dir, lights) = match fields.as_slice() {
+                ["agent", name, launch, window] if version < 12 => {
+                    (name, launch, window, None, None)
                 }
+                ["agent", name, launch, window, dir] if version == 12 => {
+                    (name, launch, window, Some(dir), None)
+                }
+                ["agent", name, launch, window, dir, octave, thinking, input] if version >= 13 => (
+                    name,
+                    launch,
+                    window,
+                    Some(dir),
+                    Some((octave, thinking, input)),
+                ),
                 _ => return Err("invalid agent record".into()),
             };
             let mut agent = Agent::new(name, launch, window)?;
-            agent.dir = dir;
+            agent.dir = dir.filter(|dir| **dir != "-").map(|dir| dir.to_string());
+            if let Some((octave, thinking, input)) = lights {
+                agent.octave = octave.parse()?;
+                agent.thinking_bpm = thinking.parse()?;
+                agent.input_bpm = input.parse()?;
+            }
             agents.push(agent);
         }
         agents
@@ -1030,6 +1076,7 @@ fn parse_config(contents: &str) -> Result<Config> {
         agent_dir,
         env,
         vars,
+        status_lights,
     })
 }
 
@@ -1059,7 +1106,7 @@ pub fn save_config(path: &Path, config: &Config) -> Result<()> {
     validate_variables(&config.vars, "user")?;
     config.validate_references()?;
     let mut contents = format!(
-        "vibeconsole-mappings-v12\nidle\t{}\t{}\t{}\n",
+        "vibeconsole-mappings-v13\nidle\t{}\t{}\t{}\n",
         opt_text(config.idle.octave),
         opt_text(config.idle.tempo),
         arp_text(config.idle.arp)
@@ -1094,14 +1141,22 @@ pub fn save_config(path: &Path, config: &Config) -> Result<()> {
             contents.push_str(&format!("{record}\t{name}\t{value}\n"));
         }
     }
+    contents.push_str(if config.status_lights {
+        "status-lights\ton\n"
+    } else {
+        "status-lights\toff\n"
+    });
     contents.push_str(&format!("agents\t{}\n", config.agents.len()));
     for agent in &config.agents {
         contents.push_str(&format!(
-            "agent\t{}\t{}\t{}\t{}\n",
+            "agent\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             agent.name,
             agent.launch,
             agent.window,
-            agent.dir.as_deref().unwrap_or("-")
+            agent.dir.as_deref().unwrap_or("-"),
+            agent.octave,
+            agent.thinking_bpm,
+            agent.input_bpm
         ));
     }
     for mapping in &config.mappings {
@@ -1484,7 +1539,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v12\n")
+                .starts_with("vibeconsole-mappings-v13\n")
         );
         assert!(
             load_config(&path)
@@ -1707,7 +1762,7 @@ mod tests {
         let path = dir.join("mappings.tsv");
         save_config(&path, &config).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
-        assert!(saved.starts_with("vibeconsole-mappings-v12\n"));
+        assert!(saved.starts_with("vibeconsole-mappings-v13\n"));
         assert!(saved.contains("\tflow\t") && !saved.contains("flow-start"));
         assert_eq!(load_config(&path).unwrap(), config);
         fs::remove_dir_all(dir).unwrap();
@@ -1733,7 +1788,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v12\n")
+                .starts_with("vibeconsole-mappings-v13\n")
         );
         assert_eq!(load_config(&path).unwrap(), config);
         fs::remove_dir_all(dir).unwrap();
@@ -1754,7 +1809,7 @@ mod tests {
         let path = dir.join("mappings.tsv");
         save_config(&path, &config).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v12\n") && text.contains("\tstatus\n"));
+        assert!(text.starts_with("vibeconsole-mappings-v13\n") && text.contains("\tstatus\n"));
         assert_eq!(load_config(&path).unwrap(), config);
         let pad = Control::from_note(10, 37).unwrap();
         for (action, observable) in [
@@ -1831,7 +1886,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v12\n")
+                .starts_with("vibeconsole-mappings-v13\n")
         );
         assert_eq!(load_config(&path).unwrap(), config);
         // ${NAME}: user variable, then startup variable; other text stays; no environment.
