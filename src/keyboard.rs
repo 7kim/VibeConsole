@@ -93,13 +93,7 @@ impl Keyboard {
         Ok(Self {
             assignments,
             down: HashSet::new(),
-            blocked: mappings
-                .iter()
-                .filter(|m| {
-                    m.behavior == Behavior::Trigger && m.control.message == crate::Message::Note
-                })
-                .map(|m| m.control)
-                .collect(),
+            blocked: HashSet::new(),
             held: HashSet::new(),
             running: true,
             armed: HashMap::new(),
@@ -313,22 +307,9 @@ impl Keyboard {
     ) -> Result<bool> {
         self.replace(mappings)?;
         self.block_down(down);
-        let fresh = std::mem::take(reconnected);
-        if fresh {
-            self.block_reconnected();
-        }
-        Ok(fresh)
-    }
-
-    pub(crate) fn block_reconnected(&mut self) {
-        // ponytail: no verified held-pad snapshot; require an observed release for
-        // every pad after reconnect. Replace with a verified snapshot when available.
-        self.blocked = self
-            .assignments
-            .iter()
-            .filter(|a| a.control.message == crate::Message::Note)
-            .map(|a| a.control)
-            .collect();
+        // A pad held through the transition sends no new note-on, so it cannot fire until
+        // pressed again; queued input is drained while output is still paused.
+        Ok(std::mem::take(reconnected))
     }
 
     pub(crate) fn active(&self, control: Control) -> bool {
@@ -547,8 +528,8 @@ mod tests {
         };
         assert_eq!(
             keyboard.observe(Event::Press(pad), &mut emit).unwrap(),
-            None
-        ); // first startup tap only arms
+            Some((pad, true))
+        ); // the first startup press fires
         keyboard
             .observe(Event::Release(pad, ReleaseType::NoteOff), &mut emit)
             .unwrap();
@@ -715,7 +696,7 @@ mod tests {
     }
 
     #[test]
-    fn context_switch_releases_latch_and_requires_new_context_release() {
+    fn context_switch_releases_latch_and_new_context_fires_on_first_press() {
         let old = Control::from_note(10, 36).unwrap();
         let new = Control::note(3, 60).unwrap();
         let mut keyboard = Keyboard::new(&[Mapping::new(old, "Shift", "toggle").unwrap()]).unwrap();
@@ -729,7 +710,6 @@ mod tests {
         keyboard
             .replace(&[Mapping::new(new, "Ctrl", "hold").unwrap()])
             .unwrap();
-        keyboard.block_reconnected();
         keyboard.resume();
         keyboard.observe(Event::Press(new), &mut emit).unwrap();
         keyboard
@@ -743,13 +723,15 @@ mod tests {
                 (KeyCode::KEY_LEFTSHIFT, true),
                 (KeyCode::KEY_LEFTSHIFT, false),
                 (KeyCode::KEY_LEFTCTRL, true),
+                (KeyCode::KEY_LEFTCTRL, false),
+                (KeyCode::KEY_LEFTCTRL, true),
                 (KeyCode::KEY_LEFTCTRL, false)
             ]
         );
     }
 
     #[test]
-    fn disconnect_reconnect_is_inactive_and_waits_for_release_without_replaying_toggles() {
+    fn disconnect_reconnect_starts_inactive_and_first_press_fires_without_replaying_toggles() {
         let a = Control::from_note(10, 36).unwrap();
         let b = Control::from_note(10, 44).unwrap();
         let mappings = [
@@ -771,7 +753,7 @@ mod tests {
                 .unwrap()
         );
         keyboard.resume();
-        // Unknown already-held pads and repeats after reconnect cannot reactivate.
+        // The toggle latched before the disconnect is not replayed; the first press fires; repeats do not.
         keyboard.observe(Event::Press(a), &mut emit).unwrap();
         keyboard.observe(Event::Press(a), &mut emit).unwrap();
         keyboard
@@ -779,11 +761,11 @@ mod tests {
             .unwrap();
         keyboard
             .observe(Event::UnmatchedRelease(b), &mut emit)
-            .unwrap(); // observed release arms a pad even without a received press
+            .unwrap(); // a release whose press was not observed sends nothing
         keyboard.observe(Event::Press(a), &mut emit).unwrap();
         keyboard.observe(Event::Press(b), &mut emit).unwrap();
         keyboard.pause(&mut emit).unwrap();
-        // Ordinary resume must not guard already-armed, released pads again.
+        // Ordinary resume: released pads fire on their next press.
         keyboard
             .observe(Event::Release(a, ReleaseType::NoteOff), &mut emit)
             .unwrap();
@@ -804,9 +786,9 @@ mod tests {
                 (KeyCode::KEY_LEFTSHIFT, true),
                 (KeyCode::KEY_LEFTSHIFT, false),
                 (KeyCode::KEY_LEFTSHIFT, true),
+                (KeyCode::KEY_LEFTSHIFT, false),
                 (KeyCode::KEY_LEFTCTRL, true),
                 (KeyCode::KEY_LEFTCTRL, false),
-                (KeyCode::KEY_LEFTSHIFT, false),
                 (KeyCode::KEY_LEFTCTRL, true),
                 (KeyCode::KEY_LEFTCTRL, false)
             ]
@@ -1125,7 +1107,6 @@ mod tests {
         .unwrap();
         command.risky = true;
         let mut keyboard = Keyboard::new(&[shift, command]).unwrap();
-        keyboard.blocked.clear(); // as after the first real release
         let mut sent = Vec::new();
         let mut emit = |key, down| {
             sent.push((key, down));
@@ -1198,6 +1179,86 @@ mod tests {
             [
                 (KeyCode::KEY_LEFTSHIFT, true),
                 (KeyCode::KEY_LEFTSHIFT, false)
+            ]
+        );
+    }
+
+    /// Ticket 03: the first press after start, resume, reconnect or program change fires;
+    /// a pad held through the transition fires only when pressed again.
+    #[test]
+    fn pads_fire_on_first_press_after_every_transition_but_held_pads_wait() {
+        let trigger = Control::from_note(10, 37).unwrap();
+        let hold = Control::from_note(10, 36).unwrap();
+        let maps = [
+            Mapping::new(hold, "Shift", "hold").unwrap(),
+            Mapping::new_action(
+                trigger,
+                crate::mappings::Input::Pad,
+                crate::actions::Action::OutputMute,
+            )
+            .unwrap(),
+        ];
+        let mut sent = Vec::new();
+        let mut emit = |key, down| {
+            sent.push((key, down));
+            Ok(())
+        };
+        let release = |pad| Event::Release(pad, ReleaseType::NoteOff);
+        let mut keyboard = Keyboard::new(&maps).unwrap(); // start
+        for transition in ["start", "resume", "reconnect", "program change"] {
+            match transition {
+                "resume" => keyboard.pause(&mut emit).unwrap(),
+                "reconnect" => {
+                    keyboard.pause(&mut emit).unwrap();
+                    let mut reconnected = true;
+                    keyboard
+                        .prepare_connection(&maps, &HashSet::new(), &mut reconnected)
+                        .unwrap();
+                }
+                "program change" => {
+                    keyboard.pause(&mut emit).unwrap();
+                    keyboard.replace(&maps).unwrap();
+                }
+                _ => {}
+            }
+            keyboard.resume();
+            assert_eq!(
+                keyboard.observe(Event::Press(trigger), &mut emit).unwrap(),
+                Some((trigger, true)),
+                "{transition}"
+            );
+            keyboard.observe(release(trigger), &mut emit).unwrap();
+        }
+        // Held through a pause: its release sends nothing; the next press fires.
+        keyboard.observe(Event::Press(hold), &mut emit).unwrap();
+        keyboard.pause(&mut emit).unwrap();
+        keyboard.resume();
+        assert_eq!(keyboard.observe(release(hold), &mut emit).unwrap(), None);
+        // Down when a fresh connection is prepared: the same.
+        keyboard.pause(&mut emit).unwrap();
+        let mut reconnected = true;
+        keyboard
+            .prepare_connection(&maps, &HashSet::from([hold]), &mut reconnected)
+            .unwrap();
+        keyboard.resume();
+        assert_eq!(
+            keyboard.observe(Event::Press(hold), &mut emit).unwrap(),
+            None
+        );
+        assert_eq!(keyboard.observe(release(hold), &mut emit).unwrap(), None);
+        assert_eq!(
+            keyboard.observe(Event::Press(hold), &mut emit).unwrap(),
+            Some((hold, true))
+        );
+        keyboard.pause(&mut emit).unwrap();
+        use KeyCode as K;
+        assert_eq!(
+            sent,
+            [
+                (K::KEY_LEFTSHIFT, true),
+                (K::KEY_LEFTSHIFT, false),
+                (K::KEY_LEFTSHIFT, true),
+                (K::KEY_LEFTSHIFT, false)
             ]
         );
     }

@@ -61,6 +61,22 @@ fn unit() -> Result<PathBuf> {
     }
     Ok(base.join("systemd/user/vibeconsole.service"))
 }
+const EXTENSION_UUID: &str = "vibeconsole@vibeconsole.local";
+const EXTENSION_FILES: [(&str, &str); 2] = [
+    ("metadata.json", include_str!("../extension/metadata.json")),
+    ("extension.js", include_str!("../extension/extension.js")),
+];
+/// The window-control Shell extension that launcher pads use for minimize/close/restore.
+fn extension_dir() -> Result<PathBuf> {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or(home()?.join(".local/share"));
+    if !base.is_absolute() {
+        return Err("XDG_DATA_HOME must be absolute".into());
+    }
+    Ok(base.join("gnome-shell/extensions").join(EXTENSION_UUID))
+}
 fn service() -> &'static str {
     "# Managed by VibeConsole\n[Unit]\nDescription=VibeConsole controller shortcuts\nAfter=graphical-session-pre.target pipewire.service wireplumber.service\nPartOf=graphical-session.target\n\n[Service]\nType=simple\nExecStart=\"%h/.local/bin/vibeconsole\" daemon\nRestart=no\n# amidi must outlive SIGTERM so handled shutdown can restore controller feedback\nKillMode=mixed\nTimeoutStopSec=15\n\n[Install]\nWantedBy=graphical-session.target\n"
 }
@@ -117,6 +133,15 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                 "Installed {}. Installation does not enable/start login startup. Add ~/.local/bin to PATH if needed.",
                 binary.display()
             );
+            let extension = extension_dir()?;
+            fs::create_dir_all(&extension)?;
+            for (name, text) in EXTENSION_FILES {
+                fs::write(extension.join(name), text)?;
+            }
+            println!(
+                "Window control extension installed in {}. Launcher pads minimize/close only once it is enabled: log out and in once (GNOME Wayland loads new extensions at login), then run: gnome-extensions enable {EXTENSION_UUID}",
+                extension.display()
+            );
         }
         "startup-enable" => {
             if !binary.is_file() {
@@ -152,7 +177,13 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
             if binary.exists() {
                 fs::remove_file(&binary)?;
             }
-            println!("Removed VibeConsole executable/service; saved mappings preserved.");
+            let extension = extension_dir()?;
+            if extension.exists() {
+                fs::remove_dir_all(&extension)?;
+            }
+            println!(
+                "Removed VibeConsole executable/service and window extension; saved mappings preserved."
+            );
         }
         "doctor" => {
             println!(
@@ -202,6 +233,30 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                 crate::mappings::load(&crate::mappings::config_path()?)?.len()
             );
             println!("Agent terminals: tmux attach -t vibe");
+            let answering = Command::new("gdbus")
+                .args([
+                    "call",
+                    "--session",
+                    "--dest",
+                    "org.freedesktop.DBus",
+                    "--object-path",
+                    "/org/freedesktop/DBus",
+                    "--method",
+                    "org.freedesktop.DBus.NameHasOwner",
+                    "org.vibeconsole.Windows",
+                ])
+                .output()
+                .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("true"));
+            println!(
+                "Window control extension: {}",
+                if answering {
+                    "answering (launcher minimize/close available)".to_string()
+                } else {
+                    format!(
+                        "not answering; after vibeconsole install, log out/in and run gnome-extensions enable {EXTENSION_UUID}"
+                    )
+                }
+            );
         }
         _ => return Err("unknown setup command".into()),
     }
@@ -223,5 +278,12 @@ mod tests {
         assert!(!service().contains("--feedback") && !service().contains("--start-flow"));
         assert!(service().contains("Restart=no"));
         assert!(service().contains("KillMode=mixed"));
+        // The installed extension's directory name must match its metadata uuid.
+        assert!(
+            EXTENSION_FILES[0]
+                .1
+                .contains(&format!("\"uuid\": \"{EXTENSION_UUID}\""))
+        );
+        assert!(EXTENSION_FILES[1].1.contains("org.vibeconsole.Windows"));
     }
 }

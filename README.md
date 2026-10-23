@@ -112,7 +112,7 @@ Highlight commands with Up/Down and press Enter. These are menu entries, not she
 | Menu command | Purpose |
 |---|---|
 | `/configure` | Learn controls; edit, save, or explicitly remove assignments |
-| Run / Pause | One entry: Run when paused, Pause when running; Run verifies the program, keeps piano confirmation, and requires a fresh press before activation |
+| Run / Pause | One entry: Run when paused, Pause when running; Run verifies the program, keeps piano confirmation; the first press after Run fires |
 | `/pause` | Direct pause command: release synthetic keys, cancel pending mapped actions, and remain paused |
 | `/release-all` | Clear holds/toggles while retaining running mode |
 | `/list` | Inspect saved mappings and toggle states |
@@ -123,8 +123,7 @@ Highlight commands with Up/Down and press Enter. These are menu entries, not she
 | `/feedback-idle` | Configure the selected program's idle musical settings |
 | `/feedback-check` | Run the bounded original-program feedback/restoration trial |
 | Start Wispr Flow with VibeConsole | Toggle automatic startup for interactive sessions and the login service; default On |
-| `/start-flow` | Prepare the virtual keyboard, start Flow if absent, and check helper capture |
-| `/repair-flow` | Pause output and explicitly request targeted graceful Flow reopening |
+| Start or repair Wispr Flow | Start Flow if it is not running, or quit and reopen it once if it is; check helper capture; resume on success |
 | `/quit` | Release keys, attempt owned-feedback restoration, and restore the terminal |
 
 Esc cancels/returns; Ctrl+C performs handled shutdown. Configuration has learning and saved-assignment panes, with Tab/Left/Right navigation. The interface supports narrow layouts, a minimum 40×16 terminal size, and `NO_COLOR=1`. Only changed screen rows are redrawn.
@@ -156,7 +155,7 @@ Absolute knobs emit at most one immediate shortcut pulse per sample crossing a c
 | Hold | Hold assigned keys | Release this control's ownership | Hold again |
 | Toggle | Latch assigned keys | Keep them held | Release the latch |
 
-Shared keys remain down until their final owner releases them. Modifiers go down before other chord keys and come up afterward. Pressure and duplicate presses do not acquire extra ownership. Startup/resume/program transitions/reconnect never replay old toggles; an initial press/release may only arm a Note control.
+Shared keys remain down until their final owner releases them. Modifiers go down before other chord keys and come up afterward. Pressure and duplicate presses do not acquire extra ownership. Startup/resume/program transitions/reconnect never replay old toggles or earlier presses. The first press after a transition fires; a pad held through the transition fires only when pressed again.
 
 Recording reads physical keyboard devices only for the capture step, excludes virtual keyboards, and keeps no keystroke log. Release all keys before recording, then press/release one chord. Use, Retry, and Cancel happen after capture closes; unfinished capture times out after 60 seconds. Recording **does not suppress real desktop shortcuts**. Escape can be recorded; choose Ctrl+C through menus because it exits the session.
 
@@ -178,7 +177,9 @@ Names represent physical keyboard keys; the desktop layout determines the result
 
 ## 🔊 Application and audio actions
 
-Launch application lists installed visible desktop entries by name and saves their exact identifier/path. GIO performs native desktop launching; VibeConsole does not run a parsed `Exec` line as a shell command. A successful launch request is separate from an observed window or application readiness. Start/Repair Wispr Flow are also selectable application actions.
+Launch application lists installed visible desktop entries by name and saves their exact identifier/path. GIO performs native desktop launching; VibeConsole does not run a parsed `Exec` line as a shell command. A successful launch request is separate from an observed window or application readiness. A failed launch says whether the entry is **missing** (file gone), **rejected** (hidden, NoDisplay, not for this desktop, or its TryExec program is missing) or **failed to start** (GIO's error). **Start or repair Wispr Flow** is also selectable here.
+
+**Second press (window control).** A launcher pad also chooses **Minimize** or **Close**. Each press asks the VibeConsole GNOME Shell extension about the app's windows: none → launch; minimized or behind other windows → restore and raise; focused → minimize or close (a polite close; the app may ask to save). GNOME on Wayland lets no ordinary app do this, so the extension does it inside GNOME Shell and offers it on the session bus as `org.vibeconsole.Windows`. `vibeconsole install` copies it to `~/.local/share/gnome-shell/extensions/vibeconsole@vibeconsole.local`; log out and in once, then run `gnome-extensions enable vibeconsole@vibeconsole.local`. `vibeconsole doctor` reports whether it answers. Without it, a launcher pad still launches and reports that minimize/close is unavailable. Windows are matched to the app by GNOME's own app tracking, so a press acts on all of that app's windows, including ones you opened yourself. Sequence steps only launch.
 
 Audio choices are **Output volume up**, **Output volume down**, **Output mute**, and **Microphone mute**. Volume steps are selectable from 1–100%; ordinary output volume is capped at 100%. `wpctl` resolves the current default sink/source at activation, changes that exact object, and reads it back. Calibrated knob directions support audio actions per movement step.
 
@@ -188,14 +189,14 @@ These actions use **Trigger**, not synthetic hold/toggle semantics. A fresh pad/
 
 ## 🤖 AI coding controls (V5)
 
-**Agents** (Configure → **Agents**) have a name, a launch command, and a tmux window name; defaults are `claude` and `codex`. All agents run in one tmux session, `vibe`, which VibeConsole creates as needed but never attaches: watch it with `tmux attach -t vibe`.
+**Agents** (Configure → **Agents**) have a name, a launch command, and a tmux window name; defaults are `claude` and `codex`. All agents run in one tmux session, `vibe`, which VibeConsole creates as needed: watch it with `tmux attach -t vibe`.
 
 New actions in `/configure` → **Action family**:
 
 | Action | What a press does |
 |---|---|
 | **Prompt** | Sends a saved prompt file. Target an agent (starts its window if missing, pastes with tmux bracketed paste, then optional Enter) or the **focused window** (copies with `wl-copy`, presses Ctrl+V or Ctrl+Shift+V on VibeConsole's keyboard, then optional Enter). Focus decides where a focused-window prompt lands; the previous clipboard is not restored. |
-| **Run command in tmux** | Runs one command line with `sh -c` in a new `vibe` window named after the pad, in a chosen absolute directory. The window stays open after it exits. |
+| **Run command in tmux** | Runs one command line with `sh -c` in a new `vibe` window named after the pad, in a chosen absolute directory. The window stays open after it exits. If no terminal is attached to `vibe`, VibeConsole opens one (Ptyxis, else the first installed terminal entry) running `tmux attach-session -t =vibe`; if that fails the notice says **sent to tmux, not shown**. |
 | **Sequence of steps** | Runs up to 32 steps in order: ensure agent, prompt, command, launch application, shortcut, wait 100–60000 ms. A failing step stops the rest; a re-press while running is ignored. |
 | **Choice knob** | Splits an absolute knob into 2–16 zones, one prompt each (e.g. `/model opus`). Resting 300 ms in a new zone sends that prompt once; sweeping sends nothing. |
 | **Value knob** | Writes the knob position, scaled to min–max with chosen decimals, to a file as `0.42` plus newline (atomic replace), for your own scripts. |
@@ -203,6 +204,19 @@ New actions in `/configure` → **Action family**:
 Prompts are plain UTF-8 files in `$XDG_CONFIG_HOME/vibeconsole/prompts/` (default `~/.config/vibeconsole/prompts/`); **New/Edit** opens `$VISUAL`, `$EDITOR`, or `nano`. Content is read at press time; empty or missing files show an error and send nothing.
 
 Any pad or piano mapping can fire **Held for 1 second (risky)**: an earlier release sends nothing, the screen shows arming progress, and pause, program change, disconnect, and exit cancel it. Prompt, command, and sequence actions fire once per press; pause cancels work not yet sent.
+
+**Settings** (Configure → **Settings**) holds:
+
+- **Default agent directory**: agents start there. Each agent can override it in Agents (**Working directory**). Override, else default, else tmux's own default. A directory must exist when you save it.
+- **Start Wispr Flow with VibeConsole** (the same toggle as in the Wispr Flow group).
+- **Startup variables** (`NAME=value`): exported with `tmux -e` into every agent and command VibeConsole starts.
+- **User variables**: `${NAME}` in a command's directory or an agent directory is replaced by the user variable, else the startup variable; an unknown name is refused when you save. Both lists are also exported into every agent's and command's environment, so command lines use them as ordinary shell variables (`"$NAME"`, quoted as you need). VibeConsole never rewrites a command line, so shell variables like `${f}` in a loop keep working.
+
+Names are letters, digits and `_`, not starting with a digit; values are one line. Every save is atomic. An invalid entry shows **Not saved: …** and changes nothing.
+
+**Prompts** (Agents → **Prompts**) lists the saved prompts. **Read** shows one, **New** and **Edit** open your editor on a hidden copy that replaces the prompt only when the editor succeeds and the text is not empty, and **Delete** asks first and names every mapping or sequence that uses the prompt. Names cannot contain `/` or start with `.`.
+
+**Status feedback.** Commands, prompts to an agent, sequences, launchers and Wispr Flow can show their state in the live pane (`Status Bank A Pad 5: running`). Turn it on per mapping in `/configure` (after **Fire when**). States: **sent** (press accepted, worker not done), **running** (the command's or agent's tmux pane is alive, the sequence is still queued or running, the app has windows per the window extension, or Flow's app process runs), **stopped** (none of that, e.g. after `tmux kill-server`), **failed** (the last press failed), **unavailable** (state cannot be read, e.g. launcher without the window extension). Running is re-read every 500 ms, never stored. Shortcuts, focused-window prompts, audio actions and knob dials have no observable state, so the option is not offered for them.
 
 **Agent status.** Agents → **Claude Code status hooks** / **Codex status hooks** shows hook settings and copies them with `wl-copy`; merge them into `~/.claude/settings.json` and `~/.codex/hooks.json` yourself (VibeConsole never edits them). Hooks call `vibeconsole agent-status - <state>`, which only reports for windows VibeConsole started (they carry `VIBECONSOLE_AGENT`), so other Claude/Codex sessions do not change status. The screen shows `Agents: claude thinking · codex FINISHED`; finished clears when the attached `vibe` session shows that agent's window or a mapping sends to that agent. Status lights on the controller are not implemented yet (they await a hardware gate).
 
@@ -224,11 +238,11 @@ These are **real musical settings**, not independent pad LEDs. Temporary feedbac
 
 ## 🎙️ Wispr Flow
 
-Use a pad mapped to **Shift / hold** with Flow's Shift push-to-talk binding. `/start-flow` creates/retains the paused virtual keyboard, starts Flow if absent, and checks whether its helper opened the current device. Starting an already-running Flow is not a repair.
+Use a pad mapped to **Shift / hold** with Flow's Shift push-to-talk binding. **Start or repair Wispr Flow** (menu or pad action) creates/retains the virtual keyboard, releases keys and pauses output, starts Flow if it is not running or performs one graceful quit/reopen if it is, and checks whether its helper opened the current device. On confirmed capture the session returns to running if it was running; on failure it stays paused and shows the failed stage. Mappings saved with the old separate start/repair actions load as this command.
 
 Automatic Flow startup is On by default. VibeConsole creates its keyboard first, starts Flow if closed, or performs one graceful quit/reopen if Flow is already running. Output waits for helper capture; `--paused` stays paused. If Flow is not installed, startup continues and the header reports it. The menu setting controls both interactive and service startup.
 
-`/repair-flow` first releases synthetic keys and pauses, then requests the intended app's graceful quit, waits boundedly for the app/helper to stop, and launches it again. It does not force-kill processes, reset settings, modify third-party files, or restart unrelated apps. Both commands finish paused; check physical Shift and actual dictation before explicitly resuming.
+The repair path requests the intended app's graceful quit, waits boundedly for the app/helper to stop, and launches it again. It does not force-kill processes, reset settings, modify third-party files, or restart unrelated apps, and it never retries in a loop.
 
 Ordinary configuration, pause/run, context changes, and MIDI reconnect retain the virtual keyboard without another automatic Flow repair. If startup recovery fails, its stage and manual fallback are reported and output stays paused: fully quit Flow, keep VibeConsole's keyboard ready, reopen Flow, test physical Shift, then select Run. Helper capture is not proof of listening or dictated text. The inspected adapter targets the installed `/usr/lib/wispr-flow` package; application updates may require rechecking it. Manual Start/Repair and ordinary continuity passed V2 user acceptance in guides 13–15; automatic startup awaits its V3 live guide.
 
@@ -285,6 +299,8 @@ vibeconsole startup-disable
 
 Only opt in when this scope matches your setup. Live login behavior remains unverified. Service configuration is inspectable/removable, unmanaged units are not overwritten, and mappings survive uninstall. Stop the service before starting a foreground owner; a new process creates a new keyboard and may require Flow discovery/recovery.
 
+**Running in the background.** The service has no screen: notices, errors and status feedback lines (`Status Bank A Pad 5: running`) go to `journalctl --user -u vibeconsole.service`. When it starts the `vibe` tmux server or opens a terminal, it does so in its own systemd scope (`systemd-run --user --scope`), because stopping a service kills everything left in its group. Agents, commands and opened terminals therefore survive `vibeconsole startup-stop`. Apps launched from pads get their own scope from GLib anyway. After a Flow pad's capture, the service resumes output for any detected non-piano program.
+
 ---
 
 ## 💾 Saved configuration
@@ -305,11 +321,11 @@ Do not concurrently edit an active configuration. If an interrupted save leaves 
 |---|---|
 | No controller / busy port | Check USB and `amidi --list-devices`; close competing MIDI readers/editors |
 | Current program unresolved | Wait for detection; identical presets or edited RAM may require explicit `/prog-select` |
-| First tap does nothing | It may only arm the Note control; release, then press again |
+| First tap does nothing | Check the header says `RUNNING` and the program is verified; a pad held through Run/resume fires only when pressed again |
 | Unexpected pad identity | Inspect emitted channel/note/release; do not assume the original bank labels apply to every preset |
 | Cannot create keyboard | Check `/dev/uinput` access; do not run the full application as root |
 | Cannot record shortcut | Check the named physical keyboard node's read permission or select keys through menus |
-| Shift works in an editor but not Flow | Test `/start-flow` or explicit `/repair-flow`; verify actual push-to-talk separately |
+| Shift works in an editor but not Flow | Use **Start or repair Wispr Flow**; verify actual push-to-talk separately |
 | Installed command behaves differently | Rebuild, quit VibeConsole, then install the new local executable |
 | Program changes feel delayed | Allow polling plus response/re-identification time; check the verified header before playing mapped controls |
 
