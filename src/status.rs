@@ -3,7 +3,13 @@ use crate::Result;
 use crate::feedback::Settings;
 use std::path::{Path, PathBuf};
 
-pub const STATES: [&str; 4] = ["idle", "thinking", "needs-input", "finished"];
+pub const STATES: [&str; 5] = [
+    "idle",
+    "thinking",
+    "needs-input",
+    "finished",
+    "needs-decision",
+];
 /// Set in every tmux window VibeConsole launches, so hooks from other sessions are ignored.
 pub const AGENT_ENV: &str = "VIBECONSOLE_AGENT";
 
@@ -47,11 +53,13 @@ pub fn command(args: &[String]) -> Result<()> {
         [agent, state] | [agent, state, _] => (agent.clone(), state.as_str()),
         _ => return Err("usage: vibeconsole agent-status <agent|-> <state>".into()),
     };
+    // SessionEnd: the agent is gone; nothing waits on it any more.
+    let state = if state == "ended" { "idle" } else { state };
     let hook = agent == "-";
     let agent = if hook {
         match std::env::var(AGENT_ENV) {
             Ok(name) if !name.is_empty() => name,
-            _ => return Ok(()),
+            _ => return session_hook(state),
         }
     } else {
         agent
@@ -69,9 +77,172 @@ pub fn command(args: &[String]) -> Result<()> {
     // daemon, started from the agent's window and then used by other Codex clients. Only a
     // live pane in the agent's own `vibe` window may report.
     if hook && !own_window(pane_window().as_deref(), &window) {
-        return Ok(());
+        return session_hook(state);
     }
     write(&agent, state)
+}
+
+/// Ticket 16: a hook from a session VibeConsole did not start reports by `session_id` and
+/// `cwd` from the hook's stdin JSON. Which folder source it lights is decided when read, so
+/// Settings changes apply at once. Without hook input (a terminal) nothing is recorded.
+fn session_hook(state: &str) -> Result<()> {
+    // SAFETY: isatty only inspects descriptor 0.
+    if unsafe { libc::isatty(0) } == 1 {
+        return Ok(());
+    }
+    let mut input = String::new();
+    std::io::Read::read_to_string(
+        &mut std::io::Read::take(std::io::stdin(), 1 << 20),
+        &mut input,
+    )?;
+    session_report(&dir()?, &input, state, agent_process())
+}
+
+fn session_report(dir: &Path, input: &str, state: &str, pid: u32) -> Result<()> {
+    if !STATES.contains(&state) {
+        return Err(format!("unknown agent state {state:?}; use {}", STATES.join(", ")).into());
+    }
+    if input.trim().is_empty() {
+        return Ok(()); // no hook payload: nothing to attribute
+    }
+    let hook: serde_json::Value = serde_json::from_str(input)?;
+    let (Some(id), Some(cwd)) = (hook["session_id"].as_str(), hook["cwd"].as_str()) else {
+        return Ok(()); // not a hook payload: nothing to attribute
+    };
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        || cwd.contains(['\t', '\n'])
+    {
+        return Err("invalid session_id or cwd in hook input".into());
+    }
+    let file = dir.join(format!("session-{id}"));
+    if state == "idle" {
+        return match std::fs::remove_file(&file) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        };
+    }
+    std::fs::create_dir_all(dir)?;
+    crate::actions::write_atomic(&file, &format!("{state}\t{pid}\t{cwd}\n"))
+}
+
+/// The Claude Code or Codex process this hook runs under (it runs hooks through a shell), or
+/// 0 when none is found; a session whose process is gone is dropped.
+fn agent_process() -> u32 {
+    // SAFETY: getppid has no preconditions.
+    let mut pid = unsafe { libc::getppid() } as u32;
+    for _ in 0..8 {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return 0;
+        };
+        let (Some(open), Some(close)) = (stat.find('('), stat.rfind(')')) else {
+            return 0;
+        };
+        if matches!(&stat[open + 1..close], "claude" | "codex") {
+            return pid;
+        }
+        match stat[close + 1..]
+            .split_whitespace()
+            .nth(1)
+            .and_then(|p| p.parse().ok())
+        {
+            Some(parent) if parent > 1 => pid = parent,
+            _ => return 0,
+        }
+    }
+    0
+}
+
+/// A session outside VibeConsole's tmux: its state and working folder.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Session {
+    pub state: &'static str,
+    pub cwd: String,
+}
+
+/// Recorded sessions, dropping those whose agent process is gone.
+pub fn sessions() -> Vec<Session> {
+    dir()
+        .map(|d| sessions_in(&d, |pid| Path::new(&format!("/proc/{pid}")).exists()))
+        .unwrap_or_default()
+}
+
+fn sessions_in(dir: &Path, alive: impl Fn(u32) -> bool) -> Vec<Session> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with("session-") {
+            continue;
+        }
+        let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+        let mut fields = text.trim_end_matches('\n').splitn(3, '\t');
+        let (Some(state), Some(pid), Some(cwd)) = (fields.next(), fields.next(), fields.next())
+        else {
+            let _ = std::fs::remove_file(entry.path());
+            continue;
+        };
+        let state = STATES.into_iter().find(|s| *s == state);
+        let pid = pid.parse::<u32>().ok();
+        // ponytail: no process found (pid 0) relies on SessionEnd; a crash then leaves the
+        // state until the next prompt in that session. Add an age limit if that bites.
+        match (state, pid) {
+            (Some(state), Some(pid)) if pid == 0 || alive(pid) => found.push(Session {
+                state,
+                cwd: cwd.to_owned(),
+            }),
+            _ => {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    found
+}
+
+/// Per light source, the most urgent state of the sessions it matches: the most specific
+/// folder containing the session's `cwd`, else Every other session when it is on (one entry
+/// per session folder). Returns (folder, state, octave) for busy sources only.
+pub fn source_states(
+    sessions: &[Session],
+    folders: &[(String, i8)],
+    other: Option<i8>,
+) -> Vec<(String, &'static str, i8)> {
+    // `BUSY` order, matching `lights`: lower index is more urgent.
+    let urgency = |state: &str| {
+        std::cmp::Reverse(BUSY.iter().position(|s| *s == state).unwrap_or(BUSY.len()))
+    };
+    let mut busy: Vec<(String, &'static str, i8)> = Vec::new();
+    for session in sessions.iter().filter(|s| s.state != "idle") {
+        let folder = folders
+            .iter()
+            .filter(|(folder, _)| within(&session.cwd, folder))
+            .max_by_key(|(folder, _)| folder.len());
+        let (name, light) = match (folder, other) {
+            (Some((folder, light)), _) => (folder.clone(), *light),
+            // Every other session: one entry per project folder, named by it on screen.
+            (None, Some(light)) => (session.cwd.clone(), light),
+            (None, None) => continue,
+        };
+        match busy.iter_mut().find(|(n, _, _)| *n == name) {
+            Some(entry) if urgency(session.state) > urgency(entry.1) => entry.1 = session.state,
+            Some(_) => {}
+            None => busy.push((name, session.state, light)),
+        }
+    }
+    busy
+}
+
+/// `cwd` is `folder` or inside it, by whole path components.
+fn within(cwd: &str, folder: &str) -> bool {
+    let folder = folder.trim_end_matches('/');
+    cwd == folder
+        || cwd
+            .strip_prefix(folder)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// `session<TAB>window` of the pane in $TMUX_PANE, None when there is no such live pane.
@@ -145,41 +316,139 @@ pub fn tmux_active() -> Option<(bool, String)> {
     Some((attached != "0", window.into()))
 }
 
-/// Ticket 14 (V5 spec decision 7): agent states to tempo/arpeggiator/octave settings.
-/// None when every agent is idle, so the program's own feedback shows. `second` counts whole
-/// seconds and drives the octave alternation.
-/// - Tempo/arpeggiator: needs input (fast) > thinking (slow) > off.
-/// - Octave: needs input holds that agent's octave steady (several alternate between them);
-///   otherwise one finished agent blinks between its octave and 0, several alternate.
-// ponytail: one-second alternation and spec-default tempos, not yet checked on hardware
-// (tests/v5/07 gate unrecorded); a faster interval waits for the gate's measured limit.
-pub fn lights(agents: &[(&str, &crate::mappings::Agent)], second: u64) -> Option<Settings> {
-    let with = |state: &str| {
-        agents
-            .iter()
-            .filter(|(s, _)| *s == state)
-            .map(|(_, agent)| *agent)
-            .collect::<Vec<_>>()
-    };
-    let (input, thinking, finished) = (with("needs-input"), with("thinking"), with("finished"));
-    if input.is_empty() && thinking.is_empty() && finished.is_empty() {
+/// The tempo light per state (ticket 17): slow and fast are the two BPM values in Patterns.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Tempo {
+    Off,
+    Slow,
+    Fast,
+}
+/// The octave light per state, on the source's own octave (which agent or folder).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Octave {
+    Off,
+    Steady,
+    Blink,
+    /// The source's octave and its negative, twice a second ("needs a decision").
+    Alternate,
+}
+pub const TEMPOS: [(&str, Tempo); 3] = [
+    ("off", Tempo::Off),
+    ("slow", Tempo::Slow),
+    ("fast", Tempo::Fast),
+];
+pub const OCTAVES: [(&str, Octave); 4] = [
+    ("off", Octave::Off),
+    ("steady", Octave::Steady),
+    ("blink", Octave::Blink),
+    ("alternate", Octave::Alternate),
+];
+pub fn tempo_word(tempo: Tempo) -> &'static str {
+    TEMPOS
+        .iter()
+        .find(|(_, t)| *t == tempo)
+        .map_or("off", |(w, _)| w)
+}
+pub fn octave_word(octave: Octave) -> &'static str {
+    OCTAVES
+        .iter()
+        .find(|(_, o)| *o == octave)
+        .map_or("off", |(w, _)| w)
+}
+/// Busy states, most urgent first: the order that decides the shared tempo light.
+pub const BUSY: [&str; 4] = ["needs-decision", "needs-input", "thinking", "finished"];
+
+/// Ticket 17: what each busy state shows, in `BUSY` order, and the two tempos.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Patterns {
+    pub slow: u16,
+    pub fast: u16,
+    pub states: [(Tempo, Octave); 4],
+}
+impl Default for Patterns {
+    fn default() -> Self {
+        Self {
+            slow: 50,
+            fast: 240,
+            states: [
+                (Tempo::Fast, Octave::Alternate), // needs a decision
+                (Tempo::Fast, Octave::Steady),    // needs input (permission)
+                (Tempo::Slow, Octave::Off),       // thinking
+                (Tempo::Off, Octave::Blink),      // finished
+            ],
+        }
+    }
+}
+impl Patterns {
+    pub fn validate(self) -> Result<Self> {
+        if !(1..=300).contains(&self.slow) || !(1..=300).contains(&self.fast) {
+            return Err("status light tempos must be 1–300 BPM".into());
+        }
+        Ok(self)
+    }
+}
+
+/// A source's octave light (an agent or a folder): ±1..±4.
+pub fn valid_octave(octave: i8) -> Result<i8> {
+    if octave == 0 || !(-4..=4).contains(&octave) {
+        return Err("status light octave must be ±1..±4".into());
+    }
+    Ok(octave)
+}
+
+/// Busy sources (state, octave) to tempo/arpeggiator/octave settings; None when every source
+/// is idle, so the program's own feedback shows. `millis` drives the blinking.
+/// - Tempo: the most urgent busy state whose pattern has a tempo sets it; none: arpeggiator off.
+/// - Octave: alternate > steady > blink. Sources showing the winning pattern take turns once a
+///   second; blink with one source flashes its octave against 0; alternate flips the shown
+///   octave's sign twice a second.
+// ponytail: one-second turns and the half-second flip are not yet checked on hardware
+// (tests/v5/07 gate unrecorded); retune from its measured limit.
+pub fn lights(sources: &[(&str, i8)], patterns: &Patterns, millis: u128) -> Option<Settings> {
+    let busy = sources
+        .iter()
+        .filter_map(|(state, octave)| {
+            let index = BUSY.iter().position(|s| s == state)?;
+            Some((patterns.states[index], *octave))
+        })
+        .collect::<Vec<_>>();
+    if busy.is_empty() {
         return None;
     }
-    let tempo = input
-        .first()
-        .map(|a| a.input_bpm)
-        .or(thinking.first().map(|a| a.thinking_bpm));
-    let cycle = match (input.as_slice(), finished.as_slice()) {
-        ([], [one]) => vec![one.octave, 0],
-        ([], many) | (many, _) => many.iter().map(|a| a.octave).collect(),
+    let tempo = BUSY
+        .iter()
+        .enumerate()
+        .filter(|(i, s)| {
+            sources.iter().any(|(state, _)| state == *s) && patterns.states[*i].0 != Tempo::Off
+        })
+        .map(|(i, _)| match patterns.states[i].0 {
+            Tempo::Fast => patterns.fast,
+            _ => patterns.slow,
+        })
+        .next();
+    let rank = |octave: Octave| match octave {
+        Octave::Off => 0,
+        Octave::Blink => 1,
+        Octave::Steady => 2,
+        Octave::Alternate => 3,
+    };
+    let best = busy.iter().map(|((_, o), _)| *o).max_by_key(|o| rank(*o));
+    let voices = busy
+        .iter()
+        .filter(|((_, o), _)| Some(*o) == best)
+        .map(|(_, octave)| *octave)
+        .collect::<Vec<_>>();
+    let turn = voices
+        .get((millis / 1000) as usize % voices.len().max(1))
+        .copied();
+    let octave = match (best, turn) {
+        (Some(Octave::Alternate), Some(o)) if (millis / 500) % 2 == 1 => -o,
+        (Some(Octave::Blink), Some(_)) if voices.len() == 1 && (millis / 1000) % 2 == 1 => 0,
+        (Some(Octave::Off), _) | (_, None) => 0,
+        (_, Some(o)) => o,
     };
     Some(Settings {
-        octave: Some(
-            cycle
-                .get(second as usize % cycle.len().max(1))
-                .copied()
-                .unwrap_or(0),
-        ),
+        octave: Some(octave),
         tempo,
         arp: Some(tempo.is_some()),
     })
@@ -189,17 +458,26 @@ pub fn lights(agents: &[(&str, &crate::mappings::Agent)], second: u64) -> Option
 type Events = [(&'static str, Option<&'static str>, &'static str)];
 const CLAUDE: &Events = &[
     ("UserPromptSubmit", None, "thinking"),
+    // Ticket 17: a multiple-choice question is a decision; a tool approval reports at once
+    // (Notification's permission_prompt waits about six seconds); any finished tool means
+    // the agent works again.
+    ("PreToolUse", Some("AskUserQuestion"), "needs-decision"),
+    ("PermissionRequest", None, "needs-input"),
+    ("PostToolUse", None, "thinking"),
     (
         "Notification",
-        Some("permission_prompt|elicitation_dialog"),
+        Some("elicitation_dialog|elicitation_url_dialog"),
         "needs-input",
     ),
     ("Stop", None, "finished"),
+    ("SessionEnd", None, "ended"),
 ];
 const CODEX: &Events = &[
     ("UserPromptSubmit", None, "thinking"),
     ("PermissionRequest", None, "needs-input"),
+    ("PostToolUse", None, "thinking"),
     ("Stop", None, "finished"),
+    ("SessionEnd", None, "ended"),
 ];
 
 pub fn claude_hooks() -> String {
@@ -426,7 +704,8 @@ mod tests {
         assert!(command(&["claude".into()]).is_err());
         assert!(command(&["a".into(), "b".into(), "c".into(), "d".into()]).is_err());
         let claude = claude_hooks();
-        assert!(claude.contains("\"matcher\": \"permission_prompt|elicitation_dialog\""));
+        assert!(claude.contains("\"matcher\": \"AskUserQuestion\""));
+        assert!(claude.contains("\"PermissionRequest\""));
         assert!(claude.contains("agent-status - finished"));
         assert!(codex_hooks().contains("\"PermissionRequest\""));
     }
@@ -450,7 +729,11 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
             created["hooks"]["Notification"][0]["matcher"],
-            "permission_prompt|elicitation_dialog"
+            "elicitation_dialog|elicitation_url_dialog"
+        );
+        assert_eq!(
+            created["hooks"]["PreToolUse"][0]["matcher"],
+            "AskUserQuestion"
         );
         // An existing file keeps its keys, order, other hooks and permissions.
         let existing = r#"{"theme": "dark", "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "notify-send done"}]}]}, "tui": "fullscreen"}"#;
@@ -460,7 +743,7 @@ mod tests {
         assert_eq!(
             status_in(&path, CLAUDE).unwrap(),
             format!(
-                "missing UserPromptSubmit, Notification, Stop in {}; Agents can install them",
+                "missing UserPromptSubmit, PreToolUse, PermissionRequest, PostToolUse, Notification, Stop, SessionEnd in {}; Agents can install them",
                 path.display()
             )
         );
@@ -517,14 +800,90 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// Ticket 14: the spec-default table, priorities and the once-a-second alternation.
+    /// Ticket 16: sessions outside tmux report by session_id and cwd, end on SessionEnd or
+    /// when their process is gone, and light the most specific matching folder.
     #[test]
-    fn agent_states_map_to_status_lights_by_priority() {
+    fn outside_sessions_light_their_most_specific_folder() {
+        let dir = std::env::temp_dir().join(format!("vibeconsole-sessions-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hook = |id: &str, cwd: &str| {
+            format!(r#"{{"session_id": "{id}", "cwd": "{cwd}", "hook_event_name": "Stop"}}"#)
+        };
+        session_report(&dir, &hook("a1", "/work/app/src"), "thinking", 0).unwrap();
+        session_report(&dir, &hook("b2", "/work/app"), "needs-input", 4242).unwrap();
+        session_report(&dir, &hook("c3", "/work/apple"), "finished", 7).unwrap(); // not in /work/app
+        session_report(&dir, &hook("d4", "/home/me"), "thinking", 0).unwrap();
+        assert!(session_report(&dir, &hook("../x", "/w"), "thinking", 0).is_err());
+        assert!(session_report(&dir, &hook("e5", "/w"), "busy", 0).is_err());
+        session_report(&dir, "{}", "thinking", 0).unwrap(); // not a hook payload: ignored
+        session_report(&dir, "", "thinking", 0).unwrap();
+        // The process of b2 is gone: dropped (and its file removed).
+        let alive = |pid: u32| pid != 4242;
+        let mut found = sessions_in(&dir, alive);
+        found.sort_by(|a, b| a.cwd.cmp(&b.cwd));
+        let cwds = found.iter().map(|s| s.cwd.as_str()).collect::<Vec<_>>();
+        assert_eq!(cwds, ["/home/me", "/work/app/src", "/work/apple"]);
+        assert!(!dir.join("session-b2").exists());
+        // SessionEnd ("ended" reaches here as idle) removes a session.
+        session_report(&dir, &hook("d4", "/home/me"), "idle", 0).unwrap();
+        assert_eq!(sessions_in(&dir, alive).len(), 2);
+        let light = |octave: i8| octave;
+        let folders = vec![
+            ("/work".to_owned(), light(2)),
+            ("/work/app/".to_owned(), light(3)),
+        ];
+        let sessions = vec![
+            Session {
+                state: "thinking",
+                cwd: "/work/app/src".into(),
+            },
+            Session {
+                state: "needs-input",
+                cwd: "/work/app".into(),
+            },
+            Session {
+                state: "finished",
+                cwd: "/work/apple".into(),
+            },
+            Session {
+                state: "thinking",
+                cwd: "/home/me".into(),
+            },
+            Session {
+                state: "idle",
+                cwd: "/work".into(),
+            },
+        ];
+        // /work/app wins over /work; its two sessions combine to the most urgent.
+        assert_eq!(
+            source_states(&sessions, &folders, None),
+            [
+                ("/work/app/".to_owned(), "needs-input", light(3)),
+                ("/work".to_owned(), "finished", light(2)),
+            ]
+        );
+        // Every other session catches what no folder matched, only when on.
+        let other = source_states(&sessions, &folders, Some(light(-2)));
+        assert_eq!(other[2], ("/home/me".to_owned(), "thinking", light(-2)));
+        assert!(source_states(&sessions, &[], None).is_empty());
+        assert!(within("/a/b", "/a/b") && within("/a/b/c", "/a/b/") && !within("/a/bc", "/a/b"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Tickets 14 and 17: the default pattern table, priorities, the once-a-second turns and
+    /// the half-second alternate ±, and edited patterns.
+    #[test]
+    fn agent_states_map_to_status_lights_by_pattern_and_priority() {
         let config = crate::mappings::Config::default();
-        let (claude, codex) = (&config.agents[0], &config.agents[1]);
-        assert_eq!((claude.octave, codex.octave), (1, -1)); // spec defaults
-        let light = |claude_state, codex_state, second| {
-            lights(&[(claude_state, claude), (codex_state, codex)], second)
+        let (claude, codex) = (config.agents[0].octave, config.agents[1].octave);
+        assert_eq!((claude, codex), (1, -1)); // spec defaults
+        let patterns = Patterns::default();
+        let light = |claude_state, codex_state, millis| {
+            lights(
+                &[(claude_state, claude), (codex_state, codex)],
+                &patterns,
+                millis,
+            )
         };
         let set = |octave, tempo, arp| Settings {
             octave: Some(octave),
@@ -538,7 +897,7 @@ mod tests {
             Some(set(1, Some(240), true))
         );
         assert_eq!(
-            light("idle", "needs-input", 1),
+            light("idle", "needs-input", 1000),
             Some(set(-1, Some(240), true))
         );
         // Needs input beats thinking for the tempo; the steady octave beats a finished blink.
@@ -552,12 +911,12 @@ mod tests {
         );
         // One finished agent blinks its octave against 0; arpeggiator off, tempo untouched.
         assert_eq!(light("finished", "idle", 0), Some(set(1, None, false)));
-        assert_eq!(light("finished", "idle", 1), Some(set(0, None, false)));
-        assert_eq!(light("finished", "idle", 2), Some(set(1, None, false)));
-        // Both finished, or both needing input: + and - alternate.
+        assert_eq!(light("finished", "idle", 1000), Some(set(0, None, false)));
+        assert_eq!(light("finished", "idle", 2000), Some(set(1, None, false)));
+        // Two finished, or two needing input: their own octaves take turns once a second.
         for both in ["finished", "needs-input"] {
             assert_eq!(light(both, both, 0).unwrap().octave, Some(1));
-            assert_eq!(light(both, both, 1).unwrap().octave, Some(-1));
+            assert_eq!(light(both, both, 1000).unwrap().octave, Some(-1));
         }
         // Thinking plus a finished agent: slow blink and the finished octave blinking.
         assert_eq!(
@@ -565,20 +924,58 @@ mod tests {
             Some(set(-1, Some(50), true))
         );
         assert_eq!(
-            light("thinking", "finished", 1),
+            light("thinking", "finished", 1000),
             Some(set(0, Some(50), true))
         );
-        // Per-agent settings are used.
-        let mut tuned = claude.clone();
-        (tuned.octave, tuned.thinking_bpm) = (4, 90);
+        // Ticket 17: a decision flips the agent's octave twice a second and beats needs input.
         assert_eq!(
-            lights(&[("thinking", &tuned)], 0),
-            Some(set(0, Some(90), true))
+            light("needs-decision", "idle", 0),
+            Some(set(1, Some(240), true))
         );
         assert_eq!(
-            lights(&[("needs-input", &tuned)], 0).unwrap().octave,
-            Some(4)
+            light("needs-decision", "idle", 500),
+            Some(set(-1, Some(240), true))
         );
-        assert_eq!(lights(&[], 0), None);
+        assert_eq!(
+            light("needs-decision", "idle", 1000),
+            Some(set(1, Some(240), true))
+        );
+        assert_eq!(
+            light("needs-decision", "needs-input", 500).unwrap().octave,
+            Some(-1)
+        );
+        assert_eq!(light("idle", "needs-decision", 0).unwrap().octave, Some(-1));
+        assert_eq!(
+            light("idle", "needs-decision", 500).unwrap().octave,
+            Some(1)
+        );
+        // Edited patterns: thinking names its agent, finished blinks the tempo fast.
+        let mut edited = Patterns::default();
+        edited.states[2] = (Tempo::Slow, Octave::Steady);
+        edited.states[3] = (Tempo::Fast, Octave::Off);
+        edited.slow = 90;
+        assert_eq!(
+            lights(&[("thinking", 4)], &edited, 0),
+            Some(set(4, Some(90), true))
+        );
+        assert_eq!(
+            lights(&[("finished", 4)], &edited, 0),
+            Some(set(0, Some(240), true))
+        );
+        // The most urgent state with a tempo sets it: finished (fast) loses to thinking (slow).
+        assert_eq!(
+            lights(&[("thinking", 1), ("finished", 2)], &edited, 0)
+                .unwrap()
+                .tempo,
+            Some(90)
+        );
+        assert_eq!(lights(&[], &patterns, 0), None);
+        assert!(valid_octave(0).is_err() && valid_octave(5).is_err() && valid_octave(-4).is_ok());
+        for (word, tempo) in TEMPOS {
+            assert_eq!(tempo_word(tempo), word);
+        }
+        for (word, octave) in OCTAVES {
+            assert_eq!(octave_word(octave), word);
+        }
     }
 }

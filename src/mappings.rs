@@ -510,6 +510,13 @@ pub struct Config {
     pub vars: Vec<(String, String)>,
     /// Status lights on the controller follow agent status (ticket 14); default On.
     pub status_lights: bool,
+    /// Ticket 16: sessions VibeConsole did not start light by folder (absolute, most specific
+    /// wins); others use `light_other` when `light_other_on`.
+    pub light_folders: Vec<(String, i8)>,
+    pub light_other: i8,
+    pub light_other_on: bool,
+    /// Ticket 17: what each busy state shows on the tempo and octave lights.
+    pub light_patterns: crate::status::Patterns,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -526,6 +533,10 @@ impl Default for Config {
             env: Vec::new(),
             vars: Vec::new(),
             status_lights: true,
+            light_folders: Vec::new(),
+            light_other: 2,
+            light_other_on: false,
+            light_patterns: crate::status::Patterns::default(),
         }
     }
 }
@@ -536,10 +547,8 @@ pub struct Agent {
     pub window: String,
     /// Working directory overriding the Settings default; `${NAME}` allowed.
     pub dir: Option<String>,
-    /// Status lights: this agent's octave light (±1..±4) and its tempo blinks (1–300 BPM).
+    /// Status lights: this agent's octave light (±1..±4), which says which agent it is.
     pub octave: i8,
-    pub thinking_bpm: u16,
-    pub input_bpm: u16,
 }
 impl Agent {
     pub fn new(name: &str, launch: &str, window: &str) -> Result<Self> {
@@ -558,21 +567,9 @@ impl Agent {
             launch: launch.into(),
             window: window.into(),
             dir: None,
-            // Spec defaults: Claude +1, Codex −1, slow blink thinking, fast blink needs input.
+            // Spec defaults: Claude +1, Codex −1.
             octave: if name == "codex" { -1 } else { 1 },
-            thinking_bpm: 50,
-            input_bpm: 240,
         })
-    }
-    pub fn validate_lights(&self) -> Result<()> {
-        if self.octave == 0
-            || !(-4..=4).contains(&self.octave)
-            || !(1..=300).contains(&self.thinking_bpm)
-            || !(1..=300).contains(&self.input_bpm)
-        {
-            return Err("status light octave must be ±1..±4 and tempos 1–300 BPM".into());
-        }
-        Ok(())
     }
 }
 pub fn simple_name(value: &str) -> bool {
@@ -668,7 +665,7 @@ fn validate_agents(agents: &[Agent]) -> Result<()> {
     for agent in agents {
         Agent::new(&agent.name, &agent.launch, &agent.window)?;
         agent.dir.as_deref().map(directory_syntax).transpose()?;
-        agent.validate_lights()?;
+        crate::status::valid_octave(agent.octave)?;
         if !names.insert(&agent.name) || !windows.insert(&agent.window) {
             return Err("agent names and tmux windows must be unique".into());
         }
@@ -777,9 +774,11 @@ fn parse_config(contents: &str) -> Result<Config> {
         Some("11") => 11,
         Some("12") => 12,
         Some("13") => 13,
+        Some("14") => 14,
+        Some("15") => 15,
         _ => {
             return Err(
-                "invalid configuration header; expected vibeconsole-mappings-v1..v13".into(),
+                "invalid configuration header; expected vibeconsole-mappings-v1..v15".into(),
             );
         }
     };
@@ -885,6 +884,84 @@ fn parse_config(contents: &str) -> Result<Config> {
     } else {
         true
     };
+    let defaults = Config::default();
+    let (mut light_other, mut light_other_on, mut light_folders) =
+        (defaults.light_other, false, Vec::new());
+    let mut light_patterns = defaults.light_patterns;
+    if version >= 15 {
+        let fields: Vec<_> = lines
+            .next()
+            .ok_or("missing light-tempos")?
+            .split('\t')
+            .collect();
+        let ["light-tempos", slow, fast] = fields.as_slice() else {
+            return Err("expected light-tempos slow/fast".into());
+        };
+        (light_patterns.slow, light_patterns.fast) = (slow.parse()?, fast.parse()?);
+        for (index, state) in crate::status::BUSY.iter().enumerate() {
+            let fields: Vec<_> = lines
+                .next()
+                .ok_or("missing light-pattern")?
+                .split('\t')
+                .collect();
+            let ["light-pattern", name, tempo, octave] = fields.as_slice() else {
+                return Err("expected light-pattern state/tempo/octave".into());
+            };
+            if name != state {
+                return Err(format!("light-pattern {state} expected, found {name}").into());
+            }
+            let tempo = crate::status::TEMPOS
+                .iter()
+                .find(|(t, _)| t == tempo)
+                .ok_or("light-pattern tempo must be off, slow or fast")?
+                .1;
+            let octave = crate::status::OCTAVES
+                .iter()
+                .find(|(o, _)| o == octave)
+                .ok_or("light-pattern octave must be off, steady, blink or alternate")?
+                .1;
+            light_patterns.states[index] = (tempo, octave);
+        }
+        light_patterns.validate()?;
+    }
+    if version >= 14 {
+        // v14 stored tempos per source; v15 keeps only the octave (tempo = state).
+        let fields: Vec<_> = lines
+            .next()
+            .ok_or("missing light-other setting")?
+            .split('\t')
+            .collect();
+        let (on, octave) = match fields.as_slice() {
+            ["light-other", on, octave, _, _] if version == 14 => (on, octave),
+            ["light-other", on, octave] if version >= 15 => (on, octave),
+            _ => return Err("expected light-other on/off/octave".into()),
+        };
+        light_other_on = match *on {
+            "on" => true,
+            "off" => false,
+            _ => return Err("light-other must be on or off".into()),
+        };
+        light_other = crate::status::valid_octave(octave.parse()?)?;
+        let count: usize = lines
+            .next()
+            .and_then(|l| l.strip_prefix("light-folders\t"))
+            .ok_or("expected light-folders count")?
+            .parse()?;
+        for _ in 0..count.min(64) {
+            let fields: Vec<_> = lines
+                .next()
+                .ok_or("missing light folder")?
+                .split('\t')
+                .collect();
+            let (folder, octave) = match fields.as_slice() {
+                ["light-folder", folder, octave, _, _] if version == 14 => (folder, octave),
+                ["light-folder", folder, octave] if version >= 15 => (folder, octave),
+                _ => return Err("invalid light-folder record".into()),
+            };
+            light_folders.push((folder.to_string(), octave.parse()?));
+        }
+        validate_light_folders(&light_folders)?;
+    }
     let agents = if version >= 8 {
         let count: usize = lines
             .next()
@@ -905,21 +982,25 @@ fn parse_config(contents: &str) -> Result<Config> {
                 ["agent", name, launch, window, dir] if version == 12 => {
                     (name, launch, window, Some(dir), None)
                 }
-                ["agent", name, launch, window, dir, octave, thinking, input] if version >= 13 => (
-                    name,
-                    launch,
-                    window,
-                    Some(dir),
-                    Some((octave, thinking, input)),
-                ),
+                ["agent", name, launch, window, dir, octave, thinking, input]
+                    if (13..15).contains(&version) =>
+                {
+                    // Per-agent tempos became the shared slow/fast tempos (first agent's).
+                    if agents.is_empty() {
+                        (light_patterns.slow, light_patterns.fast) =
+                            (thinking.parse()?, input.parse()?);
+                    }
+                    (name, launch, window, Some(dir), Some(octave))
+                }
+                ["agent", name, launch, window, dir, octave] if version >= 15 => {
+                    (name, launch, window, Some(dir), Some(octave))
+                }
                 _ => return Err("invalid agent record".into()),
             };
             let mut agent = Agent::new(name, launch, window)?;
             agent.dir = dir.filter(|dir| **dir != "-").map(|dir| dir.to_string());
-            if let Some((octave, thinking, input)) = lights {
+            if let Some(octave) = lights {
                 agent.octave = octave.parse()?;
-                agent.thinking_bpm = thinking.parse()?;
-                agent.input_bpm = input.parse()?;
             }
             agents.push(agent);
         }
@@ -1077,7 +1158,29 @@ fn parse_config(contents: &str) -> Result<Config> {
         env,
         vars,
         status_lights,
+        light_folders,
+        light_other,
+        light_other_on,
+        light_patterns: light_patterns.validate()?,
     })
+}
+
+/// Folder sources: absolute, one line, each once, at most 64.
+pub fn validate_light_folders(folders: &[(String, i8)]) -> Result<()> {
+    let mut seen = HashSet::new();
+    if folders.len() > 64 {
+        return Err("too many status-light folders".into());
+    }
+    for (folder, octave) in folders {
+        if !folder.starts_with('/') || folder.contains(['\t', '\n']) || folder.len() > 4096 {
+            return Err(format!("status-light folder {folder:?} must be one absolute path").into());
+        }
+        if !seen.insert(folder.trim_end_matches('/')) {
+            return Err(format!("status-light folder {folder} is listed twice").into());
+        }
+        crate::status::valid_octave(*octave)?;
+    }
+    Ok(())
 }
 
 pub fn load_config(path: &Path) -> Result<Config> {
@@ -1106,7 +1209,7 @@ pub fn save_config(path: &Path, config: &Config) -> Result<()> {
     validate_variables(&config.vars, "user")?;
     config.validate_references()?;
     let mut contents = format!(
-        "vibeconsole-mappings-v13\nidle\t{}\t{}\t{}\n",
+        "vibeconsole-mappings-v15\nidle\t{}\t{}\t{}\n",
         opt_text(config.idle.octave),
         opt_text(config.idle.tempo),
         arp_text(config.idle.arp)
@@ -1146,17 +1249,38 @@ pub fn save_config(path: &Path, config: &Config) -> Result<()> {
     } else {
         "status-lights\toff\n"
     });
+    let patterns = config.light_patterns.validate()?;
+    contents.push_str(&format!(
+        "light-tempos\t{}\t{}\n",
+        patterns.slow, patterns.fast
+    ));
+    for (state, (tempo, octave)) in crate::status::BUSY.iter().zip(patterns.states) {
+        contents.push_str(&format!(
+            "light-pattern\t{state}\t{}\t{}\n",
+            crate::status::tempo_word(tempo),
+            crate::status::octave_word(octave)
+        ));
+    }
+    crate::status::valid_octave(config.light_other)?;
+    validate_light_folders(&config.light_folders)?;
+    contents.push_str(&format!(
+        "light-other\t{}\t{}\nlight-folders\t{}\n",
+        if config.light_other_on { "on" } else { "off" },
+        config.light_other,
+        config.light_folders.len()
+    ));
+    for (folder, octave) in &config.light_folders {
+        contents.push_str(&format!("light-folder\t{folder}\t{octave}\n"));
+    }
     contents.push_str(&format!("agents\t{}\n", config.agents.len()));
     for agent in &config.agents {
         contents.push_str(&format!(
-            "agent\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "agent\t{}\t{}\t{}\t{}\t{}\n",
             agent.name,
             agent.launch,
             agent.window,
             agent.dir.as_deref().unwrap_or("-"),
-            agent.octave,
-            agent.thinking_bpm,
-            agent.input_bpm
+            agent.octave
         ));
     }
     for mapping in &config.mappings {
@@ -1539,7 +1663,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v13\n")
+                .starts_with("vibeconsole-mappings-v15\n")
         );
         assert!(
             load_config(&path)
@@ -1762,7 +1886,7 @@ mod tests {
         let path = dir.join("mappings.tsv");
         save_config(&path, &config).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
-        assert!(saved.starts_with("vibeconsole-mappings-v13\n"));
+        assert!(saved.starts_with("vibeconsole-mappings-v15\n"));
         assert!(saved.contains("\tflow\t") && !saved.contains("flow-start"));
         assert_eq!(load_config(&path).unwrap(), config);
         fs::remove_dir_all(dir).unwrap();
@@ -1788,7 +1912,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v13\n")
+                .starts_with("vibeconsole-mappings-v15\n")
         );
         assert_eq!(load_config(&path).unwrap(), config);
         fs::remove_dir_all(dir).unwrap();
@@ -1809,7 +1933,7 @@ mod tests {
         let path = dir.join("mappings.tsv");
         save_config(&path, &config).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v13\n") && text.contains("\tstatus\n"));
+        assert!(text.starts_with("vibeconsole-mappings-v15\n") && text.contains("\tstatus\n"));
         assert_eq!(load_config(&path).unwrap(), config);
         let pad = Control::from_note(10, 37).unwrap();
         for (action, observable) in [
@@ -1886,7 +2010,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v13\n")
+                .starts_with("vibeconsole-mappings-v15\n")
         );
         assert_eq!(load_config(&path).unwrap(), config);
         // ${NAME}: user variable, then startup variable; other text stays; no environment.
