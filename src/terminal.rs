@@ -151,6 +151,15 @@ struct Terminal {
     flow_resume: bool,
     /// (agent, tmux window, state), refreshed every `STATUS_EVERY`.
     agent_states: Vec<(String, String, &'static str)>,
+    /// Agents' status-light settings, in `agent_states` order; None while Status lights is Off.
+    light_agents: Option<Vec<mappings::Agent>>,
+    /// Ticket 16: busy folder sources from sessions VibeConsole did not start
+    /// (folder, state, light); empty while Status lights is Off.
+    light_sessions: Vec<(String, &'static str, i8)>,
+    /// Ticket 17: what each busy state shows, from Settings.
+    light_patterns: crate::status::Patterns,
+    /// Start of the status lights' once-a-second octave alternation.
+    lights_since: Instant,
     status_at: Instant,
     flow_failed: bool,
     start_flow_enabled: bool,
@@ -197,7 +206,17 @@ impl Terminal {
             .as_ref()
             .map(|o| o.keyboard.status(|control| self.name(control)))
             .unwrap_or_else(|| format!("PAUSED | {} saved assignments", self.run_mappings.len()))
-            + &agent_line(&self.agent_states);
+            + &agent_line(
+                &self
+                    .agent_states
+                    .iter()
+                    .cloned()
+                    .chain(self.light_sessions.iter().map(|(folder, state, _)| {
+                        let name = folder.rsplit('/').find(|p| !p.is_empty()).unwrap_or(folder);
+                        (name.to_owned(), String::new(), *state)
+                    }))
+                    .collect::<Vec<_>>(),
+            );
         let state = if self.wanted_run {
             let label = if !self.context_verified {
                 "RUNNING (detecting program; actions inactive)"
@@ -589,6 +608,10 @@ impl Terminal {
             probed: BTreeMap::new(),
             probe: None,
             agent_states: Vec::new(),
+            light_agents: None,
+            light_sessions: Vec::new(),
+            light_patterns: crate::status::Patterns::default(),
+            lights_since: Instant::now(),
             status_at: Instant::now(),
             flow_failed: false,
             start_flow_enabled: true,
@@ -705,6 +728,17 @@ impl Terminal {
         let Ok(config) = mappings::load_config(&self.path) else {
             return;
         };
+        self.light_agents = config.status_lights.then(|| config.agents.clone());
+        self.light_patterns = config.light_patterns;
+        self.light_sessions = if config.status_lights {
+            crate::status::source_states(
+                &crate::status::sessions(),
+                &config.light_folders,
+                config.light_other_on.then_some(config.light_other),
+            )
+        } else {
+            Vec::new()
+        };
         self.agent_states = config
             .agents
             .into_iter()
@@ -713,6 +747,23 @@ impl Terminal {
                 (a.name, a.window, state)
             })
             .collect();
+        // A busy agent whose window is gone can never report again: back to idle.
+        // ponytail: one blocking tmux call per refresh while an agent is busy (a few ms);
+        // move it into the background probe if it ever stalls the loop.
+        if self.agent_states.iter().any(|(_, _, s)| *s != "idle") {
+            let gone = crate::status::vanished(&self.agent_states, crate::actions::window_alive)
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            for (name, _, state) in &mut self.agent_states {
+                if gone.contains(name) {
+                    match crate::status::write(name, "idle") {
+                        Ok(()) => *state = "idle",
+                        Err(error) => self.error = format!("Agent status not cleared: {error}"),
+                    }
+                }
+            }
+        }
         // Only ask tmux when something could be cleared.
         if self.agent_states.iter().any(|(_, _, s)| *s == "finished") {
             let attended =
@@ -732,6 +783,50 @@ impl Terminal {
                     Err(error) => self.error = format!("Agent status not cleared: {error}"),
                 }
             }
+        }
+    }
+    /// Ticket 14: what the status lights should show now. None gives the controller back to the
+    /// program's own feedback: Status lights Off, every agent idle, output not running on a
+    /// verified program, a piano program (octave/arpeggiator change the notes), or the login
+    /// service (`interactive` false).
+    fn wanted_lights(&self, interactive: bool) -> Option<crate::feedback::Settings> {
+        let agents = self.light_agents.as_ref()?;
+        if !interactive
+            || !self.wanted_run
+            || self.suspended
+            || !self.context_verified
+            || !self.feedback_allowed
+            || self
+                .run_mappings
+                .iter()
+                .any(|m| m.input == mappings::Input::Piano)
+        {
+            return None;
+        }
+        let states = self
+            .agent_states
+            .iter()
+            .zip(agents)
+            .filter(|((name, _, _), agent)| *name == agent.name)
+            .map(|((_, _, state), agent)| (*state, agent.octave))
+            .chain(
+                self.light_sessions
+                    .iter()
+                    .map(|(_, state, octave)| (*state, *octave)),
+            )
+            .collect::<Vec<_>>();
+        crate::status::lights(
+            &states,
+            &self.light_patterns,
+            self.lights_since.elapsed().as_millis(),
+        )
+    }
+    fn status_lights(&mut self) -> Result<()> {
+        let wanted = self.wanted_lights(self.original.is_some());
+        match &mut self.controller {
+            // No writes before the controller's snapshot is validated.
+            Some(controller) if controller.baseline.is_some() => controller.light(wanted),
+            _ => Ok(()),
         }
     }
     fn dialed(&mut self, dialed: crate::motion::Dialed) {
@@ -809,6 +904,10 @@ impl Terminal {
         };
         if let (Some(controller), Some(settings)) = (&mut self.controller, settings) {
             controller.set(settings)?;
+        }
+        // Status lights end with the output: the program's feedback goes back on the controller.
+        if let Some(controller) = &mut self.controller {
+            controller.light(None)?;
         }
         Ok(())
     }
@@ -1430,6 +1529,10 @@ impl Terminal {
             self.status_at = Instant::now();
             self.refresh_agent_states();
             self.probe_status();
+        }
+        if let Err(error) = self.status_lights() {
+            self.pause()?;
+            self.error = format!("Status lights failed: {error}; paused");
         }
         // Prompt pastes and sequence shortcuts: the worker waits for each answer.
         for (keys, reply) in self.actions.tap_requests() {
@@ -2684,19 +2787,22 @@ fn status_word(phase: Option<Phase>, running: Option<bool>) -> &'static str {
     }
 }
 
-/// "\nAgents: claude thinking · codex FINISHED", or nothing without agents.
+/// "\nAgents: claude thinking · VibeConsole NEEDS INPUT", or nothing when every agent is idle.
+/// Idle (and exited) agents are left out; finished means it waits for you, so it reads as
+/// needs input like a permission question does.
 fn agent_line(states: &[(String, String, &'static str)]) -> String {
-    if states.is_empty() {
-        return String::new();
-    }
     let parts = states
         .iter()
+        .filter(|(_, _, state)| *state != "idle")
         .map(|(name, _, state)| match *state {
-            "finished" => format!("{name} FINISHED"),
-            "needs-input" => format!("{name} NEEDS INPUT"),
+            "finished" | "needs-input" => format!("{name} NEEDS INPUT"),
+            "needs-decision" => format!("{name} DECISION"),
             state => format!("{name} {state}"),
         })
         .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return String::new();
+    }
     format!("\nAgents: {}", parts.join(" · "))
 }
 
@@ -2720,26 +2826,50 @@ fn agents_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
             "Add agent",
             "Claude Code status hooks",
             "Codex status hooks",
-            "Prompts",
         ]));
+        choices.push(format!(
+            "Status lights: {} (tempo, arpeggiator and octave lights follow agent status)",
+            if config.status_lights { "On" } else { "Off" }
+        ));
+        choices.push("Prompts".into());
         let Some(index) = choose(ui, "Agents | tmux attach -t vibe", &choices)? else {
             return Ok(());
         };
-        if index == config.agents.len() + 3 {
+        if index == config.agents.len() + 4 {
             prompts_menu(ui, path)?;
             continue;
         }
+        if index == config.agents.len() + 3 {
+            config.status_lights = !config.status_lights;
+            if let Err(error) = mappings::save_config(path, &config) {
+                not_saved(ui, &error)?;
+            }
+            continue;
+        }
         if let Some(which @ (1 | 2)) = index.checked_sub(config.agents.len()) {
-            let (file, hooks) = if which == 1 {
-                ("~/.claude/settings.json", crate::status::claude_hooks())
+            let codex = which == 2;
+            let hooks = if codex {
+                crate::status::codex_hooks()
             } else {
-                ("~/.codex/hooks.json", crate::status::codex_hooks())
+                crate::status::claude_hooks()
             };
             let text = format!(
-                "Merge into {file} (VibeConsole does not edit it). Hooks report only for agents VibeConsole started in tmux; `vibeconsole` must be on PATH.\n\n{hooks}"
+                "{}\nInstall merges only the missing entries, after a backup. Hooks report only for agents VibeConsole started in tmux; `vibeconsole` must be on PATH.\n\n{hooks}",
+                crate::status::hooks_status(codex)
             );
-            if choose(ui, &text, &options(&["Copy with wl-copy", "Back"]))? == Some(0) {
-                crate::actions::copy_text(&hooks)?;
+            match choose(
+                ui,
+                &text,
+                &options(&["Install (merge, with backup)", "Copy with wl-copy", "Back"]),
+            )? {
+                Some(0) => match crate::status::install_hooks(codex) {
+                    Ok(note) => {
+                        choose(ui, &note, &options(&["Back"]))?;
+                    }
+                    Err(error) => not_saved(ui, &error)?,
+                },
+                Some(1) => crate::actions::copy_text(&hooks)?,
+                _ => {}
             }
             continue;
         }
@@ -2797,8 +2927,21 @@ fn agents_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
         else {
             continue;
         };
+        let defaults = mappings::Agent::new(&name, &launch, &window).ok();
+        let light = existing.as_ref().or(defaults.as_ref());
+        let Some(octave) = number(
+            ui,
+            "Status light octave (−4..−1 or +1..+4; Claude +1, Codex −1; tempo is set per state in Status light patterns)",
+            light.map_or(1, |a| a.octave.into()),
+            -4,
+            4,
+        )?
+        else {
+            continue;
+        };
         let saved = (|| -> Result<()> {
             let mut agent = mappings::Agent::new(&name, &launch, &window)?;
+            agent.octave = crate::status::valid_octave(octave.try_into()?)?;
             if !dir.trim().is_empty() {
                 existing_directory(&dir, &config)?;
                 agent.dir = Some(dir.clone());
@@ -2855,6 +2998,15 @@ fn settings_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 "User variables ({}): ${{NAME}} in commands and directories",
                 config.vars.len()
             ),
+            format!(
+                "Status light sources ({} folders; every other session {}): agents outside VibeConsole's tmux",
+                config.light_folders.len(),
+                if config.light_other_on { "On" } else { "Off" }
+            ),
+            format!(
+                "Status light patterns (slow {} BPM, fast {} BPM): what each agent state shows",
+                config.light_patterns.slow, config.light_patterns.fast
+            ),
         ];
         let Some(choice) = choose(ui, "Settings", &rows)? else {
             return Ok(());
@@ -2883,8 +3035,239 @@ fn settings_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 config.start_flow = !config.start_flow;
                 mappings::save_config(path, &config)
             }
-            _ => variables_menu(ui, path, choice == 3),
+            2 | 3 => variables_menu(ui, path, choice == 3),
+            4 => light_sources_menu(ui, path),
+            _ => light_patterns_menu(ui, path),
         };
+        if let Err(error) = result {
+            not_saved(ui, &error)?;
+        }
+    }
+}
+
+/// Ticket 16/17: a source's octave light, which says which agent or folder it is.
+fn edit_octave(ui: &mut impl Ui, title: &str, octave: i8) -> Result<Option<i8>> {
+    let Some(octave) = number(
+        ui,
+        &format!(
+            "{title}: octave light (−4..−1 or +1..+4; tempo is set per state in Status light patterns)"
+        ),
+        octave.into(),
+        -4,
+        4,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(crate::status::valid_octave(octave.try_into()?)?))
+}
+
+/// Ticket 17: Settings -> Status light patterns. Per busy state, the tempo light (off, slow,
+/// fast) and the octave light (off, steady, blink, alternate ±); plus the two tempos.
+fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
+    const NAMES: [&str; 4] = [
+        "Needs a decision (Claude asks a multiple-choice question)",
+        "Needs input (permission or form)",
+        "Thinking",
+        "Finished (answered, waiting for you)",
+    ];
+    loop {
+        let mut config = mappings::load_config(path)?;
+        let patterns = config.light_patterns;
+        let mut rows = NAMES
+            .iter()
+            .zip(patterns.states)
+            .map(|(name, (tempo, octave))| {
+                format!(
+                    "{name}: tempo {}, octave {}",
+                    crate::status::tempo_word(tempo),
+                    crate::status::octave_word(octave)
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.push(format!("Slow tempo: {} BPM", patterns.slow));
+        rows.push(format!("Fast tempo: {} BPM", patterns.fast));
+        let blind = NAMES
+            .iter()
+            .zip(patterns.states)
+            .filter(|(_, (_, octave))| *octave == crate::status::Octave::Off)
+            .map(|(name, _)| name.split(" (").next().unwrap_or(name))
+            .collect::<Vec<_>>();
+        let title = if blind.is_empty() {
+            "Status light patterns (tempo = state, octave = which agent or folder; the most urgent state at the top sets the tempo)".to_owned()
+        } else {
+            format!(
+                "Status light patterns. Octave off, so the lights can't say which agent: {}",
+                blind.join(", ")
+            )
+        };
+        let Some(index) = choose(ui, &title, &rows)? else {
+            return Ok(());
+        };
+        let result = (|| -> Result<()> {
+            if index < 4 {
+                let (tempo, octave) = patterns.states[index];
+                let tempos = crate::status::TEMPOS.map(|(w, _)| w);
+                let Some(t) = choose_at(
+                    ui,
+                    &format!("{}: tempo light", NAMES[index]),
+                    &options(&tempos),
+                    crate::status::TEMPOS
+                        .iter()
+                        .position(|(_, v)| *v == tempo)
+                        .unwrap_or(0),
+                )?
+                else {
+                    return Ok(());
+                };
+                let octaves = crate::status::OCTAVES.map(|(w, _)| w);
+                let Some(o) = choose_at(
+                    ui,
+                    &format!(
+                        "{}: octave light (alternate = its octave and the opposite, twice a second)",
+                        NAMES[index]
+                    ),
+                    &options(&octaves),
+                    crate::status::OCTAVES
+                        .iter()
+                        .position(|(_, v)| *v == octave)
+                        .unwrap_or(0),
+                )?
+                else {
+                    return Ok(());
+                };
+                config.light_patterns.states[index] =
+                    (crate::status::TEMPOS[t].1, crate::status::OCTAVES[o].1);
+            } else {
+                let fast = index == 5;
+                let current = if fast { patterns.fast } else { patterns.slow };
+                let Some(bpm) = number(
+                    ui,
+                    &format!("{} tempo BPM (1..300)", if fast { "Fast" } else { "Slow" }),
+                    current.into(),
+                    1,
+                    300,
+                )?
+                else {
+                    return Ok(());
+                };
+                if fast {
+                    config.light_patterns.fast = bpm.try_into()?;
+                } else {
+                    config.light_patterns.slow = bpm.try_into()?;
+                }
+            }
+            mappings::save_config(path, &config)
+        })();
+        if let Err(error) = result {
+            not_saved(ui, &error)?;
+        }
+    }
+}
+
+/// Ticket 16: Settings -> Status light sources. Sessions VibeConsole did not start light the
+/// controller through the most specific folder that contains their working directory, or
+/// through Every other session when it is On.
+fn light_sources_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
+    loop {
+        let mut config = mappings::load_config(path)?;
+        // Octaves already taken, to warn about sources that would look the same.
+        let taken = config
+            .agents
+            .iter()
+            .map(|a| (a.name.clone(), a.octave))
+            .chain(config.light_folders.iter().cloned())
+            .chain(
+                config
+                    .light_other_on
+                    .then(|| ("every other session".to_owned(), config.light_other)),
+            )
+            .collect::<Vec<_>>();
+        let look = |octave: &i8| format!("octave {octave:+}");
+        let mut rows = vec![format!(
+            "Every other session: {} ({})",
+            if config.light_other_on { "On" } else { "Off" },
+            look(&config.light_other)
+        )];
+        rows.extend(
+            config
+                .light_folders
+                .iter()
+                .map(|(f, l)| format!("{f} | {}", look(l))),
+        );
+        rows.push("Add folder".into());
+        let shared = taken
+            .iter()
+            .filter(|(_, o)| taken.iter().filter(|(_, p)| p == o).count() > 1)
+            .map(|(n, o)| format!("{n} {o:+}"))
+            .collect::<Vec<_>>();
+        let title = if shared.is_empty() {
+            "Status light sources (octave = which source, tempo = state)".to_owned()
+        } else {
+            format!(
+                "Status light sources. Same octave, looks the same: {}",
+                shared.join(", ")
+            )
+        };
+        let Some(index) = choose(ui, &title, &rows)? else {
+            return Ok(());
+        };
+        let result = (|| -> Result<()> {
+            if index == 0 {
+                match choose(
+                    ui,
+                    "Every other session (no folder matches it, including this editor's agents)",
+                    &options(&[
+                        if config.light_other_on {
+                            "Turn Off"
+                        } else {
+                            "Turn On"
+                        },
+                        "Edit octave",
+                        "Back",
+                    ]),
+                )? {
+                    Some(0) => config.light_other_on = !config.light_other_on,
+                    Some(1) => match edit_octave(ui, "Every other session", config.light_other)? {
+                        Some(octave) => config.light_other = octave,
+                        None => return Ok(()),
+                    },
+                    _ => return Ok(()),
+                }
+            } else if index == rows.len() - 1 {
+                let Some(folder) =
+                    text_entry(ui, "Folder (absolute; sessions in it or below)", "")?
+                else {
+                    return Ok(());
+                };
+                let folder = folder.trim().trim_end_matches('/').to_owned();
+                if !Path::new(&folder).is_dir() {
+                    return Err(format!("folder {folder:?} is missing or not absolute").into());
+                }
+                // First unused octave, so a new folder is told apart by default.
+                let free = [1, -1, 2, -2, 3, -3, 4, -4]
+                    .into_iter()
+                    .find(|o| !taken.iter().any(|(_, t)| t == o))
+                    .unwrap_or(1);
+                let Some(octave) = edit_octave(ui, &folder, free)? else {
+                    return Ok(());
+                };
+                config.light_folders.push((folder, octave));
+            } else {
+                let (folder, octave) = config.light_folders[index - 1].clone();
+                match choose(ui, &folder, &options(&["Edit octave", "Remove", "Back"]))? {
+                    Some(0) => match edit_octave(ui, &folder, octave)? {
+                        Some(octave) => config.light_folders[index - 1].1 = octave,
+                        None => return Ok(()),
+                    },
+                    Some(1) => {
+                        config.light_folders.remove(index - 1);
+                    }
+                    _ => return Ok(()),
+                }
+            }
+            mappings::save_config(path, &config)
+        })();
         if let Err(error) = result {
             not_saved(ui, &error)?;
         }
@@ -6353,10 +6736,10 @@ mod tests {
         let repo = dir.join("repo").to_str().unwrap().to_owned();
         let mut keys = vec![Enter, Enter, Enter, Enter, Enter]; // claude -> Edit -> name, launch, window
         keys.extend(typed("/definitely/not/here"));
-        keys.extend([Enter, Enter]); // refused -> Back
+        keys.extend([Enter, Enter, Enter]); // octave default -> refused -> Back
         keys.extend([Enter, Enter, Enter, Enter, Enter]);
         keys.extend(typed(&repo));
-        keys.extend([Enter, Escape]);
+        keys.extend([Enter, Up, Up, Up, Enter, Escape]); // octave +4
         let mut ui = Script {
             keys: keys.into(),
             ..Default::default()
@@ -6371,7 +6754,137 @@ mod tests {
         let config = mappings::load_config(&path).unwrap();
         assert_eq!(config.agents[0].dir.as_deref(), Some(repo.as_str()));
         assert_eq!(config.agents[1].dir, None);
+        // Ticket 14: the agent's status-light octave is edited and saved with it.
+        assert_eq!(config.agents[0].octave, 4);
+        assert_eq!(config.agents[1].octave, -1);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Ticket 14: status lights show only in a running interactive session on a verified,
+    /// non-piano program with Status lights On; the toggle saves, and v12 files load with the
+    /// spec defaults.
+    #[test]
+    fn status_lights_need_a_running_interactive_non_piano_session_and_can_be_turned_off() {
+        let dir = std::env::temp_dir().join(format!("vibeconsole-lights-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        ui.light_agents = Some(mappings::Config::default().agents);
+        ui.agent_states = vec![
+            ("claude".into(), "claude".into(), "needs-input"),
+            ("codex".into(), "codex".into(), "idle"),
+        ];
+        (ui.wanted_run, ui.suspended) = (true, false);
+        (ui.context_verified, ui.feedback_allowed) = (true, true);
+        let shown = ui.wanted_lights(true).unwrap();
+        assert_eq!((shown.octave, shown.tempo), (Some(1), Some(240)));
+        assert_eq!(ui.wanted_lights(false), None); // the login service never lights them
+        ui.suspended = true; // paused
+        assert_eq!(ui.wanted_lights(true), None);
+        ui.suspended = false;
+        ui.feedback_allowed = false; // unverified program
+        assert_eq!(ui.wanted_lights(true), None);
+        ui.feedback_allowed = true;
+        let mut piano = Mapping::new(Control::note(1, 60).unwrap(), "Shift", "hold").unwrap();
+        piano.input = mappings::Input::Piano;
+        ui.run_mappings = vec![piano];
+        assert_eq!(ui.wanted_lights(true), None); // octave/arpeggiator would change the notes
+        ui.run_mappings.clear();
+        ui.agent_states[0].2 = "idle";
+        assert_eq!(ui.wanted_lights(true), None); // all idle: program feedback
+        ui.agent_states[0].2 = "thinking";
+        assert!(ui.wanted_lights(true).is_some());
+        // Agents -> Status lights (just above Prompts, the last row) toggles and saves Off.
+        let mut menu = Script {
+            keys: [Key::Up, Key::Up, Key::Enter, Key::Escape].into(),
+            ..Default::default()
+        };
+        agents_menu(&mut menu, &path).unwrap();
+        assert!(menu.screens.iter().any(|s| s.contains("Status lights: On")));
+        assert!(!mappings::load_config(&path).unwrap().status_lights);
+        ui.light_agents = None; // what refresh_agent_states sets for Off
+        assert_eq!(ui.wanted_lights(true), None);
+        // Ticket 16: a busy folder source lights the controller next to idle agents.
+        ui.light_agents = Some(mappings::Config::default().agents);
+        ui.agent_states[0].2 = "idle";
+        let folder = -3;
+        ui.light_sessions = vec![("/work/app".into(), "needs-input", folder)];
+        let shown = ui.wanted_lights(true).unwrap();
+        assert_eq!((shown.octave, shown.tempo), (Some(-3), Some(240)));
+        // Folders, Every other session and edited patterns survive a save in config v15.
+        let mut config = mappings::load_config(&path).unwrap();
+        config.light_folders = vec![("/work/app".into(), folder)];
+        config.light_other_on = true;
+        config.light_patterns.states[2].1 = crate::status::Octave::Steady;
+        config.light_patterns.fast = 280;
+        mappings::save_config(&path, &config).unwrap();
+        let reloaded = mappings::load_config(&path).unwrap();
+        assert_eq!(reloaded.light_folders, config.light_folders);
+        assert_eq!(reloaded.light_patterns, config.light_patterns);
+        assert!(reloaded.light_other_on && reloaded.light_other == 2);
+        config.light_folders.push(("relative".into(), folder));
+        assert!(mappings::save_config(&path, &config).is_err());
+        // A v12 file loads with Status lights On and the spec's per-agent defaults.
+        let mut old = String::from("vibeconsole-mappings-v12\nidle\t-\t-\t-\n");
+        for context in 1..8 {
+            old.push_str(&format!("program-idle\t{context}\t-\t-\t-\n"));
+        }
+        old.push_str("start-flow\ton\nagent-dir\t-\nenv\t0\nvars\t0\nagents\t1\n");
+        old.push_str("agent\tcodex\tcodex\tcodex\t-\n");
+        std::fs::write(&path, old).unwrap();
+        let config = mappings::load_config(&path).unwrap();
+        assert!(config.status_lights);
+        assert_eq!(config.agents[0].octave, -1);
+        assert_eq!(config.light_patterns, crate::status::Patterns::default());
+        mappings::save_config(&path, &config).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains(concat!(
+            "status-lights\ton\nlight-tempos\t50\t240\n",
+            "light-pattern\tneeds-decision\tfast\talternate\n",
+            "light-pattern\tneeds-input\tfast\tsteady\n",
+            "light-pattern\tthinking\tslow\toff\n",
+            "light-pattern\tfinished\toff\tblink\n",
+            "light-other\toff\t2\nlight-folders\t0\nagents\t1\nagent\tcodex\tcodex\tcodex\t-\t-1\n"
+        )));
+        // Ticket 17: a v14 file's per-agent tempos become the shared slow/fast tempos.
+        let v14 = saved
+            .replace("vibeconsole-mappings-v15", "vibeconsole-mappings-v14")
+            .replace(
+                "light-tempos\t50\t240\nlight-pattern\tneeds-decision\tfast\talternate\nlight-pattern\tneeds-input\tfast\tsteady\nlight-pattern\tthinking\tslow\toff\nlight-pattern\tfinished\toff\tblink\n",
+                "",
+            )
+            .replace("light-other\toff\t2\n", "light-other\toff\t2\t50\t240\n")
+            .replace("agent\tcodex\tcodex\tcodex\t-\t-1\n", "agent\tcodex\tcodex\tcodex\t-\t-1\t120\t300\n");
+        std::fs::write(&path, v14).unwrap();
+        let migrated = mappings::load_config(&path).unwrap();
+        assert_eq!(
+            (migrated.light_patterns.slow, migrated.light_patterns.fast),
+            (120, 300)
+        );
+        assert_eq!(migrated.agents[0].octave, -1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The Agents line names outside sessions by their folder's last component, says NEEDS
+    /// INPUT for finished, and leaves idle or exited agents out.
+    #[test]
+    fn agent_line_shows_busy_agents_by_name_and_finished_as_needs_input() {
+        let row = |name: &str, state| (name.to_owned(), String::new(), state);
+        assert_eq!(
+            agent_line(&[
+                row("claude", "thinking"),
+                row("codex", "idle"),
+                row("VibeConsole", "finished")
+            ]),
+            "\nAgents: claude thinking · VibeConsole NEEDS INPUT"
+        );
+        assert_eq!(agent_line(&[row("claude", "idle")]), "");
+        assert_eq!(
+            agent_line(&[row("claude", "needs-decision")]),
+            "\nAgents: claude DECISION"
+        );
     }
 
     /// Ticket 13: the Prompts list reads, creates, edits and deletes; deleting a used prompt

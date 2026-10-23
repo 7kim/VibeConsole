@@ -233,6 +233,9 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                 crate::mappings::load(&crate::mappings::config_path()?)?.len()
             );
             println!("Agent terminals: tmux attach -t vibe");
+            for codex in [false, true] {
+                println!("{}", crate::status::hooks_status(codex));
+            }
             let answering = Command::new("gdbus")
                 .args([
                     "call",

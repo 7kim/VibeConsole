@@ -799,24 +799,27 @@ pub fn pane_alive(ok: bool, output: &str) -> bool {
     ok && output.lines().any(|line| line.trim() == "0")
 }
 
+/// Whether `vibe` window `name` has a live pane; None when tmux cannot be asked.
+pub fn window_alive(name: &str) -> Option<bool> {
+    let output = tmux(&[
+        "list-panes",
+        "-t",
+        &format!("=vibe:={name}"),
+        "-F",
+        "#{pane_dead}",
+    ])
+    .ok()?;
+    Some(pane_alive(
+        output.status.success(),
+        &String::from_utf8_lossy(&output.stdout),
+    ))
+}
+
 /// Whether the action's observable process runs now (tickets 09–10); None when unknowable.
 /// Sequences are answered by the dispatcher instead.
 /// `agents` are (name, tmux window) pairs.
 pub fn running(action: &Action, agents: &[(String, String)]) -> Option<bool> {
-    let window = |name: &str| {
-        let output = tmux(&[
-            "list-panes",
-            "-t",
-            &format!("=vibe:={name}"),
-            "-F",
-            "#{pane_dead}",
-        ])
-        .ok()?;
-        Some(pane_alive(
-            output.status.success(),
-            &String::from_utf8_lossy(&output.stdout),
-        ))
-    };
+    let window = window_alive;
     match action {
         Action::Command { window: name, .. } => window(name),
         Action::Prompt {
