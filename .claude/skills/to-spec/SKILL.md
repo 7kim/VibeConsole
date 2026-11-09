@@ -1,6 +1,6 @@
 ---
 name: to-spec
-description: "Turn the current conversation into a spec for a VibeConsole version and publish it to docs/<version>/spec/: no interview, just synthesis of what you've already discussed. Use when the user says /to-spec, /to-spec v7, or asks to turn a discussion into a spec."
+description: "Turn the current conversation into a spec for a VibeConsole version and publish it to docs/<version>/spec/: no interview, just synthesis of what you've already discussed. Use when the user says /to-spec, /to-spec v6.1, or asks to turn a discussion into a spec."
 ---
 
 This skill takes the current conversation context and codebase understanding and produces a spec. Do NOT interview the user; just synthesize what you already know.
