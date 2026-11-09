@@ -1464,7 +1464,7 @@ mod tests {
             message: crate::Message::Cc,
             direction,
         };
-        // Live cross-checks recorded in tickets/01-physical-control-names.md.
+        // Live cross-checks recorded in archive/tickets/01-physical-control-names.md.
         let (p1, p2, p4) = (program(0), program(1), program(3));
         assert_eq!(name(note(1, 21), 1, &p2), "Bank A Pad 1");
         assert_eq!(name(note(1, 29), 1, &p2), "Bank B Pad 1");

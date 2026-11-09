@@ -403,7 +403,7 @@ pub fn valid_octave(octave: i8) -> Result<i8> {
 ///   second; blink with one source flashes its octave against 0; alternate flips the shown
 ///   octave's sign twice a second.
 // ponytail: one-second turns and the half-second flip are not yet checked on hardware
-// (tests/v5/07 gate unrecorded); retune from its measured limit.
+// (archive/tests/v5/07 gate unrecorded); retune from its measured limit.
 pub fn lights(sources: &[(&str, i8)], patterns: &Patterns, millis: u128) -> Option<Settings> {
     let busy = sources
         .iter()

@@ -1,7 +1,7 @@
 archive/
 /target
-tickets/
-tests/
+docs/v*/
+docs/README.md
 notes.md
 SPEC-BEHAVIOR.md
 SPEC-UI.md
