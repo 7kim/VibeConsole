@@ -7,6 +7,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::Command,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 pub struct Owner {
@@ -43,6 +44,67 @@ impl Owner {
             .ok_or("XDG_RUNTIME_DIR is unavailable; run in your desktop session")?;
         Self::at(&dir.join("vibeconsole.lock"))
     }
+}
+
+const UNIT: &str = "vibeconsole.service";
+/// Start the login service when this session closes: set by a handover (ticket 20) or by
+/// Settings -> Login service (ticket 21).
+pub static RUN_ON_QUIT: AtomicBool = AtomicBool::new(false);
+
+/// The session's owner lock. Dropping it releases the lock first, then starts the login
+/// service if `restart` asks for it, so the service can take the lock.
+pub struct Session<O, F: FnMut(&[&str]) -> Result<()>> {
+    owner: Option<O>,
+    restart: &'static AtomicBool,
+    systemctl: F,
+}
+impl<O, F: FnMut(&[&str]) -> Result<()>> Drop for Session<O, F> {
+    fn drop(&mut self) {
+        self.owner.take();
+        if self.restart.swap(false, Ordering::SeqCst) {
+            match (self.systemctl)(&["start", UNIT]) {
+                Ok(()) => eprintln!("Login service started again."),
+                Err(e) => {
+                    eprintln!("Login service not started: {e}; run vibeconsole startup-start")
+                }
+            }
+        }
+    }
+}
+/// Take the owner lock. If the login service holds it, stop the service for this session
+/// and start it again on quit (ticket 20); any other lock holder is still refused.
+fn take_over<O, F: FnMut(&[&str]) -> Result<()>>(
+    acquire: impl Fn() -> Result<O>,
+    mut systemctl: F,
+    restart: &'static AtomicBool,
+) -> Result<Session<O, F>> {
+    let locked = match acquire() {
+        Ok(owner) => {
+            return Ok(Session {
+                owner: Some(owner),
+                restart,
+                systemctl,
+            });
+        }
+        Err(error) => error,
+    };
+    if systemctl(&["is-active", "--quiet", UNIT]).is_err() {
+        return Err(locked);
+    }
+    systemctl(&["stop", UNIT])
+        .map_err(|e| format!("could not pause the login service ({e}); no session opened"))?;
+    println!("Login service paused for this session; it starts again when you quit.");
+    restart.store(true, Ordering::SeqCst);
+    let mut session = Session {
+        owner: None,
+        restart,
+        systemctl,
+    };
+    session.owner = Some(acquire()?);
+    Ok(session)
+}
+pub fn session() -> Result<Session<Owner, fn(&[&str]) -> Result<()>>> {
+    take_over(Owner::acquire, systemctl, &RUN_ON_QUIT)
 }
 
 fn home() -> Result<PathBuf> {
@@ -86,16 +148,76 @@ fn managed(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+/// Output is captured: Settings calls this inside the full-screen session.
 fn systemctl(args: &[&str]) -> Result<()> {
-    let status = Command::new("systemctl")
+    let output = Command::new("systemctl")
         .arg("--user")
         .args(args)
-        .status()?;
-    if !status.success() {
-        return Err(format!("systemctl --user {} failed ({status})", args.join(" ")).into());
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "systemctl --user {} failed ({}): {}",
+            args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
     }
     Ok(())
 }
+fn binary() -> Result<PathBuf> {
+    Ok(home()?.join(".local/bin/vibeconsole"))
+}
+/// Write (or refresh) the managed user unit; it needs the installed binary.
+fn write_unit() -> Result<()> {
+    if !binary()?.is_file() {
+        return Err("run vibeconsole install first".into());
+    }
+    let path = unit()?;
+    managed(&path)?;
+    fs::create_dir_all(path.parent().unwrap())?;
+    fs::write(&path, service())?;
+    systemctl(&["daemon-reload"])
+}
+/// Settings -> Login service (ticket 21).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Login {
+    Enabled,
+    Enable,
+    Disable,
+    RunOnQuit,
+    SetRunOnQuit(bool),
+}
+pub fn login(request: Login) -> Result<bool> {
+    match request {
+        Login::Enabled => Ok(systemctl(&["is-enabled", "--quiet", UNIT]).is_ok()),
+        Login::Enable => {
+            write_unit()?;
+            systemctl(&["enable", UNIT])?;
+            Ok(true)
+        }
+        Login::Disable => systemctl(&["disable", UNIT]).map(|()| false),
+        Login::RunOnQuit => Ok(RUN_ON_QUIT.load(Ordering::SeqCst)),
+        Login::SetRunOnQuit(on) => {
+            if on {
+                write_unit()?;
+            }
+            RUN_ON_QUIT.store(on, Ordering::SeqCst);
+            Ok(on)
+        }
+    }
+}
+/// Setup and login-service commands `main` hands to `command`.
+pub const COMMANDS: [&str; 8] = [
+    "install",
+    "uninstall",
+    "doctor",
+    "startup-enable",
+    "startup-start",
+    "startup-stop",
+    "startup-status",
+    "startup-disable",
+];
 pub fn command(command: &str, flags: &[String]) -> Result<()> {
     if flags
         .iter()
@@ -104,7 +226,7 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
     {
         return Err("flags are supported only by startup-enable: --feedback, --start-flow".into());
     }
-    let binary = home()?.join(".local/bin/vibeconsole");
+    let binary = binary()?;
     match command {
         "install" => {
             let _owner = Owner::acquire()?;
@@ -144,15 +266,7 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
             );
         }
         "startup-enable" => {
-            if !binary.is_file() {
-                return Err("run vibeconsole install first".into());
-            }
-            let path = unit()?;
-            managed(&path)?;
-            fs::create_dir_all(path.parent().unwrap())?;
-            fs::write(&path, service())?;
-            systemctl(&["daemon-reload"])?;
-            systemctl(&["enable", "vibeconsole.service"])?;
+            login(Login::Enable)?;
             println!(
                 "Login startup enabled. Start explicitly with vibeconsole startup-start; journalctl --user -u vibeconsole.service shows program, Flow, and output status."
             );
@@ -164,7 +278,14 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
         }
         "startup-start" => systemctl(&["start", "vibeconsole.service"])?,
         "startup-stop" => systemctl(&["stop", "vibeconsole.service"])?,
-        "startup-status" => systemctl(&["status", "vibeconsole.service", "--no-pager"])?,
+        "startup-status" => {
+            let status = Command::new("systemctl")
+                .args(["--user", "status", UNIT, "--no-pager"])
+                .status()?;
+            if !status.success() {
+                return Err(format!("systemctl --user status {UNIT} failed ({status})").into());
+            }
+        }
         "startup-disable" => systemctl(&["disable", "--now", "vibeconsole.service"])?,
         "uninstall" => {
             if unit()?.exists() {
@@ -186,6 +307,7 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
             );
         }
         "doctor" => {
+            println!("{}", crate::version());
             println!(
                 "Session: {} / {}",
                 std::env::var("XDG_SESSION_TYPE").unwrap_or_default(),
@@ -269,6 +391,65 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Ticket 20: a running service is paused for the session and started again on quit.
+    #[test]
+    fn session_takes_over_a_running_service_and_restarts_it() {
+        use std::{cell::RefCell, rc::Rc};
+        fn run(
+            free: bool,
+            active: bool,
+            stop_ok: bool,
+            flag: &'static AtomicBool,
+        ) -> (Result<()>, Vec<String>) {
+            let calls = Rc::new(RefCell::new(Vec::new()));
+            let log = calls.clone();
+            let tries = RefCell::new(0);
+            let acquire = || {
+                *tries.borrow_mut() += 1;
+                if free || *tries.borrow() > 1 {
+                    Ok(())
+                } else {
+                    Err("locked".into())
+                }
+            };
+            let systemctl = move |args: &[&str]| -> Result<()> {
+                log.borrow_mut().push(args[0].to_string());
+                match args[0] {
+                    "is-active" if !active => Err("inactive".into()),
+                    "stop" if !stop_ok => Err("stop failed".into()),
+                    _ => Ok(()),
+                }
+            };
+            let result = take_over(acquire, systemctl, flag).map(drop);
+            let calls = calls.borrow().clone();
+            (result, calls)
+        }
+        static A: AtomicBool = AtomicBool::new(false);
+        let (result, calls) = run(false, true, true, &A);
+        assert!(result.is_ok());
+        assert_eq!(calls, ["is-active", "stop", "start"]);
+        static B: AtomicBool = AtomicBool::new(false);
+        let (result, calls) = run(false, false, true, &B);
+        assert_eq!(result.unwrap_err().to_string(), "locked");
+        assert_eq!(calls, ["is-active"]);
+        static C: AtomicBool = AtomicBool::new(false);
+        let (result, calls) = run(false, true, false, &C);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("no session opened")
+        );
+        assert_eq!(calls, ["is-active", "stop"]);
+        static D: AtomicBool = AtomicBool::new(false);
+        let (result, calls) = run(true, true, true, &D);
+        assert!(result.is_ok() && calls.is_empty());
+        // Ticket 21: Settings asked for the service on quit, with no handover.
+        static E: AtomicBool = AtomicBool::new(true);
+        let (_, calls) = run(true, false, true, &E);
+        assert_eq!(calls, ["start"]);
+    }
+
     #[test]
     fn one_owner_and_opt_in_unit_do_not_mutate_desktop() {
         let path = std::env::temp_dir().join(format!("vibeconsole-owner-{}", std::process::id()));

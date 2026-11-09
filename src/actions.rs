@@ -777,8 +777,19 @@ fn launch(path: &str, cancelled: &impl Fn() -> bool) -> Result<String> {
     })
 }
 /// `gio`, scoped inside the login service: stopping it must not half-kill Flow or apps (ticket 18).
+/// Its own process group: Ctrl+C in VibeConsole's terminal must not reach the launched app.
 fn launcher(in_unit: bool) -> Command {
-    scoped("gio", in_unit)
+    use std::os::unix::process::CommandExt;
+    let mut command = scoped("gio", in_unit);
+    command.process_group(0);
+    command
+}
+/// `wl-copy` forks a clipboard owner that must outlive a service stop (ticket 19) and Ctrl+C.
+fn wl_copy(in_unit: bool) -> Command {
+    use std::os::unix::process::CommandExt;
+    let mut command = scoped("wl-copy", in_unit);
+    command.process_group(0);
+    command
 }
 
 /// Desktop ID of an installed entry path, as the catalog and GNOME derive it: the path below
@@ -991,7 +1002,7 @@ pub fn fixed(value: i64, decimals: u8) -> String {
 }
 
 pub fn copy_text(text: &str) -> Result<()> {
-    let mut child = Command::new("wl-copy")
+    let mut child = wl_copy(in_unit())
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1545,7 +1556,7 @@ fn perform(
             target: Target::Focused { shift },
             enter,
         } => {
-            copy_prompt(&prompts_dir()?.join(file), Command::new("wl-copy"))?;
+            copy_prompt(&prompts_dir()?.join(file), wl_copy(in_unit()))?;
             tap(crate::keyboard::paste_keys(*shift))?;
             if *enter {
                 // Enter only after the application has read the clipboard and inserted it.
@@ -1603,6 +1614,34 @@ fn flow_main_args(args: &[u8]) -> bool {
         .split(|b| *b == 0 || b.is_ascii_whitespace())
         .any(|s| s.starts_with(b"--type="))
 }
+/// Parent PID from `/proc/<pid>/stat` ("pid (comm) state ppid ..."; comm may hold spaces).
+fn parent(stat: &str) -> Option<String> {
+    Some(
+        stat.rsplit_once(')')?
+            .1
+            .split_whitespace()
+            .nth(1)?
+            .to_string(),
+    )
+}
+/// A child the Flow app has just forked keeps the app's exe and arguments until it execs.
+/// Only a candidate whose parent is not another candidate owns Flow.
+fn owners(candidates: Vec<(PathBuf, String)>) -> Vec<PathBuf> {
+    let pids: Vec<String> = candidates
+        .iter()
+        .map(|(p, _)| {
+            p.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    candidates
+        .into_iter()
+        .filter(|(_, ppid)| !pids.contains(ppid))
+        .map(|(p, _)| p)
+        .collect()
+}
 fn flow_processes() -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     let mut main = Vec::new();
     let mut helper = Vec::new();
@@ -1626,12 +1665,19 @@ fn flow_processes() -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
         if exe == Path::new(FLOW_HELPER) {
             helper.push(p);
         } else if exe == Path::new(FLOW_APP) {
-            let args = fs::read(p.join("cmdline"))?;
+            // The process may exit while we look; that is not an error.
+            let (Ok(args), Ok(stat)) = (
+                fs::read(p.join("cmdline")),
+                fs::read_to_string(p.join("stat")),
+            ) else {
+                continue;
+            };
             if flow_main_args(&args) {
-                main.push(p);
+                main.push((p, parent(&stat).unwrap_or_default()));
             }
         }
     }
+    let main = owners(main);
     if main.len() > 1 {
         return Err("multiple Flow owners; resolve manually before repair".into());
     }
@@ -1946,6 +1992,24 @@ mod tests {
             b"/usr/lib/wispr-flow/wispr-flow\0--type=renderer\0"
         ));
         assert_eq!(FLOW_APP, "/usr/lib/wispr-flow/wispr-flow");
+        // A just-forked child of the app is not a second owner; two unrelated apps still are.
+        assert_eq!(
+            parent("162291 (wispr flow) S 161243 1 2").as_deref(),
+            Some("161243")
+        );
+        let candidate =
+            |pid: &str, ppid: &str| (PathBuf::from(format!("/proc/{pid}")), ppid.to_string());
+        assert_eq!(
+            owners(vec![
+                candidate("161243", "3733"),
+                candidate("162291", "161243")
+            ]),
+            [PathBuf::from("/proc/161243")]
+        );
+        assert_eq!(
+            owners(vec![candidate("10", "1"), candidate("20", "1")]).len(),
+            2
+        );
         assert_eq!(
             FLOW_HELPER,
             "/usr/lib/wispr-flow/resources/Release/wispr-flow-linux-helper"
@@ -2399,6 +2463,12 @@ mod tests {
             ["systemd-run", "--user", "--scope"]
         );
         assert_eq!(argv(&launcher(true)).last().unwrap(), "gio");
+        assert_eq!(argv(&wl_copy(false)), ["wl-copy"]);
+        assert_eq!(
+            argv(&wl_copy(true))[..3],
+            ["systemd-run", "--user", "--scope"]
+        );
+        assert_eq!(argv(&wl_copy(true)).last().unwrap(), "wl-copy");
     }
 
     /// Tickets 11–12: agents start in their override, else the Settings default, else tmux's

@@ -222,6 +222,7 @@ Any pad or piano mapping can fire **Held for 1 second (risky)**: an earlier rele
 
 - **Default agent directory**: agents start there. Each agent can override it in Agents (**Working directory**). Override, else default, else tmux's own default. A directory must exist when you save it.
 - **Start Wispr Flow with VibeConsole** (the same toggle as in the Wispr Flow group).
+- **Login service**: **Start at login** On/Off (the same as `startup-enable` / `startup-disable`), and **Start the service when this session closes**. The row always shows the state read from `systemctl`.
 - **Startup variables** (`NAME=value`): exported with `tmux -e` into every agent and command VibeConsole starts.
 - **User variables**: `${NAME}` in a command's directory or an agent directory is replaced by the user variable, else the startup variable; an unknown name is refused when you save. Both lists are also exported into every agent's and command's environment, so command lines use them as ordinary shell variables (`"$NAME"`, quoted as you need). VibeConsole never rewrites a command line, so shell variables like `${f}` in a loop keep working.
 
@@ -300,7 +301,8 @@ Use `./target/debug/vibeconsole` for the current local build. After installation
 | `vibeconsole startup-stop` | Stop the service |
 | `vibeconsole startup-disable` | Disable and stop the service |
 | `vibeconsole daemon` | Headless program-following runtime used by the optional service; old flags are accepted and ignored |
-| `vibeconsole --help` / `vibeconsole help` | Show CLI help |
+| `vibeconsole --help` / `-h` / `help` | Show grouped CLI help (colored in a terminal; plain when piped or with `NO_COLOR`) |
+| `vibeconsole --version` / `-V` / `version` | Show the version |
 
 Install/update after quitting the running VibeConsole session:
 
@@ -310,7 +312,7 @@ cargo build --locked
 ~/.local/bin/vibeconsole doctor
 ```
 
-Ensure `~/.local/bin` is on PATH. Rebuilding alone does not update the installed executable. Installation does not enable/start login startup. One runtime owns MIDI, keyboard output, and editing; a second session refuses the conflict, while `list` remains readable. Keep ordinary editing in the same foreground session to preserve keyboard continuity.
+Ensure `~/.local/bin` is on PATH. Rebuilding alone does not update the installed executable. Installation does not enable/start login startup. One runtime owns MIDI, keyboard output, and editing. If the login service owns them, `vibeconsole` pauses the service for the session and starts it again when you quit; any other second session is refused. `list`, `doctor`, `agent-status` and the `startup-*` commands never stop the service. Keep ordinary editing in the same foreground session to preserve keyboard continuity.
 
 ### Optional login service
 
@@ -325,9 +327,9 @@ vibeconsole startup-stop
 vibeconsole startup-disable
 ```
 
-Only opt in when this scope matches your setup. Live login behavior remains unverified. Service configuration is inspectable/removable, unmanaged units are not overwritten, and mappings survive uninstall. Stop the service before starting a foreground owner; a new process creates a new keyboard and may require Flow discovery/recovery.
+Only opt in when this scope matches your setup. Live login behavior remains unverified. Service configuration is inspectable/removable, unmanaged units are not overwritten, and mappings survive uninstall. Opening `vibeconsole` while the service runs hands over: the service stops cleanly, the session opens, and the service starts again when you quit. Each handover creates a new keyboard, so Flow is restarted once each way.
 
-**Running in the background.** The service has no screen: notices, errors and status feedback lines (`Status Bank A Pad 5: running`) go to `journalctl --user -u vibeconsole.service`. When it starts the `vibe` tmux server or opens a terminal, it does so in its own systemd scope (`systemd-run --user --scope`), because stopping a service kills everything left in its group. Agents, commands and opened terminals therefore survive `vibeconsole startup-stop`. Apps launched from pads get their own scope from GLib anyway. After a Flow pad's capture, the service resumes output for any detected non-piano program.
+**Running in the background.** The service has no screen: notices, errors and status feedback lines (`Status Bank A Pad 5: running`) go to `journalctl --user -u vibeconsole.service`. When it starts the `vibe` tmux server or opens a terminal, it does so in its own systemd scope (`systemd-run --user --scope`), because stopping a service kills everything left in its group. Agents, commands and opened terminals therefore survive `vibeconsole startup-stop`. Apps launched from pads (including Wispr Flow) and `wl-copy`'s clipboard owner get their own scope too, so they also survive a stop. After a Flow pad's capture, the service resumes output for any detected non-piano program.
 
 ---
 

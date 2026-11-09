@@ -123,6 +123,10 @@ trait Ui {
     fn record(&mut self) -> Result<Vec<String>> {
         Err("recording unavailable; use Select keys".into())
     }
+    /// Settings -> Login service; the session overrides this with systemctl (ticket 21).
+    fn login(&mut self, _request: crate::runtime::Login) -> Result<bool> {
+        Err("login service unavailable".into())
+    }
 }
 
 struct Terminal {
@@ -1508,7 +1512,7 @@ impl Terminal {
     fn tick(&mut self) -> Result<()> {
         if self.stop.load(Ordering::Relaxed) {
             self.pause()?;
-            return Err("session stopped; terminal restored".into());
+            return Err(STOPPED.into());
         }
         if let Err(error) = self.follow_controller() {
             self.abandon_program()?;
@@ -2211,7 +2215,7 @@ Changing musical settings while running is unsupported.",
 
     fn byte(&self, timeout: i32) -> Result<Option<u8>> {
         if self.stop.load(Ordering::Relaxed) {
-            return Err("session stopped; terminal restored".into());
+            return Err(STOPPED.into());
         }
         let mut fd = libc::pollfd {
             fd: 0,
@@ -2272,6 +2276,9 @@ impl Drop for Terminal {
 }
 
 impl Ui for Terminal {
+    fn login(&mut self, request: crate::runtime::Login) -> Result<bool> {
+        crate::runtime::login(request)
+    }
     fn edit_file(&mut self, path: &Path) -> Result<()> {
         self.suspend()?;
         let original = self
@@ -3007,6 +3014,7 @@ fn settings_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 "Status light patterns (slow {} BPM, fast {} BPM): what each agent state shows",
                 config.light_patterns.slow, config.light_patterns.fast
             ),
+            login_row(ui),
         ];
         let Some(choice) = choose(ui, "Settings", &rows)? else {
             return Ok(());
@@ -3037,11 +3045,61 @@ fn settings_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
             }
             2 | 3 => variables_menu(ui, path, choice == 3),
             4 => light_sources_menu(ui, path),
-            _ => light_patterns_menu(ui, path),
+            5 => light_patterns_menu(ui, path),
+            _ => login_menu(ui),
         };
         if let Err(error) = result {
             not_saved(ui, &error)?;
         }
+    }
+}
+
+fn on_off(state: Result<bool>) -> &'static str {
+    match state {
+        Ok(true) => "On",
+        Ok(false) => "Off",
+        Err(_) => "unknown",
+    }
+}
+/// The real state, read from systemctl each time, never a saved copy (ticket 21).
+fn login_row(ui: &mut impl Ui) -> String {
+    use crate::runtime::Login;
+    format!(
+        "Login service: start at login {}; start when this session closes {}",
+        on_off(ui.login(Login::Enabled)),
+        on_off(ui.login(Login::RunOnQuit))
+    )
+}
+/// Settings -> Login service: start at login (startup-enable/disable), and start the service
+/// when this session closes (the session holds the controller until then).
+fn login_menu(ui: &mut impl Ui) -> Result<()> {
+    use crate::runtime::Login;
+    let enabled = ui.login(Login::Enabled)?;
+    let on_quit = ui.login(Login::RunOnQuit)?;
+    let turn = |on: bool| if on { "Turn Off" } else { "Turn On" };
+    let items = vec![
+        format!(
+            "Start at login: {} ({})",
+            on_off(Ok(enabled)),
+            turn(enabled)
+        ),
+        format!(
+            "Start the service when this session closes: {} ({})",
+            on_off(Ok(on_quit)),
+            turn(on_quit)
+        ),
+        "Back".to_string(),
+    ];
+    match choose(ui, "Login service", &items)? {
+        Some(0) => ui
+            .login(if enabled {
+                Login::Disable
+            } else {
+                Login::Enable
+            })
+            .map(drop),
+        Some(1) => ui.login(Login::SetRunOnQuit(!on_quit)).map(drop),
+        _ => Ok(()),
     }
 }
 
@@ -3533,6 +3591,10 @@ fn prompt_action(
 }
 
 fn reset_file(path: &Path) -> Result<PathBuf> {
+    reset_file_at(path, &stamp()?)
+}
+/// Local time as `YYYYmmdd-HHMMSS` for reset backups.
+fn stamp() -> Result<String> {
     let mut now = 0;
     // SAFETY: localtime_r writes to the provided tm; strftime writes within the fixed buffer.
     let stamp = unsafe {
@@ -3555,6 +3617,10 @@ fn reset_file(path: &Path) -> Result<PathBuf> {
             .to_str()?
             .to_owned()
     };
+    Ok(stamp)
+}
+/// Back up `path` as `<name>.bak-<stamp>` (never overwriting one) and reset it.
+fn reset_file_at(path: &Path, stamp: &str) -> Result<PathBuf> {
     let backup = path.with_file_name(format!(
         "{}.bak-{stamp}",
         path.file_name()
@@ -5023,7 +5089,19 @@ fn command_menu(ui: &mut Terminal) -> Result<Option<usize>> {
     }
 }
 
-pub fn start(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> {
+/// Ctrl+C (or SIGTERM/SIGHUP) ends the session through this error once keys are released.
+const STOPPED: &str = "session stopped; terminal restored";
+/// A signal-requested stop is a normal quit, not a failure (exit 0, no error line).
+fn quiet_stop(result: Result<()>) -> Result<()> {
+    match result {
+        Err(error) if error.to_string() == STOPPED => Ok(()),
+        result => result,
+    }
+}
+pub fn start(path: &Path, current: Vec<Mapping>, initial: &str) -> Result<()> {
+    quiet_stop(session(path, current, initial))
+}
+fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> {
     let mut ui = Terminal::open(path)?;
     let config = mappings::load_config(path)?;
     ui.idle = config.idle;
@@ -5395,8 +5473,29 @@ mod tests {
         motions: VecDeque<(Control, mappings::Input, String)>,
         /// The editor fails after writing part of the file.
         edit_fails: bool,
+        /// Login service state and every request Settings made (ticket 21).
+        login: (bool, bool),
+        login_calls: Vec<crate::runtime::Login>,
+        login_fails: bool,
     }
     impl Ui for Script {
+        fn login(&mut self, request: crate::runtime::Login) -> Result<bool> {
+            use crate::runtime::Login;
+            self.login_calls.push(request);
+            match request {
+                Login::Enabled => Ok(self.login.0),
+                Login::RunOnQuit => Ok(self.login.1),
+                _ if self.login_fails => Err("systemctl --user enable failed".into()),
+                Login::Enable | Login::Disable => {
+                    self.login.0 = request == Login::Enable;
+                    Ok(self.login.0)
+                }
+                Login::SetRunOnQuit(on) => {
+                    self.login.1 = on;
+                    Ok(on)
+                }
+            }
+        }
         fn applications(&self) -> Result<Vec<(String, String)>> {
             Ok(vec![(
                 "Recorded app".into(),
@@ -6126,7 +6225,7 @@ mod tests {
             .unwrap();
         mappings::save_config(&path, &config).unwrap();
         let before = std::fs::read(&path).unwrap();
-        let backup = reset_file(&path).unwrap();
+        let backup = reset_file_at(&path, "20260101-000000").unwrap();
         assert_eq!(std::fs::read(&backup).unwrap(), before);
         assert!(
             backup
@@ -6140,7 +6239,8 @@ mod tests {
             mappings::Config::default()
         );
         mappings::save_config(&path, &config).unwrap();
-        assert!(reset_file(&path).is_err()); // existing timestamped backup is never overwritten
+        // existing timestamped backup is never overwritten (fixed stamp: no clock race)
+        assert!(reset_file_at(&path, "20260101-000000").is_err());
         assert_eq!(mappings::load_config(&path).unwrap(), config);
 
         let failed = dir.join("failed");
@@ -6720,6 +6820,63 @@ mod tests {
         assert!(!config.start_flow);
         assert_eq!(config.env, [("API_MODEL".to_string(), "opus".to_string())]);
         assert_eq!(config.vars, [("WORK".to_string(), work.clone())]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Ctrl+C is a normal quit; other errors still surface.
+    #[test]
+    fn a_signal_stop_quits_quietly() {
+        assert!(quiet_stop(Err(STOPPED.into())).is_ok());
+        assert!(quiet_stop(Ok(())).is_ok());
+        assert!(quiet_stop(Err("Flow capture failed".into())).is_err());
+    }
+
+    /// Ticket 21: Settings -> Login service toggles start-at-login and start-on-quit through
+    /// the injected runner; a failure is shown and nothing changes.
+    #[test]
+    fn settings_login_service_toggles_and_shows_failures() {
+        use crate::runtime::Login;
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-login-ui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let to_login = vec![Down, Down, Down, Down, Down, Down, Enter];
+        let mut keys = to_login.clone();
+        keys.push(Enter); // Start at login: Turn On
+        keys.extend(to_login.clone());
+        keys.extend([Down, Enter]); // Start when this session closes: Turn On
+        keys.push(Escape);
+        let mut ui = Script {
+            keys: keys.into(),
+            ..Default::default()
+        };
+        settings_menu(&mut ui, &path).unwrap();
+        assert!(ui.keys.is_empty());
+        assert_eq!(ui.login, (true, true));
+        assert!(ui.login_calls.contains(&Login::Enable));
+        assert!(ui.login_calls.contains(&Login::SetRunOnQuit(true)));
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains("start at login On; start when this session closes On"))
+        );
+        let mut keys = to_login;
+        keys.extend([Enter, Enter, Escape]); // Turn On fails -> Not saved -> Back
+        let mut ui = Script {
+            keys: keys.into(),
+            login_fails: true,
+            ..Default::default()
+        };
+        settings_menu(&mut ui, &path).unwrap();
+        assert!(ui.keys.is_empty());
+        assert_eq!(ui.login, (false, false));
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.starts_with("Not saved:") && s.contains("enable failed"))
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
