@@ -624,10 +624,18 @@ pub fn flow_installed() -> Result<bool> {
 
 // Only child dispatch requests are cancellable. Never kill the resulting application.
 fn command(program: &str, args: &[String], cancelled: &impl Fn() -> bool) -> Result<String> {
+    dispatch(Command::new(program), args, cancelled)
+}
+fn dispatch(
+    mut command: Command,
+    args: &[String],
+    cancelled: &impl Fn() -> bool,
+) -> Result<String> {
+    let program = command.get_program().to_string_lossy().into_owned();
     if cancelled() {
         return Err("action cancelled before dispatch".into());
     }
-    let mut child = Command::new(program)
+    let mut child = command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -765,8 +773,12 @@ fn launch(path: &str, cancelled: &impl Fn() -> bool) -> Result<String> {
     let session = std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some()
         && (std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some());
     launch_request(path, &catalog()?, session, |args| {
-        command("gio", args, cancelled)
+        dispatch(launcher(in_unit()), args, cancelled)
     })
+}
+/// `gio`, scoped inside the login service: stopping it must not half-kill Flow or apps (ticket 18).
+fn launcher(in_unit: bool) -> Command {
+    scoped("gio", in_unit)
 }
 
 /// Desktop ID of an installed entry path, as the catalog and GNOME derive it: the path below
@@ -2381,6 +2393,12 @@ mod tests {
                 "tmux"
             ]
         );
+        assert_eq!(argv(&launcher(false)), ["gio"]);
+        assert_eq!(
+            argv(&launcher(true))[..3],
+            ["systemd-run", "--user", "--scope"]
+        );
+        assert_eq!(argv(&launcher(true)).last().unwrap(), "gio");
     }
 
     /// Tickets 11–12: agents start in their override, else the Settings default, else tmux's
