@@ -77,6 +77,17 @@ sudo modprobe uinput
 sudo setfacl -m "u:$(id -un):rw" /dev/uinput
 ```
 
+### setup first time
+```bash
+vibeconsole
+```
+setup first time
+```bash
+
+vibeconsole startup-enable
+vibeconsole startup-start
+```
+
 Recheck afterward. The ACL may need reapplying after reboot or device-node recreation; VibeConsole does not install persistent permission rules. Physical shortcut recording separately needs read access to the detected `/dev/input/event*` keyboard nodes. Recording errors identify the missing access; menu-based key selection remains available.
 
 ---
