@@ -5259,14 +5259,14 @@ fn stage<E: std::fmt::Display>(name: &'static str) -> impl Fn(E) -> Box<dyn std:
 /// Action families (indexes into `FAMILIES`) a control can use; others are not offered.
 fn families(input: mappings::Input) -> Vec<usize> {
     match input {
-        mappings::Input::Pad | mappings::Input::Piano => (0..6).chain([8, 9, 10, 11]).collect(),
+        mappings::Input::Pad | mappings::Input::Piano => (0..6).chain([8, 9, 10, 11, 12]).collect(),
         mappings::Input::Knob { .. } => vec![0, 2, 6, 7],
         mappings::Input::RelativeKnob { .. } => vec![0, 2],
         mappings::Input::Joystick { .. } => vec![0],
     }
 }
 
-const FAMILIES: [&str; 12] = [
+const FAMILIES: [&str; 13] = [
     "Keyboard shortcut",
     "Launch application",
     "Fedora system action",
@@ -5279,6 +5279,7 @@ const FAMILIES: [&str; 12] = [
     "T3 Code (keys from its own key file)",
     "herdr (focus an agent)",
     "Prompt sequence (tap 1 sends prompt 1, tap 2 prompt 2, …)",
+    "Terminal command, e.g. sudo dnf update (visible terminal, hold 1 second)",
 ];
 
 fn configure(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) -> Result<()> {
@@ -5699,7 +5700,7 @@ fn configure_steps(
                 continue;
             };
             Mapping::new_action(pad, input, action)?
-        } else if family == 4 {
+        } else if family == 4 || family == 12 {
             if !matches!(input, mappings::Input::Pad | mappings::Input::Piano) {
                 return Err("commands require a pad or piano press".into());
             }
@@ -5825,7 +5826,11 @@ fn configure_steps(
             }
             _ => {}
         }
-        if matches!(mapping.input, mappings::Input::Pad | mappings::Input::Piano) {
+        // v7 ticket 23: a terminal command (sudo and the like) is a risky control: it fires
+        // only after a one-second hold, in a visible terminal where sudo asks for the password.
+        if family == 12 {
+            mapping.risky = true;
+        } else if matches!(mapping.input, mappings::Input::Pad | mappings::Input::Piano) {
             let Some(risky) = choose_saved(
                 ui,
                 "Fire when",
@@ -7961,6 +7966,45 @@ mod tests {
             crate::actions::Action::AppToggleQuit("/nonexistent/recorded.desktop".into())
         );
         assert_eq!(mappings::load(&path).unwrap(), current);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 23: a terminal command is always a one-second-hold (risky) control.
+    #[test]
+    fn terminal_commands_always_need_a_one_second_hold() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-termcmd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut keys = vec![Enter];
+        keys.extend(vec![Down; 10]); // Terminal command family
+        keys.push(Enter);
+        keys.extend(b"sudo dnf update".map(|b| if b == b' ' { Space } else { Character(b) }));
+        keys.push(Enter);
+        keys.extend(dir.to_string_lossy().bytes().map(Character)); // working directory
+        keys.push(Enter);
+        keys.extend([Enter, Down, Enter]); // no status feedback, save and finish
+        let mut ui = Script {
+            keys: keys.into(),
+            pads: [Control::from_note(10, 43).unwrap()].into(),
+            ..Default::default()
+        };
+        let mut current = Vec::new();
+        configure(&mut ui, &path, &mut current).unwrap();
+        assert!(ui.keys.is_empty());
+        assert!(
+            !ui.screens.iter().any(|s| s.starts_with("Fire when")),
+            "no choice: always held"
+        );
+        let saved = mappings::load(&path).unwrap();
+        assert!(saved[0].risky, "fires only after a one-second hold");
+        let crate::actions::Action::Command { window, line, .. } = &saved[0].action else {
+            panic!("not a command: {:?}", saved[0].action);
+        };
+        assert!(!window.is_empty(), "the window is named after the pad");
+        assert_eq!(line, "sudo dnf update");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
