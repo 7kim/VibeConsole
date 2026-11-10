@@ -247,8 +247,23 @@ pub fn analog(
     changes
 }
 
+/// v7 ticket 11: rumble when a source (agent or folder) newly finishes or needs the user;
+/// staying in that state, or going busy/idle, doesn't rumble again.
+pub fn rumble_due(before: &[(String, &str)], now: &[(String, &str)]) -> bool {
+    let alerting = |state: &str| matches!(state, "finished" | "needs-input" | "needs-decision");
+    now.iter().any(|(name, state)| {
+        alerting(state)
+            && before
+                .iter()
+                .find(|(n, _)| n == name)
+                .is_none_or(|(_, was)| was != state)
+    })
+}
+
 pub struct Pad {
     gilrs: gilrs::Gilrs,
+    /// The rumble playing now; dropping it stops it.
+    effect: Option<gilrs::ff::Effect>,
     /// Buttons whose press was seen since the last transition.
     pub down: HashSet<Control>,
     pub analog: Analog,
@@ -260,6 +275,7 @@ impl Pad {
             gilrs::Gilrs::new().map_err(|e| format!("Xbox controllers unavailable: {e}"))?;
         Ok(Self {
             gilrs,
+            effect: None,
             down: HashSet::new(),
             analog: Analog::default(),
             tuning: crate::mappings::Tuning::default(),
@@ -307,11 +323,58 @@ impl Pad {
         self.down.clear();
         self.analog = Analog::default();
     }
+    /// One short rumble on every controller that supports it, when Tuning has it on.
+    /// Rumble is hardware feedback: it plays only while VibeConsole owns the controller.
+    pub fn rumble(&mut self) -> crate::Result<()> {
+        use gilrs::ff::{BaseEffect, BaseEffectType, EffectBuilder, Repeat, Replay, Ticks};
+        if !self.tuning.rumble {
+            return Ok(());
+        }
+        let ids = self
+            .gilrs
+            .gamepads()
+            .filter(|(_, pad)| pad.is_ff_supported())
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let length = Ticks::from_ms(300);
+        let effect = EffectBuilder::new()
+            .add_effect(BaseEffect {
+                kind: BaseEffectType::Strong { magnitude: 40_000 },
+                scheduling: Replay {
+                    play_for: length,
+                    ..Default::default()
+                },
+                envelope: Default::default(),
+            })
+            .repeat(Repeat::For(length))
+            .gamepads(&ids)
+            .finish(&mut self.gilrs)
+            .map_err(|e| format!("Rumble failed: {e}"))?;
+        effect.play().map_err(|e| format!("Rumble failed: {e}"))?;
+        self.stop_rumble();
+        self.effect = Some(effect);
+        Ok(())
+    }
+    pub fn stop_rumble(&mut self) {
+        if let Some(effect) = self.effect.take() {
+            let _ = effect.stop();
+        }
+    }
     pub fn connected(&self) -> Vec<String> {
         self.gilrs
             .gamepads()
             .map(|(_, pad)| pad.name().to_owned())
             .collect()
+    }
+}
+
+impl Drop for Pad {
+    /// Quitting (or any error that drops the session) stops a rumble in progress.
+    fn drop(&mut self) {
+        self.stop_rumble();
     }
 }
 
@@ -540,6 +603,28 @@ mod tests {
                 (KeyCode::KEY_ENTER, false),
             ]
         );
+    }
+
+    #[test]
+    fn rumble_once_when_a_source_newly_finishes_or_needs_you() {
+        let state = |pairs: &[(&str, &'static str)]| {
+            pairs
+                .iter()
+                .map(|(n, s)| (n.to_string(), *s))
+                .collect::<Vec<(String, &str)>>()
+        };
+        let busy = state(&[("claude", "thinking"), ("/work", "thinking")]);
+        let done = state(&[("claude", "finished"), ("/work", "thinking")]);
+        assert!(rumble_due(&busy, &done));
+        assert!(
+            !rumble_due(&done, &done),
+            "still finished: no second rumble"
+        );
+        let asks = state(&[("claude", "finished"), ("/work", "needs-input")]);
+        assert!(rumble_due(&done, &asks));
+        assert!(!rumble_due(&asks, &busy), "going busy again doesn't rumble");
+        assert!(rumble_due(&[], &state(&[("codex", "needs-decision")])));
+        assert!(!rumble_due(&[], &state(&[("codex", "idle")])));
     }
 
     #[test]

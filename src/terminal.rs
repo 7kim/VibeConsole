@@ -749,6 +749,7 @@ impl Terminal {
         let Ok(config) = mappings::load_config(&self.path) else {
             return;
         };
+        let before = self.alert_states();
         self.light_agents = config.status_lights.then(|| config.agents.clone());
         // Settings -> Xbox tuning applies within a status refresh.
         if let Some(pad) = &mut self.gamepad {
@@ -798,6 +799,26 @@ impl Terminal {
                     .collect::<Vec<_>>();
             self.clear_finished(&attended);
         }
+        // v7 ticket 11: a short rumble when something newly finishes or needs you.
+        if crate::gamepad::rumble_due(&before, &self.alert_states()) {
+            if let Some(pad) = &mut self.gamepad {
+                if let Err(error) = pad.rumble() {
+                    self.notice = error.to_string();
+                }
+            }
+        }
+    }
+    /// Every agent and outside-folder source with its state, for rumble alerts.
+    fn alert_states(&self) -> Vec<(String, &'static str)> {
+        self.agent_states
+            .iter()
+            .map(|(name, _, state)| (name.clone(), *state))
+            .chain(
+                self.light_sessions
+                    .iter()
+                    .map(|(folder, state, _)| (folder.clone(), *state)),
+            )
+            .collect()
     }
     /// Attending to an agent (its tmux window, or a mapping sent to it) clears its finished state.
     fn clear_finished(&mut self, agents: &[String]) {
@@ -913,6 +934,9 @@ impl Terminal {
     }
     fn suspend(&mut self) -> Result<()> {
         self.suspended = true;
+        if let Some(pad) = &mut self.gamepad {
+            pad.stop_rumble();
+        }
         self.motion = crate::motion::Motion::default();
         if let Some(output) = &mut self.output {
             if let Err(error) = output.pause() {
@@ -3228,6 +3252,10 @@ fn tuning_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
     let items = vec![
         format!("Stick dead zone: {}%", tuning.dead_zone),
         format!("Triggers fire at: {}% of travel", tuning.trigger),
+        format!(
+            "Rumble when an agent finishes or needs you: {}",
+            if tuning.rumble { "On" } else { "Off" }
+        ),
         "Back".to_string(),
     ];
     match choose(ui, "Xbox tuning", &items)? {
@@ -3257,6 +3285,7 @@ fn tuning_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
             };
             config.tuning.trigger = u8::try_from(value)?;
         }
+        Some(2) => config.tuning.rumble = !tuning.rumble,
         _ => return Ok(()),
     }
     mappings::save_config(path, &config)
@@ -6715,6 +6744,15 @@ mod tests {
         assert!(ui.keys.is_empty());
         let tuning = mappings::load_config(&path).unwrap().tuning;
         assert_eq!((tuning.dead_zone, tuning.trigger), (20, 60));
+        assert!(!tuning.rumble, "rumble stays off until turned on");
+        let mut keys = to_tuning.clone();
+        keys.extend([Enter, Down, Down, Enter, Escape]);
+        let mut ui = Script {
+            keys: keys.into(),
+            ..Default::default()
+        };
+        settings_menu(&mut ui, &path).unwrap();
+        assert!(mappings::load_config(&path).unwrap().tuning.rumble);
         assert!(
             ui.screens
                 .iter()
