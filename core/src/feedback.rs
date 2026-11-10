@@ -1,10 +1,9 @@
 use crate::{Result, midi};
 use std::fmt;
-use std::io::{self, Write};
-use std::os::fd::AsRawFd;
+use std::io;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const OFFSETS: [usize; 4] = [0x13, 0x14, 0x1B, 0x1C];
 const QUERY: [u8; 9] = [0xF0, 0x47, 0x7F, 0x49, 0x66, 0, 1, 0, 0xF7];
@@ -332,41 +331,12 @@ trait Transport {
     fn write(&mut self, payload: &Payload) -> Result<()>;
 }
 struct Hardware {
-    output: std::fs::File,
+    output: midi::Output,
     replies: mpsc::Receiver<Reply>,
 }
 impl Hardware {
     fn send(&mut self, message: &[u8]) -> Result<()> {
-        let mut sent = 0;
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while sent < message.len() {
-            match self.output.write(&message[sent..]) {
-                Ok(0) => return Err("MIDI output ended".into()),
-                Ok(count) => sent += count,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                    ) =>
-                {
-                    if Instant::now() >= deadline {
-                        return Err("MIDI transmission timed out".into());
-                    }
-                    let mut fd = libc::pollfd {
-                        fd: self.output.as_raw_fd(),
-                        events: libc::POLLOUT,
-                        revents: 0,
-                    };
-                    // SAFETY: one valid borrowed output descriptor. It retains the original
-                    // kernel device, so a replaced port cannot receive a stale restoration.
-                    unsafe {
-                        libc::poll(&mut fd, 1, 10);
-                    }
-                }
-                Err(error) => return Err(format!("MIDI transmission failed: {error}").into()),
-            }
-        }
-        Ok(())
+        self.output.send(message)
     }
 }
 impl Transport for Hardware {
@@ -969,6 +939,7 @@ pub fn read_only() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn knob_mode_changes_only_one_byte_in_stored_program_and_ram() {

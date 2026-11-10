@@ -247,29 +247,26 @@ fn main() -> Result<()> {
 }
 
 fn learn_pad() -> Result<Control> {
-    let port = input_port()?;
+    let input = midi::Input::open()?;
     println!("Press a pad in either bank to learn it. No shortcuts are generated; Ctrl+C cancels.");
-    let mut child = midi::command(&port).spawn()?;
-    let stdout = child.stdout.take().expect("piped MIDI input");
-    let result = (|| -> Result<Control> {
-        let mut detector = Detector::default();
-        for message in midi::messages(stdout) {
-            if let Some(Event::Press(pad)) = detector.observe(message?) {
-                println!(
-                    "Learned: {}",
-                    describe_event(&Event::Press(pad), |c| mappings::control_name(
-                        c, None, 0, None
-                    ))
-                );
-                return Ok(pad);
+    // The input closes when `input` drops, before terminal editing, including on failures.
+    let mut detector = Detector::default();
+    loop {
+        match input.next()? {
+            Some(message) => {
+                if let Some(Event::Press(pad)) = detector.observe(message) {
+                    println!(
+                        "Learned: {}",
+                        describe_event(&Event::Press(pad), |c| mappings::control_name(
+                            c, None, 0, None
+                        ))
+                    );
+                    return Ok(pad);
+                }
             }
+            None => std::thread::sleep(std::time::Duration::from_millis(5)),
         }
-        Err("MIDI input ended before a pad was learned; configuration unchanged".into())
-    })();
-    // Close the input before terminal editing, including on read failures.
-    let _ = child.kill();
-    child.wait()?;
-    result
+    }
 }
 
 fn describe_event(event: &Event, name: impl Fn(Control) -> String) -> String {

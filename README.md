@@ -51,13 +51,13 @@ Start explicitly paused with:
 ./target/debug/vibeconsole --paused
 ```
 
-VibeConsole uses `amidi` for MIDI input, `lsusb` for device identification, and Linux uinput for keyboard output. App launching uses `gio`; audio actions require `wpctl`; optional login startup uses the native user `systemctl`. AI coding controls use `tmux` (agents, commands) and `wl-copy` (focused-window prompts, hook copying): `sudo dnf install tmux wl-clipboard`. `doctor` reports prerequisites without creating a keyboard, injecting events, launching applications, or changing controller settings.
+VibeConsole reads and writes MIDI through the ALSA sequencer (the `midir` library; building needs `alsa-lib-devel`), uses `lsusb` for device identification, and Linux uinput for keyboard output. App launching uses `gio`; audio actions require `wpctl`; optional login startup uses the native user `systemctl`. AI coding controls use `tmux` (agents, commands) and `wl-copy` (focused-window prompts, hook copying): `sudo dnf install tmux wl-clipboard`. `doctor` reports prerequisites without creating a keyboard, injecting events, launching applications, or changing controller settings.
 
 To inspect the connected device:
 
 ```bash
 lsusb -d 09e8:1049
-amidi --list-devices
+aconnect -l          # ALSA sequencer ports; or: vibeconsole doctor
 ```
 
 Device numbers can change. VibeConsole discovers the matching port; close other MIDI readers/editors before using it. Run VibeConsole as your desktop user, not as root.
@@ -349,7 +349,7 @@ Do not concurrently edit an active configuration. If an interrupted save leaves 
 
 | Symptom | Action or explanation |
 |---|---|
-| No controller / busy port | Check USB and `amidi --list-devices`; close competing MIDI readers/editors |
+| No controller / no port | Check USB and `vibeconsole doctor` (MIDI identity); close MIDI editors that reconfigure the controller |
 | Current program unresolved | Wait for detection; identical presets or edited RAM may require explicit `/prog-select` |
 | First tap does nothing | Check the header says `RUNNING` and the program is verified; a pad held through Run/resume fires only when pressed again |
 | Unexpected pad identity | Inspect emitted channel/note/release; do not assume the original bank labels apply to every preset |

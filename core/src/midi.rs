@@ -1,14 +1,4 @@
 use std::io::{self, Read};
-use std::process::{Command, Stdio};
-
-pub fn command(port: &str) -> Command {
-    let mut command = Command::new("amidi");
-    // Read packets directly: --dump starts the next line only when another message arrives.
-    command
-        .args(["--receive=/dev/stdout", "--port", port])
-        .stdout(Stdio::piped());
-    command
-}
 
 #[derive(Debug, PartialEq)]
 pub enum Packet {
@@ -97,6 +87,12 @@ pub fn packets(reader: impl Read) -> impl Iterator<Item = io::Result<Packet>> {
     })
 }
 
+/// One complete message from midir (one callback) as packets: realtime bytes dropped,
+/// SysEx bounded and checked by the same parser as a byte stream.
+pub fn message_packets(message: &[u8]) -> Vec<Packet> {
+    packets(message).filter_map(Result::ok).collect()
+}
+
 pub fn messages(reader: impl Read) -> impl Iterator<Item = io::Result<[u8; 3]>> {
     packets(reader).filter_map(|packet| match packet {
         Ok(Packet::Channel(note)) => Some(Ok(note)),
@@ -108,6 +104,36 @@ pub fn messages(reader: impl Read) -> impl Iterator<Item = io::Result<[u8; 3]>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v7 ticket 05: midir hands over one complete message per callback.
+    #[test]
+    fn one_midir_message_becomes_its_packet() {
+        assert_eq!(
+            message_packets(&[0x99, 36, 100]),
+            [Packet::Channel([0x99, 36, 100])]
+        );
+        // Two-byte messages (program change) keep the parser's padding.
+        assert_eq!(message_packets(&[0xC9, 3]), [Packet::Channel([0xC9, 3, 0])]);
+        assert_eq!(
+            message_packets(&[0xF0, 0x47, 0, 0x49, 0xF7]),
+            [Packet::SysEx(Ok(vec![0xF0, 0x47, 0, 0x49, 0xF7]))]
+        );
+        let mut large = vec![0xF0];
+        large.extend([0; 256]);
+        large.push(0xF7);
+        assert!(matches!(
+            &message_packets(&large)[..],
+            [Packet::SysEx(Err(_))]
+        ));
+        // A SysEx without its end byte is reported, never passed on as complete.
+        assert!(matches!(
+            &message_packets(&[0xF0, 0x47])[..],
+            [Packet::SysEx(Err(_))]
+        ));
+        // Clock and active sensing are dropped.
+        assert!(message_packets(&[0xF8]).is_empty());
+        assert!(message_packets(&[0xFE]).is_empty());
+    }
 
     #[test]
     fn sysex_is_bounded_and_never_swallows_an_interleaved_release() {
@@ -187,115 +213,112 @@ mod tests {
     }
 }
 
-// Own the child and reader together so cancellation cannot leave an amidi process behind.
+/// The Akai's port on the ALSA sequencer, found by name through midir. Exactly one must
+/// match, so a second Akai (or a renamed port) is never guessed.
+pub fn akai_port<T: midir::MidiIO>(midi: &T) -> crate::Result<(T::Port, String)> {
+    let mut matches = midi
+        .ports()
+        .into_iter()
+        .filter_map(|port| {
+            let name = midi.port_name(&port).ok()?;
+            name.to_lowercase()
+                .contains("mpk mini 3")
+                .then_some((port, name))
+        })
+        .collect::<Vec<_>>();
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        0 => Err("MPK mini 3 is connected, but no matching MIDI port is available".into()),
+        _ => Err("multiple MPK mini 3 MIDI ports found; refusing ambiguous selection".into()),
+    }
+}
+
+/// Bounded queues fed by the midir callback. A full queue drops both senders, so `next`
+/// reports the overflow instead of silently losing a release.
+type Senders = Option<(
+    std::sync::mpsc::SyncSender<io::Result<[u8; 3]>>,
+    std::sync::mpsc::SyncSender<std::result::Result<Vec<u8>, String>>,
+)>;
+
 pub struct Input {
-    child: std::process::Child,
-    reader: Option<std::thread::JoinHandle<()>>,
+    // Field order: the connection closes before the queues it feeds.
+    _connection: midir::MidiInputConnection<Senders>,
     receiver: std::sync::mpsc::Receiver<io::Result<[u8; 3]>>,
-    node: String,
-    identity: (u64, u64, u64),
+    /// Lists ports for the disconnect check; never connected.
+    probe: midir::MidiInput,
+    /// The sequencer `client:port` id; a replugged device gets a new one.
+    id: String,
+    checked: std::cell::Cell<std::time::Instant>,
     pub port: String,
     pub sysex: Option<std::sync::mpsc::Receiver<std::result::Result<Vec<u8>, String>>>,
 }
 
 impl Input {
     pub fn open() -> crate::Result<Self> {
-        use std::os::unix::{
-            fs::{MetadataExt, OpenOptionsExt},
-            process::CommandExt,
-        };
-        let port = crate::input_port()?;
-        let fields: Vec<_> = port
-            .strip_prefix("hw:")
-            .ok_or("unexpected ALSA port")?
-            .split(',')
-            .collect();
-        let [card, device, _] = fields.as_slice() else {
-            return Err("unexpected ALSA port".into());
-        };
-        let node = format!("/dev/snd/midiC{card}D{device}");
-        let meta = std::fs::metadata(&node)?;
-        // Check permissions and port occupancy before spawning the long-lived reader.
-        // Close this descriptor before amidi acquires the input side.
-        let probe = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&node)
-            .map_err(|error| {
-                format!("cannot open MIDI input {node} (permissions/port occupancy): {error}")
-            })?;
-        drop(probe);
-
-        let mut command = command(&port);
-        command.process_group(0); // handled parent signals must leave input alive for restoration
-        let parent = std::process::id();
-        // SAFETY: only async-signal-safe syscalls between fork and exec.
-        unsafe {
-            command.pre_exec(move || {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                if libc::getppid() as u32 != parent {
-                    return Err(io::Error::from_raw_os_error(libc::ESRCH));
-                }
-                Ok(())
-            });
-        }
-        let mut child = command.spawn()?;
-        let stdout = child.stdout.take().expect("piped MIDI input");
-        // Bound queued packets; try_send avoids a blocked reader during shutdown.
+        crate::akai_connected()?;
+        let mut midi = midir::MidiInput::new("VibeConsole")
+            .map_err(|e| format!("MIDI input unavailable: {e}"))?;
+        // SysEx carries the controller's replies; nothing is filtered by midir.
+        midi.ignore(midir::Ignore::None);
+        let (port, name) = akai_port(&midi)?;
+        let id = port.id();
         let (sender, receiver) = std::sync::mpsc::sync_channel(1024);
         let (sysex_sender, sysex) = std::sync::mpsc::sync_channel(16);
-        let reader = std::thread::spawn(move || {
-            for packet in packets(stdout) {
-                match packet {
-                    Ok(Packet::Channel(note)) => {
-                        if sender.try_send(Ok(note)).is_err() {
-                            break;
+        let connection = midi
+            .connect(
+                &port,
+                "VibeConsole input",
+                |_, message, senders: &mut Senders| {
+                    let Some((notes, frames)) = senders else {
+                        return;
+                    };
+                    for packet in message_packets(message) {
+                        let sent = match packet {
+                            Packet::Channel(note) => notes.try_send(Ok(note)).is_ok(),
+                            Packet::SysEx(frame) => frames.try_send(frame).is_ok(),
+                        };
+                        if !sent {
+                            *senders = None;
+                            return;
                         }
                     }
-                    Ok(Packet::SysEx(frame)) => {
-                        if sysex_sender.try_send(frame).is_err() {
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        let _ = sender.try_send(Err(error));
-                        break;
-                    }
-                }
-            }
-        });
+                },
+                Some((sender, sysex_sender)),
+            )
+            .map_err(|e| format!("cannot open MIDI input {name}: {e}"))?;
         Ok(Self {
-            child,
-            reader: Some(reader),
+            _connection: connection,
             receiver,
-            node,
-            identity: (meta.dev(), meta.ino(), meta.rdev()),
-            port,
+            probe: midir::MidiInput::new("VibeConsole probe")
+                .map_err(|e| format!("MIDI input unavailable: {e}"))?,
+            id,
+            checked: std::cell::Cell::new(std::time::Instant::now()),
+            port: name,
             sysex: Some(sysex),
         })
     }
 
-    pub fn output(&self) -> crate::Result<std::fs::File> {
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&self.node)?;
-        let meta = file.metadata()?;
-        if (meta.dev(), meta.ino(), meta.rdev()) != self.identity {
-            return Err("MIDI device changed while opening output".into());
-        }
-        Ok(file)
+    /// Output to the same sequencer port as the input, so a replaced device can't receive
+    /// a stale restoration.
+    pub fn output(&self) -> crate::Result<Output> {
+        let midi = midir::MidiOutput::new("VibeConsole")
+            .map_err(|e| format!("MIDI output unavailable: {e}"))?;
+        let port = midi
+            .find_port_by_id(&self.id)
+            .ok_or("MIDI device changed while opening output")?;
+        Ok(Output(midi.connect(&port, "VibeConsole output").map_err(
+            |e| format!("cannot open MIDI output {}: {e}", self.port),
+        )?))
     }
 
     pub fn next(&self) -> crate::Result<Option<[u8; 3]>> {
-        use std::os::unix::fs::MetadataExt;
-        if !std::fs::metadata(&self.node)
-            .is_ok_and(|meta| (meta.dev(), meta.ino(), meta.rdev()) == self.identity)
-        {
-            return Err("MIDI device disconnected".into());
+        // ponytail: re-enumerating ports every 250 ms; an ALSA announce subscription would
+        // report unplugging at once if that delay ever matters.
+        if self.checked.get().elapsed() >= std::time::Duration::from_millis(250) {
+            self.checked.set(std::time::Instant::now());
+            if self.probe.find_port_by_id(&self.id).is_none() {
+                return Err("MIDI device disconnected".into());
+            }
         }
         match self.receiver.try_recv() {
             Ok(message) => Ok(Some(message?)),
@@ -307,12 +330,12 @@ impl Input {
     }
 }
 
-impl Drop for Input {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
-        }
+/// An open MIDI output (midir sends each message whole, SysEx included).
+pub struct Output(midir::MidiOutputConnection);
+impl Output {
+    pub fn send(&mut self, message: &[u8]) -> crate::Result<()> {
+        self.0
+            .send(message)
+            .map_err(|e| format!("MIDI transmission failed: {e}").into())
     }
 }

@@ -140,7 +140,7 @@ fn extension_dir() -> Result<PathBuf> {
     Ok(base.join("gnome-shell/extensions").join(EXTENSION_UUID))
 }
 fn service() -> &'static str {
-    "# Managed by VibeConsole\n[Unit]\nDescription=VibeConsole controller shortcuts\nAfter=graphical-session-pre.target pipewire.service wireplumber.service\nPartOf=graphical-session.target\n\n[Service]\nType=simple\nExecStart=\"%h/.local/bin/vibeconsole\" daemon\nRestart=no\n# amidi must outlive SIGTERM so handled shutdown can restore controller feedback\nKillMode=mixed\nTimeoutStopSec=15\n\n[Install]\nWantedBy=graphical-session.target\n"
+    "# Managed by VibeConsole\n[Unit]\nDescription=VibeConsole controller shortcuts\nAfter=graphical-session-pre.target pipewire.service wireplumber.service\nPartOf=graphical-session.target\n\n[Service]\nType=simple\nExecStart=\"%h/.local/bin/vibeconsole\" daemon\nRestart=no\n# SIGTERM goes to the main process only, so its handled shutdown restores controller feedback\nKillMode=mixed\nTimeoutStopSec=15\n\n[Install]\nWantedBy=graphical-session.target\n"
 }
 fn managed(path: &Path) -> Result<()> {
     if path.exists() && !fs::read_to_string(path)?.starts_with("# Managed by VibeConsole\n") {

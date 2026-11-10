@@ -11,3 +11,4 @@ fakes = []
 evdev = "0.13.2"
 libc = { version = "0.2", default-features = false }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
+midir = "0.11.1"

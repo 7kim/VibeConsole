@@ -152,49 +152,22 @@ impl Detector {
     }
 }
 
-pub fn input_port() -> Result<String> {
+/// The Akai is on USB (`lsusb -d 09e8:1049`), checked before any MIDI port is opened.
+pub fn akai_connected() -> Result<()> {
     let usb = Command::new("lsusb").args(["-d", DEVICE]).output()?;
     if !usb.status.success() {
         return Err("AKAI MPK mini 3 (USB 09e8:1049) is unavailable; check lsusb".into());
     }
-    let usb = String::from_utf8(usb.stdout)?;
-    if usb.trim().is_empty() {
+    if String::from_utf8(usb.stdout)?.trim().is_empty() {
         return Err("AKAI MPK mini 3 (USB 09e8:1049) is not connected".into());
     }
+    Ok(())
+}
 
-    let listing = Command::new("amidi").arg("--list-devices").output()?;
-    if !listing.status.success() {
-        return Err("amidi could not enumerate ALSA MIDI ports".into());
-    }
-    let listing = String::from_utf8(listing.stdout)?;
-    let matches: Vec<_> = listing
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let direction = fields.next()?;
-            if !direction.contains('I') {
-                return None;
-            }
-            let port = fields.next()?;
-            let name = fields.collect::<Vec<_>>().join(" ");
-            name.to_lowercase()
-                .contains("mpk mini 3")
-                .then_some(port.to_owned())
-        })
-        .collect();
-    let port = match matches.as_slice() {
-        [port] => port.clone(),
-        [] => {
-            return Err(
-                "MPK mini 3 is connected, but no matching ALSA MIDI input is available".into(),
-            );
-        }
-        _ => {
-            return Err(
-                "multiple MPK mini 3 MIDI inputs found; refusing ambiguous selection".into(),
-            );
-        }
-    };
-
-    Ok(port)
+/// The Akai's MIDI port name, without opening it (`doctor`).
+pub fn input_port() -> Result<String> {
+    akai_connected()?;
+    let midi = midir::MidiInput::new("VibeConsole probe")
+        .map_err(|e| format!("MIDI input unavailable: {e}"))?;
+    Ok(midi::akai_port(&midi)?.1)
 }
