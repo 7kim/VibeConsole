@@ -3381,6 +3381,10 @@ fn profiles_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
             })
             .collect::<Vec<_>>();
         items.push("New profile".into());
+        items.push(format!(
+            "Import a profile file (from {})",
+            profiles_dir(path).display()
+        ));
         let Some(choice) = choose(
             ui,
             "App profiles: apps without a profile use Default",
@@ -3391,7 +3395,8 @@ fn profiles_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
         };
         let result = match config.profiles.get(choice) {
             Some(profile) => profile_menu(ui, path, &profile.name),
-            None => new_profile(ui, path),
+            None if choice == config.profiles.len() => new_profile(ui, path),
+            None => import_profile_file(ui, path),
         };
         if let Err(error) = result {
             not_saved(ui, &error)?;
@@ -3411,6 +3416,41 @@ fn pick_app(ui: &mut impl Ui) -> Result<Option<String>> {
     crate::actions::desktop_id(&apps[index].1)
         .map(Some)
         .ok_or_else(|| "that app has no desktop ID".into())
+}
+/// Profile files are shared through one folder beside the config (v7 ticket 14); names
+/// come from its listing, never typed paths.
+fn profiles_dir(path: &Path) -> PathBuf {
+    path.parent().unwrap_or(Path::new(".")).join("profiles")
+}
+fn import_profile_file(ui: &mut impl Ui, path: &Path) -> Result<()> {
+    let dir = profiles_dir(path);
+    let mut files = std::fs::read_dir(&dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.ends_with(".profile"))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    files.sort();
+    if files.is_empty() {
+        return Err(format!("no .profile files in {}", dir.display()).into());
+    }
+    let Some(index) = choose(ui, "Import which profile file?", &files)? else {
+        return Ok(());
+    };
+    let file = dir.join(&files[index]);
+    if std::fs::metadata(&file)?.len() > 1 << 20 {
+        return Err("profile file is larger than 1 MB".into());
+    }
+    let text = std::fs::read_to_string(&file)?;
+    let mut config = mappings::load_config(path)?;
+    let profile = mappings::import_profile(&text, &config)
+        .map_err(|e| format!("{}: {e}; nothing imported", files[index]))?;
+    config.profiles.push(profile);
+    mappings::save_config(path, &config)
 }
 fn new_profile(ui: &mut impl Ui, path: &Path) -> Result<()> {
     let Some(name) = text_entry(ui, "Profile name (1–32 characters)", "")? else {
@@ -3432,6 +3472,7 @@ fn profile_menu(ui: &mut impl Ui, path: &Path, name: &str) -> Result<()> {
         "Edit its pads and buttons",
         "Add an app",
         "Delete profile",
+        "Export to a file",
         "Back",
     ]);
     match choose(ui, &format!("Profile {name}"), &items)? {
@@ -3471,6 +3512,24 @@ fn profile_menu(ui: &mut impl Ui, path: &Path, name: &str) -> Result<()> {
             let mut config = mappings::load_config(path)?;
             config.profiles.retain(|p| p.name != name);
             mappings::save_config(path, &config)
+        }
+        Some(3) => {
+            let config = mappings::load_config(path)?;
+            let text = mappings::export_profile(
+                config
+                    .profile(name)
+                    .ok_or("this profile no longer exists")?,
+            )?;
+            let dir = profiles_dir(path);
+            std::fs::create_dir_all(&dir)?;
+            let file = dir.join(mappings::profile_file_name(name));
+            crate::actions::write_atomic(&file, &text)?;
+            choose(
+                ui,
+                &format!("Exported to {}", file.display()),
+                &options(&["Back"]),
+            )?;
+            Ok(())
         }
         _ => Ok(()),
     }
@@ -7181,6 +7240,70 @@ mod tests {
         let config = mappings::load_config(&path).unwrap();
         assert!(config.profiles.is_empty());
         assert_eq!(config.mappings, [default]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 14: a profile exports to the profiles folder and imports back; a bad file
+    /// is refused with its reason and nothing is saved.
+    #[test]
+    fn profiles_export_and_import_through_settings() {
+        use Key::*;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-profile-io-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let pad = Control::from_note(10, 36).unwrap();
+        let mut config = mappings::Config::default();
+        config.profiles.push(mappings::Profile {
+            name: "Firefox".into(),
+            apps: vec!["firefox.desktop".into()],
+            mappings: vec![Mapping::new(pad, "Ctrl+T", "hold").unwrap()],
+        });
+        mappings::save_config(&path, &config).unwrap();
+        let profiles = |keys: Vec<Key>| {
+            let mut all = vec![Down; 9];
+            all.push(Enter);
+            all.extend(keys);
+            all.extend([Escape, Escape]);
+            let mut ui = Script {
+                keys: all.into(),
+                ..Default::default()
+            };
+            settings_menu(&mut ui, &path).unwrap();
+            assert!(ui.keys.is_empty());
+            ui.screens
+        };
+        // Export: Firefox -> Export to a file -> Back.
+        profiles(vec![Enter, Down, Down, Down, Enter, Enter]);
+        let file = dir.join("profiles/Firefox.profile");
+        assert!(
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .starts_with("vibeconsole-profile-v1\n")
+        );
+        // Delete it, then import it back.
+        profiles(vec![Enter, Down, Down, Enter, Down, Enter]);
+        assert!(mappings::load_config(&path).unwrap().profiles.is_empty());
+        profiles(vec![Down, Enter, Enter]);
+        assert_eq!(
+            mappings::load_config(&path).unwrap().profiles,
+            config.profiles
+        );
+        // A bad file: refused with its reason, nothing saved.
+        std::fs::write(
+            dir.join("profiles/Bad.profile"),
+            "vibeconsole-profile-v1\nprofile\tX\t../x\t0\n",
+        )
+        .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let screens = profiles(vec![Down, Down, Enter, Enter, Enter]);
+        assert!(
+            screens
+                .iter()
+                .any(|s| s.contains("Not saved: Bad.profile:") && s.contains("nothing imported"))
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

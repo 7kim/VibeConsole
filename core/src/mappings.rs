@@ -622,6 +622,84 @@ fn validate_profiles(profiles: &[Profile]) -> Result<()> {
     }
     Ok(())
 }
+/// A profile file (v7 ticket 14): this header, the profile line, then its overrides.
+pub const PROFILE_HEADER: &str = "vibeconsole-profile-v1";
+pub fn export_profile(profile: &Profile) -> Result<String> {
+    validate_profiles(std::slice::from_ref(profile))?;
+    let mut text = format!(
+        "{PROFILE_HEADER}\nprofile\t{}\t{}\t{}\n",
+        profile.name,
+        if profile.apps.is_empty() {
+            "-".to_owned()
+        } else {
+            profile.apps.join(",")
+        },
+        profile.mappings.len()
+    );
+    for mapping in &profile.mappings {
+        text.push_str(&mapping_line(mapping)?);
+    }
+    Ok(text)
+}
+/// Read a profile file, checked in full against `config` (names, app IDs, every override,
+/// its devices, and conflicts with existing profiles) before anything can be saved.
+pub fn import_profile(text: &str, config: &Config) -> Result<Profile> {
+    let mut lines = text.lines();
+    if lines.next() != Some(PROFILE_HEADER) {
+        return Err("not a VibeConsole profile file".into());
+    }
+    let line = lines.next().ok_or("missing profile line")?;
+    let ["profile", name, apps, count] = line.split('\t').collect::<Vec<_>>()[..] else {
+        return Err("invalid profile line".into());
+    };
+    let count: usize = count.parse()?;
+    if count > 512 {
+        return Err("too many overrides".into());
+    }
+    let mut profile = Profile {
+        name: name.to_owned(),
+        apps: if apps == "-" {
+            Vec::new()
+        } else {
+            apps.split(',').map(str::to_owned).collect()
+        },
+        mappings: Vec::new(),
+    };
+    for n in 0..count {
+        let line = lines
+            .next()
+            .ok_or("fewer overrides than the profile line says")?;
+        profile.mappings.push(
+            parse_mapping_line(line, 16, &config.midi_devices)
+                .map_err(|e| format!("override {}: {e}", n + 1))?,
+        );
+    }
+    if lines.next().is_some() {
+        return Err("more lines than the profile line says".into());
+    }
+    if config.profile(&profile.name).is_some() {
+        return Err(format!("a profile named {} exists; delete it first", profile.name).into());
+    }
+    let mut all = config.profiles.clone();
+    all.push(profile.clone());
+    validate_profiles(&all)?;
+    Ok(profile)
+}
+/// A profile's export file name: letters, digits, `-` and `_` only, so it stays in its
+/// folder whatever the profile is called.
+pub fn profile_file_name(name: &str) -> String {
+    let mut file = String::new();
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            file.push(c);
+        } else if !file.is_empty() && !file.ends_with('-') {
+            file.push('-');
+        }
+    }
+    let file = file.trim_end_matches('-');
+    format!("{}.profile", if file.is_empty() { "profile" } else { file })
+}
+
 /// One context's mappings with a profile's overrides on top (v7 ticket 12).
 pub fn overlay(all: &[Mapping], profile: Option<&Profile>, context: u8) -> Vec<Mapping> {
     let overrides = profile
@@ -981,6 +1059,111 @@ fn opt_text(value: Option<impl fmt::Display>) -> String {
     value.map(|n| n.to_string()).unwrap_or_else(|| "-".into())
 }
 
+/// One mapping line of a `version` config (also a profile file's override lines).
+fn parse_mapping_line(line: &str, version: u32, midi_devices: &[String]) -> Result<Mapping> {
+    let fields: Vec<_> = line.split('\t').collect();
+    if fields.len()
+        != match version {
+            1 => 6,
+            2 => 9,
+            3 => 13,
+            4..=8 => 14,
+            9 | 10 => 15,
+            _ => 16,
+        }
+    {
+        return Err("wrong mapping field count".into());
+    }
+    let (context, label, fields) = if version >= 3 {
+        (fields[0].parse::<u8>()?, Some(fields[1]), &fields[3..])
+    } else {
+        (0, None, fields.as_slice())
+    };
+    let offset = usize::from(version >= 3);
+    let (behavior, shortcut) = (fields[4 + offset], fields[5 + offset]);
+    let [device, message, channel, note] = &fields[..4] else {
+        unreachable!()
+    };
+    let other = context >= DEVICE_CONTEXT;
+    if other && usize::from(context - DEVICE_CONTEXT) >= midi_devices.len() {
+        return Err("mapping for an unlisted MIDI device".into());
+    }
+    if *device != device_field(context) || (version < 3 && *message != "note") {
+        return Err("unsupported device or MIDI message type".into());
+    }
+    let pad = if version >= 3 {
+        let message = match *message {
+            "note" => crate::Message::Note,
+            "cc" => crate::Message::Cc,
+            "bend" => crate::Message::Bend,
+            "button" if version >= 16 => crate::Message::Button,
+            _ => return Err("unsupported MIDI message type".into()),
+        };
+        let control = Control {
+            channel: channel.parse()?,
+            id: note.parse()?,
+            message,
+            direction: fields[4].parse()?,
+        };
+        control.validate()?;
+        control
+    } else {
+        Control::from_note(channel.parse()?, note.parse()?)
+            .ok_or("unsupported pad channel or note")?
+    };
+    let action = if version >= 4 {
+        crate::actions::Action::parse(fields[10])?
+    } else {
+        crate::actions::Action::Shortcut
+    };
+    let mut mapping = if action == crate::actions::Action::Shortcut {
+        Mapping::new(pad, shortcut, behavior)?
+    } else {
+        if behavior != "trigger" || shortcut != "-" {
+            return Err("invalid action shortcut/behavior fields".into());
+        }
+        Mapping::new_action(pad, line.split('\t').nth(2).unwrap().parse()?, action)?
+    };
+    mapping.context = context;
+    mapping.risky = match fields.get(11).filter(|_| version >= 9) {
+        None | Some(&"-") => false,
+        Some(&"risky") => true,
+        Some(_) => return Err("expected risky or -".into()),
+    };
+    mapping.status = match fields.get(12).filter(|_| version >= 11) {
+        None | Some(&"-") => false,
+        Some(&"status") => true,
+        Some(_) => return Err("expected status or -".into()),
+    };
+    if version >= 3 {
+        mapping.input = line.split('\t').nth(2).unwrap().parse()?;
+    }
+    if let Some(label) = label {
+        mapping.label = label.to_owned();
+    }
+    if version >= 2 {
+        let octave = match fields[6 + offset] {
+            "-" => None,
+            value => {
+                let (kind, n) = value.split_once(':').ok_or("invalid octave setting")?;
+                Some(match kind {
+                    "offset" => Octave::Offset(n.parse()?),
+                    "absolute" => Octave::Absolute(n.parse()?),
+                    _ => return Err("invalid octave mode".into()),
+                })
+            }
+        };
+        mapping.feedback = Feedback {
+            octave,
+            tempo: optional(fields[7 + offset])?,
+            arp: arp(fields[8 + offset])?,
+        };
+        mapping.validate()?;
+    }
+    mapping.validate()?;
+    Ok(mapping)
+}
+
 fn parse_config(contents: &str) -> Result<Config> {
     let mut lines = contents.lines();
     // Files saved before the KeyAI → VibeConsole rename keep their old header.
@@ -989,7 +1172,7 @@ fn parse_config(contents: &str) -> Result<Config> {
             .strip_prefix("vibeconsole-mappings-v")
             .or_else(|| header.strip_prefix("keyai-mappings-v"))
     });
-    let version = match version {
+    let version: u32 = match version {
         Some("1") => 1,
         Some("2") => 2,
         Some("3") => 3,
@@ -1284,109 +1467,7 @@ fn parse_config(contents: &str) -> Result<Config> {
         midi_active = (active != "-").then(|| active.to_owned());
         validate_devices(&midi_devices, midi_active.as_ref())?;
     }
-    let parse_mapping = |line: &str| -> Result<Mapping> {
-        let fields: Vec<_> = line.split('\t').collect();
-        if fields.len()
-            != match version {
-                1 => 6,
-                2 => 9,
-                3 => 13,
-                4..=8 => 14,
-                9 | 10 => 15,
-                _ => 16,
-            }
-        {
-            return Err("wrong mapping field count".into());
-        }
-        let (context, label, fields) = if version >= 3 {
-            (fields[0].parse::<u8>()?, Some(fields[1]), &fields[3..])
-        } else {
-            (0, None, fields.as_slice())
-        };
-        let offset = usize::from(version >= 3);
-        let (behavior, shortcut) = (fields[4 + offset], fields[5 + offset]);
-        let [device, message, channel, note] = &fields[..4] else {
-            unreachable!()
-        };
-        let other = context >= DEVICE_CONTEXT;
-        if other && usize::from(context - DEVICE_CONTEXT) >= midi_devices.len() {
-            return Err("mapping for an unlisted MIDI device".into());
-        }
-        if *device != device_field(context) || (version < 3 && *message != "note") {
-            return Err("unsupported device or MIDI message type".into());
-        }
-        let pad = if version >= 3 {
-            let message = match *message {
-                "note" => crate::Message::Note,
-                "cc" => crate::Message::Cc,
-                "bend" => crate::Message::Bend,
-                "button" if version >= 16 => crate::Message::Button,
-                _ => return Err("unsupported MIDI message type".into()),
-            };
-            let control = Control {
-                channel: channel.parse()?,
-                id: note.parse()?,
-                message,
-                direction: fields[4].parse()?,
-            };
-            control.validate()?;
-            control
-        } else {
-            Control::from_note(channel.parse()?, note.parse()?)
-                .ok_or("unsupported pad channel or note")?
-        };
-        let action = if version >= 4 {
-            crate::actions::Action::parse(fields[10])?
-        } else {
-            crate::actions::Action::Shortcut
-        };
-        let mut mapping = if action == crate::actions::Action::Shortcut {
-            Mapping::new(pad, shortcut, behavior)?
-        } else {
-            if behavior != "trigger" || shortcut != "-" {
-                return Err("invalid action shortcut/behavior fields".into());
-            }
-            Mapping::new_action(pad, line.split('\t').nth(2).unwrap().parse()?, action)?
-        };
-        mapping.context = context;
-        mapping.risky = match fields.get(11).filter(|_| version >= 9) {
-            None | Some(&"-") => false,
-            Some(&"risky") => true,
-            Some(_) => return Err("expected risky or -".into()),
-        };
-        mapping.status = match fields.get(12).filter(|_| version >= 11) {
-            None | Some(&"-") => false,
-            Some(&"status") => true,
-            Some(_) => return Err("expected status or -".into()),
-        };
-        if version >= 3 {
-            mapping.input = line.split('\t').nth(2).unwrap().parse()?;
-        }
-        if let Some(label) = label {
-            mapping.label = label.to_owned();
-        }
-        if version >= 2 {
-            let octave = match fields[6 + offset] {
-                "-" => None,
-                value => {
-                    let (kind, n) = value.split_once(':').ok_or("invalid octave setting")?;
-                    Some(match kind {
-                        "offset" => Octave::Offset(n.parse()?),
-                        "absolute" => Octave::Absolute(n.parse()?),
-                        _ => return Err("invalid octave mode".into()),
-                    })
-                }
-            };
-            mapping.feedback = Feedback {
-                octave,
-                tempo: optional(fields[7 + offset])?,
-                arp: arp(fields[8 + offset])?,
-            };
-            mapping.validate()?;
-        }
-        mapping.validate()?;
-        Ok(mapping)
-    };
+    let parse_mapping = |line: &str| parse_mapping_line(line, version, &midi_devices);
     let mut profiles = Vec::new();
     if version >= 16 {
         let count: usize = lines
@@ -2479,6 +2560,45 @@ mod tests {
         bad.profiles[0].name = "default".into();
         assert!(save_config(&path, &bad).is_err());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 14: a profile exports to one file and imports back the same; an import is
+    /// checked in full and refused whole; file names stay inside their folder.
+    #[test]
+    fn profiles_export_and_import_whole_or_not_at_all() {
+        let pad = Control::from_note(10, 36).unwrap();
+        let profile = Profile {
+            name: "Firefox".into(),
+            apps: vec!["firefox.desktop".into()],
+            mappings: vec![Mapping::new(pad, "Ctrl+T", "hold").unwrap()],
+        };
+        let text = export_profile(&profile).unwrap();
+        assert!(text.starts_with("vibeconsole-profile-v1\nprofile\tFirefox\tfirefox.desktop\t1\n"));
+        let config = Config::default();
+        assert_eq!(import_profile(&text, &config).unwrap(), profile);
+        // A name that exists, an app another profile has, a bad action or name, extra or
+        // missing lines, another file type: all refused.
+        let mut taken = config.clone();
+        taken.profiles.push(profile.clone());
+        assert!(import_profile(&text, &taken).is_err());
+        let mut app_taken = taken.clone();
+        app_taken.profiles[0].name = "Other".into();
+        assert!(import_profile(&text, &app_taken).is_err());
+        for bad in [
+            text.replace("Ctrl+T", "Ctrl+Bogus"),
+            text.replace("\tshortcut\t", "\tcommand:x\t"),
+            text.replace("profile\tFirefox", "profile\tDefault"),
+            text.replace("firefox.desktop", "../../etc/passwd"),
+            text.replace("\t1\n", "\t2\n"),
+            format!("{text}0\textra\n"),
+            text.replace("vibeconsole-profile-v1", "vibeconsole-mappings-v16"),
+            String::new(),
+        ] {
+            assert!(import_profile(&bad, &config).is_err(), "{bad:?}");
+        }
+        assert_eq!(profile_file_name("Firefox"), "Firefox.profile");
+        assert_eq!(profile_file_name("../evil/x"), "evil-x.profile");
+        assert_eq!(profile_file_name("Orca: agents"), "Orca-agents.profile");
     }
 
     #[test]
