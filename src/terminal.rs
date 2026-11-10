@@ -192,6 +192,8 @@ struct Terminal {
     guide: crate::gamepad::Guide,
     /// Each prompt-sequence pad's next step (v7 ticket 20); step 1 after a restart.
     positions: crate::actions::Positions,
+    /// Hold-to-quit launcher pads being held (v7 ticket 21).
+    holds: crate::actions::Holds,
     context_verified: bool,
     follow_programs: bool,
     follow_retry: Instant,
@@ -663,6 +665,7 @@ impl Terminal {
             last_focus: None,
             guide: crate::gamepad::Guide::default(),
             positions: crate::actions::Positions::default(),
+            holds: crate::actions::Holds::default(),
             context_verified: true,
             follow_programs: false,
             follow_retry: Instant::now(),
@@ -991,6 +994,7 @@ impl Terminal {
     fn suspend(&mut self) -> Result<()> {
         self.suspended = true;
         self.guide.cancel();
+        self.holds.clear();
         if let Some(pad) = &mut self.gamepad {
             pad.stop_rumble();
         }
@@ -1020,6 +1024,7 @@ impl Terminal {
 
     fn release_all(&mut self) -> Result<()> {
         self.cancel_actions();
+        self.holds.clear();
         self.motion = crate::motion::Motion::new(&self.run_mappings)?;
         if let Some(output) = &mut self.output {
             output.clear()?;
@@ -1310,6 +1315,26 @@ impl Terminal {
             if let Event::Press(pad) = &event {
                 self.last_press = Some(*pad);
             }
+            // v7 ticket 21: hold-to-quit pads decide on release (tap) or at one second (quit).
+            if let Event::Press(pad) | Event::Release(pad, _) = &event {
+                let quit = self.run_mappings.iter().find_map(|m| match &m.action {
+                    crate::actions::Action::AppToggleQuit(path) if m.control == *pad => {
+                        Some(path.clone())
+                    }
+                    _ => None,
+                });
+                if let Some(path) = quit {
+                    let running = self.output.is_some() && self.wanted_run && !self.suspended;
+                    match event {
+                        Event::Press(pad) if running => self.holds.press(pad, Instant::now()),
+                        Event::Release(pad, _) if self.holds.release(pad, Instant::now()) => {
+                            self.submit_quiet(crate::actions::Action::AppToggleQuit(path))
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+            }
             if let Some(output) = &mut self.output {
                 match output.observe(event) {
                     Ok(Some((pad, active))) => {
@@ -1345,6 +1370,25 @@ impl Terminal {
             "Xbox layer 1".into()
         };
         Ok(())
+    }
+    /// Hold-to-quit pads whose hold reached one second (v7 ticket 21).
+    fn quit_holds(&mut self) {
+        for pad in self.holds.due(Instant::now()) {
+            let path = self.run_mappings.iter().find_map(|m| match &m.action {
+                crate::actions::Action::AppToggleQuit(path) if m.control == pad => {
+                    Some(path.clone())
+                }
+                _ => None,
+            });
+            if let Some(path) = path {
+                self.submit_quiet(crate::actions::Action::AppQuit(path));
+            }
+        }
+    }
+    fn submit_quiet(&mut self, action: crate::actions::Action) {
+        if let Err(error) = self.actions.submit(action, None) {
+            self.error = format!("Action rejected: {error}");
+        }
     }
     fn open_input(&self) -> Result<midi::Input> {
         midi::Input::open_device(self.device.as_deref())
@@ -2079,6 +2123,7 @@ impl Terminal {
                 ))?,
             }
         }
+        self.quit_holds();
         if let Some(action) = self.guide.tick(Instant::now()) {
             if let Err(error) = self.guide_action(action) {
                 self.error = format!("Profile lock failed: {error}");
@@ -4884,17 +4929,25 @@ fn action_menu(
         }
         let saved_close = match saved_action {
             Some(Action::AppToggle { close, .. }) => Some(usize::from(*close)),
+            Some(Action::AppToggleQuit(_)) => Some(2),
             _ => None,
         };
         let Some(close) = choose_saved(
             ui,
             "Second press while the app is focused (needs the VibeConsole window extension; see README)",
-            options(&["Minimize", "Close"]),
+            options(&[
+                "Minimize",
+                "Close",
+                "Minimize; hold 1 second to quit (when a window is open, not minimized)",
+            ]),
             saved_close,
         )?
         else {
             return Ok(None);
         };
+        if close == 2 {
+            return Ok(Some(Action::AppToggleQuit(path)));
+        }
         return Ok(Some(Action::AppToggle {
             path,
             close: close == 1,
@@ -7783,6 +7836,35 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(files, ["plan", "build"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 21: a launcher pad can minimize on a tap and quit on a one-second hold.
+    #[test]
+    fn launcher_pad_can_hold_to_quit() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-holdquit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut ui = Script {
+            // learn, Launch application, the app, hold to quit, fire when pressed, save and finish
+            keys: [
+                Enter, Down, Enter, Enter, Down, Down, Enter, Enter, Down, Enter,
+            ]
+            .into(),
+            pads: [Control::from_note(10, 42).unwrap()].into(),
+            ..Default::default()
+        };
+        let mut current = Vec::new();
+        configure(&mut ui, &path, &mut current).unwrap();
+        assert!(ui.keys.is_empty());
+        assert_eq!(
+            current[0].action,
+            crate::actions::Action::AppToggleQuit("/nonexistent/recorded.desktop".into())
+        );
+        assert_eq!(mappings::load(&path).unwrap(), current);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

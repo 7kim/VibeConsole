@@ -161,6 +161,11 @@ pub enum Action {
         agent: String,
         folder: String,
     },
+    /// v7 ticket 21: a launcher pad whose tap minimizes/restores like `AppToggle`, and whose
+    /// one-second hold quits the app (only when a window is open and not minimized).
+    AppToggleQuit(String),
+    /// The hold of `AppToggleQuit`, sent by the session after one second.
+    AppQuit(String),
     /// v7 ticket 20: one pad walks through prompts: tap 1 sends step 1, tap 2 step 2, …,
     /// wrapping after the last. Each step is a `Prompt`. Unlike `Sequence`, one tap sends
     /// one step.
@@ -335,7 +340,10 @@ impl Action {
             {
                 Err("Orca jump needs an agent name and an absolute folder".into())
             }
-            Self::Application(path) | Self::AppToggle { path, .. }
+            Self::Application(path)
+            | Self::AppToggle { path, .. }
+            | Self::AppToggleQuit(path)
+            | Self::AppQuit(path)
                 if !Path::new(path).is_absolute()
                     || !path.ends_with(".desktop")
                     || path.chars().any(char::is_control)
@@ -396,6 +404,8 @@ impl Action {
             Self::MicrophoneMute => "microphone-mute".into(),
             Self::OrcaJump { agent, folder } => format!("orca-jump:{agent}:{folder}"),
             Self::T3(command) => format!("t3:{command}"),
+            Self::AppToggleQuit(path) => format!("app-toggle:minimize+hold-quit:{path}"),
+            Self::AppQuit(path) => format!("app-quit:{path}"),
             Self::PromptSequence(steps) => format!(
                 "prompts:{}",
                 steps
@@ -471,6 +481,10 @@ impl Action {
             // Mappings saved before the merge used separate start and repair actions.
             "flow" | "flow-start" | "flow-repair" => Self::Flow,
             _ if value.starts_with("app:") => Self::Application(value[4..].into()),
+            _ if value.starts_with("app-toggle:minimize+hold-quit:") => {
+                Self::AppToggleQuit(value["app-toggle:minimize+hold-quit:".len()..].into())
+            }
+            _ if value.starts_with("app-quit:") => Self::AppQuit(value["app-quit:".len()..].into()),
             _ if value.starts_with("app-toggle:") => {
                 let (policy, path) = value["app-toggle:".len()..]
                     .split_once(':')
@@ -584,6 +598,13 @@ impl Action {
             Self::MicrophoneMute => "Toggle default microphone mute".into(),
             Self::OrcaJump { agent, folder } => format!("Orca: jump to {agent} in {folder}"),
             Self::T3(command) => format!("T3 Code: {command}"),
+            Self::AppToggleQuit(path) => format!(
+                "{}: tap minimizes/restores, hold 1 s quits",
+                desktop_id(path).unwrap_or_else(|| path.clone())
+            ),
+            Self::AppQuit(path) => {
+                format!("Quit {}", desktop_id(path).unwrap_or_else(|| path.clone()))
+            }
             Self::PromptSequence(steps) => format!(
                 "Prompt sequence: {} steps, one per tap ({} first)",
                 steps.len(),
@@ -1220,6 +1241,58 @@ fn app_toggle(
         other => {
             Err(format!("minimize/close unavailable: unexpected window state {other:?}").into())
         }
+    }
+}
+
+/// v7 ticket 21: quit an app whose window is open and not minimized; a minimized or closed
+/// app is left alone.
+fn app_quit(path: &str, mut gdbus: impl FnMut(&[String]) -> Result<String>) -> Result<String> {
+    let id = desktop_id(path).ok_or("launcher path is not under an applications directory")?;
+    let state = gdbus(&windows_call("State", &[&id]))
+        .map_err(|e| format!("quit unavailable (window extension): {e}"))?;
+    match state
+        .trim()
+        .trim_start_matches("('")
+        .trim_end_matches("',)")
+    {
+        "focused" | "background" => {
+            gdbus(&windows_call("Apply", &[&id, "close"]))?;
+            Ok(format!("Asked {id} to quit"))
+        }
+        "minimized" | "none" => Ok(format!("{id} is minimized or closed; nothing quit")),
+        other => Err(format!("quit unavailable: unexpected window state {other:?}").into()),
+    }
+}
+
+/// Hold-to-quit pads (v7 ticket 21): a release before one second is a tap; a hold reaching
+/// one second is due once. A pause or clear forgets every hold.
+#[derive(Default)]
+pub struct Holds(std::collections::HashMap<crate::Control, Instant>);
+impl Holds {
+    pub fn press(&mut self, control: crate::Control, now: Instant) {
+        self.0.insert(control, now);
+    }
+    /// True for a tap (let go before one second); a hold already due, or a release whose
+    /// press wasn't seen, is nothing.
+    pub fn release(&mut self, control: crate::Control, now: Instant) -> bool {
+        self.0
+            .remove(&control)
+            .is_some_and(|at| now.duration_since(at) < Duration::from_secs(1))
+    }
+    pub fn due(&mut self, now: Instant) -> Vec<crate::Control> {
+        let due = self
+            .0
+            .iter()
+            .filter(|(_, at)| now.duration_since(**at) >= Duration::from_secs(1))
+            .map(|(c, _)| *c)
+            .collect::<Vec<_>>();
+        for control in &due {
+            self.0.remove(control);
+        }
+        due
+    }
+    pub fn clear(&mut self) {
+        self.0.clear();
     }
 }
 
@@ -1878,6 +1951,13 @@ fn perform(
             || launch(path, &cancelled),
         ),
         Action::Flow => flow(node.ok_or("keyboard has not been registered")?, &cancelled),
+        Action::AppToggleQuit(path) => app_toggle(
+            path,
+            false,
+            |args| command("gdbus", args, &cancelled),
+            || launch(path, &cancelled),
+        ),
+        Action::AppQuit(path) => app_quit(path, |args| command("gdbus", args, &cancelled)),
         Action::T3(command) => {
             let keys = t3_keys(
                 &std::fs::read_to_string(t3_key_file()?).map_err(|e| {
@@ -2129,6 +2209,57 @@ mod tests {
         ] {
             assert!(Action::parse(bad).is_err(), "{bad}");
         }
+    }
+
+    /// v7 ticket 21: a tap minimizes/restores, a one-second hold quits an open app; early
+    /// release, pause or clear cancels; a minimized app is never quit.
+    #[test]
+    fn hold_to_quit_taps_hold_and_cancel() {
+        let pad = crate::Control::from_note(10, 42).unwrap();
+        let at = Instant::now();
+        let ms = |n| at + Duration::from_millis(n);
+        let mut holds = Holds::default();
+        holds.press(pad, ms(0));
+        assert!(holds.due(ms(900)).is_empty());
+        assert!(holds.release(pad, ms(950)), "a tap");
+        holds.press(pad, ms(2000));
+        assert_eq!(holds.due(ms(3000)), [pad]);
+        assert!(
+            !holds.release(pad, ms(3100)),
+            "the hold already quit; its release does nothing"
+        );
+        holds.press(pad, ms(4000));
+        holds.clear();
+        assert!(holds.due(ms(6000)).is_empty(), "a pause cancels");
+        assert!(!holds.release(pad, ms(6100)));
+
+        let path = "/usr/share/applications/firefox.desktop";
+        for (state, quits) in [
+            ("focused", true),
+            ("background", true),
+            ("minimized", false),
+            ("none", false),
+        ] {
+            let mut calls = Vec::new();
+            app_quit(path, |args| {
+                calls.push(args.join(" "));
+                Ok(format!("('{state}',)"))
+            })
+            .unwrap();
+            assert_eq!(
+                calls
+                    .iter()
+                    .any(|c| c.contains("Apply") && c.contains("close")),
+                quits,
+                "{state}"
+            );
+        }
+        let action = Action::AppToggleQuit(path.into());
+        assert_eq!(Action::parse(&action.encode()).unwrap(), action);
+        assert_eq!(
+            Action::parse(&Action::AppQuit(path.into()).encode()).unwrap(),
+            Action::AppQuit(path.into())
+        );
     }
 
     /// v7 ticket 20: a prompt sequence sends one step per sent tap, wraps after the last,
