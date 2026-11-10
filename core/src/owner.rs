@@ -51,7 +51,10 @@ impl Owner {
                 .filter(|l| {
                     l.rsplit_once("(pid ")
                         .and_then(|(_, pid)| pid.strip_suffix(')'))
-                        .is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists())
+                        .is_some_and(|pid| {
+                            std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                                .is_ok_and(|comm| comm.starts_with("vibeconsole"))
+                        })
                 })
                 .unwrap_or("another VibeConsole");
             return Err(format!("Startup: {holder} owns MIDI/keyboard/configuration; keep it for editing, or stop it first (vibeconsole startup-stop for the login service). No keyboard was replaced").into());

@@ -1272,7 +1272,7 @@ fn parse_mapping_line(line: &str, version: u32, midi_devices: &[String]) -> Resu
 }
 
 fn parse_config(contents: &str) -> Result<Config> {
-    let mut lines = contents.lines();
+    let mut lines = contents.lines().peekable();
     // Files saved before the KeyAI → VibeConsole rename keep their old header.
     let version = lines.next().and_then(|header| {
         header
@@ -1556,8 +1556,13 @@ fn parse_config(contents: &str) -> Result<Config> {
     } else {
         Tuning::default()
     };
+    // v16 grew record by record during v7 (devices, profiles, lock, favourites): a v16 file
+    // written before one existed loads it with its safe default instead of failing.
+    let has = |lines: &mut std::iter::Peekable<std::str::Lines>, record: &str| {
+        version >= 16 && lines.peek().is_some_and(|l| l.starts_with(record))
+    };
     let (mut midi_devices, mut midi_active) = (Vec::new(), None);
-    if version >= 16 {
+    if has(&mut lines, "midi-devices\t") {
         let count: usize = lines
             .next()
             .and_then(|l| l.strip_prefix("midi-devices\t"))
@@ -1582,7 +1587,7 @@ fn parse_config(contents: &str) -> Result<Config> {
     }
     let parse_mapping = |line: &str| parse_mapping_line(line, version, &midi_devices);
     let mut profiles = Vec::new();
-    if version >= 16 {
+    if has(&mut lines, "profiles\t") {
         let count: usize = lines
             .next()
             .and_then(|l| l.strip_prefix("profiles\t"))
@@ -1620,7 +1625,7 @@ fn parse_config(contents: &str) -> Result<Config> {
         }
         validate_profiles(&profiles)?;
     }
-    let lock = if version >= 16 {
+    let lock = if has(&mut lines, "profile-lock\t") {
         match lines
             .next()
             .and_then(|l| l.strip_prefix("profile-lock\t"))
@@ -1635,7 +1640,7 @@ fn parse_config(contents: &str) -> Result<Config> {
         None
     };
     let mut favourites = Vec::new();
-    if version >= 16 {
+    if has(&mut lines, "favourites\t") {
         let count: usize = lines
             .next()
             .and_then(|l| l.strip_prefix("favourites\t"))
@@ -2824,6 +2829,30 @@ mod tests {
         with_pads.mappings = vec![Mapping::new(pad, "F1", "hold").unwrap()];
         let request = profile_request(&with_pads, "firefox.desktop", "Tabs on the pads.").unwrap();
         assert!(request.contains("vibeconsole-profile-v1") && request.contains("Bank A Pad 1"));
+    }
+
+    /// Review fix: a v16 file written before devices, profiles, the lock or favourites
+    /// existed still loads, with their safe defaults.
+    #[test]
+    fn early_v16_files_load_with_defaults_for_later_records() {
+        let mut config = Config::default();
+        config.mappings =
+            vec![Mapping::new(Control::from_note(10, 36).unwrap(), "F1", "hold").unwrap()];
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-early-v16-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        save_config(&path, &config).unwrap();
+        let full = fs::read_to_string(&path).unwrap();
+        let early = full.replace(
+            "midi-devices\t0\nmidi-active\t-\nprofiles\t0\nprofile-lock\t-\nfavourites\t0\n",
+            "",
+        );
+        assert_ne!(early, full);
+        assert_eq!(parse_config(&early).unwrap(), config);
+        let without_favourites = full.replace("favourites\t0\n", "");
+        assert_eq!(parse_config(&without_favourites).unwrap(), config);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

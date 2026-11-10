@@ -1049,6 +1049,7 @@ impl Terminal {
     fn release_all(&mut self) -> Result<()> {
         self.cancel_actions();
         self.holds.clear();
+        self.guide.cancel();
         self.motion = crate::motion::Motion::new(&self.run_mappings)?;
         if let Some(output) = &mut self.output {
             output.clear()?;

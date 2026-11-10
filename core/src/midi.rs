@@ -135,6 +135,24 @@ mod tests {
         );
     }
 
+    /// Review fix: unread SysEx (a non-Akai device, or no feedback running) never stops pad
+    /// input; a full note queue still does.
+    #[test]
+    fn unread_sysex_never_stops_pad_input() {
+        let (notes, note_queue) = std::sync::mpsc::sync_channel(1);
+        let (frames, _frame_queue) = std::sync::mpsc::sync_channel(1);
+        let mut senders: Senders = Some((notes, frames));
+        for _ in 0..20 {
+            deliver(&mut senders, &[0xF0, 0x7E, 0x7F, 0x06, 0x02, 0xF7]);
+        }
+        assert!(senders.is_some());
+        deliver(&mut senders, &[0x99, 36, 100]);
+        assert_eq!(note_queue.try_recv().unwrap().unwrap(), [0x99, 36, 100]);
+        deliver(&mut senders, &[0x99, 37, 100]);
+        deliver(&mut senders, &[0x99, 38, 100]);
+        assert!(senders.is_none(), "a lost note ends the input");
+    }
+
     /// v7 ticket 05: midir hands over one complete message per callback.
     #[test]
     fn one_midir_message_becomes_its_packet() {
@@ -308,6 +326,28 @@ pub fn other_devices() -> crate::Result<Vec<String>> {
     Ok(names)
 }
 
+/// One midir message into the queues. A full note queue ends the input (a lost release
+/// must never pass silently); a full or unread SysEx queue only drops that frame, since
+/// SysEx is never pad input (a chatty device or a session without feedback can't stop it).
+fn deliver(senders: &mut Senders, message: &[u8]) {
+    let Some((notes, frames)) = senders else {
+        return;
+    };
+    for packet in message_packets(message) {
+        match packet {
+            Packet::Channel(note) => {
+                if notes.try_send(Ok(note)).is_err() {
+                    *senders = None;
+                    return;
+                }
+            }
+            Packet::SysEx(frame) => {
+                let _ = frames.try_send(frame);
+            }
+        }
+    }
+}
+
 /// Bounded queues fed by the midir callback. A full queue drops both senders, so `next`
 /// reports the overflow instead of silently losing a release.
 type Senders = Option<(
@@ -373,21 +413,7 @@ impl Input {
             .connect(
                 &port,
                 "VibeConsole input",
-                |_, message, senders: &mut Senders| {
-                    let Some((notes, frames)) = senders else {
-                        return;
-                    };
-                    for packet in message_packets(message) {
-                        let sent = match packet {
-                            Packet::Channel(note) => notes.try_send(Ok(note)).is_ok(),
-                            Packet::SysEx(frame) => frames.try_send(frame).is_ok(),
-                        };
-                        if !sent {
-                            *senders = None;
-                            return;
-                        }
-                    }
-                },
+                |_, message, senders: &mut Senders| deliver(senders, message),
                 Some((sender, sysex_sender)),
             )
             .map_err(|e| format!("cannot open MIDI input {name}: {e}"))?;

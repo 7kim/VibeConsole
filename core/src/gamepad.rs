@@ -178,6 +178,15 @@ pub fn layout(saved: &[Mapping]) -> Vec<Mapping> {
     layout
 }
 
+/// After a transition: buttons are forgotten (their release is then unmatched), but a stick
+/// or trigger still held past its fire point stays down, so axis jitter can't fire it
+/// again; it fires on its next fresh push after it's let go.
+pub fn keep_held_analog(down: &mut HashSet<Control>) {
+    let lt = control(gilrs::Button::LeftTrigger2);
+    let rt = control(gilrs::Button::RightTrigger2);
+    down.retain(|c| Some(*c) == lt || Some(*c) == rt || c.id >= STICK_BASE);
+}
+
 /// What happened on a controller, already decided against the buttons held.
 #[derive(Debug, PartialEq)]
 pub enum Change {
@@ -430,6 +439,8 @@ impl Pointer {
     }
 }
 
+/// ponytail: one held-button set for every controller; two pads pressing the same button
+/// count as one. Key events by gamepad id if two-controller setups matter.
 pub struct Pad {
     gilrs: gilrs::Gilrs,
     /// The rumble playing now; dropping it stops it.
@@ -490,8 +501,7 @@ impl Pad {
     /// fresh press fires and nothing replays.
     pub fn drain(&mut self) {
         while self.gilrs.next_event().is_some() {}
-        self.down.clear();
-        self.analog = Analog::default();
+        keep_held_analog(&mut self.down);
     }
     /// One short rumble on every controller that supports it, when Tuning has it on.
     /// Rumble is hardware feedback: it plays only while VibeConsole owns the controller.
@@ -902,6 +912,42 @@ mod tests {
             headset_status(&["xone-wired"], &format!("{cards}{xbox_card}")).contains("available")
         );
         assert!(headset_status(&["xpad"], xbox_card).contains("needs the xone driver"));
+    }
+
+    /// Review fix: a trigger held through a transition doesn't fire again on jitter; it
+    /// fires once it's been let go and pulled again.
+    #[test]
+    fn held_triggers_wait_for_a_fresh_pull_after_a_transition() {
+        let tuning = crate::mappings::Tuning::default();
+        let mut pad = Analog::default();
+        let mut down = HashSet::new();
+        let a = control(gilrs::Button::South).unwrap();
+        let rt = control(gilrs::Button::RightTrigger2).unwrap();
+        down.insert(a);
+        let mut feed = |down: &mut HashSet<Control>, v| {
+            analog(
+                down,
+                &mut pad,
+                Motion::Trigger(gilrs::Button::RightTrigger2, v),
+                &tuning,
+            )
+        };
+        assert_eq!(feed(&mut down, 0.9), [Change::Event(Event::Press(rt))]);
+        keep_held_analog(&mut down);
+        assert_eq!(
+            down,
+            [rt].into(),
+            "buttons forgotten, the held trigger kept"
+        );
+        assert!(
+            feed(&mut down, 0.92).is_empty(),
+            "jitter doesn't fire again"
+        );
+        assert_eq!(
+            feed(&mut down, 0.0),
+            [Change::Event(Event::Release(rt, ReleaseType::ButtonUp))]
+        );
+        assert_eq!(feed(&mut down, 0.8), [Change::Event(Event::Press(rt))]);
     }
 
     #[test]

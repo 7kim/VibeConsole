@@ -179,22 +179,34 @@ pub fn sessions() -> Vec<Session> {
     fallback.extend(herdr_sessions(&herdr_list()));
     with_fallback(hooks, fallback)
 }
-/// `herdr agent list` (2 s at most), or nothing when herdr isn't installed.
-/// ponytail: one blocking call per status refresh; move it to the background probe if
-/// herdr ever answers slowly.
+/// The last `herdr agent list` answer, refreshed on a background thread (2 s at most each),
+/// so a slow herdr never stalls the session loop; empty when herdr isn't installed.
 fn herdr_list() -> String {
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+    static LAST: Mutex<String> = Mutex::new(String::new());
+    static ASKING: AtomicBool = AtomicBool::new(false);
     let installed = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
         .any(|dir| dir.join("herdr").is_file());
     if !installed {
         return String::new();
     }
-    std::process::Command::new("timeout")
-        .args(["2", "herdr", "agent", "list"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default()
+    if !ASKING.swap(true, Ordering::AcqRel) {
+        std::thread::spawn(|| {
+            let answer = std::process::Command::new("timeout")
+                .args(["2", "herdr", "agent", "list"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default();
+            *LAST.lock().unwrap_or_else(|e| e.into_inner()) = answer;
+            ASKING.store(false, Ordering::Release);
+        });
+    }
+    LAST.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 /// herdr's agents as a light source (v7 ticket 18; herdr.dev/docs/socket-api): each
 /// agent's state and folder (`foreground_cwd`, else `cwd`). `done` lights as finished,
