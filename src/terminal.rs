@@ -446,7 +446,11 @@ impl Terminal {
     fn observe_light(&mut self, event: Option<&Event>, now: Instant) {
         self.input_flash = Some(now + Duration::from_millis(200));
         if let Some(Event::Press(control)) = event {
-            if control.message == crate::Message::Note {
+            // v7 ticket 44: Xbox buttons flash in detect like notes.
+            if matches!(
+                control.message,
+                crate::Message::Note | crate::Message::Button
+            ) {
                 self.note_flashes
                     .insert(*control, now + Duration::from_millis(200));
             }
@@ -503,6 +507,7 @@ impl Terminal {
             let mut items = self
                 .note_flashes
                 .keys()
+                .filter(|c| c.message == crate::Message::Note)
                 .map(|c| raw(*c))
                 .collect::<Vec<_>>();
             items.extend(
@@ -519,6 +524,7 @@ impl Terminal {
                 &grid(&items, width.saturating_sub(4)),
                 width,
             ));
+            rows.extend(self.xbox_rows(width, live));
             rows.push(fit(&self.last_event, width).trim_end().into());
             return rows.join("\n");
         };
@@ -605,7 +611,7 @@ impl Terminal {
         items.extend(
             self.note_flashes
                 .keys()
-                .filter(|c| !pads.contains(&Some(**c)))
+                .filter(|c| c.message == crate::Message::Note && !pads.contains(&Some(**c)))
                 .map(|c| {
                     if self.run_mappings.iter().any(|m| m.control == *c) {
                         format!("{} {}", lit(*c), self.name(*c))
@@ -619,21 +625,41 @@ impl Terminal {
             &grid(&items, width.saturating_sub(4)),
             width,
         ));
+        rows.extend(self.xbox_rows(width, live));
         rows.push(fit(&self.last_event, width).trim_end().into());
         rows.join("\n")
+    }
+    /// The detect screen's Xbox section for the controller this session has open.
+    fn xbox_rows(&self, width: usize, live: bool) -> Vec<String> {
+        let now = Instant::now();
+        let connected = self.gamepad.as_ref().map(|pad| pad.connected());
+        let xbox = self
+            .gamepad
+            .as_ref()
+            .zip(connected.as_deref())
+            .map(|(pad, names)| (names, &pad.down, pad.analog));
+        xbox_group(xbox, |c| live && self.note_light(c, now), width)
     }
 
     fn detect(&mut self) -> Result<()> {
         self.suspend()?;
         if self.input.is_none() {
-            self.input = Some(self.open_input()?);
-            self.reset_input_lights();
+            match self.open_input() {
+                Ok(input) => {
+                    self.input = Some(input);
+                    self.reset_input_lights();
+                }
+                // v7 ticket 44: an Xbox controller alone is enough to detect.
+                Err(_) if self.gamepad.is_some() => {}
+                Err(error) => return Err(error),
+            }
         }
         loop {
             self.tick()?;
-            let view = self.detection_view(self.size(), self.input.is_some());
+            let live = self.input.is_some() || self.gamepad.is_some();
+            let view = self.detection_view(self.size(), live);
             self.draw(&view)?;
-            if self.input.is_none() {
+            if self.input.is_none() && self.gamepad.is_none() {
                 return Err(self.error.clone().into());
             }
             if let Some(Key::Enter | Key::Escape) = self.key()? {
@@ -2918,6 +2944,41 @@ Labels assigned to other controls in this program are omitted.",
     fn learn_piano(&mut self) -> Result<Option<Control>> {
         self.learn_note(true)
     }
+}
+
+/// Detect's Xbox section (v7 ticket 44): the controller's name, each button lit while held or
+/// just pressed, and where the triggers and sticks are; "No Xbox controller" without one.
+fn xbox_group(
+    xbox: Option<(
+        &[String],
+        &std::collections::HashSet<Control>,
+        crate::gamepad::Analog,
+    )>,
+    lit: impl Fn(Control) -> bool,
+    width: usize,
+) -> Vec<String> {
+    use crate::screen::{bulb, grid, group};
+    let Some((names, down, analog)) = xbox.filter(|(names, _, _)| !names.is_empty()) else {
+        return group("Xbox", &["No Xbox controller".to_string()], width);
+    };
+    let mut items = (0..crate::gamepad::BUTTONS.len())
+        .map(|id| {
+            let control = Control::button(id as u8);
+            let on = down.contains(&control) || lit(control);
+            format!("{} {}", bulb(on), crate::gamepad::button_name(id as u8))
+        })
+        .collect::<Vec<_>>();
+    let trigger = |v: f32| (v.clamp(0.0, 1.0) * 100.0).round() as u8;
+    items.push(format!("LT {}%", trigger(analog.lt)));
+    items.push(format!("RT {}%", trigger(analog.rt)));
+    for (name, (x, y)) in [("Left", analog.left), ("Right", analog.right)] {
+        items.push(format!("{name} stick x {x:+.2} y {y:+.2}"));
+    }
+    group(
+        &format!("Xbox · {}", names.join(", ")),
+        &grid(&items, width.saturating_sub(4)),
+        width,
+    )
 }
 
 fn choose(ui: &mut impl Ui, title: &str, options: &[String]) -> Result<Option<usize>> {
@@ -6360,6 +6421,7 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
     ui.start_flow_enabled = config.start_flow;
     ui.run_mappings = ui.context_mappings(&current);
     if initial == "detect" {
+        ui.open_gamepad(); // v7 ticket 44: before, detect never saw the Xbox controller
         return ui.detect();
     }
     ui.use_device(&config, &current)?;
@@ -6955,6 +7017,90 @@ mod tests {
                 .count(),
             1
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 44: detect shows the Xbox controller beside the MIDI controls: each button
+    /// by name, lit while pressed, the sticks and triggers; "No Xbox controller" without one.
+    /// A button is never listed as a MIDI note.
+    #[test]
+    fn detect_shows_xbox_buttons_sticks_and_triggers() {
+        use crate::gamepad::Analog;
+        let mut ui =
+            Terminal::open_mode(Path::new("/unused-vibeconsole-detect-xbox"), true).unwrap();
+        let view = ui.detection_view((120, 40), true);
+        assert!(view.contains("No Xbox controller"), "{view}");
+        let a = Control::button(0);
+        let y = Control::button(3);
+        ui.observe_light(Some(&Event::Press(a)), Instant::now());
+        let view = ui.detection_view((120, 40), true);
+        assert!(
+            !view.contains("Note ch"),
+            "a button is not a MIDI note:\n{view}"
+        );
+        let analog = Analog {
+            lt: 0.5,
+            rt: 0.0,
+            left: (0.0, -1.0),
+            right: (0.25, 0.0),
+        };
+        let held = std::collections::HashSet::from([y]);
+        let now = Instant::now();
+        let rows = xbox_group(
+            Some((&["Xbox Series X Controller".to_string()], &held, analog)),
+            |c| ui.note_light(c, now),
+            120,
+        )
+        .join("\n");
+        assert!(rows.contains("Xbox Series X Controller"), "{rows}");
+        assert!(
+            rows.contains("💡 ON A"),
+            "A flashed after its press:\n{rows}"
+        );
+        assert!(rows.contains("💡 ON Y"), "Y is held:\n{rows}");
+        assert!(rows.contains("💡 OFF B"), "{rows}");
+        assert!(rows.contains("LT 50%") && rows.contains("RT 0%"), "{rows}");
+        assert!(rows.contains("Left stick x +0.00 y -1.00"), "{rows}");
+        assert!(rows.contains("Right stick x +0.25 y +0.00"), "{rows}");
+        let none = xbox_group(None, |_| false, 120).join("\n");
+        assert!(none.contains("No Xbox controller"), "{none}");
+    }
+
+    /// v7 ticket 44: detect suspends the session, so pressing mapped Xbox buttons there
+    /// (an Output mute, a hold-to-quit launcher) runs nothing.
+    #[test]
+    fn detect_runs_no_mapped_xbox_action() {
+        use crate::actions::Action;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-detect-quiet-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let x = Mapping::new_action(Control::button(2), mappings::Input::Pad, Action::OutputMute)
+            .unwrap();
+        let quit = Mapping::new_action(
+            Control::button(3),
+            mappings::Input::Pad,
+            Action::AppToggleQuit("/nonexistent/app.desktop".into()),
+        )
+        .unwrap();
+        mappings::save(&path, &[x.clone(), quit.clone()]).unwrap();
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        let (sent, ran) = std::sync::mpsc::channel();
+        ui.actions = crate::actions::Dispatcher::with(move |action, _, _| {
+            sent.send(action.clone()).unwrap();
+            Ok("done".into())
+        });
+        ui.suspend().unwrap(); // what detect does first
+        for control in [x.control, quit.control] {
+            ui.handle_events(vec![
+                Event::Press(control),
+                Event::Release(control, crate::ReleaseType::ButtonUp),
+            ])
+            .unwrap();
+        }
+        ui.quit_holds();
+        assert!(ran.recv_timeout(Duration::from_millis(300)).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
