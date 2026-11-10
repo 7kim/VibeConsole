@@ -207,6 +207,18 @@ pub fn login(request: Login) -> Result<bool> {
         }
     }
 }
+/// `doctor`'s login-service line (v7 ticket 01). Nothing in VibeConsole disables the unit
+/// on its own; `startup-disable` (e.g. a test guide's cleanup) does, so doctor says so.
+fn login_doctor(installed: bool, mut systemctl: impl FnMut(&[&str]) -> Result<()>) -> String {
+    if !installed {
+        "Login service: not installed (vibeconsole startup-enable starts VibeConsole at login)"
+            .into()
+    } else if systemctl(&["is-enabled", "--quiet", UNIT]).is_ok() {
+        "Login service: enabled (starts at login)".into()
+    } else {
+        "Login service: WARNING installed but disabled, so VibeConsole won't start at login; turn it on with: vibeconsole startup-enable".into()
+    }
+}
 /// Setup and login-service commands `main` hands to `command`.
 pub const COMMANDS: [&str; 8] = [
     "install",
@@ -255,6 +267,7 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                 "Installed {}. Installation does not enable/start login startup. Add ~/.local/bin to PATH if needed.",
                 binary.display()
             );
+            println!("{}", login_doctor(unit()?.is_file(), systemctl));
             let extension = extension_dir()?;
             fs::create_dir_all(&extension)?;
             for (name, text) in EXTENSION_FILES {
@@ -286,7 +299,12 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                 return Err(format!("systemctl --user status {UNIT} failed ({status})").into());
             }
         }
-        "startup-disable" => systemctl(&["disable", "--now", "vibeconsole.service"])?,
+        "startup-disable" => {
+            systemctl(&["disable", "--now", "vibeconsole.service"])?;
+            println!(
+                "Login startup disabled: VibeConsole won't start at login. Turn it back on with: vibeconsole startup-enable"
+            );
+        }
         "uninstall" => {
             if unit()?.exists() {
                 managed(&unit()?)?;
@@ -354,6 +372,7 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                 "Configuration: {} valid mappings",
                 crate::mappings::load(&crate::mappings::config_path()?)?.len()
             );
+            println!("{}", login_doctor(unit()?.is_file(), systemctl));
             println!("Agent terminals: tmux attach -t vibe");
             for codex in [false, true] {
                 println!("{}", crate::status::hooks_status(codex));
@@ -448,6 +467,27 @@ mod tests {
         static E: AtomicBool = AtomicBool::new(true);
         let (_, calls) = run(true, false, true, &E);
         assert_eq!(calls, ["start"]);
+    }
+
+    /// v7 ticket 01: doctor warns when the unit is installed but won't start at login.
+    #[test]
+    fn doctor_warns_when_login_service_is_installed_but_disabled() {
+        let line = |installed, enabled: bool| {
+            login_doctor(installed, |args: &[&str]| {
+                assert_eq!(args, ["is-enabled", "--quiet", UNIT]);
+                if enabled {
+                    Ok(())
+                } else {
+                    Err("disabled".into())
+                }
+            })
+        };
+        let off = line(true, false);
+        assert!(off.starts_with("Login service: WARNING"), "{off}");
+        assert!(off.contains("vibeconsole startup-enable"), "{off}");
+        assert_eq!(line(true, true), "Login service: enabled (starts at login)");
+        let missing = line(false, false);
+        assert!(!missing.contains("WARNING"), "{missing}");
     }
 
     #[test]
