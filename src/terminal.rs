@@ -190,6 +190,8 @@ struct Terminal {
     last_focus: Option<String>,
     /// The Xbox-button gesture (cycle profiles, toggle the lock).
     guide: crate::gamepad::Guide,
+    /// Each prompt-sequence pad's next step (v7 ticket 20); step 1 after a restart.
+    positions: crate::actions::Positions,
     context_verified: bool,
     follow_programs: bool,
     follow_retry: Instant,
@@ -660,6 +662,7 @@ impl Terminal {
             focus_unavailable: false,
             last_focus: None,
             guide: crate::gamepad::Guide::default(),
+            positions: crate::actions::Positions::default(),
             context_verified: true,
             follow_programs: false,
             follow_retry: Instant::now(),
@@ -1100,11 +1103,26 @@ impl Terminal {
                         .run_mappings
                         .iter()
                         .any(|m| m.control == pad && m.status);
+                    // v7 ticket 20: a prompt sequence sends its current step, and moves on
+                    // only once that step was sent.
+                    let sequence = match &action {
+                        crate::actions::Action::PromptSequence(steps) => Some(steps.len()),
+                        _ => None,
+                    };
+                    let action = match action {
+                        crate::actions::Action::PromptSequence(steps) => {
+                            steps[self.positions.current(pad, steps.len())].clone()
+                        }
+                        action => action,
+                    };
                     let submitted = if action.flow() {
                         self.start_flow()
                     } else {
                         self.actions.submit(action, None)
                     };
+                    if let (Some(len), Ok(_)) = (sequence, &submitted) {
+                        self.positions.sent(pad, len);
+                    }
                     let knob = self.run_mappings.iter().any(|m| {
                         m.control == pad
                             && matches!(
@@ -5108,14 +5126,14 @@ fn stage<E: std::fmt::Display>(name: &'static str) -> impl Fn(E) -> Box<dyn std:
 /// Action families (indexes into `FAMILIES`) a control can use; others are not offered.
 fn families(input: mappings::Input) -> Vec<usize> {
     match input {
-        mappings::Input::Pad | mappings::Input::Piano => (0..6).chain([8, 9, 10]).collect(),
+        mappings::Input::Pad | mappings::Input::Piano => (0..6).chain([8, 9, 10, 11]).collect(),
         mappings::Input::Knob { .. } => vec![0, 2, 6, 7],
         mappings::Input::RelativeKnob { .. } => vec![0, 2],
         mappings::Input::Joystick { .. } => vec![0],
     }
 }
 
-const FAMILIES: [&str; 11] = [
+const FAMILIES: [&str; 12] = [
     "Keyboard shortcut",
     "Launch application",
     "Fedora system action",
@@ -5127,10 +5145,62 @@ const FAMILIES: [&str; 11] = [
     "Orca (needs me, jump to an agent, its shortcuts)",
     "T3 Code (keys from its own key file)",
     "herdr (focus an agent)",
+    "Prompt sequence (tap 1 sends prompt 1, tap 2 prompt 2, …)",
 ];
 
 fn configure(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) -> Result<()> {
     configure_for(ui, path, current, None)
+}
+
+/// The prompt-sequence editor (v7 ticket 20): add step n+1 (a saved prompt or a new one),
+/// move a step up, remove one. No fixed size.
+fn prompt_sequence_action(
+    ui: &mut impl Ui,
+    path: &Path,
+    saved: Option<&crate::actions::Action>,
+) -> Result<Option<crate::actions::Action>> {
+    let mut steps = match saved {
+        Some(crate::actions::Action::PromptSequence(steps)) => steps.clone(),
+        _ => Vec::new(),
+    };
+    loop {
+        let mut items = steps
+            .iter()
+            .enumerate()
+            .map(|(i, step)| format!("{}. {}", i + 1, step.description()))
+            .collect::<Vec<_>>();
+        items.push(format!("Add step {}", steps.len() + 1));
+        items.push("Done".into());
+        let Some(choice) = choose(
+            ui,
+            "Prompt sequence: tap 1 sends step 1, tap 2 step 2, …; after the last it starts again",
+            &items,
+        )?
+        else {
+            return Ok(None);
+        };
+        if choice == steps.len() {
+            if let Some(step) = prompt_action(ui, path, None)? {
+                steps.push(step);
+            }
+        } else if choice > steps.len() {
+            if !steps.is_empty() {
+                return Ok(Some(crate::actions::Action::PromptSequence(steps)));
+            }
+        } else {
+            match choose(
+                ui,
+                &format!("Step {}: {}", choice + 1, steps[choice].description()),
+                &options(&["Move up", "Remove", "Back"]),
+            )? {
+                Some(0) if choice > 0 => steps.swap(choice, choice - 1),
+                Some(1) => {
+                    steps.remove(choice);
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 /// The T3 Code family (v7 ticket 17): each command shows the key T3's own file binds it
@@ -5456,6 +5526,15 @@ fn configure_steps(
                 }
             };
             Mapping::new(pad, &keys.join("+"), behavior)?
+        } else if family == 11 {
+            if !matches!(input, mappings::Input::Pad | mappings::Input::Piano) {
+                return Err("prompt sequences require a pad or piano press".into());
+            }
+            let Some(action) = prompt_sequence_action(ui, path, saved.as_ref().map(|m| &m.action))?
+            else {
+                continue;
+            };
+            Mapping::new_action(pad, input, action)?
         } else if family == 10 {
             let agents = ui.herdr_agents()?;
             if agents.is_empty() {
@@ -7660,6 +7739,50 @@ mod tests {
             mappings::load(&path).unwrap()[0].action,
             crate::actions::Action::T3("chat.new".into())
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 20: a prompt sequence is built step by step (n+1), reordered and saved.
+    #[test]
+    fn prompt_sequence_is_built_reordered_and_saved() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-seq-ui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("prompts")).unwrap();
+        std::fs::write(dir.join("prompts/build"), "Build it.\n").unwrap();
+        std::fs::write(dir.join("prompts/plan"), "Plan it.\n").unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut keys = vec![Enter];
+        keys.extend(vec![Down; 9]); // Prompt sequence family
+        keys.push(Enter);
+        keys.push(Enter); // Add step 1
+        keys.extend([Enter, Enter, Enter, Down, Enter]); // build, use, target, paste and Enter
+        keys.extend([Down, Enter]); // Add step 2
+        keys.extend([Down, Enter, Enter, Enter, Down, Enter]); // plan
+        keys.extend([Down, Enter, Enter]); // step 2: move up
+        keys.extend([Down, Down, Down, Enter]); // Done
+        keys.extend([Enter, Enter, Enter, Tab, Tab, Enter]);
+        let mut ui = Script {
+            keys: keys.into(),
+            pads: [Control::from_note(10, 36).unwrap()].into(),
+            ..Default::default()
+        };
+        let mut current = Vec::new();
+        configure(&mut ui, &path, &mut current).unwrap();
+        assert!(ui.keys.is_empty());
+        let saved = mappings::load(&path).unwrap();
+        let crate::actions::Action::PromptSequence(steps) = &saved[0].action else {
+            panic!("not a prompt sequence: {:?}", saved[0].action);
+        };
+        let files = steps
+            .iter()
+            .map(|s| match s {
+                crate::actions::Action::Prompt { file, .. } => file.as_str(),
+                _ => "?",
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(files, ["plan", "build"]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

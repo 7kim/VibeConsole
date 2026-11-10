@@ -161,6 +161,10 @@ pub enum Action {
         agent: String,
         folder: String,
     },
+    /// v7 ticket 20: one pad walks through prompts: tap 1 sends step 1, tap 2 step 2, …,
+    /// wrapping after the last. Each step is a `Prompt`. Unlike `Sequence`, one tap sends
+    /// one step.
+    PromptSequence(Vec<Action>),
     /// v7 ticket 18: bring herdr's agent `name` to the front (`herdr agent focus`).
     HerdrFocus(String),
     /// v7 ticket 17: a T3 Code command (`chat.new`), pressed with whatever key the user's
@@ -186,6 +190,7 @@ impl Action {
                     _ => Vec::new(),
                 })
                 .collect(),
+            Self::PromptSequence(steps) => steps.iter().flat_map(Action::agents).collect(),
             Self::Choice(choices) => choices.iter().flat_map(Self::agents).collect(),
             _ => Vec::new(),
         }
@@ -295,6 +300,14 @@ impl Action {
             {
                 Err("command must be one nonempty line without control characters, run in an absolute directory without ':'".into())
             }
+            Self::PromptSequence(steps)
+                if steps.is_empty()
+                    || steps.len() > 999
+                    || steps.iter().any(|s| !matches!(s, Self::Prompt { .. })) =>
+            {
+                Err("a prompt sequence needs 1–999 prompt steps".into())
+            }
+            Self::PromptSequence(steps) => steps.iter().try_for_each(Self::validate),
             // herdr's own rule for agent names: [a-z][a-z0-9_-]{0,31}.
             Self::HerdrFocus(name)
                 if !name.starts_with(|c: char| c.is_ascii_lowercase())
@@ -383,6 +396,14 @@ impl Action {
             Self::MicrophoneMute => "microphone-mute".into(),
             Self::OrcaJump { agent, folder } => format!("orca-jump:{agent}:{folder}"),
             Self::T3(command) => format!("t3:{command}"),
+            Self::PromptSequence(steps) => format!(
+                "prompts:{}",
+                steps
+                    .iter()
+                    .map(Action::encode)
+                    .collect::<Vec<_>>()
+                    .join(&STEP_SEPARATOR.to_string())
+            ),
             Self::HerdrFocus(name) => format!("herdr-focus:{name}"),
             Self::Flow => "flow".into(),
         }
@@ -464,6 +485,12 @@ impl Action {
                 }
             }
             _ if value.starts_with("t3:") => Self::T3(value["t3:".len()..].into()),
+            _ if value.starts_with("prompts:") => Self::PromptSequence(
+                value["prompts:".len()..]
+                    .split(STEP_SEPARATOR)
+                    .map(Action::parse)
+                    .collect::<Result<_>>()?,
+            ),
             _ if value.starts_with("herdr-focus:") => {
                 Self::HerdrFocus(value["herdr-focus:".len()..].into())
             }
@@ -557,6 +584,11 @@ impl Action {
             Self::MicrophoneMute => "Toggle default microphone mute".into(),
             Self::OrcaJump { agent, folder } => format!("Orca: jump to {agent} in {folder}"),
             Self::T3(command) => format!("T3 Code: {command}"),
+            Self::PromptSequence(steps) => format!(
+                "Prompt sequence: {} steps, one per tap ({} first)",
+                steps.len(),
+                steps.first().map(Action::description).unwrap_or_default()
+            ),
             Self::HerdrFocus(name) => format!("herdr: focus agent {name}"),
             Self::Flow => "Start or repair Wispr Flow".into(),
             Self::Shortcut => "Keyboard shortcut".into(),
@@ -1063,6 +1095,26 @@ pub fn write_t3_key_file(text: &str) -> Result<std::path::PathBuf> {
     })?;
     write_atomic(&path, text)?;
     Ok(backup)
+}
+
+/// Which step of a prompt sequence a pad sends next (v7 ticket 20). Positions live only in
+/// the running session, so they start at step 1 after a restart.
+#[derive(Default)]
+pub struct Positions(std::collections::HashMap<crate::Control, usize>);
+impl Positions {
+    /// The step this tap sends, for a sequence of `len` steps.
+    pub fn current(&self, control: crate::Control, len: usize) -> usize {
+        self.0.get(&control).copied().unwrap_or(0) % len.max(1)
+    }
+    /// Only a tap that was sent moves on; after the last step it wraps to the first.
+    pub fn sent(&mut self, control: crate::Control, len: usize) {
+        let next = (self.current(control, len) + 1) % len.max(1);
+        self.0.insert(control, next);
+    }
+    /// "3/5" for the hints window.
+    pub fn label(&self, control: crate::Control, len: usize) -> String {
+        format!("{}/{len}", self.current(control, len) + 1)
+    }
 }
 
 /// Orca's CLI: on PATH, else the shim Orca installs (the login service's PATH is short).
@@ -2077,6 +2129,40 @@ mod tests {
         ] {
             assert!(Action::parse(bad).is_err(), "{bad}");
         }
+    }
+
+    /// v7 ticket 20: a prompt sequence sends one step per sent tap, wraps after the last,
+    /// and round-trips; only prompts can be steps.
+    #[test]
+    fn prompt_sequences_step_once_per_sent_tap_and_wrap() {
+        let prompt = |file: &str| Action::Prompt {
+            file: file.into(),
+            target: Target::Agent("claude".into()),
+            enter: true,
+        };
+        let sequence =
+            Action::PromptSequence(vec![prompt("plan"), prompt("build"), prompt("review")]);
+        assert_eq!(Action::parse(&sequence.encode()).unwrap(), sequence);
+        assert!(Action::parse("prompts:").is_err());
+        assert!(Action::parse("prompts:output-mute").is_err());
+        assert_eq!(sequence.agents(), ["claude", "claude", "claude"]);
+        let pad = crate::Control::from_note(10, 36).unwrap();
+        let mut positions = Positions::default();
+        let mut sent = Vec::new();
+        for tap in 0..5 {
+            let index = positions.current(pad, 3);
+            sent.push(index);
+            // The fourth tap was rejected (queue full): it doesn't move on.
+            if tap != 3 {
+                positions.sent(pad, 3);
+            }
+        }
+        assert_eq!(sent, [0, 1, 2, 0, 0]);
+        assert_eq!(positions.label(pad, 3), "2/3");
+        // A sequence edited shorter never points past its end.
+        assert_eq!(positions.current(pad, 1), 0);
+        // A restart starts again at step 1.
+        assert_eq!(Positions::default().label(pad, 3), "1/3");
     }
 
     /// v7 ticket 19: the free-key helper picks an unused Ctrl+Alt key, keeps every user
