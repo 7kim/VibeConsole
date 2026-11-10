@@ -4795,6 +4795,12 @@ fn configure(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) -> Resul
     })
 }
 
+/// /configure's saved list: the open program's mappings and the Xbox ones (active beside
+/// every program).
+fn listed(mapping: &Mapping, context: u8) -> bool {
+    mapping.context == context || mappings::gamepad_context(mapping.context)
+}
+
 fn configure_steps(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) -> Result<()> {
     loop {
         let Some(action) = configure_choice(ui)? else {
@@ -4811,8 +4817,8 @@ fn configure_steps(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) ->
         if matches!(action, 2 | 3) && motion.is_none() {
             continue;
         }
-        let pad = if let Some((control, _, _)) = &motion {
-            *control
+        let (pad, pad_context) = if let Some((control, _, _)) = &motion {
+            (*control, ui.context())
         } else if action == 0 || action == 1 {
             let Some(pad) = (if action == 1 {
                 ui.learn_piano()
@@ -4823,30 +4829,36 @@ fn configure_steps(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) ->
             else {
                 continue;
             };
-            pad
+            // An Xbox button's saved mapping is looked up on layer 1; its layer is asked below.
+            let context = if pad.message == crate::Message::Button {
+                mappings::GAMEPAD_CONTEXT
+            } else {
+                ui.context()
+            };
+            (pad, context)
         } else {
             let Some(index) = choose(
                 ui,
                 "Saved assignments",
                 &current
                     .iter()
-                    .filter(|m| m.context == ui.context())
+                    .filter(|m| listed(m, ui.context()))
                     .map(|m| mapping_label(m, ui.program().as_ref()))
                     .collect::<Vec<_>>(),
             )?
             else {
                 continue;
             };
-            current
+            let chosen = current
                 .iter()
-                .filter(|m| m.context == ui.context())
+                .filter(|m| listed(m, ui.context()))
                 .nth(index)
-                .unwrap()
-                .control
+                .unwrap();
+            (chosen.control, chosen.context)
         };
         let existing = current
             .iter()
-            .find(|m| m.context == ui.context() && m.control == pad)
+            .find(|m| m.context == pad_context && m.control == pad)
             .map(|m| mapping_label(m, ui.program().as_ref()))
             .unwrap_or_else(|| {
                 let name = mappings::control_name(pad, None, ui.context(), ui.program().as_ref());
@@ -4859,13 +4871,13 @@ fn configure_steps(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) ->
                 &options(&["Cancel", "Remove assignment"]),
             )? == Some(1)
             {
-                commit(path, current, pad, ui.context(), None).map_err(stage("file I/O"))?;
+                commit(path, current, pad, pad_context, None).map_err(stage("file I/O"))?;
             }
             continue;
         }
         let saved = current
             .iter()
-            .find(|m| m.context == ui.context() && m.control == pad)
+            .find(|m| m.context == pad_context && m.control == pad)
             .cloned();
         let input = motion
             .as_ref()
@@ -4873,7 +4885,7 @@ fn configure_steps(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) ->
             .or_else(|| {
                 current
                     .iter()
-                    .find(|m| m.context == ui.context() && m.control == pad)
+                    .find(|m| m.context == pad_context && m.control == pad)
                     .map(|m| m.input)
             })
             .unwrap_or(if action == 1 {
@@ -5058,7 +5070,7 @@ fn configure_steps(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) ->
             label.clone()
         } else if let Some(old) = current
             .iter()
-            .find(|m| m.context == ui.context() && m.control == pad)
+            .find(|m| m.context == pad_context && m.control == pad)
         {
             old.label.clone()
         } else {
@@ -5073,7 +5085,7 @@ fn configure_steps(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) ->
         };
         let previous = current
             .iter()
-            .find(|m| m.context == ui.context() && m.control == pad)
+            .find(|m| m.context == pad_context && m.control == pad)
             .map(|m| m.feedback)
             .unwrap_or_default();
         let Some(feedback) = (if mapping.action != crate::actions::Action::Shortcut
@@ -5142,7 +5154,7 @@ fn configure_steps(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) ->
             &options(&["Save and configure another", "Save and finish", "Cancel"]),
         )? {
             Some(choice @ (0 | 1)) => {
-                commit(path, current, pad, ui.context(), Some(mapping))
+                commit(path, current, pad, mapping.context, Some(mapping))
                     .map_err(stage("file I/O"))?;
                 if choice == 1 {
                     return Ok(());
@@ -6809,6 +6821,59 @@ mod tests {
         assert_eq!(
             first.iter().find(|m| m.control == a).unwrap().keys,
             ["Enter"]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Remapping a saved Xbox button replaces it (no duplicate), and saved Xbox mappings are
+    /// listed for edit and removal whatever program is open.
+    #[test]
+    fn saved_xbox_buttons_are_replaced_and_removable() {
+        use Key::*;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-xbox-edit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let a = Control::button(0);
+        let map = |modifier: usize, save: Key| {
+            let mut keys = vec![Enter, Enter, Enter, Enter];
+            keys.extend(std::iter::repeat_n(Down, modifier));
+            keys.extend([Space, Enter]);
+            keys.extend(std::iter::repeat_n(Down, 7));
+            keys.extend([Enter, Enter, Enter, Enter]); // done, hold, layer 1, fire when
+            keys.push(save);
+            keys
+        };
+        let shown = |screens: &[String], text: &str| screens.iter().any(|s| s.contains(text));
+        let mut keys = map(0, Enter); // Ctrl, save and configure another
+        // A again: "Already assigned ... Replace it?" -> Replace; Ctrl off, Shift on.
+        keys.extend([
+            Enter, Down, Enter, Enter, Enter, Enter, Space, Down, Space, Enter,
+        ]);
+        keys.extend(std::iter::repeat_n(Down, 7));
+        keys.extend([Enter, Enter, Enter, Enter, Enter]); // done, hold, layer 1, fire, save
+        keys.extend([Tab, Down, Enter, Enter, Down, Enter]); // remove A from the saved list
+        keys.extend([Tab, Tab, Enter]); // finish
+        let mut ui = Script {
+            keys: keys.into(),
+            pads: [a, a].into(),
+            context: 3,
+            ..Default::default()
+        };
+        let mut current = Vec::new();
+        configure(&mut ui, &path, &mut current).unwrap();
+        assert!(ui.keys.is_empty());
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains("Xbox A") && s.contains("Shift")),
+            "the second mapping replaced the first"
+        );
+        assert!(
+            mappings::load(&path).unwrap().is_empty(),
+            "removed from the list"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
