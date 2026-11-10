@@ -138,6 +138,8 @@ struct Terminal {
     /// Another MIDI device by name (v7 ticket 06); None is the Akai. It never gets
     /// device-specific messages and has no programs to verify.
     device: Option<String>,
+    /// Xbox controllers (v7 ticket 07), opened by real sessions only.
+    gamepad: Option<crate::gamepad::Pad>,
     context_verified: bool,
     follow_programs: bool,
     follow_retry: Instant,
@@ -601,6 +603,7 @@ impl Terminal {
         let mut terminal = Self {
             context: 0,
             device: None,
+            gamepad: None,
             context_verified: true,
             follow_programs: false,
             follow_retry: Instant::now(),
@@ -946,7 +949,9 @@ impl Terminal {
     /// Start or repair Wispr Flow against VibeConsole's current keyboard.
     fn start_flow(&mut self) -> Result<()> {
         if self.output.is_none() {
-            self.output = Some(crate::keyboard::Output::new(&self.run_mappings)?);
+            self.output = Some(crate::keyboard::Output::new(
+                &self.with_gamepad(&self.run_mappings)?,
+            )?);
         }
         let node = self.output.as_ref().map(|o| o.node.clone());
         self.begin_flow(node)
@@ -1056,6 +1061,66 @@ impl Terminal {
         Ok(())
     }
 
+    /// The keyboard's mappings: the MIDI context's plus, with a controller open, the Xbox
+    /// layout (saved buttons over the defaults), active beside any program.
+    fn with_gamepad(&self, mappings: &[Mapping]) -> Result<Vec<Mapping>> {
+        let mut all = mappings.to_vec();
+        if self.gamepad.is_some() {
+            all.extend(crate::gamepad::layout(
+                &mappings::load_config(&self.path)?.mappings,
+            ));
+        }
+        Ok(all)
+    }
+    fn open_gamepad(&mut self) {
+        match crate::gamepad::Pad::open() {
+            Ok(pad) => {
+                if let Some(name) = pad.connected().first() {
+                    self.notice = format!("Xbox controller ready: {name}");
+                }
+                self.gamepad = Some(pad);
+            }
+            Err(error) => self.notice = error.to_string(),
+        }
+    }
+    /// Plugging or unplugging a controller is a transition: held keys are released, queued
+    /// buttons dropped, and the next fresh press fires.
+    fn gamepad_transition(&mut self, notice: String) -> Result<()> {
+        self.release_all()?;
+        if let Some(pad) = &mut self.gamepad {
+            pad.drain();
+        }
+        self.notice = notice;
+        Ok(())
+    }
+    /// Pad, key and button events into the keyboard and actions (MIDI and Xbox alike).
+    fn handle_events(&mut self, events: Vec<Event>) -> Result<()> {
+        for event in events {
+            self.observe_light(Some(&event), Instant::now());
+            self.last_event = crate::describe_event(&event, |control| self.name(control));
+            if let Event::Press(pad) = &event {
+                self.last_press = Some(*pad);
+            }
+            if let Some(output) = &mut self.output {
+                match output.observe(event) {
+                    Ok(Some((pad, active))) => {
+                        if let Err(error) = self.transition(pad, active) {
+                            self.pause()?;
+                            self.error = format!("Action/feedback rejected: {error}; paused");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.error = format!("Keyboard output failed: {error}");
+                        self.output = None;
+                        self.pause()?;
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
     fn open_input(&self) -> Result<midi::Input> {
         midi::Input::open_device(self.device.as_deref())
     }
@@ -1497,15 +1562,12 @@ impl Terminal {
                     self.wanted_run = false;
                 }
                 self.suspended = !self.wanted_run || service_piano;
-                if self.output.is_none()
-                    && self.wanted_run
-                    && !self.suspended
-                    && !self.run_mappings.is_empty()
-                {
-                    self.output = Some(crate::keyboard::Output::new(&self.run_mappings)?);
+                let all = self.with_gamepad(&self.run_mappings)?;
+                if self.output.is_none() && self.wanted_run && !self.suspended && !all.is_empty() {
+                    self.output = Some(crate::keyboard::Output::new(&all)?);
                 }
                 if let Some(output) = &mut self.output {
-                    output.keyboard.replace(&self.run_mappings)?;
+                    output.keyboard.replace(&all)?;
                 }
                 // Drop queued input collected before identifying this preset. Never replay it into new mappings.
                 if let Some(input) = &self.input {
@@ -1746,29 +1808,23 @@ impl Terminal {
             if let Some(event) = self.detector.observe(message) {
                 events.push(event);
             }
-            for event in events {
-                self.observe_light(Some(&event), Instant::now());
-                self.last_event = crate::describe_event(&event, |control| self.name(control));
-                if let Event::Press(pad) = &event {
-                    self.last_press = Some(*pad);
-                }
-                if let Some(output) = &mut self.output {
-                    match output.observe(event) {
-                        Ok(Some((pad, active))) => {
-                            if let Err(error) = self.transition(pad, active) {
-                                self.pause()?;
-                                self.error = format!("Action/feedback rejected: {error}; paused");
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            self.error = format!("Keyboard output failed: {error}");
-                            self.output = None;
-                            self.pause()?;
-                            break;
-                        }
-                    }
-                }
+            self.handle_events(events)?;
+        }
+        // Xbox controllers (v7 ticket 07): buttons take the same path as MIDI events.
+        let changes = self
+            .gamepad
+            .as_mut()
+            .map(crate::gamepad::Pad::poll)
+            .unwrap_or_default();
+        for change in changes {
+            match change {
+                crate::gamepad::Change::Event(event) => self.handle_events(vec![event])?,
+                crate::gamepad::Change::Connected(name) => self.gamepad_transition(format!(
+                    "Xbox controller connected: {name}; buttons fire on their next press"
+                ))?,
+                crate::gamepad::Change::Disconnected(name) => self.gamepad_transition(format!(
+                    "Xbox controller disconnected: {name}; held keys released"
+                ))?,
             }
         }
         for dialed in self.motion.settle(Instant::now()) {
@@ -1899,18 +1955,19 @@ Changing musical settings while running is unsupported.",
         self.run_mappings = mappings.to_vec();
         self.wanted_run = true;
         self.suspended = false;
-        if mappings.is_empty() && !self.feedback_enabled() {
+        let all = self.with_gamepad(mappings)?;
+        if all.is_empty() && !self.feedback_enabled() {
             self.motion = crate::motion::Motion::default();
             self.retry = None;
             self.connecting = false;
             if let Some(output) = &mut self.output {
-                output.keyboard.replace(mappings)?;
+                output.keyboard.replace(&all)?;
                 output.keyboard.resume();
             }
             return Ok(());
         }
         if self.output.is_none() {
-            self.output = Some(crate::keyboard::Output::new(mappings)?);
+            self.output = Some(crate::keyboard::Output::new(&all)?);
         }
         self.retry = Some(Instant::now());
         self.tick()
@@ -1944,9 +2001,10 @@ Changing musical settings while running is unsupported.",
             self.resolver = None;
         }
         let mut reconnected = false;
+        let all = self.with_gamepad(&self.run_mappings)?;
         if let Some(output) = &mut self.output {
             reconnected = output.keyboard.prepare_connection(
-                &self.run_mappings,
+                &all,
                 &self.detector.down,
                 &mut self.reconnected,
             )?;
@@ -2208,21 +2266,31 @@ Changing musical settings while running is unsupported.",
     fn learn_note(&mut self, piano: bool) -> Result<Option<Control>> {
         self.suspend()?;
         if self.input.is_none() {
-            self.input = Some(self.open_input()?);
+            match self.open_input() {
+                Ok(input) => self.input = Some(input),
+                // An Xbox button can still be learned without a MIDI device.
+                Err(_) if self.gamepad.is_some() && !piano => {}
+                Err(error) => return Err(error),
+            }
         }
         self.tick()?;
         self.last_press = None;
         let mut learned = None;
         loop {
             self.draw(&format!("{}: press then release one control.\nTurn arpeggiator OFF for piano input; hold/release must be observed.\nCC/Program Change pad mode is unsupported. Esc cancels.\n{}", if piano { "Learn piano key" } else { "Learn pad in either bank" }, self.last_event))?;
-            if self.input.is_none() {
+            if self.input.is_none() && self.gamepad.is_none() {
                 return Err(self.error.clone().into());
             }
             if learned.is_none() {
                 learned = self.last_press.take();
             }
             if let Some(control) = learned {
-                if !self.detector.down.contains(&control) {
+                let held = self.detector.down.contains(&control)
+                    || self
+                        .gamepad
+                        .as_ref()
+                        .is_some_and(|pad| pad.down.contains(&control));
+                if !held {
                     if choose(
                         self,
                         &format!(
@@ -4825,7 +4893,11 @@ fn configure_steps(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) ->
             };
             Mapping::new_action(pad, input, action)?
         };
-        mapping.context = ui.context();
+        mapping.context = if pad.message == crate::Message::Button {
+            mappings::GAMEPAD_CONTEXT
+        } else {
+            ui.context()
+        };
         mapping.input = input;
         if let (mappings::Input::Knob { step }, false) = (input, mapping.action.dial()) {
             let Some(step) = number(
@@ -4955,6 +5027,7 @@ pub fn daemon(path: &Path, current: Vec<Mapping>) -> Result<()> {
     ui.context_verified = false;
     ui.follow_programs = true;
     ui.use_device(&config, &current)?;
+    ui.open_gamepad();
     let flow_ready = match ui.startup_flow() {
         Ok(()) => true,
         Err(error) => {
@@ -5208,6 +5281,7 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
     ui.context_verified = false;
     ui.follow_programs = true;
     ui.use_device(&config, &current)?;
+    ui.open_gamepad();
     let flow_ready = match ui.startup_flow() {
         Ok(()) => true,
         Err(error) => {
@@ -5244,8 +5318,9 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
                     .filter(|mapping| mapping.context == ui.context)
                     .cloned()
                     .collect();
+                let all = ui.with_gamepad(&ui.run_mappings)?;
                 if let Some(output) = &mut ui.output {
-                    output.keyboard.replace(&ui.run_mappings)?;
+                    output.keyboard.replace(&all)?;
                 }
                 Ok(())
             })(),
@@ -5385,8 +5460,9 @@ Running/paused mode is retained; held keys and toggles start inactive.",
                         .filter(|m| m.context == ui.context)
                         .cloned()
                         .collect();
+                    let all = ui.with_gamepad(&ui.run_mappings)?;
                     if let Some(output) = &mut ui.output {
-                        output.keyboard.replace(&ui.run_mappings)?;
+                        output.keyboard.replace(&all)?;
                         }
                     ui.reconnected = true;
                 }
@@ -6462,6 +6538,46 @@ mod tests {
                 .iter()
                 .any(|s| s.contains("nanoPAD2  (not connected)  (in use)"))
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 07: an Xbox button learned in /configure is saved in the Xbox context
+    /// (active beside every program) with no feedback step, and replaces its default.
+    #[test]
+    fn xbox_button_is_mapped_in_configure_and_replaces_its_default() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-xbox-ui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let a = Control::button(0); // A
+        assert_eq!(a.label(), "Xbox A");
+        let mut keys = vec![Enter, Enter, Enter, Enter, Space, Enter];
+        keys.extend(std::iter::repeat_n(Down, 7));
+        keys.extend([Enter, Enter, Enter]); // done, hold, fire when pressed: no feedback step
+        keys.extend([Enter, Tab, Tab, Enter]); // save, finish
+        let mut ui = Script {
+            keys: keys.into(),
+            pads: [a].into(),
+            context: 2, // Program 3 open: the button still goes to the Xbox context
+            ..Default::default()
+        };
+        let mut current = Vec::new();
+        configure(&mut ui, &path, &mut current).unwrap();
+        assert!(ui.keys.is_empty());
+        let saved = mappings::load_config(&path).unwrap().mappings;
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].context, mappings::GAMEPAD_CONTEXT);
+        assert_eq!(saved[0].keys, ["Ctrl"]);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\txbox\tbutton\t1\t0\t0\t"), "{text}");
+        let layout = crate::gamepad::layout(&saved);
+        assert_eq!(
+            layout.iter().find(|m| m.control == a).unwrap().keys,
+            ["Ctrl"]
+        );
+        assert_eq!(layout.len(), crate::gamepad::default_layout().len());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

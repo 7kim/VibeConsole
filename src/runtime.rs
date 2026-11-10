@@ -346,6 +346,13 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                 Ok(p) => println!("MIDI identity: {p} (no input opened)"),
                 Err(e) => println!("MIDI unavailable: {e}"),
             }
+            match crate::gamepad::Pad::open() {
+                Ok(pad) => match pad.connected().as_slice() {
+                    [] => println!("Xbox controllers: none connected (USB)"),
+                    names => println!("Xbox controllers: {}", names.join(", ")),
+                },
+                Err(e) => println!("Xbox controllers: {e}"),
+            }
             match crate::recording::permissions() {
                 Ok(n) => {
                     println!("Physical-key recording: {n} readable keyboard(s); no events captured")

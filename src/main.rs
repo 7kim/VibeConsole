@@ -2,8 +2,8 @@ mod runtime;
 mod terminal;
 use mappings::{config_path, load};
 use vibeconsole_core::{
-    Control, Detector, Event, Message, ReleaseType, actions, feedback, input_port, keyboard,
-    mappings, midi, motion, recording, screen, status,
+    Control, Detector, Event, Message, ReleaseType, actions, feedback, gamepad, input_port,
+    keyboard, mappings, midi, motion, recording, screen, status,
 };
 
 pub use vibeconsole_core::Result;
@@ -282,6 +282,7 @@ fn describe_event(event: &Event, name: impl Fn(Control) -> String) -> String {
         Event::Release(pad, ReleaseType::PulseComplete) => {
             (pad, "RELEASE: shortcut pulse complete")
         }
+        Event::Release(pad, ReleaseType::ButtonUp) => (pad, "RELEASE: button up"),
         Event::DuplicatePress(pad) => (pad, "REPEAT IGNORED: pad already down"),
         Event::UnmatchedRelease(pad) => (pad, "RELEASE IGNORED: pad was not down"),
         Event::Pulse(pad) => (pad, "PULSE: movement step"),

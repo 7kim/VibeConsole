@@ -160,8 +160,12 @@ pub struct Mapping {
 /// Other MIDI devices (v7) use contexts from here up, one per listed device, so their
 /// mappings never mix with the Akai's Programs 1–8 or legacy contexts.
 pub const DEVICE_CONTEXT: u8 = 240;
+/// Xbox controller mappings (v7 ticket 07): one set, active beside whichever MIDI context.
+pub const GAMEPAD_CONTEXT: u8 = 239;
 pub fn program_label(context: u8) -> String {
-    if context >= DEVICE_CONTEXT {
+    if context == GAMEPAD_CONTEXT {
+        "Xbox controller".into()
+    } else if context >= DEVICE_CONTEXT {
         format!("Other MIDI device {}", context - DEVICE_CONTEXT + 1)
     } else if context < 8 {
         format!("Program {}", context + 1)
@@ -194,6 +198,7 @@ pub fn physical_name(
         crate::Message::Note => format!("Note ch{} #{}", control.channel, control.id),
         crate::Message::Cc => format!("CC ch{} #{}{side}", control.channel, control.id),
         crate::Message::Bend => return Ok(format!("Joystick X{side}")),
+        crate::Message::Button => return Ok(control.label()),
     };
     if input == Some(Input::Piano) {
         const NOTES: [&str; 12] = [
@@ -305,7 +310,8 @@ impl Mapping {
                 "application/system actions require Trigger, empty keys, and no feedback".into(),
             );
         }
-        if (self.context > 16 && self.context < DEVICE_CONTEXT)
+        if (self.context > 16 && self.context < GAMEPAD_CONTEXT)
+            || (self.context == GAMEPAD_CONTEXT) != (self.control.message == crate::Message::Button)
             || self.label.is_empty()
             || self.label.len() > 80
             || self.label.chars().any(char::is_control)
@@ -314,7 +320,11 @@ impl Mapping {
         }
         use crate::Message;
         let valid = match self.input {
-            Input::Pad | Input::Piano => {
+            Input::Pad => {
+                matches!(self.control.message, Message::Note | Message::Button)
+                    && self.behavior != Behavior::Pulse
+            }
+            Input::Piano => {
                 self.control.message == Message::Note && self.behavior != Behavior::Pulse
             }
             Input::Knob { step } | Input::RelativeKnob { step } => {
@@ -585,6 +595,14 @@ impl Default for Config {
             midi_devices: Vec::new(),
             midi_active: None,
         }
+    }
+}
+/// The device column of a mapping line: the Akai's USB id, `midi` or `xbox`.
+fn device_field(context: u8) -> &'static str {
+    match context {
+        GAMEPAD_CONTEXT => "xbox",
+        c if c >= DEVICE_CONTEXT => "midi",
+        _ => DEVICE,
     }
 }
 impl Config {
@@ -1164,8 +1182,7 @@ fn parse_config(contents: &str) -> Result<Config> {
             if other && usize::from(context - DEVICE_CONTEXT) >= midi_devices.len() {
                 return Err("mapping for an unlisted MIDI device".into());
             }
-            if *device != if other { "midi" } else { DEVICE } || (version < 3 && *message != "note")
-            {
+            if *device != device_field(context) || (version < 3 && *message != "note") {
                 return Err("unsupported device or MIDI message type".into());
             }
             let pad = if version >= 3 {
@@ -1173,6 +1190,7 @@ fn parse_config(contents: &str) -> Result<Config> {
                     "note" => crate::Message::Note,
                     "cc" => crate::Message::Cc,
                     "bend" => crate::Message::Bend,
+                    "button" if version >= 16 => crate::Message::Button,
                     _ => return Err("unsupported MIDI message type".into()),
                 };
                 let control = Control {
@@ -1434,11 +1452,7 @@ pub fn save_config(path: &Path, config: &Config) -> Result<()> {
     for mapping in &config.mappings {
         mapping.validate()?;
         let feedback = mapping.feedback;
-        let device = if mapping.context >= DEVICE_CONTEXT {
-            "midi"
-        } else {
-            DEVICE
-        };
+        let device = device_field(mapping.context);
         let octave = match feedback.octave {
             None => "-".into(),
             Some(Octave::Offset(n)) => format!("offset:{n}"),

@@ -2,6 +2,7 @@
 //! status sources and Akai feedback. Both editions (cli, app) call it.
 pub mod actions;
 pub mod feedback;
+pub mod gamepad;
 pub mod keyboard;
 pub mod mappings;
 pub mod midi;
@@ -22,6 +23,8 @@ pub enum Message {
     Note,
     Cc,
     Bend,
+    /// An Xbox controller button (v7 ticket 07); `id` indexes `gamepad::BUTTONS`.
+    Button,
 }
 impl Message {
     pub fn text(self) -> &'static str {
@@ -29,6 +32,7 @@ impl Message {
             Self::Note => "note",
             Self::Cc => "cc",
             Self::Bend => "bend",
+            Self::Button => "button",
         }
     }
 }
@@ -57,11 +61,25 @@ impl Control {
             direction: 0,
         })
     }
+    /// An Xbox controller button (channel 1, no direction).
+    pub fn button(id: u8) -> Self {
+        Self {
+            channel: 1,
+            id,
+            message: Message::Button,
+            direction: 0,
+        }
+    }
     pub fn validate(self) -> Result<()> {
         if !(1..=16).contains(&self.channel)
             || self.id > 127
             || match self.message {
                 Message::Note => self.direction != 0,
+                Message::Button => {
+                    self.channel != 1
+                        || self.direction != 0
+                        || usize::from(self.id) >= gamepad::BUTTONS.len()
+                }
                 Message::Cc => ![-1, 1].contains(&self.direction),
                 Message::Bend => self.id != 0 || ![-1, 1].contains(&self.direction),
             }
@@ -71,6 +89,9 @@ impl Control {
         Ok(())
     }
     pub fn label(self) -> String {
+        if self.message == Message::Button {
+            return format!("Xbox {}", gamepad::button_name(self.id));
+        }
         if self.message != Message::Note {
             return format!(
                 "{} channel {} id {} direction {}",
@@ -105,6 +126,8 @@ pub enum ReleaseType {
     NoteOnVelocityZero,
     Neutral,
     PulseComplete,
+    /// An Xbox button let go.
+    ButtonUp,
 }
 
 #[derive(Default)]
