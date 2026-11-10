@@ -127,6 +127,10 @@ trait Ui {
     fn login(&mut self, _request: crate::runtime::Login) -> Result<bool> {
         Err("login service unavailable".into())
     }
+    /// The free-key helper's write (v7 ticket 19): backup first, then an atomic write.
+    fn write_t3_key_file(&mut self, text: &str) -> Result<String> {
+        crate::actions::write_t3_key_file(text).map(|backup| backup.display().to_string())
+    }
     /// herdr's agent names (v7 ticket 18).
     fn herdr_agents(&mut self) -> Result<Vec<String>> {
         let output = std::process::Command::new("herdr")
@@ -5162,7 +5166,31 @@ fn t3_action(ui: &mut impl Ui) -> Result<Option<crate::actions::Action>> {
     let Some(index) = choose(ui, "T3 Code (keys from your T3 key file)", &items)? else {
         return Ok(None);
     };
-    Ok(Some(crate::actions::Action::T3(commands[index].1.clone())))
+    let (name, command) = &commands[index];
+    if crate::actions::t3_keys(&file, command).is_err() {
+        // v7 ticket 19: the free-key helper. Nothing is written until confirmed.
+        let key = crate::actions::free_t3_key(&file)?;
+        let shown = crate::actions::t3_keys(&format!(r#"[{{"key":"{key}","command":"c"}}]"#), "c")?
+            .join("+");
+        if choose(
+            ui,
+            &format!(
+                "T3 has no key for {name}. Add the free {shown} to T3's key file? A backup is made first; your own keys stay."
+            ),
+            &options(&["Cancel", &format!("Add {shown} for {name}")]),
+        )? != Some(1)
+        {
+            return Ok(None);
+        }
+        let backup =
+            ui.write_t3_key_file(&crate::actions::add_t3_binding(&file, command, &key)?)?;
+        choose(
+            ui,
+            &format!("Added {shown} for {name}. Backup: {backup}"),
+            &options(&["Continue"]),
+        )?;
+    }
+    Ok(Some(crate::actions::Action::T3(command.clone())))
 }
 
 /// The Orca family (v7 ticket 15): Orca's Linux default keys, "needs me" (the jump
@@ -6255,6 +6283,10 @@ mod tests {
         }
         fn t3_key_file(&mut self) -> Result<String> {
             Ok(self.t3.clone())
+        }
+        fn write_t3_key_file(&mut self, text: &str) -> Result<String> {
+            self.t3 = text.to_owned();
+            Ok("/fake/keybindings.json.vibeconsole-backup".into())
         }
         fn herdr_agents(&mut self) -> Result<Vec<String>> {
             Ok(self.herdr.clone())
@@ -7587,6 +7619,46 @@ mod tests {
         assert_eq!(
             saved[0].action,
             crate::actions::Action::HerdrFocus("docs".into())
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 19: an unbound T3 command gets a free Ctrl+Alt key, written only after
+    /// confirming, then the pad uses it.
+    #[test]
+    fn free_key_helper_binds_an_unbound_t3_command_after_confirming() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-freekey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut keys = vec![Enter];
+        keys.extend(vec![Down; 7]); // T3 Code
+        keys.extend([Enter, Enter]); // New chat (not bound)
+        keys.extend([Down, Enter, Enter]); // add the free key, continue
+        keys.extend([Enter, Enter, Tab, Tab, Enter]);
+        let mut ui = Script {
+            keys: keys.into(),
+            pads: [Control::from_note(10, 36).unwrap()].into(),
+            t3: r#"[{"key":"mod+alt+a","command":"x"}]"#.into(),
+            ..Default::default()
+        };
+        let mut current = Vec::new();
+        configure(&mut ui, &path, &mut current).unwrap();
+        assert!(ui.keys.is_empty());
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains("Add the free Ctrl+Alt+B"))
+        );
+        assert_eq!(
+            crate::actions::t3_keys(&ui.t3, "chat.new").unwrap(),
+            ["Ctrl", "Alt", "B"]
+        );
+        assert_eq!(
+            mappings::load(&path).unwrap()[0].action,
+            crate::actions::Action::T3("chat.new".into())
         );
         std::fs::remove_dir_all(dir).unwrap();
     }

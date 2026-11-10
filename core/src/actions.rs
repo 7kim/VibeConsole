@@ -1019,6 +1019,52 @@ pub fn t3_keys(json: &str, command: &str) -> Result<Vec<String>> {
     Ok(crate::mappings::parse_shortcut(&keys.join("+"))?)
 }
 
+/// v7 ticket 19: a free Ctrl+Alt key for a T3 command that has none, in T3's notation
+/// (`mod+alt+k`). Keys the desktop keeps (Ctrl+Alt+T terminal, D, L, Delete, arrows,
+/// F1–F12) and keys already bound are skipped.
+pub fn free_t3_key(json: &str) -> Result<String> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("T3 key file is not valid JSON: {e}"))?;
+    let list = value
+        .as_array()
+        .ok_or("T3 key file: expected a list of bindings")?;
+    let used = list
+        .iter()
+        .filter_map(|b| b["key"].as_str())
+        .map(|k| k.to_ascii_lowercase().replace("ctrl+", "mod+"))
+        .collect::<Vec<_>>();
+    ('a'..='z')
+        .chain('0'..='9')
+        .filter(|c| !matches!(c, 't' | 'd' | 'l'))
+        .map(|c| format!("mod+alt+{c}"))
+        .find(|key| !used.contains(key))
+        .ok_or_else(|| "no free Ctrl+Alt key left in T3".into())
+}
+/// T3's key file with `key` bound to `command` added at the end; the user's own bindings
+/// stay as they are. An unparseable file is refused, never rewritten.
+pub fn add_t3_binding(json: &str, command: &str, key: &str) -> Result<String> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("T3 key file is not valid JSON: {e}"))?;
+    let list = value
+        .as_array_mut()
+        .ok_or("T3 key file: expected a list of bindings")?;
+    list.push(serde_json::json!({ "key": key, "command": command }));
+    Ok(serde_json::to_string_pretty(&value)? + "\n")
+}
+/// Write T3's key file after copying the current one beside it (`.vibeconsole-backup`).
+pub fn write_t3_key_file(text: &str) -> Result<std::path::PathBuf> {
+    let path = t3_key_file()?;
+    let backup = path.with_extension("json.vibeconsole-backup");
+    std::fs::copy(&path, &backup).map_err(|e| {
+        format!(
+            "T3 key file backup {}: {e}; nothing written",
+            backup.display()
+        )
+    })?;
+    write_atomic(&path, text)?;
+    Ok(backup)
+}
+
 /// Orca's CLI: on PATH, else the shim Orca installs (the login service's PATH is short).
 fn orca_program() -> String {
     let on_path = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
@@ -2031,6 +2077,35 @@ mod tests {
         ] {
             assert!(Action::parse(bad).is_err(), "{bad}");
         }
+    }
+
+    /// v7 ticket 19: the free-key helper picks an unused Ctrl+Alt key, keeps every user
+    /// binding, and refuses a file it can't read.
+    #[test]
+    fn free_key_helper_adds_an_unused_ctrl_alt_key_and_keeps_user_keys() {
+        let file = r#"[{"key":"mod+alt+a","command":"x.one","when":"!terminalFocus"},
+                       {"key":"ctrl+alt+b","command":"x.two"}]"#;
+        let key = free_t3_key(file).unwrap();
+        assert_eq!(key, "mod+alt+c", "a and b are taken");
+        let written = add_t3_binding(file, "chat.newLocal", &key).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(value.as_array().unwrap().len(), 3);
+        assert_eq!(
+            value[0]["when"], "!terminalFocus",
+            "user keys kept as they are"
+        );
+        assert_eq!(
+            t3_keys(&written, "chat.newLocal").unwrap(),
+            ["Ctrl", "Alt", "C"]
+        );
+        let busy = (b'a'..=b'z')
+            .map(|c| format!(r#"{{"key":"mod+alt+{}","command":"c"}}"#, c as char))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(free_t3_key(&format!("[{busy}]")).unwrap(), "mod+alt+0");
+        assert!(free_t3_key("{").is_err());
+        assert!(add_t3_binding("not json", "c", "mod+alt+c").is_err());
+        assert!(add_t3_binding("{}", "c", "mod+alt+c").is_err());
     }
 
     /// v7 ticket 17: T3 actions use the user's own T3 key file, read at press time.
