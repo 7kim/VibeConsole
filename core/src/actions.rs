@@ -161,6 +161,8 @@ pub enum Action {
         agent: String,
         folder: String,
     },
+    /// v7 ticket 18: bring herdr's agent `name` to the front (`herdr agent focus`).
+    HerdrFocus(String),
     /// v7 ticket 17: a T3 Code command (`chat.new`), pressed with whatever key the user's
     /// own T3 key file binds it to, read at press time.
     T3(String),
@@ -293,6 +295,16 @@ impl Action {
             {
                 Err("command must be one nonempty line without control characters, run in an absolute directory without ':'".into())
             }
+            // herdr's own rule for agent names: [a-z][a-z0-9_-]{0,31}.
+            Self::HerdrFocus(name)
+                if !name.starts_with(|c: char| c.is_ascii_lowercase())
+                    || name.len() > 32
+                    || !name.bytes().all(|b| {
+                        b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-'
+                    }) =>
+            {
+                Err("herdr agent names are lowercase letters, digits, _ and -".into())
+            }
             Self::T3(command)
                 if command.is_empty()
                     || command.len() > 64
@@ -371,6 +383,7 @@ impl Action {
             Self::MicrophoneMute => "microphone-mute".into(),
             Self::OrcaJump { agent, folder } => format!("orca-jump:{agent}:{folder}"),
             Self::T3(command) => format!("t3:{command}"),
+            Self::HerdrFocus(name) => format!("herdr-focus:{name}"),
             Self::Flow => "flow".into(),
         }
     }
@@ -451,6 +464,9 @@ impl Action {
                 }
             }
             _ if value.starts_with("t3:") => Self::T3(value["t3:".len()..].into()),
+            _ if value.starts_with("herdr-focus:") => {
+                Self::HerdrFocus(value["herdr-focus:".len()..].into())
+            }
             _ if value.starts_with("orca-jump:") => {
                 let (agent, folder) = value["orca-jump:".len()..]
                     .split_once(':')
@@ -541,6 +557,7 @@ impl Action {
             Self::MicrophoneMute => "Toggle default microphone mute".into(),
             Self::OrcaJump { agent, folder } => format!("Orca: jump to {agent} in {folder}"),
             Self::T3(command) => format!("T3 Code: {command}"),
+            Self::HerdrFocus(name) => format!("herdr: focus agent {name}"),
             Self::Flow => "Start or repair Wispr Flow".into(),
             Self::Shortcut => "Keyboard shortcut".into(),
         }
@@ -1779,6 +1796,14 @@ fn perform(
                 .collect::<Result<_>>()?)?;
             Ok(format!("T3 Code: {command} ({})", keys.join("+")))
         }
+        Action::HerdrFocus(name) => {
+            command(
+                "herdr",
+                &["agent".into(), "focus".into(), name.clone()],
+                &cancelled,
+            )?;
+            Ok(format!("herdr: focused {name}"))
+        }
         Action::OrcaJump { agent, folder } => orca_jump(agent, folder, |args| {
             command(&orca_program(), args, &cancelled)
         }),
@@ -1993,6 +2018,20 @@ fn flow(node: &Path, cancelled: &impl Fn() -> bool) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn herdr_focus_keeps_to_herdrs_agent_names() {
+        let action = Action::HerdrFocus("api-1".into());
+        assert_eq!(Action::parse(&action.encode()).unwrap(), action);
+        for bad in [
+            "herdr-focus:",
+            "herdr-focus:API",
+            "herdr-focus:-x",
+            "herdr-focus:a b",
+        ] {
+            assert!(Action::parse(bad).is_err(), "{bad}");
+        }
+    }
 
     /// v7 ticket 17: T3 actions use the user's own T3 key file, read at press time.
     #[test]

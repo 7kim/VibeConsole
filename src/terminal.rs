@@ -127,6 +127,19 @@ trait Ui {
     fn login(&mut self, _request: crate::runtime::Login) -> Result<bool> {
         Err("login service unavailable".into())
     }
+    /// herdr's agent names (v7 ticket 18).
+    fn herdr_agents(&mut self) -> Result<Vec<String>> {
+        let output = std::process::Command::new("herdr")
+            .args(["agent", "list"])
+            .output()
+            .map_err(|e| format!("herdr isn't available: {e}"))?;
+        Ok(
+            crate::status::herdr_agents(&String::from_utf8_lossy(&output.stdout))
+                .into_iter()
+                .map(|(name, _, _)| name)
+                .collect(),
+        )
+    }
     /// T3 Code's key file (v7 ticket 17).
     fn t3_key_file(&mut self) -> Result<String> {
         let path = crate::actions::t3_key_file()?;
@@ -5091,14 +5104,14 @@ fn stage<E: std::fmt::Display>(name: &'static str) -> impl Fn(E) -> Box<dyn std:
 /// Action families (indexes into `FAMILIES`) a control can use; others are not offered.
 fn families(input: mappings::Input) -> Vec<usize> {
     match input {
-        mappings::Input::Pad | mappings::Input::Piano => (0..6).chain([8, 9]).collect(),
+        mappings::Input::Pad | mappings::Input::Piano => (0..6).chain([8, 9, 10]).collect(),
         mappings::Input::Knob { .. } => vec![0, 2, 6, 7],
         mappings::Input::RelativeKnob { .. } => vec![0, 2],
         mappings::Input::Joystick { .. } => vec![0],
     }
 }
 
-const FAMILIES: [&str; 10] = [
+const FAMILIES: [&str; 11] = [
     "Keyboard shortcut",
     "Launch application",
     "Fedora system action",
@@ -5109,6 +5122,7 @@ const FAMILIES: [&str; 10] = [
     "Value knob (number written to a file)",
     "Orca (needs me, jump to an agent, its shortcuts)",
     "T3 Code (keys from its own key file)",
+    "herdr (focus an agent)",
 ];
 
 fn configure(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) -> Result<()> {
@@ -5414,6 +5428,19 @@ fn configure_steps(
                 }
             };
             Mapping::new(pad, &keys.join("+"), behavior)?
+        } else if family == 10 {
+            let agents = ui.herdr_agents()?;
+            if agents.is_empty() {
+                return Err("herdr has no agents running; start one first".into());
+            }
+            let Some(index) = choose(ui, "Focus which herdr agent?", &agents)? else {
+                continue;
+            };
+            Mapping::new_action(
+                pad,
+                input,
+                crate::actions::Action::HerdrFocus(agents[index].clone()),
+            )?
         } else if family == 9 {
             let Some(action) = t3_action(ui)? else {
                 continue;
@@ -6216,6 +6243,8 @@ mod tests {
         orca: Vec<(String, String)>,
         /// T3 Code's key file (v7 ticket 17).
         t3: String,
+        /// herdr's agents (v7 ticket 18).
+        herdr: Vec<String>,
     }
     impl Ui for Script {
         fn midi_devices(&mut self) -> Result<Vec<String>> {
@@ -6226,6 +6255,9 @@ mod tests {
         }
         fn t3_key_file(&mut self) -> Result<String> {
             Ok(self.t3.clone())
+        }
+        fn herdr_agents(&mut self) -> Result<Vec<String>> {
+            Ok(self.herdr.clone())
         }
         fn context(&self) -> u8 {
             self.context
@@ -7525,6 +7557,36 @@ mod tests {
         assert_eq!(
             saved[0].action,
             crate::actions::Action::T3("thread.next".into())
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 18: the herdr family focuses an agent picked from herdr's own list.
+    #[test]
+    fn herdr_family_focuses_a_listed_agent() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-herdr-ui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut keys = vec![Enter];
+        keys.extend(vec![Down; 8]); // herdr is the 9th family for a pad
+        keys.extend([Enter, Down, Enter]); // docs
+        keys.extend([Enter, Enter, Tab, Tab, Enter]);
+        let mut ui = Script {
+            keys: keys.into(),
+            pads: [Control::from_note(10, 36).unwrap()].into(),
+            herdr: vec!["api".into(), "docs".into()],
+            ..Default::default()
+        };
+        let mut current = Vec::new();
+        configure(&mut ui, &path, &mut current).unwrap();
+        assert!(ui.keys.is_empty());
+        let saved = mappings::load(&path).unwrap();
+        assert_eq!(
+            saved[0].action,
+            crate::actions::Action::HerdrFocus("docs".into())
         );
         std::fs::remove_dir_all(dir).unwrap();
     }

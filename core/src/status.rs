@@ -175,7 +175,79 @@ pub fn sessions() -> Vec<Session> {
         .and_then(|path| std::fs::read_to_string(path).ok())
         .map(|text| orca_sessions(&text))
         .unwrap_or_default();
-    with_fallback(hooks, orca)
+    let mut fallback = orca;
+    fallback.extend(herdr_sessions(&herdr_list()));
+    with_fallback(hooks, fallback)
+}
+/// `herdr agent list` (2 s at most), or nothing when herdr isn't installed.
+/// ponytail: one blocking call per status refresh; move it to the background probe if
+/// herdr ever answers slowly.
+fn herdr_list() -> String {
+    let installed = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .any(|dir| dir.join("herdr").is_file());
+    if !installed {
+        return String::new();
+    }
+    std::process::Command::new("timeout")
+        .args(["2", "herdr", "agent", "list"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
+}
+/// herdr's agents as a light source (v7 ticket 18; herdr.dev/docs/socket-api): each
+/// agent's state and folder (`foreground_cwd`, else `cwd`). `done` lights as finished,
+/// `unknown` is ignored; our hooks win (see `with_fallback`).
+pub fn herdr_sessions(json: &str) -> Vec<Session> {
+    herdr_agents(json)
+        .into_iter()
+        .filter_map(|(_, state, folder)| {
+            let state = match state.as_str() {
+                "working" => "thinking",
+                "blocked" => "needs-input",
+                "done" => "finished",
+                "idle" => "idle",
+                _ => return None,
+            };
+            folder.map(|cwd| Session { state, cwd })
+        })
+        .collect()
+}
+/// (name, state, folder) per agent in `herdr agent list` output, whichever envelope it uses.
+pub fn herdr_agents(json: &str) -> Vec<(String, String, Option<String>)> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let list = [
+        &value["result"]["agents"],
+        &value["result"],
+        &value["agents"],
+        &value,
+    ]
+    .into_iter()
+    .find_map(|v| v.as_array());
+    let Some(list) = list else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter_map(|agent| {
+            let name = ["name", "agent"]
+                .iter()
+                .find_map(|k| agent[*k].as_str())?
+                .to_owned();
+            let state = ["agent_status", "state", "status"]
+                .iter()
+                .find_map(|k| agent[*k].as_str())?
+                .to_owned();
+            let folder = ["foreground_cwd", "cwd"]
+                .iter()
+                .find_map(|k| agent[*k].as_str())
+                .filter(|f| f.starts_with('/') && !f.contains(['\t', '\n']))
+                .map(str::to_owned);
+            Some((name, state, folder))
+        })
+        .collect()
 }
 /// Orca's own status file as a fallback source: each entry's `payload.state` and the folder
 /// in its `worktreeId` (`<id>::<folder>`), nothing else; prompts and messages in it are
@@ -881,6 +953,46 @@ mod tests {
             all.iter().find(|s| s.cwd == "/work/app").unwrap().state,
             "finished"
         );
+    }
+
+    /// v7 ticket 18: herdr's agent list lights folders (foreground cwd first); done is
+    /// finished, unknown is ignored, and our hooks win.
+    #[test]
+    fn herdr_agents_light_their_folders_and_our_hooks_win() {
+        let list = r#"{"id":"1","result":{"agents":[
+            {"name":"api","pane_id":"w1:p1","agent_status":"working","cwd":"/home","foreground_cwd":"/work/api"},
+            {"name":"docs","pane_id":"w1:p2","agent_status":"blocked","cwd":"/work/docs"},
+            {"name":"old","pane_id":"w1:p3","agent_status":"done","cwd":"/work/old"},
+            {"name":"odd","pane_id":"w1:p4","agent_status":"unknown","cwd":"/work/odd"}]}}"#;
+        let found = herdr_sessions(list);
+        assert_eq!(
+            found,
+            [
+                Session {
+                    state: "thinking",
+                    cwd: "/work/api".into()
+                },
+                Session {
+                    state: "needs-input",
+                    cwd: "/work/docs".into()
+                },
+                Session {
+                    state: "finished",
+                    cwd: "/work/old".into()
+                },
+            ]
+        );
+        assert!(herdr_sessions("").is_empty());
+        let names = herdr_agents(list)
+            .into_iter()
+            .map(|a| a.0)
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["api", "docs", "old", "odd"]);
+        let hooks = vec![Session {
+            state: "idle",
+            cwd: "/work/api".into(),
+        }];
+        assert_eq!(with_fallback(hooks, found).len(), 3);
     }
 
     /// Ticket 16: sessions outside tmux report by session_id and cwd, end on SessionEnd or

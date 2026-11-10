@@ -78,7 +78,18 @@ mod tests {
         );
         assert!(refused.contains("No keyboard was replaced"));
         drop(owner);
-        drop(Owner::at(&path, "terminal session").unwrap());
+        // A child another test thread is spawning shares the lock's open file until it
+        // execs, so the release can lag by a few milliseconds.
+        let again = (0..40).find_map(|_| {
+            Owner::at(&path, "terminal session").ok().or_else(|| {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                None
+            })
+        });
+        assert!(
+            again.is_some(),
+            "the lock comes free once its owner is gone"
+        );
         std::fs::remove_file(path).unwrap();
     }
 }
