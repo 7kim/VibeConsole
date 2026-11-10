@@ -727,6 +727,24 @@ pub struct Tuning {
     pub trigger: u8,
     pub mouse_speed: u8,
     pub rumble: bool,
+    /// v7 ticket 22: the stick that moves the pointer, if any.
+    pub mouse: MouseStick,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MouseStick {
+    #[default]
+    Off,
+    Left,
+    Right,
+}
+impl MouseStick {
+    pub fn text(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
 }
 impl Default for Tuning {
     fn default() -> Self {
@@ -735,6 +753,7 @@ impl Default for Tuning {
             trigger: 30,
             mouse_speed: 10,
             rumble: false,
+            mouse: MouseStick::Off,
         }
     }
 }
@@ -1424,10 +1443,10 @@ fn parse_config(contents: &str) -> Result<Config> {
     validate_agents(&agents)?;
     let tuning = if version >= 16 {
         let line = lines.next().ok_or("missing tuning")?;
-        let ["tuning", dead_zone, trigger, speed, rumble] =
+        let ["tuning", dead_zone, trigger, speed, rumble, mouse] =
             line.split('\t').collect::<Vec<_>>()[..]
         else {
-            return Err("expected tuning dead-zone/trigger/mouse-speed/rumble fields".into());
+            return Err("expected tuning dead-zone/trigger/mouse-speed/rumble/mouse fields".into());
         };
         Tuning {
             dead_zone: dead_zone.parse()?,
@@ -1437,6 +1456,12 @@ fn parse_config(contents: &str) -> Result<Config> {
                 "on" => true,
                 "off" => false,
                 _ => return Err("tuning rumble must be on or off".into()),
+            },
+            mouse: match mouse {
+                "off" => MouseStick::Off,
+                "left" => MouseStick::Left,
+                "right" => MouseStick::Right,
+                _ => return Err("tuning mouse must be off, left or right".into()),
             },
         }
         .validate()?
@@ -1740,11 +1765,12 @@ pub fn save_config(path: &Path, config: &Config) -> Result<()> {
     }
     let tuning = config.tuning.validate()?;
     contents.push_str(&format!(
-        "tuning\t{}\t{}\t{}\t{}\n",
+        "tuning\t{}\t{}\t{}\t{}\t{}\n",
         tuning.dead_zone,
         tuning.trigger,
         tuning.mouse_speed,
-        if tuning.rumble { "on" } else { "off" }
+        if tuning.rumble { "on" } else { "off" },
+        tuning.mouse.text()
     ));
     contents.push_str(&format!("midi-devices\t{}\n", config.midi_devices.len()));
     for name in &config.midi_devices {
@@ -2295,7 +2321,8 @@ mod tests {
                 dead_zone: 15,
                 trigger: 30,
                 mouse_speed: 10,
-                rumble: false
+                rumble: false,
+                mouse: MouseStick::Off
             }
         );
         // A failed save leaves the v15 file byte-identical.
@@ -2310,11 +2337,12 @@ mod tests {
             trigger: 60,
             mouse_speed: 25,
             rumble: true,
+            mouse: MouseStick::Off,
         };
         save_config(&path, &tuned).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.starts_with("vibeconsole-mappings-v16\n"));
-        assert!(text.contains("\ntuning\t20\t60\t25\ton\n"));
+        assert!(text.contains("\ntuning\t20\t60\t25\ton\toff\n"));
         assert_eq!(load_config(&path).unwrap(), tuned);
         for bad in [
             Tuning {
@@ -2342,7 +2370,7 @@ mod tests {
         }
         // A v16 file without its tuning line, or with a bad one, is refused.
         let v16 = text.clone();
-        assert!(parse_config(&v16.replace("tuning\t20\t60\t25\ton\n", "")).is_err());
+        assert!(parse_config(&v16.replace("tuning\t20\t60\t25\ton\toff\n", "")).is_err());
         assert!(
             parse_config(&v16.replace("tuning\t20\t60\t25\ton", "tuning\t20\t60\t25\tmaybe"))
                 .is_err()

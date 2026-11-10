@@ -288,6 +288,15 @@ pub fn analog(
             } else {
                 stick.0 = value;
             }
+            // The mouse stick moves the pointer; its directions don't fire.
+            let mouse = match tuning.mouse {
+                crate::mappings::MouseStick::Left => 0,
+                crate::mappings::MouseStick::Right => 4,
+                crate::mappings::MouseStick::Off => u8::MAX,
+            };
+            if offset == mouse {
+                return changes;
+            }
             // Up/down for y (gilrs: up is positive), right/left for x.
             let (positive, negative) = if y { (0, 1) } else { (3, 2) };
             let at = |n: u8| Control::button(STICK_BASE + offset + n);
@@ -323,6 +332,63 @@ pub fn rumble_due(before: &[(String, &str)], now: &[(String, &str)]) -> bool {
                 .find(|(n, _)| n == name)
                 .is_none_or(|(_, was)| was != state)
     })
+}
+
+/// v7 ticket 22: how far the pointer moves for one step of `dt` seconds with the mouse
+/// stick at `stick` (-1–1, gilrs: up is positive). Inside the dead zone nothing moves; past
+/// it, speed scales from 0 to `mouse_speed` × 40 px/s at full push. `carry` keeps the
+/// fractions, so slow moves aren't lost.
+pub fn pointer_step(
+    stick: (f32, f32),
+    tuning: &crate::mappings::Tuning,
+    dt: f32,
+    carry: &mut (f32, f32),
+) -> (i32, i32) {
+    let dead = f32::from(tuning.dead_zone) / 100.0;
+    let push = |v: f32| {
+        if v.abs() <= dead {
+            0.0
+        } else {
+            v.signum() * (v.abs() - dead) / (1.0 - dead).max(0.01)
+        }
+    };
+    let speed = f32::from(tuning.mouse_speed) * 40.0 * dt;
+    carry.0 += push(stick.0) * speed;
+    carry.1 -= push(stick.1) * speed; // screen y grows downward
+    let step = (carry.0.trunc() as i32, carry.1.trunc() as i32);
+    carry.0 -= step.0 as f32;
+    carry.1 -= step.1 as f32;
+    step
+}
+/// The virtual pointer the mouse stick moves (created only when Tuning turns it on).
+pub struct Pointer(evdev::uinput::VirtualDevice);
+impl Pointer {
+    pub fn new() -> crate::Result<Self> {
+        use evdev::{AttributeSet, KeyCode, RelativeAxisCode};
+        let axes = AttributeSet::from_iter([RelativeAxisCode::REL_X, RelativeAxisCode::REL_Y]);
+        // A button makes desktops treat it as a mouse.
+        let buttons = AttributeSet::from_iter([KeyCode::BTN_LEFT]);
+        let device = evdev::uinput::VirtualDevice::builder()
+            .and_then(|b| {
+                b.name("VibeConsole pointer")
+                    .with_relative_axes(&axes)?
+                    .with_keys(&buttons)?
+                    .build()
+            })
+            .map_err(|e| format!("cannot create the pointer through /dev/uinput: {e}"))?;
+        Ok(Self(device))
+    }
+    pub fn move_by(&mut self, (dx, dy): (i32, i32)) -> crate::Result<()> {
+        use evdev::{EventType, InputEvent, RelativeAxisCode};
+        if (dx, dy) == (0, 0) {
+            return Ok(());
+        }
+        self.0.emit(&[
+            InputEvent::new(EventType::RELATIVE.0, RelativeAxisCode::REL_X.0, dx),
+            InputEvent::new(EventType::RELATIVE.0, RelativeAxisCode::REL_Y.0, dy),
+        ])?;
+        Ok(())
+    }
 }
 
 pub struct Pad {
@@ -731,6 +797,59 @@ mod tests {
         g.cancel();
         assert_eq!(g.tick(ms(7500)), None, "a pause or clear cancels");
         assert!(is_reserved(guide) && !is_reserved(a));
+    }
+
+    /// v7 ticket 22: the mouse stick moves the pointer by its push past the dead zone, scaled
+    /// by speed, keeps fractions, and its directions stop firing.
+    #[test]
+    fn mouse_stick_moves_by_push_past_the_dead_zone_and_keeps_fractions() {
+        let tuning = crate::mappings::Tuning {
+            dead_zone: 15,
+            mouse_speed: 10,
+            mouse: crate::mappings::MouseStick::Left,
+            ..Default::default()
+        };
+        let mut carry = (0.0, 0.0);
+        assert_eq!(
+            pointer_step((0.1, -0.1), &tuning, 0.1, &mut carry),
+            (0, 0),
+            "drift"
+        );
+        // Full right push for 0.1 s at speed 10: 40 px; full up push moves up (negative y).
+        assert_eq!(
+            pointer_step((1.0, 1.0), &tuning, 0.1, &mut carry),
+            (40, -40)
+        );
+        let mut carry = (0.0, 0.0);
+        let mut total = 0;
+        for _ in 0..10 {
+            total += pointer_step((0.2, 0.0), &tuning, 0.01, &mut carry).0;
+        }
+        assert_eq!(total, 2, "slow moves add up instead of vanishing");
+        let mut down = HashSet::new();
+        let mut pad = Analog::default();
+        assert!(
+            analog(
+                &mut down,
+                &mut pad,
+                Motion::Axis(gilrs::Axis::LeftStickY, 0.9),
+                &tuning
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            pad.left.1, 0.9,
+            "the position is still kept for the pointer"
+        );
+        assert!(
+            !analog(
+                &mut down,
+                &mut pad,
+                Motion::Axis(gilrs::Axis::RightStickY, 0.9),
+                &tuning
+            )
+            .is_empty()
+        );
     }
 
     #[test]

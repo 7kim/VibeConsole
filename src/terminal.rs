@@ -194,6 +194,10 @@ struct Terminal {
     positions: crate::actions::Positions,
     /// Hold-to-quit launcher pads being held (v7 ticket 21).
     holds: crate::actions::Holds,
+    /// The mouse stick's pointer (v7 ticket 22): created when first needed.
+    pointer: Option<crate::gamepad::Pointer>,
+    pointer_carry: (f32, f32),
+    pointer_at: Instant,
     context_verified: bool,
     follow_programs: bool,
     follow_retry: Instant,
@@ -666,6 +670,9 @@ impl Terminal {
             guide: crate::gamepad::Guide::default(),
             positions: crate::actions::Positions::default(),
             holds: crate::actions::Holds::default(),
+            pointer: None,
+            pointer_carry: (0.0, 0.0),
+            pointer_at: Instant::now(),
             context_verified: true,
             follow_programs: false,
             follow_retry: Instant::now(),
@@ -1370,6 +1377,41 @@ impl Terminal {
             "Xbox layer 1".into()
         };
         Ok(())
+    }
+    /// The mouse stick moves the pointer while output runs (v7 ticket 22); paused, it never
+    /// moves.
+    fn move_pointer(&mut self) {
+        let dt = self.pointer_at.elapsed().as_secs_f32().min(0.1);
+        self.pointer_at = Instant::now();
+        let Some(pad) = &self.gamepad else {
+            return;
+        };
+        let stick = match pad.tuning.mouse {
+            mappings::MouseStick::Off => return,
+            mappings::MouseStick::Left => pad.analog.left,
+            mappings::MouseStick::Right => pad.analog.right,
+        };
+        if !(self.output.is_some() && self.wanted_run && !self.suspended) {
+            self.pointer_carry = (0.0, 0.0);
+            return;
+        }
+        let step = crate::gamepad::pointer_step(stick, &pad.tuning, dt, &mut self.pointer_carry);
+        if step == (0, 0) {
+            return;
+        }
+        if self.pointer.is_none() {
+            match crate::gamepad::Pointer::new() {
+                Ok(pointer) => self.pointer = Some(pointer),
+                Err(error) => {
+                    self.error = error.to_string();
+                    return;
+                }
+            }
+        }
+        if let Some(Err(error)) = self.pointer.as_mut().map(|p| p.move_by(step)) {
+            self.error = format!("Pointer move failed: {error}");
+            self.pointer = None;
+        }
     }
     /// Hold-to-quit pads whose hold reached one second (v7 ticket 21).
     fn quit_holds(&mut self) {
@@ -2124,6 +2166,7 @@ impl Terminal {
             }
         }
         self.quit_holds();
+        self.move_pointer();
         if let Some(action) = self.guide.tick(Instant::now()) {
             if let Err(error) = self.guide_action(action) {
                 self.error = format!("Profile lock failed: {error}");
@@ -3647,6 +3690,15 @@ fn tuning_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
             "Rumble when an agent finishes or needs you: {}",
             if tuning.rumble { "On" } else { "Off" }
         ),
+        format!(
+            "Mouse: {}",
+            match tuning.mouse {
+                mappings::MouseStick::Off => "Off",
+                mappings::MouseStick::Left => "left stick moves the pointer",
+                mappings::MouseStick::Right => "right stick moves the pointer",
+            }
+        ),
+        format!("Mouse speed: {}", tuning.mouse_speed),
         "Back".to_string(),
     ];
     match choose(ui, "Xbox tuning", &items)? {
@@ -3677,6 +3729,34 @@ fn tuning_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
             config.tuning.trigger = u8::try_from(value)?;
         }
         Some(2) => config.tuning.rumble = !tuning.rumble,
+        Some(3) => {
+            let Some(stick) = choose(
+                ui,
+                "Which stick moves the pointer? Its directions stop firing while it does.",
+                &options(&["Off", "Left stick", "Right stick"]),
+            )?
+            else {
+                return Ok(());
+            };
+            config.tuning.mouse = [
+                mappings::MouseStick::Off,
+                mappings::MouseStick::Left,
+                mappings::MouseStick::Right,
+            ][stick];
+        }
+        Some(4) => {
+            let Some(value) = number(
+                ui,
+                "Mouse speed (1–50): at full push, speed × 40 pixels a second",
+                i32::from(tuning.mouse_speed),
+                1,
+                50,
+            )?
+            else {
+                return Ok(());
+            };
+            config.tuning.mouse_speed = u8::try_from(value)?;
+        }
         _ => return Ok(()),
     }
     mappings::save_config(path, &config)
@@ -7394,6 +7474,22 @@ mod tests {
         };
         settings_menu(&mut ui, &path).unwrap();
         assert!(mappings::load_config(&path).unwrap().tuning.rumble);
+        // v7 ticket 22: the left stick moves the pointer at speed 12.
+        let mut keys = to_tuning.clone();
+        keys.extend([Enter, Down, Down, Down, Enter, Down, Enter]);
+        keys.extend(to_tuning.clone());
+        keys.extend([Enter, Down, Down, Down, Down, Enter, Up, Up, Enter, Escape]);
+        let mut ui = Script {
+            keys: keys.into(),
+            ..Default::default()
+        };
+        settings_menu(&mut ui, &path).unwrap();
+        assert!(ui.keys.is_empty());
+        let tuning = mappings::load_config(&path).unwrap().tuning;
+        assert_eq!(
+            (tuning.mouse, tuning.mouse_speed),
+            (mappings::MouseStick::Left, 12)
+        );
         assert!(
             ui.screens
                 .iter()
@@ -8588,7 +8684,7 @@ mod tests {
         let v14 = saved
             .replace("vibeconsole-mappings-v16", "vibeconsole-mappings-v14")
             .replace(
-                "tuning\t15\t30\t10\toff\nmidi-devices\t0\nmidi-active\t-\nprofiles\t0\nprofile-lock\t-\n",
+                "tuning\t15\t30\t10\toff\toff\nmidi-devices\t0\nmidi-active\t-\nprofiles\t0\nprofile-lock\t-\n",
                 "",
             )
             .replace(
