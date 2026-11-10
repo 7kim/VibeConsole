@@ -161,6 +161,9 @@ pub enum Action {
         agent: String,
         folder: String,
     },
+    /// v7 ticket 17: a T3 Code command (`chat.new`), pressed with whatever key the user's
+    /// own T3 key file binds it to, read at press time.
+    T3(String),
 }
 impl Action {
     pub fn flow(&self) -> bool {
@@ -290,6 +293,15 @@ impl Action {
             {
                 Err("command must be one nonempty line without control characters, run in an absolute directory without ':'".into())
             }
+            Self::T3(command)
+                if command.is_empty()
+                    || command.len() > 64
+                    || !command
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'.') =>
+            {
+                Err("T3 command must be a name like chat.new".into())
+            }
             Self::OrcaJump { agent, folder }
                 if !crate::mappings::simple_name(agent)
                     || !Path::new(folder).is_absolute()
@@ -358,6 +370,7 @@ impl Action {
             Self::OutputMute => "output-mute".into(),
             Self::MicrophoneMute => "microphone-mute".into(),
             Self::OrcaJump { agent, folder } => format!("orca-jump:{agent}:{folder}"),
+            Self::T3(command) => format!("t3:{command}"),
             Self::Flow => "flow".into(),
         }
     }
@@ -437,6 +450,7 @@ impl Action {
                     },
                 }
             }
+            _ if value.starts_with("t3:") => Self::T3(value["t3:".len()..].into()),
             _ if value.starts_with("orca-jump:") => {
                 let (agent, folder) = value["orca-jump:".len()..]
                     .split_once(':')
@@ -526,6 +540,7 @@ impl Action {
             Self::OutputMute => "Toggle default output mute".into(),
             Self::MicrophoneMute => "Toggle default microphone mute".into(),
             Self::OrcaJump { agent, folder } => format!("Orca: jump to {agent} in {folder}"),
+            Self::T3(command) => format!("T3 Code: {command}"),
             Self::Flow => "Start or repair Wispr Flow".into(),
             Self::Shortcut => "Keyboard shortcut".into(),
         }
@@ -917,6 +932,74 @@ pub fn gdbus_output(argv: &[String]) -> Result<String> {
             .into());
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+pub fn t3_key_file() -> Result<std::path::PathBuf> {
+    let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
+    Ok(Path::new(&home).join(".t3/userdata/keybindings.json"))
+}
+/// The keys T3 Code binds `command` to, from its key file (`[{key, command, when}]`), as
+/// VibeConsole key names. `mod` is Ctrl on Linux. The first binding wins.
+pub fn t3_keys(json: &str, command: &str) -> Result<Vec<String>> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("T3 key file is not valid JSON: {e}"))?;
+    let list = value
+        .as_array()
+        .ok_or("T3 key file: expected a list of bindings")?;
+    let key = list
+        .iter()
+        .find(|b| b["command"].as_str() == Some(command))
+        .and_then(|b| b["key"].as_str())
+        .ok_or_else(|| format!("T3 Code has no key for {command}"))?;
+    let mut keys = Vec::new();
+    // `mod++` is mod plus the `+` key.
+    let (body, plus) = match key.strip_suffix("++") {
+        Some(body) => (body, true),
+        None => (key, false),
+    };
+    for part in body.split('+').filter(|p| !p.is_empty()) {
+        let name = match part.to_ascii_lowercase().as_str() {
+            "mod" | "ctrl" | "control" => "Ctrl".to_owned(),
+            "shift" => "Shift".into(),
+            "alt" | "option" => "Alt".into(),
+            "meta" | "cmd" | "super" => "Meta".into(),
+            "enter" | "return" => "Enter".into(),
+            "escape" | "esc" => "Escape".into(),
+            "tab" => "Tab".into(),
+            "space" => "Space".into(),
+            "backspace" => "Backspace".into(),
+            "arrowup" | "up" => "Up".into(),
+            "arrowdown" | "down" => "Down".into(),
+            "arrowleft" | "left" => "Left".into(),
+            "arrowright" | "right" => "Right".into(),
+            "[" => "LeftBracket".into(),
+            "]" => "RightBracket".into(),
+            "=" => "Equal".into(),
+            "-" => "Minus".into(),
+            "," => "Comma".into(),
+            "." => "Period".into(),
+            "/" => "Slash".into(),
+            ";" => "Semicolon".into(),
+            "`" => "Grave".into(),
+            other if other.len() == 1 && other.as_bytes()[0].is_ascii_alphanumeric() => {
+                other.to_ascii_uppercase()
+            }
+            other
+                if other.starts_with('f')
+                    && other[1..]
+                        .parse::<u8>()
+                        .is_ok_and(|n| (1..=12).contains(&n)) =>
+            {
+                other.to_ascii_uppercase()
+            }
+            _ => return Err(format!("T3 key {key:?} has a key VibeConsole can't press").into()),
+        };
+        keys.push(name);
+    }
+    if plus {
+        keys.extend(["Shift".to_owned(), "Equal".to_owned()]);
+    }
+    Ok(crate::mappings::parse_shortcut(&keys.join("+"))?)
 }
 
 /// Orca's CLI: on PATH, else the shim Orca installs (the login service's PATH is short).
@@ -1680,6 +1763,22 @@ fn perform(
             || launch(path, &cancelled),
         ),
         Action::Flow => flow(node.ok_or("keyboard has not been registered")?, &cancelled),
+        Action::T3(command) => {
+            let keys = t3_keys(
+                &std::fs::read_to_string(t3_key_file()?).map_err(|e| {
+                    format!(
+                        "T3 key file {}: {e}",
+                        t3_key_file().unwrap_or_default().display()
+                    )
+                })?,
+                command,
+            )?;
+            tap(keys
+                .iter()
+                .map(|k| crate::keyboard::key_code(k))
+                .collect::<Result<_>>()?)?;
+            Ok(format!("T3 Code: {command} ({})", keys.join("+")))
+        }
         Action::OrcaJump { agent, folder } => orca_jump(agent, folder, |args| {
             command(&orca_program(), args, &cancelled)
         }),
@@ -1894,6 +1993,47 @@ fn flow(node: &Path, cancelled: &impl Fn() -> bool) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v7 ticket 17: T3 actions use the user's own T3 key file, read at press time.
+    #[test]
+    fn t3_commands_use_the_keys_in_t3s_own_file() {
+        let file = r#"[
+            {"key":"mod+shift+d","command":"composer.dictation","when":"!terminalFocus"},
+            {"key":"mod+n","command":"chat.new"},
+            {"key":"mod+]","command":"thread.next"},
+            {"key":"mod++","command":"preview.zoomIn"},
+            {"key":"f6","command":"workspace.focusNext"}]"#;
+        assert_eq!(
+            t3_keys(file, "composer.dictation").unwrap(),
+            ["Ctrl", "Shift", "D"]
+        );
+        assert_eq!(t3_keys(file, "chat.new").unwrap(), ["Ctrl", "N"]);
+        assert_eq!(
+            t3_keys(file, "thread.next").unwrap(),
+            ["Ctrl", "RightBracket"]
+        );
+        assert_eq!(
+            t3_keys(file, "preview.zoomIn").unwrap(),
+            ["Ctrl", "Shift", "Equal"]
+        );
+        assert_eq!(t3_keys(file, "workspace.focusNext").unwrap(), ["F6"]);
+        // A key the user changed is what's pressed.
+        let changed = file.replace("mod+n", "mod+alt+n");
+        assert_eq!(t3_keys(&changed, "chat.new").unwrap(), ["Ctrl", "Alt", "N"]);
+        assert_eq!(
+            t3_keys(file, "thread.jump.1").unwrap_err().to_string(),
+            "T3 Code has no key for thread.jump.1"
+        );
+        assert!(
+            t3_keys("{", "chat.new")
+                .unwrap_err()
+                .to_string()
+                .starts_with("T3 key file")
+        );
+        let action = Action::T3("chat.new".into());
+        assert_eq!(Action::parse(&action.encode()).unwrap(), action);
+        assert!(Action::parse("t3:chat.new; rm").is_err());
+    }
 
     /// v7 ticket 15: "jump to agent" finds the handle at press time from Orca's list (only
     /// agent, folder and handle are read) and switches with plain arguments.
