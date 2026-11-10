@@ -46,7 +46,8 @@ with tempfile.TemporaryDirectory(prefix="vibeconsole-install-") as directory:
     staging.unlink()
     with (root / "vibeconsole.lock").open("r+") as owner:
         fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        assert b"another VibeConsole session" in run("configure", ok=False).stderr
+        refused = run("configure", ok=False).stderr
+        assert b"Startup: another VibeConsole owns MIDI/keyboard/configuration" in refused
     legacy = run("startup-enable", "--feedback", "--start-flow")
     assert b"Legacy startup-enable flags ignored" in legacy.stdout
     assert 'daemon\n' in unit.read_text()
@@ -62,7 +63,15 @@ with tempfile.TemporaryDirectory(prefix="vibeconsole-install-") as directory:
         if daemon.poll() is None:
             daemon.kill()
             daemon.wait(timeout=3)
-    assert log.read_text().splitlines() == ["--user daemon-reload", "--user enable vibeconsole.service"]
+    # The refused configure first checks whether the login service holds the lock (the fake
+    # says it's active), pauses it, finds the lock still held, and starts it again on exit.
+    assert log.read_text().splitlines() == [
+        "--user is-active --quiet vibeconsole.service",
+        "--user stop vibeconsole.service",
+        "--user start vibeconsole.service",
+        "--user daemon-reload",
+        "--user enable vibeconsole.service",
+    ]
     for cmd in ("startup-start", "startup-status", "startup-stop", "startup-disable"):
         run(cmd)
     managed = unit.read_text()

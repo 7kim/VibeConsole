@@ -13,7 +13,14 @@ use std::{
 };
 
 pub struct Owner {
-    _file: File,
+    file: File,
+}
+impl Drop for Owner {
+    /// Clear the name while the lock is still held, so the next refusal never names a
+    /// holder that is gone.
+    fn drop(&mut self) {
+        let _ = self.file.set_len(0);
+    }
 }
 impl Owner {
     /// `who` describes this copy, e.g. "terminal session" or "login service".
@@ -35,17 +42,24 @@ impl Owner {
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             let mut holder = String::new();
             let _ = file.read_to_string(&mut holder);
+            // Trust the recorded holder only while its process is alive (a killed owner
+            // can't clear it).
             let holder = holder
                 .lines()
                 .next()
                 .filter(|l| !l.is_empty() && !l.chars().any(char::is_control))
+                .filter(|l| {
+                    l.rsplit_once("(pid ")
+                        .and_then(|(_, pid)| pid.strip_suffix(')'))
+                        .is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists())
+                })
                 .unwrap_or("another VibeConsole");
             return Err(format!("Startup: {holder} owns MIDI/keyboard/configuration; keep it for editing, or stop it first (vibeconsole startup-stop for the login service). No keyboard was replaced").into());
         }
         file.set_len(0)?;
         file.rewind()?;
         writeln!(file, "the {who} (pid {})", std::process::id())?;
-        Ok(Self { _file: file })
+        Ok(Self { file })
     }
     pub fn acquire(who: &str) -> Result<Self> {
         // SAFETY: geteuid has no preconditions.
