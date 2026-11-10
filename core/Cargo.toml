@@ -1,0 +1,13 @@
+[package]
+name = "vibeconsole-core"
+version = "0.6.0"
+edition = "2024"
+
+[features]
+# Test fakes the cli's scripted menu tests use; never enabled in a release build.
+fakes = []
+
+[dependencies]
+evdev = "0.13.2"
+libc = { version = "0.2", default-features = false }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }

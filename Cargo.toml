@@ -3,8 +3,16 @@ name = "vibeconsole"
 version = "0.6.0"
 edition = "2024"
 
+[workspace]
+members = [".", "core"]
+default-members = [".", "core"]
+
 [dependencies]
+vibeconsole-core = { path = "core" }
 evdev = "0.13.2"
 libc = { version = "0.2", default-features = false }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 signal-hook = { version = "0.4.4", default-features = false }
+
+[dev-dependencies]
+vibeconsole-core = { path = "core", features = ["fakes"] }

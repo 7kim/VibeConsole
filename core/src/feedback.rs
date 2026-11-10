@@ -684,12 +684,13 @@ impl Controller {
             selected.map(|(c, _)| c),
         ))
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fakes"))]
     fn spawn(transport: impl Transport + Send + 'static) -> Self {
         Self::spawn_verified(transport, None)
     }
-    #[cfg(test)]
-    pub(crate) fn fake_for_reset(writes: Arc<Mutex<usize>>) -> Self {
+    /// A controller that answers like a verified Akai and counts writes (cli menu tests).
+    #[cfg(any(test, feature = "fakes"))]
+    pub fn fake_for_reset(writes: Arc<Mutex<usize>>) -> Self {
         struct Fake(Arc<Mutex<usize>>);
         impl Transport for Fake {
             fn read(&mut self) -> Result<Payload> {
@@ -1088,7 +1089,7 @@ mod tests {
         }
         let capture = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/testdata/mpk-mini3-programs.hex"
+            "/../testdata/mpk-mini3-programs.hex"
         ));
         let slots: Vec<Payload> = capture
             .lines()

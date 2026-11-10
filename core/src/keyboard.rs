@@ -7,7 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 /// How long a risky control must be held before it fires.
-pub(crate) const ARM: Duration = Duration::from_secs(1);
+pub const ARM: Duration = Duration::from_secs(1);
 
 pub fn key_code(name: &str) -> Result<KeyCode> {
     let linux_name = match name {
@@ -26,7 +26,7 @@ pub fn key_code(name: &str) -> Result<KeyCode> {
         .map_err(|_| format!("key {name:?} is unsupported by the Linux input backend").into())
 }
 
-pub(crate) fn paste_keys(shift: bool) -> Vec<KeyCode> {
+pub fn paste_keys(shift: bool) -> Vec<KeyCode> {
     let mut keys = vec![KeyCode::KEY_LEFTCTRL];
     if shift {
         keys.push(KeyCode::KEY_LEFTSHIFT);
@@ -57,7 +57,7 @@ struct Assignment {
     risky: bool,
 }
 
-pub(crate) struct Keyboard {
+pub struct Keyboard {
     assignments: Vec<Assignment>,
     down: HashSet<Control>,
     blocked: HashSet<Control>,
@@ -69,7 +69,7 @@ pub(crate) struct Keyboard {
 }
 
 impl Keyboard {
-    pub(crate) fn new(mappings: &[Mapping]) -> Result<Self> {
+    pub fn new(mappings: &[Mapping]) -> Result<Self> {
         let mut seen = HashSet::new();
         let mut assignments = Vec::new();
         for mapping in mappings {
@@ -100,7 +100,7 @@ impl Keyboard {
         })
     }
 
-    pub(crate) fn observe(
+    pub fn observe(
         &mut self,
         event: Event,
         emit: &mut impl FnMut(KeyCode, bool) -> io::Result<()>,
@@ -108,7 +108,7 @@ impl Keyboard {
         self.observe_at(event, Instant::now(), emit)
     }
 
-    pub(crate) fn observe_at(
+    pub fn observe_at(
         &mut self,
         event: Event,
         now: Instant,
@@ -163,7 +163,7 @@ impl Keyboard {
     }
 
     /// Fire risky controls held for at least `ARM` by `now`.
-    pub(crate) fn fire_due(
+    pub fn fire_due(
         &mut self,
         now: Instant,
         emit: &mut impl FnMut(KeyCode, bool) -> io::Result<()>,
@@ -228,7 +228,7 @@ impl Keyboard {
         Ok(Some((pad, active)))
     }
 
-    pub(crate) fn pause(
+    pub fn pause(
         &mut self,
         emit: &mut impl FnMut(KeyCode, bool) -> io::Result<()>,
     ) -> io::Result<()> {
@@ -236,7 +236,7 @@ impl Keyboard {
         self.clear(emit)
     }
 
-    pub(crate) fn clear(
+    pub fn clear(
         &mut self,
         emit: &mut impl FnMut(KeyCode, bool) -> io::Result<()>,
     ) -> io::Result<()> {
@@ -253,7 +253,7 @@ impl Keyboard {
         result
     }
 
-    pub(crate) fn replace(&mut self, mappings: &[Mapping]) -> Result<()> {
+    pub fn replace(&mut self, mappings: &[Mapping]) -> Result<()> {
         if self.running || !self.held.is_empty() {
             return Err("pause and release keys before editing mappings".into());
         }
@@ -266,7 +266,7 @@ impl Keyboard {
     }
 
     /// Press then release `keys` once. Keys already held by an active mapping stay held.
-    pub(crate) fn tap(
+    pub fn tap(
         &mut self,
         keys: &[KeyCode],
         emit: &mut impl FnMut(KeyCode, bool) -> io::Result<()>,
@@ -290,16 +290,16 @@ impl Keyboard {
         Ok(())
     }
 
-    pub(crate) fn resume(&mut self) {
+    pub fn resume(&mut self) {
         self.running = true;
     }
 
-    pub(crate) fn block_down(&mut self, down: &HashSet<Control>) {
+    pub fn block_down(&mut self, down: &HashSet<Control>) {
         self.down = down.clone();
         self.blocked.extend(down);
     }
 
-    pub(crate) fn prepare_connection(
+    pub fn prepare_connection(
         &mut self,
         mappings: &[Mapping],
         down: &HashSet<Control>,
@@ -312,13 +312,13 @@ impl Keyboard {
         Ok(std::mem::take(reconnected))
     }
 
-    pub(crate) fn active(&self, control: Control) -> bool {
+    pub fn active(&self, control: Control) -> bool {
         self.assignments
             .iter()
             .any(|assignment| assignment.control == control && assignment.active)
     }
 
-    pub(crate) fn status(&self, name: impl Fn(Control) -> String) -> String {
+    pub fn status(&self, name: impl Fn(Control) -> String) -> String {
         let active = self
             .assignments
             .iter()
@@ -407,14 +407,14 @@ fn create_output() -> Result<VirtualDevice> {
     Ok(output)
 }
 
-pub(crate) struct Output {
-    pub(crate) keyboard: Keyboard,
+pub struct Output {
+    pub keyboard: Keyboard,
     device: VirtualDevice,
-    pub(crate) node: std::path::PathBuf,
+    pub node: std::path::PathBuf,
 }
 
 impl Output {
-    pub(crate) fn new(mappings: &[Mapping]) -> Result<Self> {
+    pub fn new(mappings: &[Mapping]) -> Result<Self> {
         let mut keyboard = Keyboard::new(mappings)?;
         keyboard.running = false;
         let mut device = create_output()?;
@@ -442,32 +442,32 @@ impl Output {
             node,
         })
     }
-    pub(crate) fn fire_due(&mut self) -> Result<Vec<(Control, bool)>> {
+    pub fn fire_due(&mut self) -> Result<Vec<(Control, bool)>> {
         let device = &mut self.device;
         Ok(self.keyboard.fire_due(Instant::now(), &mut |key, down| {
             device.emit(&[InputEvent::new(EventType::KEY.0, key.0, i32::from(down))])
         })?)
     }
-    pub(crate) fn observe(&mut self, event: Event) -> Result<Option<(Control, bool)>> {
+    pub fn observe(&mut self, event: Event) -> Result<Option<(Control, bool)>> {
         let device = &mut self.device;
         Ok(self.keyboard.observe(event, &mut |key, down| {
             device.emit(&[InputEvent::new(EventType::KEY.0, key.0, i32::from(down))])
         })?)
     }
-    pub(crate) fn tap(&mut self, keys: &[KeyCode]) -> Result<()> {
+    pub fn tap(&mut self, keys: &[KeyCode]) -> Result<()> {
         let device = &mut self.device;
         Ok(self.keyboard.tap(keys, &mut |key, down| {
             device.emit(&[InputEvent::new(EventType::KEY.0, key.0, i32::from(down))])
         })?)
     }
-    pub(crate) fn pause(&mut self) -> Result<()> {
+    pub fn pause(&mut self) -> Result<()> {
         let device = &mut self.device;
         self.keyboard.pause(&mut |key, down| {
             device.emit(&[InputEvent::new(EventType::KEY.0, key.0, i32::from(down))])
         })?;
         Ok(())
     }
-    pub(crate) fn clear(&mut self) -> Result<()> {
+    pub fn clear(&mut self) -> Result<()> {
         let device = &mut self.device;
         self.keyboard.clear(&mut |key, down| {
             device.emit(&[InputEvent::new(EventType::KEY.0, key.0, i32::from(down))])

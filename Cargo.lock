@@ -237,6 +237,16 @@ dependencies = [
  "libc",
  "serde_json",
  "signal-hook",
+ "vibeconsole-core",
+]
+
+[[package]]
+name = "vibeconsole-core"
+version = "0.6.0"
+dependencies = [
+ "evdev",
+ "libc",
+ "serde_json",
 ]
 
 [[package]]

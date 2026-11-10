@@ -1440,7 +1440,7 @@ mod tests {
     fn captured_programs_name_pads_knobs_and_fall_back_to_raw_identity() {
         let capture = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/testdata/mpk-mini3-programs.hex"
+            "/../testdata/mpk-mini3-programs.hex"
         ));
         // Line 0 is RAM; lines 1–8 are stored Programs 1–8 (contexts 0–7).
         let program = |context: u8| {

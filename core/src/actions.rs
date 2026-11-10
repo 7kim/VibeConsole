@@ -1390,7 +1390,7 @@ pub struct Dispatcher {
     worker: Option<thread::JoinHandle<()>>,
 }
 impl Dispatcher {
-    pub(crate) fn with(
+    pub fn with(
         mut run: impl FnMut(&Action, Option<&Path>, &dyn Fn() -> bool) -> Result<String>
         + Send
         + 'static,
