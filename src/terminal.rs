@@ -5608,7 +5608,7 @@ fn orca_mapping(ui: &mut impl Ui, pad: Control, input: mappings::Input) -> Resul
         1 => {
             let agents = ui.orca_agents()?;
             if agents.is_empty() {
-                return Err("Orca has no agent terminals open; start one first".into());
+                return Err("validation: Orca has no agent terminals open; start one first".into());
             }
             let names = agents
                 .iter()
@@ -5620,9 +5620,15 @@ fn orca_mapping(ui: &mut impl Ui, pad: Control, input: mappings::Input) -> Resul
             let (agent, folder) = agents[index].clone();
             crate::actions::Action::OrcaJump { agent, folder }
         }
-        n => return Ok(Some(Mapping::new(pad, SHORTCUTS[n - 2].1, "hold")?)),
+        n => {
+            return Ok(Some(
+                Mapping::new(pad, SHORTCUTS[n - 2].1, "hold").map_err(stage("validation"))?,
+            ));
+        }
     };
-    Ok(Some(Mapping::new_action(pad, input, action)?))
+    Ok(Some(
+        Mapping::new_action(pad, input, action).map_err(stage("validation"))?,
+    ))
 }
 /// /configure for Default (`None`) or one app profile's overrides (v7 ticket 12).
 fn configure_for(
@@ -5631,14 +5637,27 @@ fn configure_for(
     current: &mut Vec<Mapping>,
     profile: Option<&str>,
 ) -> Result<()> {
-    configure_steps(ui, path, current, profile).map_err(|error| {
+    let staged = |error: Box<dyn std::error::Error>| {
         let text = error.to_string();
         if STAGES.iter().any(|s| text.starts_with(&format!("{s}: "))) {
             error
         } else {
             stage("validation")(error)
         }
-    })
+    };
+    loop {
+        let Err(error) = configure_steps(ui, path, current, profile) else {
+            return Ok(());
+        };
+        let text = error.to_string();
+        // v7 ticket 42: a refused assignment (explicitly a validation error) left the config
+        // file untouched, so it's a note and /configure goes on. Anything else (controller,
+        // file, process, a stop) is staged and pauses, as before.
+        if !text.starts_with("validation: ") {
+            return Err(staged(error));
+        }
+        not_saved(ui, &text).map_err(staged)?;
+    }
 }
 
 fn lock_on(profile: Option<&str>) -> mappings::Lock {
@@ -5772,7 +5791,7 @@ fn configure_steps(
         if (action == 1 && input != mappings::Input::Piano)
             || (action == 0 && input != mappings::Input::Pad)
         {
-            return Err("pad/piano source collision; this emitted note is already assigned as another control family".into());
+            return Err("validation: pad/piano source collision; this emitted note is already assigned as another control family".into());
         }
         if input == mappings::Input::Piano {
             let config = mappings::load_config(path).map_err(stage("file I/O"))?;
@@ -5857,20 +5876,20 @@ fn configure_steps(
                     if b == 0 { "hold" } else { "toggle" }
                 }
             };
-            Mapping::new(pad, &keys.join("+"), behavior)?
+            Mapping::new(pad, &keys.join("+"), behavior).map_err(stage("validation"))?
         } else if family == 11 {
             if !matches!(input, mappings::Input::Pad | mappings::Input::Piano) {
-                return Err("prompt sequences require a pad or piano press".into());
+                return Err("validation: prompt sequences require a pad or piano press".into());
             }
             let Some(action) = prompt_sequence_action(ui, path, saved.as_ref().map(|m| &m.action))?
             else {
                 continue;
             };
-            Mapping::new_action(pad, input, action)?
+            Mapping::new_action(pad, input, action).map_err(stage("validation"))?
         } else if family == 10 {
             let agents = ui.herdr_agents()?;
             if agents.is_empty() {
-                return Err("herdr has no agents running; start one first".into());
+                return Err("validation: herdr has no agents running; start one first".into());
             }
             let Some(index) = choose(ui, "Focus which herdr agent?", &agents)? else {
                 continue;
@@ -5879,12 +5898,13 @@ fn configure_steps(
                 pad,
                 input,
                 crate::actions::Action::HerdrFocus(agents[index].clone()),
-            )?
+            )
+            .map_err(stage("validation"))?
         } else if family == 9 {
             let Some(action) = t3_action(ui)? else {
                 continue;
             };
-            Mapping::new_action(pad, input, action)?
+            Mapping::new_action(pad, input, action).map_err(stage("validation"))?
         } else if family == 8 {
             let Some(mapping) = orca_mapping(ui, pad, input)? else {
                 continue;
@@ -5892,23 +5912,23 @@ fn configure_steps(
             mapping
         } else if family == 3 {
             if !matches!(input, mappings::Input::Pad | mappings::Input::Piano) {
-                return Err("prompts require a pad or piano press".into());
+                return Err("validation: prompts require a pad or piano press".into());
             }
             let Some(action) = prompt_action(ui, path, saved.as_ref().map(|m| &m.action))? else {
                 continue;
             };
-            Mapping::new_action(pad, input, action)?
+            Mapping::new_action(pad, input, action).map_err(stage("validation"))?
         } else if family == 4 || family == 12 {
             if !matches!(input, mappings::Input::Pad | mappings::Input::Piano) {
-                return Err("commands require a pad or piano press".into());
+                return Err("validation: commands require a pad or piano press".into());
             }
             let Some(action) = command_action(ui, saved.as_ref().map(|m| &m.action))? else {
                 continue;
             };
-            Mapping::new_action(pad, input, action)?
+            Mapping::new_action(pad, input, action).map_err(stage("validation"))?
         } else if family == 5 {
             if !matches!(input, mappings::Input::Pad | mappings::Input::Piano) {
-                return Err("sequences require a pad or piano press".into());
+                return Err("validation: sequences require a pad or piano press".into());
             }
             let steps = match saved.as_ref().map(|m| &m.action) {
                 Some(crate::actions::Action::Sequence(steps)) => steps.clone(),
@@ -5917,10 +5937,11 @@ fn configure_steps(
             let Some(steps) = sequence_menu(ui, path, steps)? else {
                 continue;
             };
-            Mapping::new_action(pad, input, crate::actions::Action::Sequence(steps))?
+            Mapping::new_action(pad, input, crate::actions::Action::Sequence(steps))
+                .map_err(stage("validation"))?
         } else if family >= 6 {
             if !matches!(input, mappings::Input::Knob { .. }) {
-                return Err("choice and value actions need an absolute knob".into());
+                return Err("validation: choice and value actions need an absolute knob".into());
             }
             let saved_action = saved.as_ref().map(|m| &m.action);
             let Some(action) = (if family == 6 {
@@ -5930,14 +5951,14 @@ fn configure_steps(
             }) else {
                 continue;
             };
-            Mapping::new_action(pad, input, action)?
+            Mapping::new_action(pad, input, action).map_err(stage("validation"))?
         } else {
             let Some(action) =
                 action_menu(ui, family, input, saved.as_ref().map(|m| &m.action), true)?
             else {
                 continue;
             };
-            Mapping::new_action(pad, input, action)?
+            Mapping::new_action(pad, input, action).map_err(stage("validation"))?
         };
         mapping.context = if pad.message == crate::Message::Button {
             // v7 ticket 09: layer 2 is what the button does while LB is held.
@@ -6055,11 +6076,11 @@ fn configure_steps(
             };
             mapping.status = status == 1;
         }
-        mapping.validate()?;
+        mapping.validate().map_err(stage("validation"))?;
         // A directory's ${NAME} must resolve now, not when the pad is pressed (ticket 12).
         let config = mappings::load_config(path).map_err(stage("file I/O"))?;
         for (_, dir) in mapping.action.commands() {
-            mappings::absolute_directory(dir, &config)?;
+            mappings::absolute_directory(dir, &config).map_err(stage("validation"))?;
         }
         match choose(
             ui,
@@ -6750,7 +6771,12 @@ mod tests {
             Ok(())
         }
         fn key(&mut self) -> Result<Option<Key>> {
-            Ok(Some(self.keys.pop_front().expect("script exhausted")))
+            Ok(Some(self.keys.pop_front().unwrap_or_else(|| {
+                panic!(
+                    "script exhausted at:\n{}",
+                    self.screens.last().map_or("", |s| s)
+                )
+            })))
         }
         fn record(&mut self) -> Result<Vec<String>> {
             self.recordings
@@ -7648,6 +7674,219 @@ mod tests {
             ["Ctrl"]
         );
         assert_eq!(layout.len(), crate::gamepad::default_layout().len());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 42: an Xbox button saves through a non-shortcut family (here Fedora system
+    /// action -> Output mute) on the layer chosen, instead of failing validation and pausing.
+    #[test]
+    fn xbox_button_saves_a_system_action_on_its_layer() {
+        use Key::*;
+        for (layer, context) in [
+            (Enter, mappings::GAMEPAD_CONTEXT),
+            (Down, mappings::GAMEPAD_LAYER_2),
+        ] {
+            let dir = std::env::temp_dir()
+                .join(format!("vibeconsole-xbox-family-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("mappings.tsv");
+            mappings::save(&path, &[]).unwrap();
+            let a = Control::button(0);
+            let mut keys = vec![Enter]; // learn a pad
+            keys.extend([Down, Down, Enter]); // Fedora system action
+            keys.extend([Down, Down, Enter]); // Output mute
+            keys.push(layer);
+            if layer == Down {
+                keys.push(Enter);
+            }
+            keys.extend([Enter, Enter, Tab, Tab, Enter]); // fire when, save, finish
+            let mut ui = Script {
+                keys: keys.into(),
+                pads: [a].into(),
+                context: 2,
+                ..Default::default()
+            };
+            let mut current = Vec::new();
+            let result = configure(&mut ui, &path, &mut current);
+            assert!(
+                result.is_ok(),
+                "{result:?}\n{}",
+                ui.screens.join("\n----\n")
+            );
+            let saved = mappings::load_config(&path).unwrap().mappings;
+            assert_eq!(saved.len(), 1, "{}", ui.screens.join("\n----\n"));
+            assert_eq!(saved[0].control, a);
+            assert_eq!(saved[0].context, context);
+            assert_eq!(saved[0].action, crate::actions::Action::OutputMute);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    /// v7 ticket 42: every non-shortcut family the user tried on an Xbox button saves there
+    /// (the user's notes: launch with hold to quit, prompt, run command in tmux, sequence of
+    /// steps, Orca, T3 Code, herdr, prompt sequence, terminal command).
+    #[test]
+    fn xbox_button_saves_in_every_action_family() {
+        use crate::actions::Action;
+        use Key::*;
+        fn text(s: &str) -> Vec<Key> {
+            s.bytes()
+                .map(|b| {
+                    if b == b' ' {
+                        Key::Space
+                    } else {
+                        Key::Character(b)
+                    }
+                })
+                .collect()
+        }
+        let family = |n: usize| {
+            let mut keys = vec![Enter]; // learn a pad
+            keys.extend(vec![Down; n]);
+            keys.push(Enter);
+            keys
+        };
+        let dir = std::env::temp_dir().join(format!("vibeconsole-xbox-all-{}", std::process::id()));
+        let work = dir.to_string_lossy().into_owned();
+        let command = |line: &str| {
+            let mut keys = text(line);
+            keys.push(Enter);
+            keys.extend(text(&work));
+            keys.push(Enter);
+            keys
+        };
+        let cases: Vec<(&str, Vec<Key>, Vec<Key>, fn(&Action) -> bool)> = vec![
+            (
+                "launch, hold to quit",
+                [family(1), vec![Enter, Down, Down, Enter]].concat(),
+                vec![Enter, Enter, Down, Enter], // layer 1, fire when pressed, save and finish
+                |a| matches!(a, Action::AppToggleQuit(_)),
+            ),
+            (
+                "prompt",
+                [
+                    family(3),
+                    vec![Enter],
+                    text("review"),
+                    vec![Enter, Enter, Enter],
+                ]
+                .concat(),
+                vec![Enter, Enter, Enter, Down, Enter], // layer, fire when, status off, finish
+                |a| matches!(a, Action::Prompt { .. }),
+            ),
+            (
+                "run command in tmux",
+                [family(4), command("claude")].concat(),
+                vec![Enter, Enter, Enter, Down, Enter],
+                |a| matches!(a, Action::Command { .. }),
+            ),
+            (
+                "sequence of steps",
+                [
+                    family(5),
+                    vec![
+                        Enter, Down, Enter, Enter, Enter, Enter, Enter, Down, Down, Enter,
+                    ],
+                ]
+                .concat(),
+                vec![Enter, Enter, Enter, Down, Enter],
+                |a| matches!(a, Action::Sequence(_)),
+            ),
+            (
+                "orca needs me",
+                [family(6), vec![Enter]].concat(),
+                vec![Enter, Enter, Enter, Down, Enter],
+                |a| a.encode().contains("Ctrl+J"),
+            ),
+            (
+                "t3 code",
+                [family(7), vec![Down, Down, Enter]].concat(),
+                vec![Enter, Enter, Down, Enter],
+                |a| matches!(a, Action::T3(_)),
+            ),
+            (
+                "herdr",
+                [family(8), vec![Down, Enter]].concat(),
+                vec![Enter, Enter, Down, Enter],
+                |a| matches!(a, Action::HerdrFocus(_)),
+            ),
+            (
+                "prompt sequence",
+                [
+                    family(9),
+                    vec![Enter, Enter, Enter, Enter, Down, Enter, Down, Down, Enter],
+                ]
+                .concat(),
+                vec![Enter, Enter, Down, Enter], // layer, fire when, finish (no status step)
+                |a| matches!(a, Action::PromptSequence(_)),
+            ),
+            (
+                "terminal command",
+                [family(10), command("sudo dnf update")].concat(),
+                vec![Enter, Enter, Down, Enter], // layer, status off, finish (always held)
+                |a| matches!(a, Action::Command { .. }),
+            ),
+        ];
+        for (name, action, tail, check) in cases {
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("prompts")).unwrap();
+            std::fs::write(dir.join("prompts/review"), "Review this change.\n").unwrap();
+            let path = dir.join("mappings.tsv");
+            mappings::save(&path, &[]).unwrap();
+            let a = Control::button(0);
+            let mut ui = Script {
+                keys: [action, tail].concat().into(),
+                pads: [a].into(),
+                orca: vec![("claude".into(), "/work/a".into())],
+                t3: r#"[{"key":"mod+]","command":"thread.next"}]"#.into(),
+                herdr: vec!["api".into(), "docs".into()],
+                ..Default::default()
+            };
+            let mut current = Vec::new();
+            let result = configure(&mut ui, &path, &mut current);
+            let screens = ui.screens.join("\n----\n");
+            assert!(result.is_ok(), "{name}: {result:?}\n{screens}");
+            assert!(ui.keys.is_empty(), "{name}: keys left\n{screens}");
+            let saved = mappings::load_config(&path).unwrap().mappings;
+            assert_eq!(saved.len(), 1, "{name}");
+            assert_eq!(saved[0].control, a, "{name}");
+            assert_eq!(saved[0].context, mappings::GAMEPAD_CONTEXT, "{name}");
+            assert!(check(&saved[0].action), "{name}: {:?}", saved[0].action);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 42: a refused assignment is a "Not saved" note that stays in /configure: the
+    /// session isn't paused and the saved file is untouched.
+    #[test]
+    fn a_refused_assignment_stays_in_configure_and_saves_nothing() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-refused-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut keys = vec![Enter];
+        keys.extend(vec![Down; 8]); // herdr, with no agents running
+        keys.extend([Enter, Enter]); // herdr -> Back
+        keys.extend([Tab, Tab, Enter]); // still in /configure: Finish
+        let mut ui = Script {
+            keys: keys.into(),
+            pads: [Control::button(0)].into(),
+            ..Default::default()
+        };
+        let mut current = Vec::new();
+        let result = configure(&mut ui, &path, &mut current);
+        assert!(result.is_ok(), "{result:?}");
+        assert!(ui.keys.is_empty());
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| { s.starts_with("Not saved: validation: herdr has no agents running") })
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -270,7 +270,13 @@ impl Mapping {
         Ok(Self {
             control: pad,
             input: Input::Pad,
-            context: 0,
+            // v7 ticket 42: an Xbox button starts in the Xbox context (layer 1) so it validates
+            // like one; the caller may move it to layer 2. MIDI controls start in context 0.
+            context: if pad.message == crate::Message::Button {
+                GAMEPAD_CONTEXT
+            } else {
+                0
+            },
             label: pad.label(),
             action: crate::actions::Action::Shortcut,
             keys: parse_shortcut(shortcut)?,
