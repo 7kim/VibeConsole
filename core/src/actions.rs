@@ -863,6 +863,37 @@ pub fn running(action: &Action, agents: &[(String, String)]) -> Option<bool> {
     }
 }
 
+/// The focused app's desktop ID from the window extension (v7 ticket 12): `Ok(None)` when
+/// no app has focus, `Err` when the desktop can't tell (no extension) — never a guess.
+/// ponytail: asked once per status refresh; add a focus-changed signal if that lags.
+pub fn focused_app(mut gdbus: impl FnMut(&[String]) -> Result<String>) -> Result<Option<String>> {
+    let reply = gdbus(&windows_call("Focused", &[]))
+        .map_err(|e| format!("focused app unavailable: {e}"))?;
+    // gdbus prints `('firefox.desktop',)`.
+    let id = reply
+        .trim()
+        .strip_prefix("('")
+        .and_then(|r| r.strip_suffix("',)"))
+        .ok_or("focused app unavailable: unexpected reply")?;
+    if id.is_empty() {
+        return Ok(None);
+    }
+    if !crate::mappings::valid_app_id(id) {
+        return Err(format!("focused app unavailable: invalid ID {id:?}").into());
+    }
+    Ok(Some(id.to_owned()))
+}
+pub fn gdbus_output(argv: &[String]) -> Result<String> {
+    let output = Command::new("gdbus").args(argv).output()?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr)
+            .trim()
+            .to_owned()
+            .into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 /// One launcher-pad press, decided by the Shell extension's view of the app's windows.
 fn app_toggle(
     path: &str,
@@ -1785,6 +1816,31 @@ fn flow(node: &Path, cancelled: &impl Fn() -> bool) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v7 ticket 12: the focused app comes from the extension; without it the answer is
+    /// "unavailable", never a guess.
+    #[test]
+    fn focused_app_is_read_from_the_extension_and_never_guessed() {
+        let reply = |text: &'static str| {
+            move |argv: &[String]| -> Result<String> {
+                assert!(argv.iter().any(|a| a == "org.vibeconsole.Windows.Focused"));
+                Ok(text.to_owned())
+            }
+        };
+        assert_eq!(
+            focused_app(reply("('firefox.desktop',)\n"))
+                .unwrap()
+                .as_deref(),
+            Some("firefox.desktop")
+        );
+        assert_eq!(focused_app(reply("('',)\n")).unwrap(), None);
+        assert!(focused_app(reply("('../x; rm',)")).is_err());
+        let missing = focused_app(|_: &[String]| -> Result<String> {
+            Err("The name org.vibeconsole.Windows was not provided".into())
+        })
+        .unwrap_err();
+        assert!(missing.to_string().starts_with("focused app unavailable"));
+    }
     #[test]
     fn prompt_file_and_action_validation_without_tmux() {
         assert_eq!(

@@ -142,6 +142,12 @@ struct Terminal {
     gamepad: Option<crate::gamepad::Pad>,
     /// LB held: Xbox buttons use layer 2 (v7 ticket 09).
     layer2: bool,
+    /// The focused app's profile (v7 ticket 12); None is Default.
+    profile: Option<String>,
+    /// Real sessions follow the focused app; tests never call the desktop.
+    follow_apps: bool,
+    /// "focused app unavailable" was shown; shown once until it comes back.
+    focus_unavailable: bool,
     context_verified: bool,
     follow_programs: bool,
     follow_retry: Instant,
@@ -607,6 +613,9 @@ impl Terminal {
             device: None,
             gamepad: None,
             layer2: false,
+            profile: None,
+            follow_apps: false,
+            focus_unavailable: false,
             context_verified: true,
             follow_programs: false,
             follow_retry: Instant::now(),
@@ -1097,12 +1106,78 @@ impl Terminal {
     fn with_gamepad(&self, mappings: &[Mapping]) -> Result<Vec<Mapping>> {
         let mut all = mappings.to_vec();
         if self.gamepad.is_some() {
-            all.extend(crate::gamepad::layer(
-                &mappings::load_config(&self.path)?.mappings,
-                self.layer2,
-            ));
+            let config = mappings::load_config(&self.path)?;
+            let layer = crate::gamepad::layer(&config.mappings, self.layer2);
+            let profile = self
+                .profile
+                .as_deref()
+                .and_then(|name| config.profile(name));
+            let context = if self.layer2 {
+                mappings::GAMEPAD_LAYER_2
+            } else {
+                mappings::GAMEPAD_CONTEXT
+            };
+            all.extend(mappings::overlay(&layer, profile, context));
         }
         Ok(all)
+    }
+    /// The open context's mappings with the focused app's profile on top (v7 ticket 12).
+    fn context_mappings(&self, all: &[Mapping]) -> Vec<Mapping> {
+        let config = self
+            .profile
+            .as_ref()
+            .and_then(|_| mappings::load_config(&self.path).ok());
+        let profile = config
+            .as_ref()
+            .zip(self.profile.as_deref())
+            .and_then(|(config, name)| config.profile(name));
+        mappings::overlay(all, profile, self.context)
+    }
+    /// The keyboard takes a new mapping set (layer or profile change): a transition. Held
+    /// keys are released, held pads and buttons wait for a fresh press.
+    fn reload_keyboard(&mut self) -> Result<()> {
+        let all = self.with_gamepad(&self.run_mappings)?;
+        let resume = self.wanted_run && !self.suspended && self.context_verified;
+        if let Some(output) = &mut self.output {
+            output.pause()?;
+            output
+                .keyboard
+                .prepare_connection(&all, &self.detector.down, &mut false)?;
+            if resume {
+                output.keyboard.resume();
+            }
+        }
+        Ok(())
+    }
+    /// Follow the focused app (v7 ticket 12): its profile, or Default. Without the window
+    /// extension the focused app is "unavailable" and Default applies.
+    fn follow_focus(&mut self, config: &mappings::Config) -> Result<()> {
+        let profile = match crate::actions::focused_app(crate::actions::gdbus_output) {
+            Ok(app) => {
+                self.focus_unavailable = false;
+                app.and_then(|app| config.profile_for(&app).map(|p| p.name.clone()))
+            }
+            Err(error) => {
+                if !self.focus_unavailable && !config.profiles.is_empty() {
+                    self.notice = format!("{error}; Default applies");
+                }
+                self.focus_unavailable = true;
+                None
+            }
+        };
+        self.set_profile(profile)
+    }
+    fn set_profile(&mut self, profile: Option<String>) -> Result<()> {
+        if self.profile == profile {
+            return Ok(());
+        }
+        self.release_all()?;
+        self.profile = profile;
+        let config = mappings::load_config(&self.path)?;
+        self.run_mappings = self.context_mappings(&config.mappings);
+        self.reload_keyboard()?;
+        self.notice = format!("Profile: {}", self.profile.as_deref().unwrap_or("Default"));
+        Ok(())
     }
     fn open_gamepad(&mut self) {
         match crate::gamepad::Pad::open() {
@@ -1165,17 +1240,7 @@ impl Terminal {
         }
         self.release_all()?;
         self.layer2 = second;
-        let all = self.with_gamepad(&self.run_mappings)?;
-        let resume = self.wanted_run && !self.suspended && self.context_verified;
-        if let Some(output) = &mut self.output {
-            output.pause()?;
-            output
-                .keyboard
-                .prepare_connection(&all, &self.detector.down, &mut false)?;
-            if resume {
-                output.keyboard.resume();
-            }
-        }
+        self.reload_keyboard()?;
         self.notice = if second {
             "Xbox layer 2 (LB held)".into()
         } else {
@@ -1200,11 +1265,7 @@ impl Terminal {
         self.context_verified = true;
         self.follow_programs = false;
         self.feedback_allowed = false;
-        self.run_mappings = current
-            .iter()
-            .filter(|m| m.context == context)
-            .cloned()
-            .collect();
+        self.run_mappings = self.context_mappings(current);
         Ok(())
     }
 
@@ -1609,11 +1670,11 @@ impl Terminal {
                 self.error.clear();
                 let config = mappings::load_config(&self.path)?;
                 self.idle = config.idle_for(context);
-                self.run_mappings = config
-                    .mappings
-                    .into_iter()
-                    .filter(|m| m.context == context)
-                    .collect();
+                let profile = self
+                    .profile
+                    .as_deref()
+                    .and_then(|name| config.profile(name));
+                self.run_mappings = mappings::overlay(&config.mappings, profile, context);
                 // Piano safety confirmation still needs an explicit Run; never prompt recursively from draw/tick.
                 let piano = self
                     .run_mappings
@@ -1694,6 +1755,14 @@ impl Terminal {
             self.status_at = Instant::now();
             self.refresh_agent_states();
             self.probe_status();
+            if self.follow_apps {
+                if let Ok(config) = mappings::load_config(&self.path) {
+                    if let Err(error) = self.follow_focus(&config) {
+                        self.pause()?;
+                        self.error = format!("Profile change failed: {error}; paused");
+                    }
+                }
+            }
         }
         if let Err(error) = self.status_lights() {
             self.pause()?;
@@ -1974,13 +2043,7 @@ impl Terminal {
             );
         }
         let config = mappings::load_config(&self.path)?;
-        if config
-            .mappings
-            .iter()
-            .filter(|m| m.context == self.context)
-            .cloned()
-            .collect::<Vec<_>>()
-            != mappings
+        if self.context_mappings(&config.mappings) != mappings
             || config.idle_for(self.context) != self.idle
         {
             return Err(
@@ -2049,13 +2112,7 @@ Changing musical settings while running is unsupported.",
 
     fn prepare_connection(&mut self) -> Result<()> {
         let config = mappings::load_config(&self.path)?;
-        if config
-            .mappings
-            .iter()
-            .filter(|m| m.context == self.context)
-            .cloned()
-            .collect::<Vec<_>>()
-            != self.run_mappings
+        if self.context_mappings(&config.mappings) != self.run_mappings
             || config.idle_for(self.context) != self.idle
         {
             return Err("saved configuration changed/invalid; paused until reloaded".into());
@@ -2109,13 +2166,7 @@ Changing musical settings while running is unsupported.",
             return Ok(());
         }
         let config = mappings::load_config(&self.path)?;
-        if config
-            .mappings
-            .iter()
-            .filter(|m| m.context == self.context)
-            .cloned()
-            .collect::<Vec<_>>()
-            != self.run_mappings
+        if self.context_mappings(&config.mappings) != self.run_mappings
             || config.idle_for(self.context) != self.idle
         {
             return Err("saved configuration changed/invalid; paused until reloaded".into());
@@ -3203,6 +3254,10 @@ fn settings_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 "Xbox tuning: stick dead zone {}%, triggers fire at {}%",
                 config.tuning.dead_zone, config.tuning.trigger
             ),
+            format!(
+                "App profiles ({}): pads that change with the focused app",
+                config.profiles.len()
+            ),
         ];
         let Some(choice) = choose(ui, "Settings", &rows)? else {
             return Ok(());
@@ -3236,11 +3291,129 @@ fn settings_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
             5 => light_patterns_menu(ui, path),
             6 => login_menu(ui),
             7 => midi_device_menu(ui, path),
-            _ => tuning_menu(ui, path),
+            8 => tuning_menu(ui, path),
+            _ => profiles_menu(ui, path),
         };
         if let Err(error) = result {
             not_saved(ui, &error)?;
         }
+    }
+}
+
+/// Settings -> App profiles (v7 ticket 12): while one of a profile's apps is focused, its
+/// pads and buttons replace Default; every other control and every other app use Default.
+fn profiles_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
+    loop {
+        let config = mappings::load_config(path)?;
+        let mut items = config
+            .profiles
+            .iter()
+            .map(|p| {
+                format!(
+                    "{} ({}; {} overrides)",
+                    p.name,
+                    if p.apps.is_empty() {
+                        "no apps".to_owned()
+                    } else {
+                        p.apps.join(", ")
+                    },
+                    p.mappings.len()
+                )
+            })
+            .collect::<Vec<_>>();
+        items.push("New profile".into());
+        let Some(choice) = choose(
+            ui,
+            "App profiles: apps without a profile use Default",
+            &items,
+        )?
+        else {
+            return Ok(());
+        };
+        let result = match config.profiles.get(choice) {
+            Some(profile) => profile_menu(ui, path, &profile.name),
+            None => new_profile(ui, path),
+        };
+        if let Err(error) = result {
+            not_saved(ui, &error)?;
+        }
+    }
+}
+/// An installed app's desktop ID, picked from the app list.
+fn pick_app(ui: &mut impl Ui) -> Result<Option<String>> {
+    let apps = ui.applications()?;
+    let names = apps
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    let Some(index) = choose(ui, "Which app?", &names)? else {
+        return Ok(None);
+    };
+    crate::actions::desktop_id(&apps[index].1)
+        .map(Some)
+        .ok_or_else(|| "that app has no desktop ID".into())
+}
+fn new_profile(ui: &mut impl Ui, path: &Path) -> Result<()> {
+    let Some(name) = text_entry(ui, "Profile name (1–32 characters)", "")? else {
+        return Ok(());
+    };
+    let Some(app) = pick_app(ui)? else {
+        return Ok(());
+    };
+    let mut config = mappings::load_config(path)?;
+    config.profiles.push(mappings::Profile {
+        name: name.trim().to_owned(),
+        apps: vec![app],
+        mappings: Vec::new(),
+    });
+    mappings::save_config(path, &config)
+}
+fn profile_menu(ui: &mut impl Ui, path: &Path, name: &str) -> Result<()> {
+    let items = options(&[
+        "Edit its pads and buttons",
+        "Add an app",
+        "Delete profile",
+        "Back",
+    ]);
+    match choose(ui, &format!("Profile {name}"), &items)? {
+        Some(0) => {
+            let config = mappings::load_config(path)?;
+            let mut current = config
+                .profile(name)
+                .ok_or("this profile no longer exists")?
+                .mappings
+                .clone();
+            configure_for(ui, path, &mut current, Some(name))
+        }
+        Some(1) => {
+            let Some(app) = pick_app(ui)? else {
+                return Ok(());
+            };
+            let mut config = mappings::load_config(path)?;
+            let profile = config
+                .profiles
+                .iter_mut()
+                .find(|p| p.name == name)
+                .ok_or("this profile no longer exists")?;
+            if !profile.apps.contains(&app) {
+                profile.apps.push(app);
+            }
+            mappings::save_config(path, &config)
+        }
+        Some(2) => {
+            if choose(
+                ui,
+                &format!("Delete profile {name}? Its apps go back to Default."),
+                &options(&["Cancel", "Delete profile"]),
+            )? != Some(1)
+            {
+                return Ok(());
+            }
+            let mut config = mappings::load_config(path)?;
+            config.profiles.retain(|p| p.name != name);
+            mappings::save_config(path, &config)
+        }
+        _ => Ok(()),
     }
 }
 
@@ -4642,6 +4815,7 @@ fn commit(
     pad: Control,
     context: u8,
     replacement: Option<Mapping>,
+    profile: Option<&str>,
 ) -> Result<()> {
     let mut next = current.clone();
     next.retain(|mapping| mapping.context != context || mapping.control != pad);
@@ -4665,7 +4839,20 @@ fn commit(
     }
     next.extend(replacement);
     next.sort_by_key(|mapping| (mapping.context, mapping.control));
-    mappings::save(path, &next)?;
+    match profile {
+        // v7 ticket 12: a profile's overrides are saved into that profile.
+        Some(name) => {
+            let mut config = mappings::load_config(path)?;
+            config
+                .profiles
+                .iter_mut()
+                .find(|p| p.name == name)
+                .ok_or("this profile no longer exists")?
+                .mappings = next.clone();
+            mappings::save_config(path, &config)?;
+        }
+        None => mappings::save(path, &next)?,
+    }
     *current = next;
     Ok(())
 }
@@ -4785,7 +4972,16 @@ const FAMILIES: [&str; 8] = [
 ];
 
 fn configure(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) -> Result<()> {
-    configure_steps(ui, path, current).map_err(|error| {
+    configure_for(ui, path, current, None)
+}
+/// /configure for Default (`None`) or one app profile's overrides (v7 ticket 12).
+fn configure_for(
+    ui: &mut impl Ui,
+    path: &Path,
+    current: &mut Vec<Mapping>,
+    profile: Option<&str>,
+) -> Result<()> {
+    configure_steps(ui, path, current, profile).map_err(|error| {
         let text = error.to_string();
         if STAGES.iter().any(|s| text.starts_with(&format!("{s}: "))) {
             error
@@ -4801,7 +4997,12 @@ fn listed(mapping: &Mapping, context: u8) -> bool {
     mapping.context == context || mappings::gamepad_context(mapping.context)
 }
 
-fn configure_steps(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) -> Result<()> {
+fn configure_steps(
+    ui: &mut impl Ui,
+    path: &Path,
+    current: &mut Vec<Mapping>,
+    profile: Option<&str>,
+) -> Result<()> {
     loop {
         let Some(action) = configure_choice(ui)? else {
             return Ok(());
@@ -4871,7 +5072,8 @@ fn configure_steps(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) ->
                 &options(&["Cancel", "Remove assignment"]),
             )? == Some(1)
             {
-                commit(path, current, pad, pad_context, None).map_err(stage("file I/O"))?;
+                commit(path, current, pad, pad_context, None, profile)
+                    .map_err(stage("file I/O"))?;
             }
             continue;
         }
@@ -5091,6 +5293,7 @@ fn configure_steps(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) ->
         let Some(feedback) = (if mapping.action != crate::actions::Action::Shortcut
             || mapping.input != mappings::Input::Pad
             || mapping.context > 7
+            || profile.is_some()
         {
             Some(crate::feedback::Feedback::default())
         } else {
@@ -5154,7 +5357,7 @@ fn configure_steps(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) ->
             &options(&["Save and configure another", "Save and finish", "Cancel"]),
         )? {
             Some(choice @ (0 | 1)) => {
-                commit(path, current, pad, mapping.context, Some(mapping))
+                commit(path, current, pad, mapping.context, Some(mapping), profile)
                     .map_err(stage("file I/O"))?;
                 if choice == 1 {
                     return Ok(());
@@ -5175,6 +5378,7 @@ pub fn daemon(path: &Path, current: Vec<Mapping>) -> Result<()> {
     ui.follow_programs = true;
     ui.use_device(&config, &current)?;
     ui.open_gamepad();
+    ui.follow_apps = true;
     let flow_ready = match ui.startup_flow() {
         Ok(()) => true,
         Err(error) => {
@@ -5413,11 +5617,7 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
     let config = mappings::load_config(path)?;
     ui.idle = config.idle;
     ui.start_flow_enabled = config.start_flow;
-    ui.run_mappings = current
-        .iter()
-        .filter(|mapping| mapping.context == ui.context)
-        .cloned()
-        .collect();
+    ui.run_mappings = ui.context_mappings(&current);
     if initial == "detect" {
         return ui.detect();
     }
@@ -5429,6 +5629,7 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
     ui.follow_programs = true;
     ui.use_device(&config, &current)?;
     ui.open_gamepad();
+    ui.follow_apps = true;
     let flow_ready = match ui.startup_flow() {
         Ok(()) => true,
         Err(error) => {
@@ -5442,11 +5643,7 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
         ui.notice = "Detecting the controller’s current program before enabling actions.".into();
     }
     loop {
-        ui.run_mappings = current
-            .iter()
-            .filter(|mapping| mapping.context == ui.context)
-            .cloned()
-            .collect();
+        ui.run_mappings = ui.context_mappings(&current);
         ui.at_menu = true;
         let Some(command) = command_menu(&mut ui)? else {
             return Ok(());
@@ -5460,11 +5657,7 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
                 // A reassigned pad must not keep its old action's status.
                 ui.phases.clear();
                 ui.probed.clear();
-                ui.run_mappings = current
-                    .iter()
-                    .filter(|mapping| mapping.context == ui.context)
-                    .cloned()
-                    .collect();
+                ui.run_mappings = ui.context_mappings(&current);
                 let all = ui.with_gamepad(&ui.run_mappings)?;
                 if let Some(output) = &mut ui.output {
                     output.keyboard.replace(&all)?;
@@ -5478,11 +5671,7 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
                 &options(&["Back"]),
             ).map(|_| ()),
             1 => ui.run(
-                &current
-                    .iter()
-                    .filter(|m| m.context == ui.context)
-                    .cloned()
-                    .collect::<Vec<_>>(),
+                &ui.context_mappings(&current),
             ),
             2 => {
                 let labels = current
@@ -5602,11 +5791,7 @@ Running/paused mode is retained; held keys and toggles start inactive.",
                     ui.notice.clear();
                     ui.feedback_allowed = true;
                     ui.idle = mappings::load_config(path)?.idle_for(ui.context);
-                    ui.run_mappings = current
-                        .iter()
-                        .filter(|m| m.context == ui.context)
-                        .cloned()
-                        .collect();
+                    ui.run_mappings = ui.context_mappings(&current);
                     let all = ui.with_gamepad(&ui.run_mappings)?;
                     if let Some(output) = &mut ui.output {
                         output.keyboard.replace(&all)?;
@@ -5651,14 +5836,7 @@ Running/paused mode is retained; held keys and toggles start inactive.",
                 && was_running
                 && matches!(command, 0 | 6 | 7 | 8 | 9 | 10 | 14 | 17 | 18)
             {
-                ui.run_mode(
-                    &current
-                        .iter()
-                        .filter(|m| m.context == ui.context)
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                    false,
-                )?;
+                ui.run_mode(&ui.context_mappings(&current), false)?;
             } else if refresh_idle_after_menu(command, was_running, ui.context_verified) {
                 // Menus may restore the original hardware baseline; paused mode still owns its idle setup.
                 ui.selected_idle()?;
@@ -5792,6 +5970,8 @@ mod tests {
         /// Connected other MIDI devices and the session's context (v7 ticket 06).
         midi_devices: Vec<String>,
         context: u8,
+        /// Installed apps offered by the app list, when set (v7 ticket 12).
+        apps: Vec<(String, String)>,
     }
     impl Ui for Script {
         fn midi_devices(&mut self) -> Result<Vec<String>> {
@@ -5818,6 +5998,9 @@ mod tests {
             }
         }
         fn applications(&self) -> Result<Vec<(String, String)>> {
+            if !self.apps.is_empty() {
+                return Ok(self.apps.clone());
+            }
             Ok(vec![(
                 "Recorded app".into(),
                 "/nonexistent/recorded.desktop".into(),
@@ -5963,7 +6146,7 @@ mod tests {
         let mut candidate = Mapping::new(pad, "Shift", "toggle").unwrap();
         candidate.context = 1;
         candidate.label = saved.label.clone();
-        let error = commit(&path, &mut current, pad, 1, Some(candidate.clone())).unwrap_err();
+        let error = commit(&path, &mut current, pad, 1, Some(candidate.clone()), None).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -5984,7 +6167,7 @@ mod tests {
             .unwrap()
             .unwrap()]
         .clone();
-        commit(&path, &mut current, pad, 1, Some(candidate)).unwrap();
+        commit(&path, &mut current, pad, 1, Some(candidate), None).unwrap();
         assert_eq!(mappings::load(&path).unwrap(), current);
         assert!(current.contains(&saved));
         assert!(pad_labels(saved.control, &current, 1).contains(&saved.label));
@@ -6878,6 +7061,64 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7 ticket 12: Settings -> App profiles creates a profile for an installed app, maps
+    /// its pads (overrides only, no feedback step) and deletes it; Default is untouched.
+    #[test]
+    fn app_profiles_are_created_edited_and_deleted() {
+        use Key::*;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-profile-ui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let pad = Control::from_note(10, 36).unwrap();
+        let default = Mapping::new(pad, "F1", "hold").unwrap();
+        mappings::save(&path, &[default.clone()]).unwrap();
+        let mut keys = vec![Down; 9];
+        keys.push(Enter); // App profiles
+        keys.push(Enter); // New profile
+        keys.extend(b"Firefox".iter().map(|b| Character(*b)));
+        keys.extend([Enter, Enter]); // name, the app
+        keys.extend([Enter, Enter]); // Firefox, edit its pads
+        keys.extend([Enter, Enter, Enter, Enter, Space, Enter]); // learn, Ctrl
+        keys.extend(std::iter::repeat_n(Down, 7));
+        keys.extend([Enter, Enter, Enter]); // done, hold, fire when: no feedback step
+        keys.extend([Down, Enter]); // save and finish
+        keys.push(Escape); // leave the profiles list
+        keys.push(Escape); // leave Settings
+        let mut ui = Script {
+            keys: keys.into(),
+            pads: [pad].into(),
+            apps: vec![(
+                "Firefox".into(),
+                "/usr/share/applications/firefox.desktop".into(),
+            )],
+            ..Default::default()
+        };
+        settings_menu(&mut ui, &path).unwrap();
+        assert!(ui.keys.is_empty());
+        let config = mappings::load_config(&path).unwrap();
+        assert_eq!(config.mappings, [default.clone()], "Default untouched");
+        let profile = config.profile_for("firefox.desktop").unwrap();
+        assert_eq!(profile.name, "Firefox");
+        assert_eq!(profile.mappings.len(), 1);
+        assert_eq!(profile.mappings[0].keys, ["Ctrl"]);
+        let set = mappings::overlay(&config.mappings, Some(profile), 0);
+        assert_eq!(set[0].keys, ["Ctrl"]);
+
+        let mut keys = vec![Down; 9];
+        keys.extend([Enter, Enter, Down, Down, Enter, Down, Enter, Escape, Escape]);
+        let mut ui = Script {
+            keys: keys.into(),
+            ..Default::default()
+        };
+        settings_menu(&mut ui, &path).unwrap();
+        let config = mappings::load_config(&path).unwrap();
+        assert!(config.profiles.is_empty());
+        assert_eq!(config.mappings, [default]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn menus_save_both_banks_cancel_edit_remove_and_preserve_failed_save() {
         use Key::*;
@@ -6919,7 +7160,7 @@ mod tests {
         assert_eq!(current[0].keys, ["Shift"]);
         std::fs::write(path.with_extension("tmp"), "occupied").unwrap();
         let previous = current.clone();
-        assert!(commit(&path, &mut current, a, 0, None).is_err());
+        assert!(commit(&path, &mut current, a, 0, None, None).is_err());
         assert_eq!(current, previous);
         assert_eq!(mappings::load(&path).unwrap(), previous);
         std::fs::remove_dir_all(dir).unwrap();
@@ -7597,7 +7838,10 @@ mod tests {
         // Ticket 17: a v14 file's per-agent tempos become the shared slow/fast tempos.
         let v14 = saved
             .replace("vibeconsole-mappings-v16", "vibeconsole-mappings-v14")
-            .replace("tuning\t15\t30\t10\toff\nmidi-devices\t0\nmidi-active\t-\n", "")
+            .replace(
+                "tuning\t15\t30\t10\toff\nmidi-devices\t0\nmidi-active\t-\nprofiles\t0\n",
+                "",
+            )
             .replace(
                 "light-tempos\t50\t240\nlight-pattern\tneeds-decision\tfast\talternate\nlight-pattern\tneeds-input\tfast\tsteady\nlight-pattern\tthinking\tslow\toff\nlight-pattern\tfinished\toff\tblink\n",
                 "",

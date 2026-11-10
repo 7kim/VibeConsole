@@ -546,6 +546,92 @@ pub struct Config {
     pub midi_devices: Vec<String>,
     /// The MIDI device the session uses: None is the Akai.
     pub midi_active: Option<String>,
+    /// v7 ticket 12: per-app overrides; an app with no profile uses Default.
+    pub profiles: Vec<Profile>,
+}
+/// An app profile (v7 ticket 12): while one of its apps is focused, its mappings replace
+/// the Default ones for the same controls; every other control keeps its Default meaning.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Profile {
+    pub name: String,
+    /// Desktop IDs, e.g. `firefox.desktop`: identifiers, never commands.
+    pub apps: Vec<String>,
+    /// Overrides only: pads and Xbox buttons, no feedback.
+    pub mappings: Vec<Mapping>,
+}
+/// A profile name: one printable line, 1–32 characters.
+pub fn valid_profile_name(name: &str) -> bool {
+    !name.trim().is_empty()
+        && name.chars().count() <= 32
+        && name != "-"
+        && !name.chars().any(char::is_control)
+}
+/// A desktop ID (`firefox.desktop`, `com.t3tools.T3Code.desktop`): letters, digits, `.`,
+/// `-` and `_` only, so it can never be a path or a command.
+pub fn valid_app_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && !id.starts_with(['.', '-'])
+        && !id.contains("..")
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+}
+fn validate_profiles(profiles: &[Profile]) -> Result<()> {
+    if profiles.len() > 32 {
+        return Err("too many app profiles (32 at most)".into());
+    }
+    let mut apps = HashSet::new();
+    for (i, profile) in profiles.iter().enumerate() {
+        if !valid_profile_name(&profile.name) {
+            return Err(format!("invalid profile name {:?}", profile.name).into());
+        }
+        if profiles[..i].iter().any(|p| p.name == profile.name) {
+            return Err(format!("profile {} exists twice", profile.name).into());
+        }
+        for app in &profile.apps {
+            if !valid_app_id(app) {
+                return Err(format!("invalid app ID {app:?} in profile {}", profile.name).into());
+            }
+            if !apps.insert(app.as_str()) {
+                return Err(format!("{app} is in two profiles").into());
+            }
+        }
+        let mut seen = HashSet::new();
+        for mapping in &profile.mappings {
+            mapping.validate()?;
+            if mapping.input != Input::Pad || mapping.feedback.enabled() {
+                return Err(format!(
+                    "profile {}: overrides are pads and Xbox buttons without feedback",
+                    profile.name
+                )
+                .into());
+            }
+            if !seen.insert((mapping.context, mapping.control)) {
+                return Err(format!("profile {}: a control is set twice", profile.name).into());
+            }
+        }
+    }
+    Ok(())
+}
+/// One context's mappings with a profile's overrides on top (v7 ticket 12).
+pub fn overlay(all: &[Mapping], profile: Option<&Profile>, context: u8) -> Vec<Mapping> {
+    let overrides = profile
+        .map(|p| {
+            p.mappings
+                .iter()
+                .filter(|m| m.context == context)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut set = all
+        .iter()
+        .filter(|m| m.context == context && !overrides.iter().any(|o| o.control == m.control))
+        .cloned()
+        .collect::<Vec<_>>();
+    set.extend(overrides.into_iter().cloned());
+    set.sort_by_key(|m| (m.context, m.control));
+    set
 }
 /// Gamepad tuning (v7 config v16): stick dead zone and trigger fire point in percent of
 /// travel, mouse speed 1–50, rumble on/off. Defaults are safe: rumble off.
@@ -602,6 +688,7 @@ impl Default for Config {
             tuning: Tuning::default(),
             midi_devices: Vec::new(),
             midi_active: None,
+            profiles: Vec::new(),
         }
     }
 }
@@ -614,6 +701,14 @@ fn device_field(context: u8) -> &'static str {
     }
 }
 impl Config {
+    pub fn profile_for(&self, app: &str) -> Option<&Profile> {
+        self.profiles
+            .iter()
+            .find(|p| p.apps.iter().any(|a| a == app))
+    }
+    pub fn profile(&self, name: &str) -> Option<&Profile> {
+        self.profiles.iter().find(|p| p.name == name)
+    }
     pub fn device_context(&self, name: &str) -> Option<u8> {
         let index = self.midi_devices.iter().position(|d| d == name)?;
         Some(DEVICE_CONTEXT + u8::try_from(index).ok()?)
@@ -1158,119 +1253,161 @@ fn parse_config(contents: &str) -> Result<Config> {
         midi_active = (active != "-").then(|| active.to_owned());
         validate_devices(&midi_devices, midi_active.as_ref())?;
     }
+    let parse_mapping = |line: &str| -> Result<Mapping> {
+        let fields: Vec<_> = line.split('\t').collect();
+        if fields.len()
+            != match version {
+                1 => 6,
+                2 => 9,
+                3 => 13,
+                4..=8 => 14,
+                9 | 10 => 15,
+                _ => 16,
+            }
+        {
+            return Err("wrong mapping field count".into());
+        }
+        let (context, label, fields) = if version >= 3 {
+            (fields[0].parse::<u8>()?, Some(fields[1]), &fields[3..])
+        } else {
+            (0, None, fields.as_slice())
+        };
+        let offset = usize::from(version >= 3);
+        let (behavior, shortcut) = (fields[4 + offset], fields[5 + offset]);
+        let [device, message, channel, note] = &fields[..4] else {
+            unreachable!()
+        };
+        let other = context >= DEVICE_CONTEXT;
+        if other && usize::from(context - DEVICE_CONTEXT) >= midi_devices.len() {
+            return Err("mapping for an unlisted MIDI device".into());
+        }
+        if *device != device_field(context) || (version < 3 && *message != "note") {
+            return Err("unsupported device or MIDI message type".into());
+        }
+        let pad = if version >= 3 {
+            let message = match *message {
+                "note" => crate::Message::Note,
+                "cc" => crate::Message::Cc,
+                "bend" => crate::Message::Bend,
+                "button" if version >= 16 => crate::Message::Button,
+                _ => return Err("unsupported MIDI message type".into()),
+            };
+            let control = Control {
+                channel: channel.parse()?,
+                id: note.parse()?,
+                message,
+                direction: fields[4].parse()?,
+            };
+            control.validate()?;
+            control
+        } else {
+            Control::from_note(channel.parse()?, note.parse()?)
+                .ok_or("unsupported pad channel or note")?
+        };
+        let action = if version >= 4 {
+            crate::actions::Action::parse(fields[10])?
+        } else {
+            crate::actions::Action::Shortcut
+        };
+        let mut mapping = if action == crate::actions::Action::Shortcut {
+            Mapping::new(pad, shortcut, behavior)?
+        } else {
+            if behavior != "trigger" || shortcut != "-" {
+                return Err("invalid action shortcut/behavior fields".into());
+            }
+            Mapping::new_action(pad, line.split('\t').nth(2).unwrap().parse()?, action)?
+        };
+        mapping.context = context;
+        mapping.risky = match fields.get(11).filter(|_| version >= 9) {
+            None | Some(&"-") => false,
+            Some(&"risky") => true,
+            Some(_) => return Err("expected risky or -".into()),
+        };
+        mapping.status = match fields.get(12).filter(|_| version >= 11) {
+            None | Some(&"-") => false,
+            Some(&"status") => true,
+            Some(_) => return Err("expected status or -".into()),
+        };
+        if version >= 3 {
+            mapping.input = line.split('\t').nth(2).unwrap().parse()?;
+        }
+        if let Some(label) = label {
+            mapping.label = label.to_owned();
+        }
+        if version >= 2 {
+            let octave = match fields[6 + offset] {
+                "-" => None,
+                value => {
+                    let (kind, n) = value.split_once(':').ok_or("invalid octave setting")?;
+                    Some(match kind {
+                        "offset" => Octave::Offset(n.parse()?),
+                        "absolute" => Octave::Absolute(n.parse()?),
+                        _ => return Err("invalid octave mode".into()),
+                    })
+                }
+            };
+            mapping.feedback = Feedback {
+                octave,
+                tempo: optional(fields[7 + offset])?,
+                arp: arp(fields[8 + offset])?,
+            };
+            mapping.validate()?;
+        }
+        mapping.validate()?;
+        Ok(mapping)
+    };
+    let mut profiles = Vec::new();
+    if version >= 16 {
+        let count: usize = lines
+            .next()
+            .and_then(|l| l.strip_prefix("profiles\t"))
+            .ok_or("expected profiles count")?
+            .parse()?;
+        if count > 32 {
+            return Err("too many app profiles (32 at most)".into());
+        }
+        for _ in 0..count {
+            let line = lines.next().ok_or("missing profile")?;
+            let ["profile", name, apps, overrides] = line.split('\t').collect::<Vec<_>>()[..]
+            else {
+                return Err("invalid profile record".into());
+            };
+            let overrides: usize = overrides.parse()?;
+            if overrides > 512 {
+                return Err(format!("profile {name}: too many overrides").into());
+            }
+            let mut profile = Profile {
+                name: name.to_owned(),
+                apps: if apps == "-" {
+                    Vec::new()
+                } else {
+                    apps.split(',').map(str::to_owned).collect()
+                },
+                mappings: Vec::new(),
+            };
+            for _ in 0..overrides {
+                let line = lines.next().ok_or("missing profile override")?;
+                profile
+                    .mappings
+                    .push(parse_mapping(line).map_err(|e| format!("profile {name}: {e}"))?);
+            }
+            profiles.push(profile);
+        }
+        validate_profiles(&profiles)?;
+    }
     let mut mappings = Vec::new();
     let mut seen = HashSet::new();
     let mut labels = HashSet::new();
     for (index, line) in lines.enumerate() {
-        let result = (|| -> Result<Mapping> {
-            let fields: Vec<_> = line.split('\t').collect();
-            if fields.len()
-                != match version {
-                    1 => 6,
-                    2 => 9,
-                    3 => 13,
-                    4..=8 => 14,
-                    9 | 10 => 15,
-                    _ => 16,
-                }
-            {
-                return Err("wrong mapping field count".into());
-            }
-            let (context, label, fields) = if version >= 3 {
-                (fields[0].parse::<u8>()?, Some(fields[1]), &fields[3..])
-            } else {
-                (0, None, fields.as_slice())
-            };
-            let offset = usize::from(version >= 3);
-            let (behavior, shortcut) = (fields[4 + offset], fields[5 + offset]);
-            let [device, message, channel, note] = &fields[..4] else {
-                unreachable!()
-            };
-            let other = context >= DEVICE_CONTEXT;
-            if other && usize::from(context - DEVICE_CONTEXT) >= midi_devices.len() {
-                return Err("mapping for an unlisted MIDI device".into());
-            }
-            if *device != device_field(context) || (version < 3 && *message != "note") {
-                return Err("unsupported device or MIDI message type".into());
-            }
-            let pad = if version >= 3 {
-                let message = match *message {
-                    "note" => crate::Message::Note,
-                    "cc" => crate::Message::Cc,
-                    "bend" => crate::Message::Bend,
-                    "button" if version >= 16 => crate::Message::Button,
-                    _ => return Err("unsupported MIDI message type".into()),
-                };
-                let control = Control {
-                    channel: channel.parse()?,
-                    id: note.parse()?,
-                    message,
-                    direction: fields[4].parse()?,
-                };
-                control.validate()?;
-                control
-            } else {
-                Control::from_note(channel.parse()?, note.parse()?)
-                    .ok_or("unsupported pad channel or note")?
-            };
-            let action = if version >= 4 {
-                crate::actions::Action::parse(fields[10])?
-            } else {
-                crate::actions::Action::Shortcut
-            };
-            let mut mapping = if action == crate::actions::Action::Shortcut {
-                Mapping::new(pad, shortcut, behavior)?
-            } else {
-                if behavior != "trigger" || shortcut != "-" {
-                    return Err("invalid action shortcut/behavior fields".into());
-                }
-                Mapping::new_action(pad, line.split('\t').nth(2).unwrap().parse()?, action)?
-            };
-            mapping.context = context;
-            mapping.risky = match fields.get(11).filter(|_| version >= 9) {
-                None | Some(&"-") => false,
-                Some(&"risky") => true,
-                Some(_) => return Err("expected risky or -".into()),
-            };
-            mapping.status = match fields.get(12).filter(|_| version >= 11) {
-                None | Some(&"-") => false,
-                Some(&"status") => true,
-                Some(_) => return Err("expected status or -".into()),
-            };
-            if version >= 3 {
-                mapping.input = line.split('\t').nth(2).unwrap().parse()?;
-            }
-            if let Some(label) = label {
-                mapping.label = label.to_owned();
-            }
-            if version >= 2 {
-                let octave = match fields[6 + offset] {
-                    "-" => None,
-                    value => {
-                        let (kind, n) = value.split_once(':').ok_or("invalid octave setting")?;
-                        Some(match kind {
-                            "offset" => Octave::Offset(n.parse()?),
-                            "absolute" => Octave::Absolute(n.parse()?),
-                            _ => return Err("invalid octave mode".into()),
-                        })
-                    }
-                };
-                mapping.feedback = Feedback {
-                    octave,
-                    tempo: optional(fields[7 + offset])?,
-                    arp: arp(fields[8 + offset])?,
-                };
-                mapping.validate()?;
-            }
-            mapping.validate()?;
-            if !seen.insert((context, pad)) {
+        let result = parse_mapping(line).and_then(|mapping| {
+            if !seen.insert((mapping.context, mapping.control)) {
                 return Err("duplicate control assignment in context".into());
             }
-            if !labels.insert((context, mapping.label.clone())) {
+            if !labels.insert((mapping.context, mapping.label.clone())) {
                 return Err("duplicate physical label in context".into());
             }
             Ok(mapping)
-        })();
+        });
         mappings
             .push(result.map_err(|error| format!("configuration line {}: {error}", index + 2))?);
     }
@@ -1319,6 +1456,7 @@ fn parse_config(contents: &str) -> Result<Config> {
         tuning,
         midi_devices,
         midi_active,
+        profiles,
     })
 }
 
@@ -1357,6 +1495,39 @@ pub fn save(path: &Path, mappings: &[Mapping]) -> Result<()> {
     let mut config = load_config(path)?;
     config.mappings = mappings.to_vec();
     save_config(path, &config)
+}
+
+/// One mapping as a config line (Default mappings and profile overrides alike).
+fn mapping_line(mapping: &Mapping) -> Result<String> {
+    mapping.validate()?;
+    let feedback = mapping.feedback;
+    let device = device_field(mapping.context);
+    let octave = match feedback.octave {
+        None => "-".into(),
+        Some(Octave::Offset(n)) => format!("offset:{n}"),
+        Some(Octave::Absolute(n)) => format!("absolute:{n}"),
+    };
+    Ok(format!(
+        "{}\t{}\t{}\t{device}\t{}\t{}\t{}\t{}\t{}\t{}\t{octave}\t{}\t{}\t{}\t{}\t{}\n",
+        mapping.context,
+        mapping.label,
+        mapping.input,
+        mapping.control.message.text(),
+        mapping.control.channel,
+        mapping.control.id,
+        mapping.control.direction,
+        mapping.behavior,
+        if mapping.keys.is_empty() {
+            "-".into()
+        } else {
+            mapping.keys.join("+")
+        },
+        opt_text(feedback.tempo),
+        arp_text(feedback.arp),
+        mapping.action.encode(),
+        if mapping.risky { "risky" } else { "-" },
+        if mapping.status { "status" } else { "-" }
+    ))
 }
 
 pub fn save_config(path: &Path, config: &Config) -> Result<()> {
@@ -1457,36 +1628,25 @@ pub fn save_config(path: &Path, config: &Config) -> Result<()> {
         config.midi_active.as_deref().unwrap_or("-")
     ));
     validate_devices(&config.midi_devices, config.midi_active.as_ref())?;
-    for mapping in &config.mappings {
-        mapping.validate()?;
-        let feedback = mapping.feedback;
-        let device = device_field(mapping.context);
-        let octave = match feedback.octave {
-            None => "-".into(),
-            Some(Octave::Offset(n)) => format!("offset:{n}"),
-            Some(Octave::Absolute(n)) => format!("absolute:{n}"),
-        };
+    validate_profiles(&config.profiles)?;
+    contents.push_str(&format!("profiles\t{}\n", config.profiles.len()));
+    for profile in &config.profiles {
         contents.push_str(&format!(
-            "{}\t{}\t{}\t{device}\t{}\t{}\t{}\t{}\t{}\t{}\t{octave}\t{}\t{}\t{}\t{}\t{}\n",
-            mapping.context,
-            mapping.label,
-            mapping.input,
-            mapping.control.message.text(),
-            mapping.control.channel,
-            mapping.control.id,
-            mapping.control.direction,
-            mapping.behavior,
-            if mapping.keys.is_empty() {
-                "-".into()
+            "profile\t{}\t{}\t{}\n",
+            profile.name,
+            if profile.apps.is_empty() {
+                "-".to_owned()
             } else {
-                mapping.keys.join("+")
+                profile.apps.join(",")
             },
-            opt_text(feedback.tempo),
-            arp_text(feedback.arp),
-            mapping.action.encode(),
-            if mapping.risky { "risky" } else { "-" },
-            if mapping.status { "status" } else { "-" }
+            profile.mappings.len()
         ));
+        for mapping in &profile.mappings {
+            contents.push_str(&mapping_line(mapping)?);
+        }
+    }
+    for mapping in &config.mappings {
+        contents.push_str(&mapping_line(mapping)?);
     }
     parse_config(&contents)?;
     fs::create_dir_all(path.parent().ok_or("configuration path has no parent")?)?;
@@ -2096,6 +2256,124 @@ mod tests {
         assert!(save_config(&path, &bad).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), text);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 12: an app profile holds overrides only. Its pads and buttons replace
+    /// the Default ones in the same context; everything else keeps its Default meaning.
+    #[test]
+    fn app_profiles_round_trip_and_override_only_what_they_set() {
+        let dir = std::env::temp_dir().join(format!("vibeconsole-profiles-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let pad1 = Control::from_note(10, 36).unwrap();
+        let pad2 = Control::from_note(10, 37).unwrap();
+        let mut config = Config::default();
+        config.mappings = vec![
+            Mapping::new(pad1, "F1", "hold").unwrap(),
+            Mapping::new(pad2, "F2", "hold").unwrap(),
+        ];
+        let mut firefox_pad1 = Mapping::new(pad1, "Ctrl+T", "hold").unwrap();
+        firefox_pad1.label = "Bank A Pad 1".into();
+        config.profiles = vec![Profile {
+            name: "Firefox".into(),
+            apps: vec![
+                "firefox.desktop".into(),
+                "org.mozilla.firefox.desktop".into(),
+            ],
+            mappings: vec![firefox_pad1],
+        }];
+        save_config(&path, &config).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains(
+            "\nprofiles\t1\nprofile\tFirefox\tfirefox.desktop,org.mozilla.firefox.desktop\t1\n0\t"
+        ));
+        let loaded = load_config(&path).unwrap();
+        assert_eq!(loaded, config);
+        assert_eq!(
+            loaded.profile_for("firefox.desktop").unwrap().name,
+            "Firefox"
+        );
+        assert!(loaded.profile_for("org.gnome.Ptyxis.desktop").is_none());
+        let profile = loaded.profile_for("firefox.desktop");
+        let set = overlay(&loaded.mappings, profile, 0);
+        assert_eq!(set.len(), 2);
+        assert_eq!(
+            set.iter().find(|m| m.control == pad1).unwrap().keys,
+            ["Ctrl", "T"]
+        );
+        assert_eq!(set.iter().find(|m| m.control == pad2).unwrap().keys, ["F2"]);
+        assert_eq!(overlay(&loaded.mappings, None, 0), loaded.mappings);
+        // Refused, keeping the file: bad names and app IDs, an app in two profiles, and
+        // overrides that aren't plain pads/buttons without feedback.
+        let refused = |change: &dyn Fn(&mut Config)| {
+            let mut bad = config.clone();
+            change(&mut bad);
+            assert!(save_config(&path, &bad).is_err());
+            assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        };
+        refused(&|c| c.profiles[0].name = "".into());
+        refused(&|c| c.profiles[0].name = "a\tb".into());
+        refused(&|c| c.profiles[0].apps = vec!["../evil.desktop".into()]);
+        refused(&|c| c.profiles[0].apps = vec!["firefox.desktop; rm -rf ~".into()]);
+        refused(&|c| {
+            let mut other = c.profiles[0].clone();
+            other.name = "Other".into();
+            other.mappings.clear();
+            c.profiles.push(other);
+        });
+        refused(&|c| c.profiles[0].mappings[0].feedback.tempo = Some(120));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 12: a focus change is a transition: a key held under Default is released,
+    /// its release sends nothing, and the next press uses the profile's action.
+    #[test]
+    fn focus_change_releases_held_keys_and_the_next_press_uses_the_profile() {
+        use evdev::KeyCode;
+        let pad = Control::from_note(10, 36).unwrap();
+        let default = vec![Mapping::new(pad, "F1", "hold").unwrap()];
+        let profile = Profile {
+            name: "Firefox".into(),
+            apps: vec!["firefox.desktop".into()],
+            mappings: vec![Mapping::new(pad, "F2", "hold").unwrap()],
+        };
+        let mut keyboard = crate::keyboard::Keyboard::new(&overlay(&default, None, 0)).unwrap();
+        keyboard.resume();
+        let mut sent = Vec::new();
+        let mut emit = |key, down| {
+            sent.push((key, down));
+            Ok(())
+        };
+        keyboard
+            .observe(crate::Event::Press(pad), &mut emit)
+            .unwrap();
+        // Firefox focused: what the session does on a profile change.
+        keyboard.pause(&mut emit).unwrap();
+        keyboard
+            .prepare_connection(
+                &overlay(&default, Some(&profile), 0),
+                &[pad].into(),
+                &mut false,
+            )
+            .unwrap();
+        keyboard.resume();
+        keyboard
+            .observe(
+                crate::Event::Release(pad, crate::ReleaseType::NoteOff),
+                &mut emit,
+            )
+            .unwrap();
+        keyboard
+            .observe(crate::Event::Press(pad), &mut emit)
+            .unwrap();
+        assert_eq!(
+            sent,
+            [
+                (KeyCode::KEY_F1, true),
+                (KeyCode::KEY_F1, false),
+                (KeyCode::KEY_F2, true),
+            ]
+        );
     }
 
     #[test]

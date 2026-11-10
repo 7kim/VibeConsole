@@ -11,6 +11,9 @@ const IFACE = `<node>
       <arg type="s" direction="in" name="app"/>
       <arg type="s" direction="out" name="state"/>
     </method>
+    <method name="Focused">
+      <arg type="s" direction="out" name="app"/>
+    </method>
     <method name="Apply">
       <arg type="s" direction="in" name="app"/>
       <arg type="s" direction="in" name="action"/>
@@ -36,6 +39,12 @@ class Windows {
         if (windows.every(w => w.minimized))
             return 'minimized';
         return windows.some(w => w.has_focus()) ? 'focused' : 'background';
+    }
+
+    // The focused window's desktop ID (v7 app profiles), or '' when none is known.
+    Focused() {
+        const app = Shell.WindowTracker.get_default().focus_app;
+        return app?.get_id() ?? '';
     }
 
     // minimize | close | restore; returns how many windows it acted on.
