@@ -157,8 +157,13 @@ pub struct Mapping {
     pub status: bool,
 }
 
+/// Other MIDI devices (v7) use contexts from here up, one per listed device, so their
+/// mappings never mix with the Akai's Programs 1–8 or legacy contexts.
+pub const DEVICE_CONTEXT: u8 = 240;
 pub fn program_label(context: u8) -> String {
-    if context < 8 {
+    if context >= DEVICE_CONTEXT {
+        format!("Other MIDI device {}", context - DEVICE_CONTEXT + 1)
+    } else if context < 8 {
         format!("Program {}", context + 1)
     } else {
         format!("Legacy context {context} (not one of Programs 1–8)")
@@ -300,7 +305,7 @@ impl Mapping {
                 "application/system actions require Trigger, empty keys, and no feedback".into(),
             );
         }
-        if self.context > 16
+        if (self.context > 16 && self.context < DEVICE_CONTEXT)
             || self.label.is_empty()
             || self.label.len() > 80
             || self.label.chars().any(char::is_control)
@@ -519,6 +524,10 @@ pub struct Config {
     pub light_patterns: crate::status::Patterns,
     /// v7: gamepad stick/trigger tuning, mouse speed and rumble (config v16).
     pub tuning: Tuning,
+    /// v7: other MIDI devices by device name; the n-th uses context `DEVICE_CONTEXT + n`.
+    pub midi_devices: Vec<String>,
+    /// The MIDI device the session uses: None is the Akai.
+    pub midi_active: Option<String>,
 }
 /// Gamepad tuning (v7 config v16): stick dead zone and trigger fire point in percent of
 /// travel, mouse speed 1–50, rumble on/off. Defaults are safe: rumble off.
@@ -573,8 +582,40 @@ impl Default for Config {
             light_other_on: false,
             light_patterns: crate::status::Patterns::default(),
             tuning: Tuning::default(),
+            midi_devices: Vec::new(),
+            midi_active: None,
         }
     }
+}
+impl Config {
+    pub fn device_context(&self, name: &str) -> Option<u8> {
+        let index = self.midi_devices.iter().position(|d| d == name)?;
+        Some(DEVICE_CONTEXT + u8::try_from(index).ok()?)
+    }
+}
+/// A MIDI device name: one printable line, at most 64 characters, never `-`.
+pub fn valid_device_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "-"
+        && name.chars().count() <= 64
+        && !name.chars().any(char::is_control)
+}
+fn validate_devices(devices: &[String], active: Option<&String>) -> Result<()> {
+    if devices.len() > usize::from(u8::MAX - DEVICE_CONTEXT) + 1 {
+        return Err("too many MIDI devices (16 at most)".into());
+    }
+    for (i, name) in devices.iter().enumerate() {
+        if !valid_device_name(name) {
+            return Err(format!("invalid MIDI device name {name:?}").into());
+        }
+        if devices[..i].contains(name) {
+            return Err(format!("MIDI device {name} listed twice").into());
+        }
+    }
+    if active.is_some_and(|a| !devices.contains(a)) {
+        return Err("the active MIDI device isn't listed".into());
+    }
+    Ok(())
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Agent {
@@ -1067,6 +1108,30 @@ fn parse_config(contents: &str) -> Result<Config> {
     } else {
         Tuning::default()
     };
+    let (mut midi_devices, mut midi_active) = (Vec::new(), None);
+    if version >= 16 {
+        let count: usize = lines
+            .next()
+            .and_then(|l| l.strip_prefix("midi-devices\t"))
+            .ok_or("expected midi-devices count")?
+            .parse()?;
+        if count > 16 {
+            return Err("too many MIDI devices (16 at most)".into());
+        }
+        for _ in 0..count {
+            let name = lines
+                .next()
+                .and_then(|l| l.strip_prefix("midi-device\t"))
+                .ok_or("expected midi-device record")?;
+            midi_devices.push(name.to_owned());
+        }
+        let active = lines
+            .next()
+            .and_then(|l| l.strip_prefix("midi-active\t"))
+            .ok_or("expected midi-active")?;
+        midi_active = (active != "-").then(|| active.to_owned());
+        validate_devices(&midi_devices, midi_active.as_ref())?;
+    }
     let mut mappings = Vec::new();
     let mut seen = HashSet::new();
     let mut labels = HashSet::new();
@@ -1095,7 +1160,12 @@ fn parse_config(contents: &str) -> Result<Config> {
             let [device, message, channel, note] = &fields[..4] else {
                 unreachable!()
             };
-            if *device != DEVICE || (version < 3 && *message != "note") {
+            let other = context >= DEVICE_CONTEXT;
+            if other && usize::from(context - DEVICE_CONTEXT) >= midi_devices.len() {
+                return Err("mapping for an unlisted MIDI device".into());
+            }
+            if *device != if other { "midi" } else { DEVICE } || (version < 3 && *message != "note")
+            {
                 return Err("unsupported device or MIDI message type".into());
             }
             let pad = if version >= 3 {
@@ -1221,6 +1291,8 @@ fn parse_config(contents: &str) -> Result<Config> {
         light_other_on,
         light_patterns: light_patterns.validate()?,
         tuning,
+        midi_devices,
+        midi_active,
     })
 }
 
@@ -1350,16 +1422,30 @@ pub fn save_config(path: &Path, config: &Config) -> Result<()> {
         tuning.mouse_speed,
         if tuning.rumble { "on" } else { "off" }
     ));
+    contents.push_str(&format!("midi-devices\t{}\n", config.midi_devices.len()));
+    for name in &config.midi_devices {
+        contents.push_str(&format!("midi-device\t{name}\n"));
+    }
+    contents.push_str(&format!(
+        "midi-active\t{}\n",
+        config.midi_active.as_deref().unwrap_or("-")
+    ));
+    validate_devices(&config.midi_devices, config.midi_active.as_ref())?;
     for mapping in &config.mappings {
         mapping.validate()?;
         let feedback = mapping.feedback;
+        let device = if mapping.context >= DEVICE_CONTEXT {
+            "midi"
+        } else {
+            DEVICE
+        };
         let octave = match feedback.octave {
             None => "-".into(),
             Some(Octave::Offset(n)) => format!("offset:{n}"),
             Some(Octave::Absolute(n)) => format!("absolute:{n}"),
         };
         contents.push_str(&format!(
-            "{}\t{}\t{}\t{DEVICE}\t{}\t{}\t{}\t{}\t{}\t{}\t{octave}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{device}\t{}\t{}\t{}\t{}\t{}\t{}\t{octave}\t{}\t{}\t{}\t{}\t{}\n",
             mapping.context,
             mapping.label,
             mapping.input,
@@ -1944,6 +2030,49 @@ mod tests {
             parse_config(&v16.replace("tuning\t20\t60\t25\ton", "tuning\t20\t60\t25\tmaybe"))
                 .is_err()
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 06: other MIDI devices are listed by name; each gets its own context, so
+    /// their mappings never mix with the Akai's programs or each other.
+    #[test]
+    fn other_midi_devices_round_trip_with_their_own_contexts() {
+        let dir = std::env::temp_dir().join(format!("vibeconsole-devices-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let mut config = Config::default();
+        assert_eq!(config.device_context("Launchkey"), None);
+        config.midi_devices = vec!["Launchkey".into(), "nanoPAD2".into()];
+        config.midi_active = Some("nanoPAD2".into());
+        let context = config.device_context("nanoPAD2").unwrap();
+        assert_eq!(context, DEVICE_CONTEXT + 1);
+        let mut mapping = Mapping::new(Control::note(1, 60).unwrap(), "F5", "hold").unwrap();
+        mapping.context = context;
+        mapping.label = "nanoPAD2 note 60".into();
+        config.mappings = vec![mapping];
+        save_config(&path, &config).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\nmidi-devices\t2\nmidi-device\tLaunchkey\nmidi-device\tnanoPAD2\nmidi-active\tnanoPAD2\n"));
+        assert!(text.contains("\tmidi\tnote\t1\t60\t"));
+        assert_eq!(load_config(&path).unwrap(), config);
+        assert_eq!(program_label(context), "Other MIDI device 2");
+        // Refused: a mapping for a device that isn't listed, an active device that isn't
+        // listed, a name that could break the file, and feedback on another device.
+        let mut bad = config.clone();
+        bad.mappings[0].context = DEVICE_CONTEXT + 2;
+        assert!(save_config(&path, &bad).is_err());
+        let mut bad = config.clone();
+        bad.midi_active = Some("Missing".into());
+        assert!(save_config(&path, &bad).is_err());
+        for name in ["", "-", "a\tb", "line\nbreak", &"x".repeat(65)] {
+            let mut bad = config.clone();
+            bad.midi_devices[0] = name.into();
+            assert!(save_config(&path, &bad).is_err(), "{name:?}");
+        }
+        let mut bad = config.clone();
+        bad.mappings[0].feedback.tempo = Some(120);
+        assert!(save_config(&path, &bad).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -105,6 +105,36 @@ pub fn messages(reader: impl Read) -> impl Iterator<Item = io::Result<[u8; 3]>> 
 mod tests {
     use super::*;
 
+    /// v7 ticket 06: a device is named without its sequencer id (which changes on replug);
+    /// only the Akai counts as the Akai, and system ports are never offered.
+    #[test]
+    fn devices_are_named_without_their_port_id_and_only_the_akai_is_writable() {
+        assert_eq!(
+            device_name("Launchkey Mini MK3:Launchkey Mini MK3 MIDI 1 24:0"),
+            "Launchkey Mini MK3:Launchkey Mini MK3 MIDI 1"
+        );
+        assert_eq!(device_name("plain name"), "plain name");
+        assert!(is_akai("MPK mini 3:MPK mini 3 MIDI 1 16:0"));
+        assert!(!is_akai(
+            "Launchkey Mini MK3:Launchkey Mini MK3 MIDI 1 24:0"
+        ));
+        assert!(offered("Launchkey Mini MK3:Launchkey Mini MK3 MIDI 1 24:0"));
+        for system in [
+            "Midi Through:Midi Through Port-0 14:0",
+            "MPK mini 3:MPK mini 3 MIDI 1 16:0",
+            "VibeConsole:VibeConsole input 128:0",
+        ] {
+            assert!(!offered(system), "{system}");
+        }
+        assert!(akai_only(true).is_ok());
+        assert!(
+            akai_only(false)
+                .unwrap_err()
+                .to_string()
+                .contains("only to the Akai")
+        );
+    }
+
     /// v7 ticket 05: midir hands over one complete message per callback.
     #[test]
     fn one_midir_message_becomes_its_packet() {
@@ -221,9 +251,7 @@ pub fn akai_port<T: midir::MidiIO>(midi: &T) -> crate::Result<(T::Port, String)>
         .into_iter()
         .filter_map(|port| {
             let name = midi.port_name(&port).ok()?;
-            name.to_lowercase()
-                .contains("mpk mini 3")
-                .then_some((port, name))
+            is_akai(&name).then_some((port, name))
         })
         .collect::<Vec<_>>();
     match matches.len() {
@@ -231,6 +259,53 @@ pub fn akai_port<T: midir::MidiIO>(midi: &T) -> crate::Result<(T::Port, String)>
         0 => Err("MPK mini 3 is connected, but no matching MIDI port is available".into()),
         _ => Err("multiple MPK mini 3 MIDI ports found; refusing ambiguous selection".into()),
     }
+}
+
+pub fn is_akai(port: &str) -> bool {
+    port.to_lowercase().contains("mpk mini 3")
+}
+/// A port's device name: its ALSA name without the trailing `client:port` id, which
+/// changes on every replug.
+pub fn device_name(port: &str) -> String {
+    match port.rsplit_once(' ') {
+        Some((name, id))
+            if id.split_once(':').is_some_and(|(c, p)| {
+                [c, p]
+                    .iter()
+                    .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            }) =>
+        {
+            name.to_owned()
+        }
+        _ => port.to_owned(),
+    }
+}
+/// Ports offered as "other MIDI devices": not the Akai, ALSA's Midi Through or ours.
+pub fn offered(port: &str) -> bool {
+    let lower = port.to_lowercase();
+    !is_akai(port) && !lower.contains("midi through") && !lower.starts_with("vibeconsole")
+}
+/// The one gate for device-specific messages (SysEx feedback): only the Akai gets them.
+pub fn akai_only(akai: bool) -> crate::Result<()> {
+    if akai {
+        Ok(())
+    } else {
+        Err("device-specific messages go only to the Akai MPK mini 3; this device gets none".into())
+    }
+}
+/// Connected other MIDI devices, by device name.
+pub fn other_devices() -> crate::Result<Vec<String>> {
+    let midi = midir::MidiInput::new("VibeConsole probe")
+        .map_err(|e| format!("MIDI input unavailable: {e}"))?;
+    let mut names = midi
+        .ports()
+        .iter()
+        .filter_map(|port| midi.port_name(port).ok())
+        .filter(|name| offered(name))
+        .map(|name| device_name(&name))
+        .collect::<Vec<_>>();
+    names.dedup();
+    Ok(names)
 }
 
 /// Bounded queues fed by the midir callback. A full queue drops both senders, so `next`
@@ -250,17 +325,47 @@ pub struct Input {
     id: String,
     checked: std::cell::Cell<std::time::Instant>,
     pub port: String,
+    /// Only the Akai receives device-specific messages (`output`).
+    pub akai: bool,
     pub sysex: Option<std::sync::mpsc::Receiver<std::result::Result<Vec<u8>, String>>>,
 }
 
 impl Input {
     pub fn open() -> crate::Result<Self> {
-        crate::akai_connected()?;
+        Self::open_device(None)
+    }
+    /// The Akai (`None`) or another MIDI device by its device name.
+    pub fn open_device(device: Option<&str>) -> crate::Result<Self> {
+        if device.is_none() {
+            crate::akai_connected()?;
+        }
         let mut midi = midir::MidiInput::new("VibeConsole")
             .map_err(|e| format!("MIDI input unavailable: {e}"))?;
         // SysEx carries the controller's replies; nothing is filtered by midir.
         midi.ignore(midir::Ignore::None);
-        let (port, name) = akai_port(&midi)?;
+        let (port, name) = match device {
+            None => akai_port(&midi)?,
+            Some(device) => {
+                let mut matches = midi
+                    .ports()
+                    .into_iter()
+                    .filter_map(|port| {
+                        let name = midi.port_name(&port).ok()?;
+                        (offered(&name) && device_name(&name) == device).then_some((port, name))
+                    })
+                    .collect::<Vec<_>>();
+                match matches.len() {
+                    1 => matches.remove(0),
+                    0 => return Err(format!("MIDI device {device} is not connected").into()),
+                    _ => {
+                        return Err(format!(
+                            "several ports named {device}; refusing ambiguous selection"
+                        )
+                        .into());
+                    }
+                }
+            }
+        };
         let id = port.id();
         let (sender, receiver) = std::sync::mpsc::sync_channel(1024);
         let (sysex_sender, sysex) = std::sync::mpsc::sync_channel(16);
@@ -293,6 +398,7 @@ impl Input {
                 .map_err(|e| format!("MIDI input unavailable: {e}"))?,
             id,
             checked: std::cell::Cell::new(std::time::Instant::now()),
+            akai: device.is_none(),
             port: name,
             sysex: Some(sysex),
         })
@@ -301,6 +407,7 @@ impl Input {
     /// Output to the same sequencer port as the input, so a replaced device can't receive
     /// a stale restoration.
     pub fn output(&self) -> crate::Result<Output> {
+        akai_only(self.akai)?;
         let midi = midir::MidiOutput::new("VibeConsole")
             .map_err(|e| format!("MIDI output unavailable: {e}"))?;
         let port = midi

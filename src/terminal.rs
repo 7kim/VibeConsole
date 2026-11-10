@@ -127,10 +127,17 @@ trait Ui {
     fn login(&mut self, _request: crate::runtime::Login) -> Result<bool> {
         Err("login service unavailable".into())
     }
+    /// Settings -> MIDI device: connected other MIDI devices (v7 ticket 06).
+    fn midi_devices(&mut self) -> Result<Vec<String>> {
+        crate::midi::other_devices()
+    }
 }
 
 struct Terminal {
     context: u8,
+    /// Another MIDI device by name (v7 ticket 06); None is the Akai. It never gets
+    /// device-specific messages and has no programs to verify.
+    device: Option<String>,
     context_verified: bool,
     follow_programs: bool,
     follow_retry: Instant,
@@ -279,10 +286,13 @@ impl Terminal {
                 crate::screen::bulb(input_on)
             )
         };
-        let program = if self.program_names.len() == 8 {
-            self.program_names[self.context as usize].clone()
-        } else {
-            mappings::program_label(self.context)
+        let program = match (
+            &self.device,
+            self.program_names.get(usize::from(self.context)),
+        ) {
+            (Some(device), _) => format!("MIDI device {device}"),
+            (None, Some(name)) => name.clone(),
+            (None, None) => mappings::program_label(self.context),
         };
         let program = if self.context_verified {
             format!("{program} (hardware/RAM verified)")
@@ -539,7 +549,7 @@ impl Terminal {
     fn detect(&mut self) -> Result<()> {
         self.suspend()?;
         if self.input.is_none() {
-            self.input = Some(midi::Input::open()?);
+            self.input = Some(self.open_input()?);
             self.reset_input_lights();
         }
         loop {
@@ -590,6 +600,7 @@ impl Terminal {
         };
         let mut terminal = Self {
             context: 0,
+            device: None,
             context_verified: true,
             follow_programs: false,
             follow_retry: Instant::now(),
@@ -1045,9 +1056,35 @@ impl Terminal {
         Ok(())
     }
 
+    fn open_input(&self) -> Result<midi::Input> {
+        midi::Input::open_device(self.device.as_deref())
+    }
+    /// Settings -> MIDI device chose another device: its own context, nothing to verify,
+    /// no feedback (v7 ticket 06).
+    fn use_device(&mut self, config: &mappings::Config, current: &[Mapping]) -> Result<()> {
+        let Some(name) = config.midi_active.clone() else {
+            return Ok(());
+        };
+        let context = config
+            .device_context(&name)
+            .ok_or("the active MIDI device isn't listed")?;
+        self.device = Some(name);
+        self.context = context;
+        self.context_verified = true;
+        self.follow_programs = false;
+        self.feedback_allowed = false;
+        self.run_mappings = current
+            .iter()
+            .filter(|m| m.context == context)
+            .cloned()
+            .collect();
+        Ok(())
+    }
+
     fn controller(&mut self) -> Result<()> {
+        crate::midi::akai_only(self.device.is_none())?;
         if self.input.is_none() {
-            self.input = Some(midi::Input::open()?);
+            self.input = Some(self.open_input()?);
         }
         if self.controller.is_none() {
             self.controller = Some(if self.follow_programs {
@@ -1082,7 +1119,7 @@ impl Terminal {
             }
         }
         if self.input.is_none() {
-            self.input = Some(midi::Input::open()?);
+            self.input = Some(self.open_input()?);
         }
         self.reconnected = true;
         self.reset_input_lights();
@@ -1823,7 +1860,8 @@ impl Terminal {
         self.suspend()?;
         let feedback = self.idle.enabled() || mappings.iter().any(|m| m.feedback.enabled());
         if self.original.is_none()
-            && (self.context != 0 || mappings.iter().any(|m| m.input != mappings::Input::Pad))
+            && ((self.context != 0 && self.device.is_none())
+                || mappings.iter().any(|m| m.input != mappings::Input::Pad))
         {
             return Err("background startup supports the confirmed original pad setup only; configure other contexts/controls interactively".into());
         }
@@ -1951,7 +1989,7 @@ Changing musical settings while running is unsupported.",
             return Err("saved configuration changed/invalid; paused until reloaded".into());
         }
         if self.input.is_none() {
-            match midi::Input::open() {
+            match self.open_input() {
                 Ok(input) => {
                     self.input = Some(input);
                     self.reset_input_lights();
@@ -1991,7 +2029,7 @@ Changing musical settings while running is unsupported.",
             return Err("select a verified program before changing knob mode".into());
         }
         if self.input.is_none() {
-            self.input = Some(midi::Input::open()?);
+            self.input = Some(self.open_input()?);
         }
         self.tick()?;
         let result = (|| -> Result<Option<(Control, mappings::Input, String)>> {
@@ -2170,7 +2208,7 @@ Changing musical settings while running is unsupported.",
     fn learn_note(&mut self, piano: bool) -> Result<Option<Control>> {
         self.suspend()?;
         if self.input.is_none() {
-            self.input = Some(midi::Input::open()?);
+            self.input = Some(self.open_input()?);
         }
         self.tick()?;
         self.last_press = None;
@@ -3015,6 +3053,10 @@ fn settings_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 config.light_patterns.slow, config.light_patterns.fast
             ),
             login_row(ui),
+            format!(
+                "MIDI device: {} (takes effect next launch)",
+                config.midi_active.as_deref().unwrap_or("Akai MPK mini 3")
+            ),
         ];
         let Some(choice) = choose(ui, "Settings", &rows)? else {
             return Ok(());
@@ -3046,12 +3088,56 @@ fn settings_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
             2 | 3 => variables_menu(ui, path, choice == 3),
             4 => light_sources_menu(ui, path),
             5 => light_patterns_menu(ui, path),
-            _ => login_menu(ui),
+            6 => login_menu(ui),
+            _ => midi_device_menu(ui, path),
         };
         if let Err(error) = result {
             not_saved(ui, &error)?;
         }
     }
+}
+
+/// Settings -> MIDI device (v7 ticket 06): the Akai, or another MIDI device, connected now
+/// or used before. A new device is added to the list and gets its own mappings.
+fn midi_device_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
+    let mut config = mappings::load_config(path)?;
+    let connected = ui.midi_devices()?;
+    let mut names = config.midi_devices.clone();
+    for name in &connected {
+        if !names.contains(name) && mappings::valid_device_name(name) {
+            names.push(name.clone());
+        }
+    }
+    let mark = |active: bool| if active { "  (in use)" } else { "" };
+    let mut items = vec![format!(
+        "Akai MPK mini 3 (lights, octave, programs){}",
+        mark(config.midi_active.is_none())
+    )];
+    items.extend(names.iter().map(|name| {
+        format!(
+            "{name}{}{}",
+            if connected.contains(name) {
+                ""
+            } else {
+                "  (not connected)"
+            },
+            mark(config.midi_active.as_ref() == Some(name))
+        )
+    }));
+    let Some(choice) = choose(ui, "MIDI device", &items)? else {
+        return Ok(());
+    };
+    config.midi_active = match choice {
+        0 => None,
+        n => {
+            let name = names[n - 1].clone();
+            if !config.midi_devices.contains(&name) {
+                config.midi_devices.push(name.clone());
+            }
+            Some(name)
+        }
+    };
+    mappings::save_config(path, &config)
 }
 
 fn on_off(state: Result<bool>) -> &'static str {
@@ -4865,9 +4951,10 @@ pub fn daemon(path: &Path, current: Vec<Mapping>) -> Result<()> {
     let config = mappings::load_config(path)?;
     ui.idle = config.idle;
     ui.start_flow_enabled = config.start_flow;
-    ui.run_mappings = current.into_iter().filter(|m| m.context == 0).collect();
+    ui.run_mappings = current.iter().filter(|m| m.context == 0).cloned().collect();
     ui.context_verified = false;
     ui.follow_programs = true;
+    ui.use_device(&config, &current)?;
     let flow_ready = match ui.startup_flow() {
         Ok(()) => true,
         Err(error) => {
@@ -5114,11 +5201,13 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
     if initial == "detect" {
         return ui.detect();
     }
+    ui.use_device(&config, &current)?;
     if initial == "configure" {
         return configure(&mut ui, path, &mut current);
     }
     ui.context_verified = false;
     ui.follow_programs = true;
+    ui.use_device(&config, &current)?;
     let flow_ready = match ui.startup_flow() {
         Ok(()) => true,
         Err(error) => {
@@ -5477,8 +5566,17 @@ mod tests {
         login: (bool, bool),
         login_calls: Vec<crate::runtime::Login>,
         login_fails: bool,
+        /// Connected other MIDI devices and the session's context (v7 ticket 06).
+        midi_devices: Vec<String>,
+        context: u8,
     }
     impl Ui for Script {
+        fn midi_devices(&mut self) -> Result<Vec<String>> {
+            Ok(self.midi_devices.clone())
+        }
+        fn context(&self) -> u8 {
+            self.context
+        }
         fn login(&mut self, request: crate::runtime::Login) -> Result<bool> {
             use crate::runtime::Login;
             self.login_calls.push(request);
@@ -6289,6 +6387,84 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7 ticket 06: Settings -> MIDI device picks another connected device; its pads are
+    /// learned and mapped in its own context, with no feedback step, and survive switching
+    /// back to the Akai.
+    #[test]
+    fn another_midi_device_is_chosen_learned_and_mapped_in_its_own_context() {
+        use Key::*;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-device-ui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let to_device = [Down, Down, Down, Down, Down, Down, Down, Enter];
+        let mut keys = to_device.to_vec();
+        keys.extend([Down, Enter, Escape]); // nanoPAD2, back
+        let mut ui = Script {
+            keys: keys.into(),
+            midi_devices: vec!["nanoPAD2".into()],
+            ..Default::default()
+        };
+        settings_menu(&mut ui, &path).unwrap();
+        assert!(ui.keys.is_empty());
+        let config = mappings::load_config(&path).unwrap();
+        assert_eq!(config.midi_active.as_deref(), Some("nanoPAD2"));
+        assert_eq!(config.midi_devices, ["nanoPAD2"]);
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains("MIDI device: nanoPAD2"))
+        );
+        let context = config.device_context("nanoPAD2").unwrap();
+
+        let note = Control::note(1, 60).unwrap();
+        let mut keys = vec![Enter, Enter, Enter, Enter, Space, Enter];
+        keys.extend(std::iter::repeat_n(Down, 7));
+        keys.extend([Enter, Enter, Enter]); // done, hold, fire when pressed: no feedback step
+        keys.extend([Enter, Tab, Tab, Enter]); // save, finish
+        let mut ui = Script {
+            keys: keys.into(),
+            pads: [note].into(),
+            context,
+            ..Default::default()
+        };
+        let mut current = Vec::new();
+        configure(&mut ui, &path, &mut current).unwrap();
+        assert!(ui.keys.is_empty());
+        let saved = mappings::load_config(&path).unwrap();
+        assert_eq!(saved.mappings.len(), 1);
+        assert_eq!(saved.mappings[0].context, context);
+        assert_eq!(saved.mappings[0].control, note);
+        assert_eq!(saved.mappings[0].keys, ["Ctrl"]);
+        assert!(!saved.mappings[0].feedback.enabled());
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("\tmidi\tnote\t1\t60\t")
+        );
+
+        let mut keys = to_device.to_vec();
+        keys.extend([Enter, Escape]); // back to the Akai
+        let mut ui = Script {
+            keys: keys.into(),
+            midi_devices: vec![],
+            ..Default::default()
+        };
+        settings_menu(&mut ui, &path).unwrap();
+        let config = mappings::load_config(&path).unwrap();
+        assert_eq!(config.midi_active, None);
+        assert_eq!(config.midi_devices, ["nanoPAD2"]);
+        assert_eq!(config.mappings.len(), 1);
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains("nanoPAD2  (not connected)  (in use)"))
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn menus_save_both_banks_cancel_edit_remove_and_preserve_failed_save() {
         use Key::*;
@@ -7008,7 +7184,7 @@ mod tests {
         // Ticket 17: a v14 file's per-agent tempos become the shared slow/fast tempos.
         let v14 = saved
             .replace("vibeconsole-mappings-v16", "vibeconsole-mappings-v14")
-            .replace("tuning\t15\t30\t10\toff\n", "")
+            .replace("tuning\t15\t30\t10\toff\nmidi-devices\t0\nmidi-active\t-\n", "")
             .replace(
                 "light-tempos\t50\t240\nlight-pattern\tneeds-decision\tfast\talternate\nlight-pattern\tneeds-input\tfast\tsteady\nlight-pattern\tthinking\tslow\toff\nlight-pattern\tfinished\toff\tblink\n",
                 "",
