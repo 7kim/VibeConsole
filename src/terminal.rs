@@ -3460,6 +3460,10 @@ fn settings_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 "App profiles ({}): pads that change with the focused app",
                 config.profiles.len()
             ),
+            format!(
+                "Favourites ({}): ★ assignments and profiles, listed first",
+                config.favourites.len()
+            ),
         ];
         let Some(choice) = choose(ui, "Settings", &rows)? else {
             return Ok(());
@@ -3494,7 +3498,8 @@ fn settings_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
             6 => login_menu(ui),
             7 => midi_device_menu(ui, path),
             8 => tuning_menu(ui, path),
-            _ => profiles_menu(ui, path),
+            9 => profiles_menu(ui, path),
+            _ => favourites_menu(ui, path),
         };
         if let Err(error) = result {
             not_saved(ui, &error)?;
@@ -3560,6 +3565,54 @@ fn pick_app(ui: &mut impl Ui) -> Result<Option<String>> {
         .map(Some)
         .ok_or_else(|| "that app has no desktop ID".into())
 }
+/// Settings -> Favourites (v7 ticket 24): Enter marks or unmarks one; saved at once.
+fn favourites_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
+    let mut cursor = 0;
+    loop {
+        let mut config = mappings::load_config(path)?;
+        let mut keys = config
+            .mappings
+            .iter()
+            .map(|m| (mappings::favourite_key(m), mapping_label(m, None)))
+            .collect::<Vec<_>>();
+        keys.extend(config.profiles.iter().map(|p| {
+            (
+                mappings::profile_favourite_key(&p.name),
+                format!("Profile {}", p.name),
+            )
+        }));
+        if keys.is_empty() {
+            return Err("nothing saved yet to mark".into());
+        }
+        let items = keys
+            .iter()
+            .map(|(key, label)| {
+                format!(
+                    "{} {label}",
+                    if config.favourites.contains(key) {
+                        "★"
+                    } else {
+                        "☆"
+                    }
+                )
+            })
+            .collect::<Vec<_>>();
+        let Some(choice) = choose_at(ui, "Favourites: Enter marks or unmarks", &items, cursor)?
+        else {
+            return Ok(());
+        };
+        cursor = choice;
+        let key = &keys[choice].0;
+        match config.favourites.iter().position(|k| k == key) {
+            Some(at) => {
+                config.favourites.remove(at);
+            }
+            None => config.favourites.push(key.clone()),
+        }
+        mappings::save_config(path, &config)?;
+    }
+}
+
 /// Profile files are shared through one folder beside the config (v7 ticket 14); names
 /// come from its listing, never typed paths.
 fn profiles_dir(path: &Path) -> PathBuf {
@@ -5472,6 +5525,20 @@ fn lock_on(profile: Option<&str>) -> mappings::Lock {
 fn listed(mapping: &Mapping, context: u8) -> bool {
     mapping.context == context || mappings::gamepad_context(mapping.context)
 }
+/// The saved list with favourites first (v7 ticket 24), each flagged for its ★.
+fn saved_list<'a>(
+    current: &'a [Mapping],
+    context: u8,
+    favourites: &[String],
+) -> Vec<(&'a Mapping, bool)> {
+    let mut list = current
+        .iter()
+        .filter(|m| listed(m, context))
+        .map(|m| (m, favourites.contains(&mappings::favourite_key(m))))
+        .collect::<Vec<_>>();
+    list.sort_by_key(|(_, star)| !star);
+    list
+}
 
 fn configure_steps(
     ui: &mut impl Ui,
@@ -5514,23 +5581,27 @@ fn configure_steps(
             };
             (pad, context)
         } else {
+            let favourites = mappings::load_config(path)
+                .map(|c| c.favourites)
+                .unwrap_or_default();
             let Some(index) = choose(
                 ui,
                 "Saved assignments",
-                &current
-                    .iter()
-                    .filter(|m| listed(m, ui.context()))
-                    .map(|m| mapping_label(m, ui.program().as_ref()))
+                &saved_list(current, ui.context(), &favourites)
+                    .into_iter()
+                    .map(|(m, star)| {
+                        format!(
+                            "{}{}",
+                            if star { "★ " } else { "" },
+                            mapping_label(m, ui.program().as_ref())
+                        )
+                    })
                     .collect::<Vec<_>>(),
             )?
             else {
                 continue;
             };
-            let chosen = current
-                .iter()
-                .filter(|m| listed(m, ui.context()))
-                .nth(index)
-                .unwrap();
+            let chosen = saved_list(current, ui.context(), &favourites)[index].0;
             (chosen.control, chosen.context)
         };
         let existing = current
@@ -8008,6 +8079,33 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7 ticket 24: Settings -> Favourites marks a mapping; /configure lists it first.
+    #[test]
+    fn favourites_are_marked_and_listed_first() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-favs-ui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let a = Mapping::new(Control::from_note(10, 36).unwrap(), "F1", "hold").unwrap();
+        let b = Mapping::new(Control::from_note(10, 37).unwrap(), "F2", "hold").unwrap();
+        mappings::save(&path, &[a.clone(), b.clone()]).unwrap();
+        let mut keys = vec![Down; 10];
+        keys.extend([Enter, Down, Enter, Escape, Escape]); // mark Pad 2
+        let mut ui = Script {
+            keys: keys.into(),
+            ..Default::default()
+        };
+        settings_menu(&mut ui, &path).unwrap();
+        assert!(ui.keys.is_empty());
+        let config = mappings::load_config(&path).unwrap();
+        assert_eq!(config.favourites, [mappings::favourite_key(&b)]);
+        let list = saved_list(&config.mappings, 0, &config.favourites);
+        assert_eq!(list[0], (&b, true));
+        assert_eq!(list[1], (&a, false));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn menus_save_both_banks_cancel_edit_remove_and_preserve_failed_save() {
         use Key::*;
@@ -8728,7 +8826,7 @@ mod tests {
         let v14 = saved
             .replace("vibeconsole-mappings-v16", "vibeconsole-mappings-v14")
             .replace(
-                "tuning\t15\t30\t10\toff\toff\nmidi-devices\t0\nmidi-active\t-\nprofiles\t0\nprofile-lock\t-\n",
+                "tuning\t15\t30\t10\toff\toff\nmidi-devices\t0\nmidi-active\t-\nprofiles\t0\nprofile-lock\t-\nfavourites\t0\n",
                 "",
             )
             .replace(

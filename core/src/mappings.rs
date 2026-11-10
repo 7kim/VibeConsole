@@ -550,6 +550,24 @@ pub struct Config {
     pub profiles: Vec<Profile>,
     /// v7 ticket 13: a pinned profile (or Default) that ignores focus changes.
     pub lock: Option<Lock>,
+    /// v7 ticket 24: favourite mappings and profiles (`favourite_key`), listed first.
+    pub favourites: Vec<String>,
+}
+/// A mapping's favourite key: its context and control, which stay the same when its
+/// action is edited.
+pub fn favourite_key(mapping: &Mapping) -> String {
+    let c = mapping.control;
+    format!(
+        "{}:{}:{}:{}:{}",
+        mapping.context,
+        c.message.text(),
+        c.channel,
+        c.id,
+        c.direction
+    )
+}
+pub fn profile_favourite_key(name: &str) -> String {
+    format!("profile:{name}")
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Lock {
@@ -795,6 +813,7 @@ impl Default for Config {
             midi_active: None,
             profiles: Vec::new(),
             lock: None,
+            favourites: Vec::new(),
         }
     }
 }
@@ -1546,6 +1565,25 @@ fn parse_config(contents: &str) -> Result<Config> {
     } else {
         None
     };
+    let mut favourites = Vec::new();
+    if version >= 16 {
+        let count: usize = lines
+            .next()
+            .and_then(|l| l.strip_prefix("favourites\t"))
+            .ok_or("expected favourites count")?
+            .parse()?;
+        if count > 1024 {
+            return Err("too many favourites".into());
+        }
+        for _ in 0..count {
+            let key = lines
+                .next()
+                .and_then(|l| l.strip_prefix("favourite\t"))
+                .ok_or("expected favourite record")?;
+            favourites.push(key.to_owned());
+        }
+        validate_favourites(&favourites)?;
+    }
     let mut mappings = Vec::new();
     let mut seen = HashSet::new();
     let mut labels = HashSet::new();
@@ -1609,6 +1647,7 @@ fn parse_config(contents: &str) -> Result<Config> {
         midi_active,
         profiles,
         lock,
+        favourites,
     })
 }
 
@@ -1647,6 +1686,21 @@ pub fn save(path: &Path, mappings: &[Mapping]) -> Result<()> {
     let mut config = load_config(path)?;
     config.mappings = mappings.to_vec();
     save_config(path, &config)
+}
+
+fn validate_favourites(favourites: &[String]) -> Result<()> {
+    if favourites.len() > 1024 {
+        return Err("too many favourites".into());
+    }
+    for (i, key) in favourites.iter().enumerate() {
+        if key.is_empty() || key.len() > 200 || key.chars().any(char::is_control) {
+            return Err(format!("invalid favourite {key:?}").into());
+        }
+        if favourites[..i].contains(key) {
+            return Err(format!("favourite {key} listed twice").into());
+        }
+    }
+    Ok(())
 }
 
 /// One mapping as a config line (Default mappings and profile overrides alike).
@@ -1806,6 +1860,11 @@ pub fn save_config(path: &Path, config: &Config) -> Result<()> {
             Some(Lock::Profile(name)) => name,
         }
     ));
+    validate_favourites(&config.favourites)?;
+    contents.push_str(&format!("favourites\t{}\n", config.favourites.len()));
+    for key in &config.favourites {
+        contents.push_str(&format!("favourite\t{key}\n"));
+    }
     for mapping in &config.mappings {
         contents.push_str(&mapping_line(mapping)?);
     }
@@ -2627,6 +2686,27 @@ mod tests {
         assert_eq!(profile_file_name("Firefox"), "Firefox.profile");
         assert_eq!(profile_file_name("../evil/x"), "evil-x.profile");
         assert_eq!(profile_file_name("Orca: agents"), "Orca-agents.profile");
+    }
+
+    /// v7 ticket 24: favourites round-trip and survive an edited action.
+    #[test]
+    fn favourites_round_trip_and_follow_the_control() {
+        let dir = std::env::temp_dir().join(format!("vibeconsole-favs-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let pad = Control::from_note(10, 36).unwrap();
+        let mapping = Mapping::new(pad, "F1", "hold").unwrap();
+        let mut config = Config::default();
+        config.mappings = vec![mapping.clone()];
+        config.favourites = vec![favourite_key(&mapping), profile_favourite_key("Orca")];
+        save_config(&path, &config).unwrap();
+        assert_eq!(load_config(&path).unwrap(), config);
+        let edited = Mapping::new(pad, "F2", "toggle").unwrap();
+        assert_eq!(favourite_key(&edited), favourite_key(&mapping));
+        let mut bad = config.clone();
+        bad.favourites.push(bad.favourites[0].clone());
+        assert!(save_config(&path, &bad).is_err());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
