@@ -747,6 +747,10 @@ impl Terminal {
             return;
         };
         self.light_agents = config.status_lights.then(|| config.agents.clone());
+        // Settings -> Xbox tuning applies within a status refresh.
+        if let Some(pad) = &mut self.gamepad {
+            pad.tuning = config.tuning;
+        }
         self.light_patterns = config.light_patterns;
         self.light_sessions = if config.status_lights {
             crate::status::source_states(
@@ -1074,7 +1078,10 @@ impl Terminal {
     }
     fn open_gamepad(&mut self) {
         match crate::gamepad::Pad::open() {
-            Ok(pad) => {
+            Ok(mut pad) => {
+                if let Ok(config) = mappings::load_config(&self.path) {
+                    pad.tuning = config.tuning;
+                }
                 if let Some(name) = pad.connected().first() {
                     self.notice = format!("Xbox controller ready: {name}");
                 }
@@ -3125,6 +3132,10 @@ fn settings_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 "MIDI device: {} (takes effect next launch)",
                 config.midi_active.as_deref().unwrap_or("Akai MPK mini 3")
             ),
+            format!(
+                "Xbox tuning: stick dead zone {}%, triggers fire at {}%",
+                config.tuning.dead_zone, config.tuning.trigger
+            ),
         ];
         let Some(choice) = choose(ui, "Settings", &rows)? else {
             return Ok(());
@@ -3157,12 +3168,55 @@ fn settings_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
             4 => light_sources_menu(ui, path),
             5 => light_patterns_menu(ui, path),
             6 => login_menu(ui),
-            _ => midi_device_menu(ui, path),
+            7 => midi_device_menu(ui, path),
+            _ => tuning_menu(ui, path),
         };
         if let Err(error) = result {
             not_saved(ui, &error)?;
         }
     }
+}
+
+/// Settings -> Xbox tuning (v7 ticket 08): the stick dead zone (drift inside it never
+/// fires) and how far a trigger is pulled before it fires.
+fn tuning_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
+    let mut config = mappings::load_config(path)?;
+    let tuning = config.tuning;
+    let items = vec![
+        format!("Stick dead zone: {}%", tuning.dead_zone),
+        format!("Triggers fire at: {}% of travel", tuning.trigger),
+        "Back".to_string(),
+    ];
+    match choose(ui, "Xbox tuning", &items)? {
+        Some(0) => {
+            let Some(value) = number(
+                ui,
+                "Stick dead zone in percent (0–90): drift inside it never fires",
+                i32::from(tuning.dead_zone),
+                0,
+                90,
+            )?
+            else {
+                return Ok(());
+            };
+            config.tuning.dead_zone = u8::try_from(value)?;
+        }
+        Some(1) => {
+            let Some(value) = number(
+                ui,
+                "Trigger fire point in percent of travel (1–100)",
+                i32::from(tuning.trigger),
+                1,
+                100,
+            )?
+            else {
+                return Ok(());
+            };
+            config.tuning.trigger = u8::try_from(value)?;
+        }
+        _ => return Ok(()),
+    }
+    mappings::save_config(path, &config)
 }
 
 /// Settings -> MIDI device (v7 ticket 06): the Akai, or another MIDI device, connected now
@@ -6578,6 +6632,52 @@ mod tests {
             ["Ctrl"]
         );
         assert_eq!(layout.len(), crate::gamepad::default_layout().len());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 08: Settings -> Xbox tuning saves the dead zone and trigger point; a failed
+    /// save shows its reason and keeps the old values.
+    #[test]
+    fn xbox_tuning_saves_and_a_failed_save_keeps_the_old_values() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-tuning-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let to_tuning = vec![Down; 8];
+        let mut keys = to_tuning.clone();
+        keys.extend([Enter, Enter]); // Xbox tuning, dead zone
+        keys.extend(vec![Up; 5]);
+        keys.push(Enter); // 20%
+        keys.extend(to_tuning.clone());
+        keys.extend([Enter, Down, Enter]); // trigger point
+        keys.extend(vec![Up; 30]);
+        keys.extend([Enter, Escape]); // 60%
+        let mut ui = Script {
+            keys: keys.into(),
+            ..Default::default()
+        };
+        settings_menu(&mut ui, &path).unwrap();
+        assert!(ui.keys.is_empty());
+        let tuning = mappings::load_config(&path).unwrap().tuning;
+        assert_eq!((tuning.dead_zone, tuning.trigger), (20, 60));
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains("Xbox tuning: stick dead zone 20%, triggers fire at 60%"))
+        );
+        let before = std::fs::read(&path).unwrap();
+        std::fs::write(path.with_extension("tmp"), "occupied").unwrap();
+        let mut keys = to_tuning;
+        keys.extend([Enter, Enter, Up, Enter, Enter, Escape]); // 21% -> Not saved -> Back
+        let mut ui = Script {
+            keys: keys.into(),
+            ..Default::default()
+        };
+        settings_menu(&mut ui, &path).unwrap();
+        assert!(ui.screens.iter().any(|s| s.contains("Not saved")));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

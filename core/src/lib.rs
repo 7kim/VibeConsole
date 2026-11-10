@@ -78,7 +78,7 @@ impl Control {
                 Message::Button => {
                     self.channel != 1
                         || self.direction != 0
-                        || usize::from(self.id) >= gamepad::BUTTONS.len()
+                        || usize::from(self.id) >= gamepad::CONTROLS
                 }
                 Message::Cc => ![-1, 1].contains(&self.direction),
                 Message::Bend => self.id != 0 || ![-1, 1].contains(&self.direction),
