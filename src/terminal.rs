@@ -1115,12 +1115,8 @@ impl Terminal {
         Ok(())
     }
     fn transition(&mut self, pad: Control, active: bool) -> Result<()> {
-        if let Some(action) = self
-            .run_mappings
-            .iter()
-            .find(|m| m.control == pad)
-            .map(|m| m.action.clone())
-        {
+        let fired = self.fired(pad)?;
+        if let Some(action) = fired.as_ref().map(|m| m.action.clone()) {
             if action != crate::actions::Action::Shortcut {
                 if active {
                     let agents = action
@@ -1129,10 +1125,7 @@ impl Terminal {
                         .map(str::to_owned)
                         .collect::<Vec<_>>();
                     self.clear_finished(&agents);
-                    let status = self
-                        .run_mappings
-                        .iter()
-                        .any(|m| m.control == pad && m.status);
+                    let status = fired.as_ref().is_some_and(|m| m.status);
                     // v7 ticket 20: a prompt sequence sends its current step, and moves on
                     // only once that step was sent.
                     let sequence = match &action {
@@ -1153,12 +1146,11 @@ impl Terminal {
                     if let (Some(len), Ok(_)) = (sequence, &submitted) {
                         self.positions.sent(pad, len);
                     }
-                    let knob = self.run_mappings.iter().any(|m| {
-                        m.control == pad
-                            && matches!(
-                                m.input,
-                                mappings::Input::Knob { .. } | mappings::Input::RelativeKnob { .. }
-                            )
+                    let knob = fired.as_ref().is_some_and(|m| {
+                        matches!(
+                            m.input,
+                            mappings::Input::Knob { .. } | mappings::Input::RelativeKnob { .. }
+                        )
                     });
                     // A fast turn sends steps faster than the worker runs them; drop the
                     // extra steps instead of pausing. A rejected pad press still pauses.
@@ -1199,20 +1191,42 @@ impl Terminal {
     fn with_gamepad(&self, mappings: &[Mapping]) -> Result<Vec<Mapping>> {
         let mut all = mappings.to_vec();
         if self.gamepad.is_some() {
-            let config = mappings::load_config(&self.path)?;
-            let layer = crate::gamepad::layer(&config.mappings, self.layer2);
-            let profile = self
-                .profile
-                .as_deref()
-                .and_then(|name| config.profile(name));
-            let context = if self.layer2 {
-                mappings::GAMEPAD_LAYER_2
-            } else {
-                mappings::GAMEPAD_CONTEXT
-            };
-            all.extend(mappings::overlay(&layer, profile, context));
+            all.extend(self.xbox_layout()?);
         }
         Ok(all)
+    }
+    /// The Xbox layout on the current layer (saved buttons over the defaults), with the
+    /// focused app's profile on top.
+    fn xbox_layout(&self) -> Result<Vec<Mapping>> {
+        let config = mappings::load_config(&self.path)?;
+        let layer = crate::gamepad::layer(&config.mappings, self.layer2);
+        let profile = self
+            .profile
+            .as_deref()
+            .and_then(|name| config.profile(name));
+        let context = if self.layer2 {
+            mappings::GAMEPAD_LAYER_2
+        } else {
+            mappings::GAMEPAD_CONTEXT
+        };
+        Ok(mappings::overlay(&layer, profile, context))
+    }
+    /// The mapping a press fires, as the keyboard has it: the open context's, or for an Xbox
+    /// button the Xbox layout's (v7 ticket 43: `run_mappings` holds the MIDI context only).
+    fn fired(&self, control: Control) -> Result<Option<Mapping>> {
+        if control.message == crate::Message::Button {
+            // ponytail: reads the config per Xbox press; cache the layout beside the
+            // keyboard's set if that ever shows up in a profile.
+            return Ok(self
+                .xbox_layout()?
+                .into_iter()
+                .find(|m| m.control == control));
+        }
+        Ok(self
+            .run_mappings
+            .iter()
+            .find(|m| m.control == control)
+            .cloned())
     }
     /// The open context's mappings with the focused app's profile on top (v7 ticket 12).
     fn context_mappings(&self, all: &[Mapping]) -> Vec<Mapping> {
@@ -1342,10 +1356,8 @@ impl Terminal {
             }
             // v7 ticket 21: hold-to-quit pads decide on release (tap) or at one second (quit).
             if let Event::Press(pad) | Event::Release(pad, _) = &event {
-                let quit = self.run_mappings.iter().find_map(|m| match &m.action {
-                    crate::actions::Action::AppToggleQuit(path) if m.control == *pad => {
-                        Some(path.clone())
-                    }
+                let quit = self.fired(*pad)?.and_then(|m| match m.action {
+                    crate::actions::Action::AppToggleQuit(path) => Some(path),
                     _ => None,
                 });
                 if let Some(path) = quit {
@@ -1434,10 +1446,8 @@ impl Terminal {
     /// Hold-to-quit pads whose hold reached one second (v7 ticket 21).
     fn quit_holds(&mut self) {
         for pad in self.holds.due(Instant::now()) {
-            let path = self.run_mappings.iter().find_map(|m| match &m.action {
-                crate::actions::Action::AppToggleQuit(path) if m.control == pad => {
-                    Some(path.clone())
-                }
+            let path = self.fired(pad).ok().flatten().and_then(|m| match m.action {
+                crate::actions::Action::AppToggleQuit(path) => Some(path),
                 _ => None,
             });
             if let Some(path) = path {
@@ -8898,6 +8908,54 @@ mod tests {
             .to_string();
         assert!(error.starts_with("file I/O: "), "{error}");
         assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 43: with a verified Akai program, Xbox buttons saved in /configure fire
+    /// without pausing: a shortcut (saved Y = Left, or the default A = Enter) passes the Akai
+    /// lights, and a non-shortcut action (X = Output mute) runs. The session's sets come from
+    /// the saved file, as at Run. An Akai pad the program's lights don't know still fails.
+    #[test]
+    fn xbox_buttons_fire_beside_a_verified_akai_program_without_pausing() {
+        use crate::actions::Action;
+        use crate::feedback::{Octave, Resolver, Settings, State};
+        let dir = std::env::temp_dir().join(format!("vibeconsole-xbox-run-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let pad = Control::from_note(10, 36).unwrap();
+        let mut lit = Mapping::new(pad, "F1", "hold").unwrap();
+        lit.feedback.octave = Some(Octave::Offset(1));
+        let y = Mapping::new(Control::button(3), "Left", "hold").unwrap();
+        let x = Mapping::new_action(Control::button(2), mappings::Input::Pad, Action::OutputMute)
+            .unwrap();
+        mappings::save(&path, &[lit, y.clone(), x.clone()]).unwrap();
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        let (sent, ran) = std::sync::mpsc::channel();
+        ui.actions = crate::actions::Dispatcher::with(move |action, _, _| {
+            sent.send(action.clone()).unwrap();
+            Ok("done".into())
+        });
+        let saved = mappings::load_config(&path).unwrap().mappings;
+        ui.run_mappings = ui.context_mappings(&saved); // the Akai program's set, as at Run
+        let baseline = State {
+            octave: 0,
+            tempo: 120,
+            arp: false,
+        };
+        ui.resolver = Some(Resolver::new(&ui.run_mappings, baseline, Settings::default()).unwrap());
+        for button in [y.control, Control::button(0)] {
+            ui.transition(button, true).unwrap();
+            ui.transition(button, false).unwrap();
+        }
+        ui.transition(x.control, true).unwrap();
+        assert_eq!(
+            ran.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Action::OutputMute
+        );
+        ui.transition(pad, true).unwrap(); // the Akai pad's own light still works
+        let stranger = Control::from_note(10, 37).unwrap();
+        assert!(ui.transition(stranger, true).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

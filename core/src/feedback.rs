@@ -153,6 +153,10 @@ impl Resolver {
         })
     }
     pub fn transition(&mut self, pad: crate::Control, active: bool) -> Result<Option<Settings>> {
+        // v7 ticket 43: Xbox buttons have no Akai lights; they never own feedback here.
+        if pad.message == crate::Message::Button {
+            return Ok(None);
+        }
         self.order.retain(|p| *p != pad);
         if active {
             self.order.push(pad);
