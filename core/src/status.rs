@@ -163,11 +163,54 @@ pub struct Session {
     pub cwd: String,
 }
 
-/// Recorded sessions, dropping those whose agent process is gone.
+/// Recorded sessions, dropping those whose agent process is gone, plus Orca's agents in
+/// folders our hooks don't cover (v7 ticket 16).
 pub fn sessions() -> Vec<Session> {
-    dir()
+    let hooks = dir()
         .map(|d| sessions_in(&d, |pid| Path::new(&format!("/proc/{pid}")).exists()))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let orca = std::env::var_os("HOME")
+        .map(|home| Path::new(&home).join(".config/orca/agent-hooks/last-status.json"))
+        .filter(|path| std::fs::metadata(path).is_ok_and(|m| m.len() <= 8 << 20))
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|text| orca_sessions(&text))
+        .unwrap_or_default();
+    with_fallback(hooks, orca)
+}
+/// Orca's own status file as a fallback source: each entry's `payload.state` and the folder
+/// in its `worktreeId` (`<id>::<folder>`), nothing else; prompts and messages in it are
+/// never kept. A state Orca adds later, or a file it reshapes, is ignored, not an error.
+pub fn orca_sessions(text: &str) -> Vec<Session> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Vec::new();
+    };
+    let Some(entries) = value["entries"].as_object() else {
+        return Vec::new();
+    };
+    entries
+        .values()
+        .filter_map(|entry| {
+            let state = match entry["payload"]["state"].as_str()? {
+                "working" | "thinking" | "running" => "thinking",
+                "waiting" | "blocked" | "needs-input" | "permission" => "needs-input",
+                "done" | "finished" | "completed" => "finished",
+                "idle" => "idle",
+                _ => return None,
+            };
+            let (_, folder) = entry["worktreeId"].as_str()?.split_once("::")?;
+            (folder.starts_with('/') && !folder.contains(['\t', '\n'])).then(|| Session {
+                state,
+                cwd: folder.to_owned(),
+            })
+        })
+        .collect()
+}
+/// Our hooks win: an Orca session counts only for a folder no hook session reports.
+fn with_fallback(hooks: Vec<Session>, orca: Vec<Session>) -> Vec<Session> {
+    let covered = hooks.iter().map(|s| s.cwd.clone()).collect::<Vec<_>>();
+    let mut all = hooks;
+    all.extend(orca.into_iter().filter(|s| !covered.contains(&s.cwd)));
+    all
 }
 
 fn sessions_in(dir: &Path, alive: impl Fn(u32) -> bool) -> Vec<Session> {
@@ -798,6 +841,46 @@ mod tests {
         assert!(status_in(&path, CODEX).is_err()); // doctor: unreadable
         assert!(codex_hooks().contains("vibeconsole agent-status - needs-input"));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 16: Orca's status file lights folders our hooks don't report; only the
+    /// state and folder are read, and our hooks win any disagreement.
+    #[test]
+    fn orca_status_file_is_a_fallback_that_reads_only_state_and_folder() {
+        let file = r#"{"version":1,"entries":{
+            "a":{"worktreeId":"w1::/work/app","payload":{"state":"working","prompt":"SECRET"}},
+            "b":{"worktreeId":"w2::/work/lib","payload":{"state":"waiting","lastAssistantMessage":"x"}},
+            "c":{"worktreeId":"w3::/work/new","payload":{"state":"some-future-state"}},
+            "d":{"worktreeId":"no-folder","payload":{"state":"done"}}}}"#;
+        let mut orca = orca_sessions(file);
+        orca.sort_by(|a, b| a.cwd.cmp(&b.cwd));
+        assert_eq!(
+            orca,
+            [
+                Session {
+                    state: "thinking",
+                    cwd: "/work/app".into()
+                },
+                Session {
+                    state: "needs-input",
+                    cwd: "/work/lib".into()
+                },
+            ]
+        );
+        assert!(format!("{orca:?}").find("SECRET").is_none());
+        assert!(orca_sessions("not json").is_empty());
+        assert!(orca_sessions(r#"{"entries":[]}"#).is_empty());
+        // Our hook says /work/app finished: it wins over Orca's "working".
+        let hooks = vec![Session {
+            state: "finished",
+            cwd: "/work/app".into(),
+        }];
+        let all = with_fallback(hooks, orca);
+        assert_eq!(all.len(), 2);
+        assert_eq!(
+            all.iter().find(|s| s.cwd == "/work/app").unwrap().state,
+            "finished"
+        );
     }
 
     /// Ticket 16: sessions outside tmux report by session_id and cwd, end on SessionEnd or
