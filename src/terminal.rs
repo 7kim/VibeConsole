@@ -5557,15 +5557,87 @@ fn stage<E: std::fmt::Display>(name: &'static str) -> impl Fn(E) -> Box<dyn std:
 
 /// Action families (indexes into `FAMILIES`) a control can use; others are not offered.
 fn families(input: mappings::Input) -> Vec<usize> {
-    match input {
+    let mut offered = match input {
         mappings::Input::Pad | mappings::Input::Piano => (0..6).chain([8, 9, 10, 11, 12]).collect(),
         mappings::Input::Knob { .. } => vec![0, 2, 6, 7],
         mappings::Input::RelativeKnob { .. } => vec![0, 2],
         mappings::Input::Joystick { .. } => vec![0],
+    };
+    offered.push(13); // v7 ticket 46: Favourites, for every control
+    offered
+}
+
+/// The family (index into `FAMILIES`) a saved assignment's action belongs to. Orca's
+/// "needs me" is saved as a key sequence, so it reads as a sequence of steps.
+fn action_family(mapping: &Mapping) -> usize {
+    use crate::actions::Action;
+    match &mapping.action {
+        Action::Shortcut => 0,
+        Action::Command { .. } if mapping.risky => 12,
+        Action::Command { .. } => 4,
+        Action::Prompt { .. } => 3,
+        Action::Sequence(_) => 5,
+        Action::Choice(_) => 6,
+        Action::Value { .. } => 7,
+        Action::OrcaJump { .. } => 8,
+        Action::T3(_) => 9,
+        Action::HerdrFocus(_) => 10,
+        Action::PromptSequence(_) => 11,
+        action if action.audio() => 2,
+        _ => 1, // launchers, hold to quit, Wispr Flow
     }
 }
 
-const FAMILIES: [&str; 13] = [
+/// Configure's Favourites family (v7 ticket 46): a starred assignment's action, keys,
+/// behaviour, feedback, hold and status, copied onto the learned control. The favourite
+/// itself stays; the copy is independent. A family the control can't take is refused.
+fn favourite_mapping(
+    ui: &mut impl Ui,
+    path: &Path,
+    pad: Control,
+    input: mappings::Input,
+) -> Result<Option<Mapping>> {
+    let config = mappings::load_config(path).map_err(stage("file I/O"))?;
+    let starred = config
+        .mappings
+        .iter()
+        .filter(|m| config.favourites.contains(&mappings::favourite_key(m)))
+        .collect::<Vec<_>>();
+    if starred.is_empty() {
+        return Err(
+            "validation: no favourites yet; star an assignment in Settings → Favourites".into(),
+        );
+    }
+    let program = ui.program();
+    let Some(index) = choose(
+        ui,
+        "Favourites: give this control the same action",
+        &starred
+            .iter()
+            .map(|m| format!("★ {}", mapping_label(m, program.as_ref())))
+            .collect::<Vec<_>>(),
+    )?
+    else {
+        return Ok(None);
+    };
+    let favourite = starred[index];
+    let family = action_family(favourite);
+    if !families(input).contains(&family) {
+        let name = mappings::control_name(pad, Some(input), ui.context(), program.as_ref());
+        return Err(format!(
+            "validation: {} is a \"{}\" action, which {name} can't take",
+            mapping_label(favourite, program.as_ref()),
+            FAMILIES[family]
+        )
+        .into());
+    }
+    let mut copy = favourite.clone();
+    copy.control = pad;
+    copy.input = input;
+    Ok(Some(copy))
+}
+
+const FAMILIES: [&str; 14] = [
     "Keyboard shortcut",
     "Launch application",
     "Fedora system action",
@@ -5579,6 +5651,7 @@ const FAMILIES: [&str; 13] = [
     "herdr (focus an agent)",
     "Prompt sequence (tap 1 sends prompt 1, tap 2 prompt 2, …)",
     "Terminal command, e.g. sudo dnf update (visible terminal, hold 1 second)",
+    "Favourites (the same action as a starred assignment)",
 ];
 
 fn configure(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) -> Result<()> {
@@ -6042,7 +6115,13 @@ fn configure_steps(
         .map(|i| offered[i]) else {
             continue;
         };
-        let mut mapping = if family == 0 {
+        let copied = family == 13;
+        let mut mapping = if copied {
+            let Some(copy) = favourite_mapping(ui, path, pad, input)? else {
+                continue;
+            };
+            copy
+        } else if family == 0 {
             let Some(keys) = shortcut(ui, saved.as_ref().map_or(&[], |m| &m.keys))? else {
                 continue;
             };
@@ -6214,6 +6293,8 @@ fn configure_steps(
             || profile.is_some()
         {
             Some(crate::feedback::Feedback::default())
+        } else if copied {
+            Some(mapping.feedback) // a favourite keeps its feedback where the control can show it
         } else {
             feedback_menu(ui, previous, saved.is_some(), false)?
         }) else {
@@ -6240,6 +6321,9 @@ fn configure_steps(
         // only after a one-second hold, in a visible terminal where sudo asks for the password.
         if family == 12 {
             mapping.risky = true;
+        } else if copied {
+            // A favourite keeps its "fire when", but only pads and keys can be held.
+            mapping.risky &= matches!(mapping.input, mappings::Input::Pad | mappings::Input::Piano);
         } else if matches!(mapping.input, mappings::Input::Pad | mappings::Input::Piano) {
             let Some(risky) = choose_saved(
                 ui,
@@ -6255,7 +6339,9 @@ fn configure_steps(
             };
             mapping.risky = risky == 1;
         }
-        if mapping.action.observable() {
+        if copied {
+            mapping.status &= mapping.action.observable();
+        } else if mapping.action.observable() {
             let Some(status) = choose_saved(
                 ui,
                 "Status feedback in the live pane (sent, running, stopped, failed)",
@@ -7231,6 +7317,114 @@ mod tests {
         ui.quit_holds();
         assert!(ran.recv_timeout(Duration::from_millis(300)).is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 46: Configure's Favourites family copies a starred assignment onto the
+    /// learned control (Akai pad or Xbox button) and goes to Review; an action the control
+    /// can't take is refused by name; with nothing starred it says where to star one.
+    #[test]
+    fn favourites_family_copies_a_starred_assignment() {
+        use crate::actions::Action;
+        use Key::*;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-fav-family-{}", std::process::id()));
+        let a = Control::from_note(10, 36).unwrap();
+        let mute = Mapping::new_action(a, mappings::Input::Pad, Action::OutputMute).unwrap();
+        let mut prompt = Mapping::new_action(
+            Control::from_note(10, 37).unwrap(),
+            mappings::Input::Pad,
+            Action::Prompt {
+                file: "review".into(),
+                target: crate::actions::Target::Agent("claude".into()),
+                enter: false,
+            },
+        )
+        .unwrap();
+        prompt.status = true;
+        let run = |starred: &[&Mapping], keys: Vec<Key>, pads: Vec<Control>, motions| {
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("mappings.tsv");
+            let mut config = mappings::Config::default();
+            config.mappings = vec![mute.clone(), prompt.clone()];
+            config.favourites = starred.iter().map(|m| mappings::favourite_key(m)).collect();
+            mappings::save_config(&path, &config).unwrap();
+            let mut ui = Script {
+                keys: keys.into(),
+                pads: pads.into(),
+                motions,
+                ..Default::default()
+            };
+            let mut current = config.mappings.clone();
+            let result = configure(&mut ui, &path, &mut current);
+            let screens = ui.screens.join("\n----\n");
+            assert!(result.is_ok(), "{result:?}\n{screens}");
+            assert!(ui.keys.is_empty(), "keys left\n{screens}");
+            (mappings::load_config(&path).unwrap().mappings, screens)
+        };
+        let favourites = |n: usize| {
+            let mut keys = vec![Enter];
+            keys.extend(vec![Down; n]); // Favourites is the last family offered
+            keys.push(Enter);
+            keys
+        };
+        // An Akai pad: Favourites -> Output mute -> Review -> save.
+        let b = Control::from_note(10, 38).unwrap();
+        let mut keys = favourites(11);
+        keys.extend([Enter, Enter, Tab, Tab, Enter]); // the favourite, save, finish
+        let (saved, screens) = run(&[&mute, &prompt], keys, vec![b], VecDeque::new());
+        assert!(screens.contains("★"), "{screens}");
+        let copy = saved.iter().find(|m| m.control == b).unwrap();
+        assert_eq!(copy.action, Action::OutputMute);
+        assert!(
+            saved.iter().any(|m| m.control == a),
+            "the favourite itself stays"
+        );
+        // A prompt copies its status feedback too.
+        let mut keys = favourites(11);
+        keys.extend([Down, Enter, Enter, Tab, Tab, Enter]);
+        let (saved, _) = run(&[&mute, &prompt], keys, vec![b], VecDeque::new());
+        let copy = saved.iter().find(|m| m.control == b).unwrap();
+        assert!(matches!(copy.action, Action::Prompt { .. }) && copy.status);
+        // An Xbox button: its layer is asked, then Review.
+        let mut keys = favourites(11);
+        keys.extend([Enter, Enter, Enter, Tab, Tab, Enter]); // favourite, layer 1, save, finish
+        let (saved, _) = run(&[&mute], keys, vec![Control::button(3)], VecDeque::new());
+        let copy = saved
+            .iter()
+            .find(|m| m.control == Control::button(3))
+            .unwrap();
+        assert_eq!(
+            (copy.action.clone(), copy.context),
+            (Action::OutputMute, mappings::GAMEPAD_CONTEXT)
+        );
+        // A knob can't take a prompt: refused by name, nothing saved.
+        let knob = Control {
+            channel: 1,
+            id: 70,
+            message: crate::Message::Cc,
+            direction: 1,
+        };
+        let mut keys = vec![Down, Down, Enter]; // Learn a knob
+        keys.extend(vec![Down; 4]);
+        keys.extend([Enter, Enter, Enter, Tab, Tab, Enter]); // Favourites, the prompt, Back
+        let turned = (
+            knob,
+            mappings::Input::Knob { step: 4 },
+            "Knob 2 increase".to_string(),
+        );
+        let (saved, screens) = run(&[&prompt], keys, vec![], [turned].into());
+        assert!(!saved.iter().any(|m| m.control == knob));
+        assert!(
+            screens.contains("Not saved: validation:") && screens.contains("can't take"),
+            "{screens}"
+        );
+        // Nothing starred: it says where to star one.
+        let mut keys = favourites(11);
+        keys.extend([Enter, Tab, Tab, Enter]); // Back, finish
+        let (_, screens) = run(&[], keys, vec![b], VecDeque::new());
+        assert!(screens.contains("Settings → Favourites"), "{screens}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Stored Program 2 of the recorded MPK Mini MK3 (testdata), as a verified program.
