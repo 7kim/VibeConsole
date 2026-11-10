@@ -706,6 +706,13 @@ pub fn import_profile(text: &str, config: &Config) -> Result<Profile> {
 /// A profile's export file name: letters, digits, `-` and `_` only, so it stays in its
 /// folder whatever the profile is called.
 pub fn profile_file_name(name: &str) -> String {
+    safe_file_name(name, "profile")
+}
+/// A preset's file name (v7 ticket 25), kept inside its folder like a profile's.
+pub fn preset_file_name(name: &str) -> String {
+    safe_file_name(name, "preset")
+}
+fn safe_file_name(name: &str, extension: &str) -> String {
     let mut file = String::new();
     for c in name.chars() {
         if c.is_ascii_alphanumeric() || c == '_' {
@@ -715,7 +722,33 @@ pub fn profile_file_name(name: &str) -> String {
         }
     }
     let file = file.trim_end_matches('-');
-    format!("{}.profile", if file.is_empty() { "profile" } else { file })
+    format!(
+        "{}.{extension}",
+        if file.is_empty() { extension } else { file }
+    )
+}
+
+/// v7 ticket 25: load a saved preset's setup (mappings, app profiles and the MIDI devices
+/// they use) into `config`; settings, agents and tuning stay. A lock or active device the
+/// preset doesn't have is dropped.
+pub fn apply_preset(config: &Config, preset: &Config) -> Config {
+    let mut next = config.clone();
+    next.mappings = preset.mappings.clone();
+    next.profiles = preset.profiles.clone();
+    next.midi_devices = preset.midi_devices.clone();
+    if next
+        .midi_active
+        .as_ref()
+        .is_some_and(|a| !next.midi_devices.contains(a))
+    {
+        next.midi_active = None;
+    }
+    if let Some(Lock::Profile(name)) = &next.lock {
+        if next.profile(name).is_none() {
+            next.lock = None;
+        }
+    }
+    next
 }
 
 /// One context's mappings with a profile's overrides on top (v7 ticket 12).
@@ -2707,6 +2740,30 @@ mod tests {
         bad.favourites.push(bad.favourites[0].clone());
         assert!(save_config(&path, &bad).is_err());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 25: a preset brings back mappings, profiles and their devices; settings
+    /// stay; a lock on a profile the preset lacks is dropped.
+    #[test]
+    fn presets_bring_back_the_setup_and_keep_settings() {
+        let pad = Control::from_note(10, 36).unwrap();
+        let mut preset = Config::default();
+        preset.mappings = vec![Mapping::new(pad, "F1", "hold").unwrap()];
+        let mut config = Config::default();
+        config.start_flow = false;
+        config.profiles = vec![Profile {
+            name: "Orca".into(),
+            apps: vec!["orca.desktop".into()],
+            mappings: Vec::new(),
+        }];
+        config.lock = Some(Lock::Profile("Orca".into()));
+        let next = apply_preset(&config, &preset);
+        assert_eq!(next.mappings, preset.mappings);
+        assert!(next.profiles.is_empty());
+        assert_eq!(next.lock, None);
+        assert!(!next.start_flow, "settings stay");
+        assert_eq!(preset_file_name("Work: day"), "Work-day.preset");
+        assert_eq!(preset_file_name("../x"), "x.preset");
     }
 
     #[test]

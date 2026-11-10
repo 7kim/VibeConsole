@@ -3464,6 +3464,7 @@ fn settings_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 "Favourites ({}): ★ assignments and profiles, listed first",
                 config.favourites.len()
             ),
+            "Presets: save the whole setup by name, load it later".to_string(),
         ];
         let Some(choice) = choose(ui, "Settings", &rows)? else {
             return Ok(());
@@ -3499,7 +3500,8 @@ fn settings_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
             7 => midi_device_menu(ui, path),
             8 => tuning_menu(ui, path),
             9 => profiles_menu(ui, path),
-            _ => favourites_menu(ui, path),
+            10 => favourites_menu(ui, path),
+            _ => presets_menu(ui, path),
         };
         if let Err(error) = result {
             not_saved(ui, &error)?;
@@ -3565,6 +3567,72 @@ fn pick_app(ui: &mut impl Ui) -> Result<Option<String>> {
         .map(Some)
         .ok_or_else(|| "that app has no desktop ID".into())
 }
+fn presets_dir(path: &Path) -> PathBuf {
+    path.parent().unwrap_or(Path::new(".")).join("presets")
+}
+/// Settings -> Presets (v7 ticket 25): the whole setup (mappings, app profiles and their
+/// MIDI devices) saved by name and loaded later. Loading replaces the setup and keeps
+/// settings; a bad preset file is refused whole.
+fn presets_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
+    loop {
+        let dir = presets_dir(path);
+        let mut files = std::fs::read_dir(&dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|name| name.ends_with(".preset"))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        files.sort();
+        let mut items = files.clone();
+        items.push("Save the current setup as a preset".into());
+        let Some(choice) = choose(ui, &format!("Presets ({})", dir.display()), &items)? else {
+            return Ok(());
+        };
+        let result = if choice == files.len() {
+            (|| {
+                let Some(name) = text_entry(ui, "Preset name", "")? else {
+                    return Ok(());
+                };
+                if !mappings::valid_profile_name(&name) {
+                    return Err("a preset name is 1–32 printable characters".into());
+                }
+                std::fs::create_dir_all(&dir)?;
+                mappings::save_config(
+                    &dir.join(mappings::preset_file_name(name.trim())),
+                    &mappings::load_config(path)?,
+                )
+            })()
+        } else {
+            let file = dir.join(&files[choice]);
+            match choose(
+                ui,
+                &format!("Preset {}", files[choice]),
+                &options(&[
+                    "Load it (replaces mappings and app profiles; settings stay)",
+                    "Delete it",
+                    "Back",
+                ]),
+            )? {
+                Some(0) => (|| {
+                    let preset = mappings::load_config(&file)
+                        .map_err(|e| format!("{}: {e}; nothing loaded", files[choice]))?;
+                    let config = mappings::load_config(path)?;
+                    mappings::save_config(path, &mappings::apply_preset(&config, &preset))
+                })(),
+                Some(1) => std::fs::remove_file(&file).map_err(Into::into),
+                _ => Ok(()),
+            }
+        };
+        if let Err(error) = result {
+            not_saved(ui, &error)?;
+        }
+    }
+}
+
 /// Settings -> Favourites (v7 ticket 24): Enter marks or unmarks one; saved at once.
 fn favourites_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
     let mut cursor = 0;
@@ -6408,9 +6476,13 @@ Running/paused mode is retained; held keys and toggles start inactive.",
             17 => (|| { ui.suspend()?; agents_menu(&mut ui, path) })(),
             18 => (|| {
                 ui.suspend()?;
-                settings_menu(&mut ui, path)?;
-                ui.start_flow_enabled = mappings::load_config(path)?.start_flow;
-                Ok(())
+                let shown = settings_menu(&mut ui, path);
+                // A preset (or anything else in Settings) may have replaced the mappings:
+                // pick them up, so resuming is a transition, never a stale set.
+                let config = mappings::load_config(path)?;
+                current = config.mappings;
+                ui.start_flow_enabled = config.start_flow;
+                shown
             })(),
             _ => return Ok(()),
         };
@@ -8103,6 +8175,51 @@ mod tests {
         let list = saved_list(&config.mappings, 0, &config.favourites);
         assert_eq!(list[0], (&b, true));
         assert_eq!(list[1], (&a, false));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 25: save the setup as a preset, change it, load the preset back; a bad
+    /// preset is refused and nothing changes.
+    #[test]
+    fn presets_save_load_and_refuse_bad_files() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-presets-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let a = Mapping::new(Control::from_note(10, 36).unwrap(), "F1", "hold").unwrap();
+        mappings::save(&path, &[a.clone()]).unwrap();
+        let presets = |keys: Vec<Key>| {
+            let mut all = vec![Down; 11];
+            all.push(Enter);
+            all.extend(keys);
+            all.extend([Escape, Escape]);
+            let mut ui = Script {
+                keys: all.into(),
+                ..Default::default()
+            };
+            settings_menu(&mut ui, &path).unwrap();
+            assert!(ui.keys.is_empty());
+            ui.screens
+        };
+        let mut save = vec![Enter];
+        save.extend(b"Work".map(Character));
+        save.push(Enter);
+        presets(save);
+        assert!(dir.join("presets/Work.preset").exists());
+        let b = Mapping::new(Control::from_note(10, 37).unwrap(), "F2", "hold").unwrap();
+        mappings::save(&path, &[b]).unwrap();
+        presets(vec![Enter, Enter]); // Work.preset -> Load it
+        assert_eq!(mappings::load(&path).unwrap(), [a]);
+        std::fs::write(dir.join("presets/Bad.preset"), "not a config").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let screens = presets(vec![Enter, Enter, Enter]); // Bad.preset -> Load -> Back
+        assert!(
+            screens
+                .iter()
+                .any(|s| s.contains("Bad.preset") && s.contains("nothing loaded"))
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
