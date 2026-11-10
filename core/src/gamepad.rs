@@ -334,6 +334,45 @@ pub fn rumble_due(before: &[(String, &str)], now: &[(String, &str)]) -> bool {
     })
 }
 
+/// v7 ticket 27: whether headset audio through the controller's 3.5 mm jack can work, from
+/// which driver holds the controller (`bound`: driver names with a device bound) and ALSA's
+/// card list. Only `xone` carries controller audio; VibeConsole never loads or unloads a
+/// kernel module, it only says what it found.
+pub fn headset_status(bound: &[&str], cards: &str) -> String {
+    let xone = bound.iter().any(|d| d.starts_with("xone"));
+    let xpad = bound.contains(&"xpad");
+    let audio = cards.lines().any(|line| {
+        let line = line.to_lowercase();
+        line.contains("xbox") || line.contains("xone") || line.contains("gip")
+    });
+    match (xone, xpad, audio) {
+        (true, _, true) => "Xbox headset audio: available (xone driver, controller audio device present)".into(),
+        (true, _, false) => {
+            "Xbox headset audio: unavailable: xone is bound but no controller audio device is present".into()
+        }
+        (false, true, _) => {
+            "Xbox headset audio: unavailable: needs the xone driver (the controller uses xpad)".into()
+        }
+        (false, false, _) => "Xbox headset audio: no Xbox controller on a USB driver".into(),
+    }
+}
+/// The real inputs for `headset_status`: drivers in /sys with a device bound, and
+/// /proc/asound/cards.
+pub fn headset() -> String {
+    let bound = ["xpad", "xone-wired", "xone-dongle", "xone-gip"]
+        .into_iter()
+        .filter(|driver| {
+            std::fs::read_dir(format!("/sys/bus/usb/drivers/{driver}")).is_ok_and(|entries| {
+                entries
+                    .flatten()
+                    .any(|e| e.file_name().to_string_lossy().contains(':'))
+            })
+        })
+        .collect::<Vec<_>>();
+    let cards = std::fs::read_to_string("/proc/asound/cards").unwrap_or_default();
+    headset_status(&bound, &cards)
+}
+
 /// v7 ticket 22: how far the pointer moves for one step of `dt` seconds with the mouse
 /// stick at `stick` (-1–1, gilrs: up is positive). Inside the dead zone nothing moves; past
 /// it, speed scales from 0 to `mouse_speed` × 40 px/s at full push. `carry` keeps the
@@ -850,6 +889,19 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn headset_audio_is_reported_from_the_driver_and_cards_never_guessed() {
+        let cards = " 0 [M3 ]: USB-Audio - MPK mini 3\n";
+        let xbox_card = " 5 [Controller ]: XboxGIP - Xbox Wireless Controller audio\n";
+        assert!(headset_status(&[], cards).contains("no Xbox controller"));
+        assert!(headset_status(&["xpad"], cards).contains("needs the xone driver"));
+        assert!(headset_status(&["xone-wired"], cards).contains("no controller audio device"));
+        assert!(
+            headset_status(&["xone-wired"], &format!("{cards}{xbox_card}")).contains("available")
+        );
+        assert!(headset_status(&["xpad"], xbox_card).contains("needs the xone driver"));
     }
 
     #[test]

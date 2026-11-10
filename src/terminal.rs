@@ -3879,7 +3879,8 @@ fn tuning_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
         format!("Mouse speed: {}", tuning.mouse_speed),
         "Back".to_string(),
     ];
-    match choose(ui, "Xbox tuning", &items)? {
+    let title = format!("Xbox tuning\n{}", crate::gamepad::headset());
+    match choose(ui, &title, &items)? {
         Some(0) => {
             let Some(value) = number(
                 ui,
