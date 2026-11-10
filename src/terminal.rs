@@ -148,6 +148,11 @@ struct Terminal {
     follow_apps: bool,
     /// "focused app unavailable" was shown; shown once until it comes back.
     focus_unavailable: bool,
+    /// The app focused at the last refresh: profiles follow focus *changes*, so one picked
+    /// from the controller stays until another app is focused (v7 ticket 13).
+    last_focus: Option<String>,
+    /// The Xbox-button gesture (cycle profiles, toggle the lock).
+    guide: crate::gamepad::Guide,
     context_verified: bool,
     follow_programs: bool,
     follow_retry: Instant,
@@ -616,6 +621,8 @@ impl Terminal {
             profile: None,
             follow_apps: false,
             focus_unavailable: false,
+            last_focus: None,
+            guide: crate::gamepad::Guide::default(),
             context_verified: true,
             follow_programs: false,
             follow_retry: Instant::now(),
@@ -943,6 +950,7 @@ impl Terminal {
     }
     fn suspend(&mut self) -> Result<()> {
         self.suspended = true;
+        self.guide.cancel();
         if let Some(pad) = &mut self.gamepad {
             pad.stop_rumble();
         }
@@ -1152,10 +1160,10 @@ impl Terminal {
     /// Follow the focused app (v7 ticket 12): its profile, or Default. Without the window
     /// extension the focused app is "unavailable" and Default applies.
     fn follow_focus(&mut self, config: &mappings::Config) -> Result<()> {
-        let profile = match crate::actions::focused_app(crate::actions::gdbus_output) {
+        let focused = match crate::actions::focused_app(crate::actions::gdbus_output) {
             Ok(app) => {
                 self.focus_unavailable = false;
-                app.and_then(|app| config.profile_for(&app).map(|p| p.name.clone()))
+                app
             }
             Err(error) => {
                 if !self.focus_unavailable && !config.profiles.is_empty() {
@@ -1165,7 +1173,42 @@ impl Terminal {
                 None
             }
         };
-        self.set_profile(profile)
+        let changed = focused != self.last_focus;
+        self.last_focus = focused.clone();
+        // A lock pins its profile whatever is focused; otherwise only a focus change moves.
+        if config.lock.is_some() || changed {
+            self.set_profile(config.choice(focused.as_deref()))?;
+        }
+        Ok(())
+    }
+    /// The Xbox-button gesture's actions (v7 ticket 13). Cycling while locked moves the lock.
+    fn guide_action(&mut self, action: crate::gamepad::GuideAction) -> Result<()> {
+        let mut config = mappings::load_config(&self.path)?;
+        match action {
+            crate::gamepad::GuideAction::Cycle { forward } => {
+                let next = config.cycle(self.profile.as_deref(), forward);
+                if config.lock.is_some() {
+                    config.lock = Some(lock_on(next.as_deref()));
+                    mappings::save_config(&self.path, &config)?;
+                }
+                self.set_profile(next)?;
+            }
+            crate::gamepad::GuideAction::ToggleLock => {
+                config.lock = match config.lock {
+                    Some(_) => None,
+                    None => Some(lock_on(self.profile.as_deref())),
+                };
+                mappings::save_config(&self.path, &config)?;
+                self.notice = match &config.lock {
+                    Some(_) => format!(
+                        "Locked on {}: focus changes are ignored",
+                        self.profile.as_deref().unwrap_or("Default")
+                    ),
+                    None => "Unlocked: profiles follow the focused app".into(),
+                };
+            }
+        }
+        Ok(())
     }
     fn set_profile(&mut self, profile: Option<String>) -> Result<()> {
         if self.profile == profile {
@@ -1948,6 +1991,17 @@ impl Terminal {
             .map(crate::gamepad::Pad::poll)
             .unwrap_or_default();
         for change in changes {
+            if let crate::gamepad::Change::Event(event) = &change {
+                let (action, gesture) = self.guide.event(event, Instant::now());
+                if let Some(action) = action {
+                    if let Err(error) = self.guide_action(action) {
+                        self.error = format!("Profile switch failed: {error}");
+                    }
+                }
+                if gesture {
+                    continue;
+                }
+            }
             match change {
                 crate::gamepad::Change::Event(
                     Event::Press(control) | Event::Release(control, _),
@@ -1968,6 +2022,11 @@ impl Terminal {
                 crate::gamepad::Change::Disconnected(name) => self.gamepad_transition(format!(
                     "Xbox controller disconnected: {name}; held keys released"
                 ))?,
+            }
+        }
+        if let Some(action) = self.guide.tick(Instant::now()) {
+            if let Err(error) = self.guide_action(action) {
+                self.error = format!("Profile lock failed: {error}");
             }
         }
         for dialed in self.motion.settle(Instant::now()) {
@@ -4991,6 +5050,12 @@ fn configure_for(
     })
 }
 
+fn lock_on(profile: Option<&str>) -> mappings::Lock {
+    profile.map_or(mappings::Lock::Default, |name| {
+        mappings::Lock::Profile(name.to_owned())
+    })
+}
+
 /// /configure's saved list: the open program's mappings and the Xbox ones (active beside
 /// every program).
 fn listed(mapping: &Mapping, context: u8) -> bool {
@@ -7839,7 +7904,7 @@ mod tests {
         let v14 = saved
             .replace("vibeconsole-mappings-v16", "vibeconsole-mappings-v14")
             .replace(
-                "tuning\t15\t30\t10\toff\nmidi-devices\t0\nmidi-active\t-\nprofiles\t0\n",
+                "tuning\t15\t30\t10\toff\nmidi-devices\t0\nmidi-active\t-\nprofiles\t0\nprofile-lock\t-\n",
                 "",
             )
             .replace(

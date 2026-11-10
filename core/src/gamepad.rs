@@ -84,6 +84,71 @@ pub fn default_layout() -> Vec<Mapping> {
 pub fn is_layer_key(control: Control) -> bool {
     Some(control) == self::control(gilrs::Button::LeftTrigger)
 }
+/// The Xbox button (v7 ticket 13): held with the D-pad it cycles profiles; held alone
+/// for a second it toggles the lock. Reserved like LB.
+pub fn is_guide(control: Control) -> bool {
+    Some(control) == self::control(gilrs::Button::Mode)
+}
+/// Buttons VibeConsole keeps for itself; they can't be mapped.
+pub fn is_reserved(control: Control) -> bool {
+    is_layer_key(control) || is_guide(control)
+}
+#[derive(Debug, PartialEq)]
+pub enum GuideAction {
+    Cycle { forward: bool },
+    ToggleLock,
+}
+/// The Xbox-button gesture: D-pad presses while it's held cycle (right/down forward,
+/// left/up back) and are swallowed; holding it alone for one second toggles the lock,
+/// once. Letting go early, a pause or a clear cancels.
+#[derive(Default)]
+pub struct Guide {
+    since: Option<std::time::Instant>,
+    used: bool,
+}
+impl Guide {
+    /// The action for `event`, and whether the event is the gesture's (not for mappings).
+    pub fn event(&mut self, event: &Event, now: std::time::Instant) -> (Option<GuideAction>, bool) {
+        let dpad = |c: &Control, buttons: [gilrs::Button; 2]| {
+            buttons.iter().any(|b| control(*b) == Some(*c))
+        };
+        match event {
+            Event::Press(c) if is_guide(*c) => {
+                self.since = Some(now);
+                self.used = false;
+                (None, true)
+            }
+            Event::Release(c, _) | Event::UnmatchedRelease(c) | Event::DuplicatePress(c)
+                if is_guide(*c) =>
+            {
+                self.since = None;
+                (None, true)
+            }
+            Event::Press(c) if self.since.is_some() => {
+                let forward = dpad(c, [gilrs::Button::DPadRight, gilrs::Button::DPadDown]);
+                if forward || dpad(c, [gilrs::Button::DPadLeft, gilrs::Button::DPadUp]) {
+                    self.used = true;
+                    (Some(GuideAction::Cycle { forward }), true)
+                } else {
+                    (None, false)
+                }
+            }
+            _ => (None, false),
+        }
+    }
+    pub fn tick(&mut self, now: std::time::Instant) -> Option<GuideAction> {
+        let since = self.since?;
+        if self.used || now.duration_since(since) < std::time::Duration::from_secs(1) {
+            return None;
+        }
+        self.used = true;
+        Some(GuideAction::ToggleLock)
+    }
+    pub fn cancel(&mut self) {
+        self.since = None;
+    }
+}
+
 /// The mappings for a layer: layer 1 is the layout (defaults plus saved), layer 2 only
 /// what was saved for it.
 pub fn layer(saved: &[Mapping], second: bool) -> Vec<Mapping> {
@@ -625,6 +690,47 @@ mod tests {
         assert!(!rumble_due(&asks, &busy), "going busy again doesn't rumble");
         assert!(rumble_due(&[], &state(&[("codex", "needs-decision")])));
         assert!(!rumble_due(&[], &state(&[("codex", "idle")])));
+    }
+
+    #[test]
+    fn xbox_button_with_the_dpad_cycles_and_a_one_second_hold_toggles_the_lock() {
+        use std::time::{Duration, Instant};
+        let at = Instant::now();
+        let ms = |n| at + Duration::from_millis(n);
+        let guide = control(gilrs::Button::Mode).unwrap();
+        let right = control(gilrs::Button::DPadRight).unwrap();
+        let up = control(gilrs::Button::DPadUp).unwrap();
+        let a = control(gilrs::Button::South).unwrap();
+        let mut g = Guide::default();
+        assert_eq!(
+            g.event(&Event::Press(right), ms(0)),
+            (None, false),
+            "D-pad alone is a mapping"
+        );
+        assert_eq!(g.event(&Event::Press(guide), ms(0)), (None, true));
+        assert_eq!(
+            g.event(&Event::Press(right), ms(100)),
+            (Some(GuideAction::Cycle { forward: true }), true)
+        );
+        assert_eq!(
+            g.event(&Event::Press(up), ms(200)),
+            (Some(GuideAction::Cycle { forward: false }), true)
+        );
+        assert_eq!(g.event(&Event::Press(a), ms(250)), (None, false));
+        assert_eq!(g.tick(ms(1500)), None, "used for cycling: no lock toggle");
+        g.event(&Event::Release(guide, ReleaseType::ButtonUp), ms(1600));
+        g.event(&Event::Press(guide), ms(2000));
+        assert_eq!(g.tick(ms(2900)), None);
+        assert_eq!(g.tick(ms(3000)), Some(GuideAction::ToggleLock));
+        assert_eq!(g.tick(ms(3500)), None, "once per hold");
+        g.event(&Event::Release(guide, ReleaseType::ButtonUp), ms(3600));
+        g.event(&Event::Press(guide), ms(4000));
+        g.event(&Event::Release(guide, ReleaseType::ButtonUp), ms(4500));
+        assert_eq!(g.tick(ms(5500)), None, "letting go early cancels");
+        g.event(&Event::Press(guide), ms(6000));
+        g.cancel();
+        assert_eq!(g.tick(ms(7500)), None, "a pause or clear cancels");
+        assert!(is_reserved(guide) && !is_reserved(a));
     }
 
     #[test]

@@ -319,7 +319,7 @@ impl Mapping {
         }
         if (self.context > 16 && self.context < GAMEPAD_LAYER_2)
             || gamepad_context(self.context) != (self.control.message == crate::Message::Button)
-            || (gamepad_context(self.context) && crate::gamepad::is_layer_key(self.control))
+            || (gamepad_context(self.context) && crate::gamepad::is_reserved(self.control))
             || self.label.is_empty()
             || self.label.len() > 80
             || self.label.chars().any(char::is_control)
@@ -548,6 +548,13 @@ pub struct Config {
     pub midi_active: Option<String>,
     /// v7 ticket 12: per-app overrides; an app with no profile uses Default.
     pub profiles: Vec<Profile>,
+    /// v7 ticket 13: a pinned profile (or Default) that ignores focus changes.
+    pub lock: Option<Lock>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Lock {
+    Default,
+    Profile(String),
 }
 /// An app profile (v7 ticket 12): while one of its apps is focused, its mappings replace
 /// the Default ones for the same controls; every other control keeps its Default meaning.
@@ -562,6 +569,7 @@ pub struct Profile {
 /// A profile name: one printable line, 1–32 characters.
 pub fn valid_profile_name(name: &str) -> bool {
     !name.trim().is_empty()
+        && !name.trim().eq_ignore_ascii_case("default")
         && name.chars().count() <= 32
         && name != "-"
         && !name.chars().any(char::is_control)
@@ -689,6 +697,7 @@ impl Default for Config {
             midi_devices: Vec::new(),
             midi_active: None,
             profiles: Vec::new(),
+            lock: None,
         }
     }
 }
@@ -705,6 +714,28 @@ impl Config {
         self.profiles
             .iter()
             .find(|p| p.apps.iter().any(|a| a == app))
+    }
+    /// The profile that applies with `focused` in front: the lock, else the app's own.
+    pub fn choice(&self, focused: Option<&str>) -> Option<String> {
+        match &self.lock {
+            Some(Lock::Default) => None,
+            Some(Lock::Profile(name)) => Some(name.clone()),
+            None => focused
+                .and_then(|app| self.profile_for(app))
+                .map(|p| p.name.clone()),
+        }
+    }
+    /// Default, then each profile in order, then Default again (or backwards).
+    pub fn cycle(&self, current: Option<&str>, forward: bool) -> Option<String> {
+        let mut order = vec![None];
+        order.extend(self.profiles.iter().map(|p| Some(p.name.as_str())));
+        let at = order.iter().position(|o| *o == current).unwrap_or(0);
+        let next = if forward {
+            (at + 1) % order.len()
+        } else {
+            (at + order.len() - 1) % order.len()
+        };
+        order[next].map(str::to_owned)
     }
     pub fn profile(&self, name: &str) -> Option<&Profile> {
         self.profiles.iter().find(|p| p.name == name)
@@ -1395,6 +1426,20 @@ fn parse_config(contents: &str) -> Result<Config> {
         }
         validate_profiles(&profiles)?;
     }
+    let lock = if version >= 16 {
+        match lines
+            .next()
+            .and_then(|l| l.strip_prefix("profile-lock\t"))
+            .ok_or("expected profile-lock")?
+        {
+            "-" => None,
+            "Default" => Some(Lock::Default),
+            name if profiles.iter().any(|p| p.name == name) => Some(Lock::Profile(name.into())),
+            _ => return Err("the locked profile doesn't exist".into()),
+        }
+    } else {
+        None
+    };
     let mut mappings = Vec::new();
     let mut seen = HashSet::new();
     let mut labels = HashSet::new();
@@ -1457,6 +1502,7 @@ fn parse_config(contents: &str) -> Result<Config> {
         midi_devices,
         midi_active,
         profiles,
+        lock,
     })
 }
 
@@ -1645,6 +1691,14 @@ pub fn save_config(path: &Path, config: &Config) -> Result<()> {
             contents.push_str(&mapping_line(mapping)?);
         }
     }
+    contents.push_str(&format!(
+        "profile-lock\t{}\n",
+        match &config.lock {
+            None => "-",
+            Some(Lock::Default) => "Default",
+            Some(Lock::Profile(name)) => name,
+        }
+    ));
     for mapping in &config.mappings {
         contents.push_str(&mapping_line(mapping)?);
     }
@@ -2374,6 +2428,57 @@ mod tests {
                 (KeyCode::KEY_F2, true),
             ]
         );
+    }
+
+    /// v7 ticket 13: profiles cycle Default -> each profile -> Default; a saved lock pins
+    /// one (or Default) whatever app is focused; "Default" can't name a profile.
+    #[test]
+    fn profiles_cycle_and_a_saved_lock_ignores_focus() {
+        let dir = std::env::temp_dir().join(format!("vibeconsole-lock-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let profile = |name: &str, app: &str| Profile {
+            name: name.into(),
+            apps: vec![app.into()],
+            mappings: Vec::new(),
+        };
+        let mut config = Config::default();
+        config.profiles = vec![
+            profile("Orca", "orca.desktop"),
+            profile("Firefox", "firefox.desktop"),
+        ];
+        assert_eq!(config.cycle(None, true).as_deref(), Some("Orca"));
+        assert_eq!(config.cycle(Some("Orca"), true).as_deref(), Some("Firefox"));
+        assert_eq!(config.cycle(Some("Firefox"), true), None);
+        assert_eq!(config.cycle(None, false).as_deref(), Some("Firefox"));
+        assert_eq!(
+            config.choice(Some("firefox.desktop")).as_deref(),
+            Some("Firefox")
+        );
+        assert_eq!(config.choice(Some("gedit.desktop")), None);
+        config.lock = Some(Lock::Profile("Orca".into()));
+        assert_eq!(
+            config.choice(Some("firefox.desktop")).as_deref(),
+            Some("Orca")
+        );
+        save_config(&path, &config).unwrap();
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("\nprofile-lock\tOrca\n")
+        );
+        assert_eq!(load_config(&path).unwrap(), config);
+        config.lock = Some(Lock::Default);
+        assert_eq!(config.choice(Some("firefox.desktop")), None);
+        save_config(&path, &config).unwrap();
+        assert_eq!(load_config(&path).unwrap().lock, Some(Lock::Default));
+        let mut bad = config.clone();
+        bad.lock = Some(Lock::Profile("Missing".into()));
+        assert!(save_config(&path, &bad).is_err());
+        let mut bad = config.clone();
+        bad.profiles[0].name = "default".into();
+        assert!(save_config(&path, &bad).is_err());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
