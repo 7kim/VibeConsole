@@ -155,6 +155,12 @@ pub enum Action {
     MicrophoneMute,
     /// Start Wispr Flow when it is not running; repair (quit and reopen) it once when it is.
     Flow,
+    /// v7 ticket 15: bring Orca's tab for `agent` working in `folder` to the front. The
+    /// terminal handle is looked up at press time, so a restarted agent is still found.
+    OrcaJump {
+        agent: String,
+        folder: String,
+    },
 }
 impl Action {
     pub fn flow(&self) -> bool {
@@ -284,6 +290,14 @@ impl Action {
             {
                 Err("command must be one nonempty line without control characters, run in an absolute directory without ':'".into())
             }
+            Self::OrcaJump { agent, folder }
+                if !crate::mappings::simple_name(agent)
+                    || !Path::new(folder).is_absolute()
+                    || folder.len() > 4096
+                    || folder.chars().any(char::is_control) =>
+            {
+                Err("Orca jump needs an agent name and an absolute folder".into())
+            }
             Self::Application(path) | Self::AppToggle { path, .. }
                 if !Path::new(path).is_absolute()
                     || !path.ends_with(".desktop")
@@ -343,6 +357,7 @@ impl Action {
             }
             Self::OutputMute => "output-mute".into(),
             Self::MicrophoneMute => "microphone-mute".into(),
+            Self::OrcaJump { agent, folder } => format!("orca-jump:{agent}:{folder}"),
             Self::Flow => "flow".into(),
         }
     }
@@ -420,6 +435,15 @@ impl Action {
                         "minimize" => false,
                         _ => return Err("app toggle second press must be minimize or close".into()),
                     },
+                }
+            }
+            _ if value.starts_with("orca-jump:") => {
+                let (agent, folder) = value["orca-jump:".len()..]
+                    .split_once(':')
+                    .ok_or("invalid Orca jump")?;
+                Self::OrcaJump {
+                    agent: agent.into(),
+                    folder: folder.into(),
                 }
             }
             _ if value.starts_with("volume-up:") => Self::Volume {
@@ -501,6 +525,7 @@ impl Action {
             ),
             Self::OutputMute => "Toggle default output mute".into(),
             Self::MicrophoneMute => "Toggle default microphone mute".into(),
+            Self::OrcaJump { agent, folder } => format!("Orca: jump to {agent} in {folder}"),
             Self::Flow => "Start or repair Wispr Flow".into(),
             Self::Shortcut => "Keyboard shortcut".into(),
         }
@@ -892,6 +917,56 @@ pub fn gdbus_output(argv: &[String]) -> Result<String> {
             .into());
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Orca's CLI: on PATH, else the shim Orca installs (the login service's PATH is short).
+fn orca_program() -> String {
+    let on_path = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .any(|dir| dir.join("orca").is_file());
+    match std::env::var_os("HOME") {
+        Some(home) if !on_path => {
+            let shim = Path::new(&home).join(".config/orca/linux-orca-cli-shim/orca");
+            if shim.is_file() {
+                return shim.to_string_lossy().into_owned();
+            }
+            "orca".into()
+        }
+        _ => "orca".into(),
+    }
+}
+/// Orca's terminals as (agent, folder, handle), from `orca terminal list --json`. Only
+/// those three fields are read; previews and titles (which hold your text) are not.
+pub fn orca_terminals(json: &str) -> Result<Vec<(String, String, String)>> {
+    let value: serde_json::Value = serde_json::from_str(json)?;
+    let list = value["result"]["terminals"]
+        .as_array()
+        .ok_or("Orca terminal list: unexpected reply")?;
+    Ok(list
+        .iter()
+        .filter_map(|t| {
+            Some((
+                t["agentIdentity"].as_str()?.to_owned(),
+                t["worktreePath"].as_str()?.to_owned(),
+                t["handle"].as_str()?.to_owned(),
+            ))
+        })
+        .collect())
+}
+/// Ask Orca for its terminals and switch to the one running `agent` in `folder`. Every
+/// argument is passed as one argument, never through a shell.
+fn orca_jump(
+    agent: &str,
+    folder: &str,
+    mut orca: impl FnMut(&[String]) -> Result<String>,
+) -> Result<String> {
+    let args = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+    let terminals = orca_terminals(&orca(&args(&["terminal", "list", "--json"]))?)?;
+    let (_, _, handle) = terminals
+        .iter()
+        .find(|(a, f, _)| a == agent && f == folder)
+        .ok_or_else(|| format!("Orca: no {agent} terminal in {folder}"))?;
+    orca(&args(&["terminal", "switch", "--terminal", handle]))?;
+    Ok(format!("Orca: switched to {agent} in {folder}"))
 }
 
 /// One launcher-pad press, decided by the Shell extension's view of the app's windows.
@@ -1605,6 +1680,9 @@ fn perform(
             || launch(path, &cancelled),
         ),
         Action::Flow => flow(node.ok_or("keyboard has not been registered")?, &cancelled),
+        Action::OrcaJump { agent, folder } => orca_jump(agent, folder, |args| {
+            command(&orca_program(), args, &cancelled)
+        }),
         Action::Shortcut => Err("shortcut belongs to keyboard output".into()),
         Action::Choice(_) | Action::Value { .. } => Err("knob actions run in the session".into()),
         _ => audio(action, |args| command("wpctl", args, &cancelled)),
@@ -1816,6 +1894,36 @@ fn flow(node: &Path, cancelled: &impl Fn() -> bool) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v7 ticket 15: "jump to agent" finds the handle at press time from Orca's list (only
+    /// agent, folder and handle are read) and switches with plain arguments.
+    #[test]
+    fn orca_jump_resolves_the_handle_at_press_time_and_reports_no_match() {
+        let list = r#"{"ok":true,"result":{"terminals":[
+            {"handle":"term_1","worktreePath":"/work/app","agentIdentity":"codex","preview":"secret"},
+            {"handle":"term_2","worktreePath":"/work/app","agentIdentity":"claude","title":"x"}]}}"#;
+        let mut calls = Vec::new();
+        let result = orca_jump("claude", "/work/app", |args| {
+            calls.push(args.to_vec());
+            Ok(if args[1] == "list" {
+                list.into()
+            } else {
+                String::new()
+            })
+        })
+        .unwrap();
+        assert_eq!(result, "Orca: switched to claude in /work/app");
+        assert_eq!(calls[1], ["terminal", "switch", "--terminal", "term_2"]);
+        let missing = orca_jump("claude", "/other", |_| Ok(list.into())).unwrap_err();
+        assert_eq!(missing.to_string(), "Orca: no claude terminal in /other");
+        let jump = Action::OrcaJump {
+            agent: "claude".into(),
+            folder: "/work/app".into(),
+        };
+        assert_eq!(Action::parse(&jump.encode()).unwrap(), jump);
+        assert!(Action::parse("orca-jump:../x:/work").is_err());
+        assert!(Action::parse("orca-jump:claude:relative").is_err());
+    }
 
     /// v7 ticket 12: the focused app comes from the extension; without it the answer is
     /// "unavailable", never a guess.

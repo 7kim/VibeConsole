@@ -127,6 +127,20 @@ trait Ui {
     fn login(&mut self, _request: crate::runtime::Login) -> Result<bool> {
         Err("login service unavailable".into())
     }
+    /// Orca's agent terminals as (agent, folder) (v7 ticket 15).
+    fn orca_agents(&mut self) -> Result<Vec<(String, String)>> {
+        let output = std::process::Command::new("orca")
+            .args(["terminal", "list", "--json"])
+            .output()
+            .map_err(|e| format!("Orca CLI unavailable: {e}"))?;
+        let mut agents = crate::actions::orca_terminals(&String::from_utf8_lossy(&output.stdout))?
+            .into_iter()
+            .map(|(agent, folder, _)| (agent, folder))
+            .collect::<Vec<_>>();
+        agents.sort();
+        agents.dedup();
+        Ok(agents)
+    }
     /// Settings -> MIDI device: connected other MIDI devices (v7 ticket 06).
     fn midi_devices(&mut self) -> Result<Vec<String>> {
         crate::midi::other_devices()
@@ -5071,14 +5085,14 @@ fn stage<E: std::fmt::Display>(name: &'static str) -> impl Fn(E) -> Box<dyn std:
 /// Action families (indexes into `FAMILIES`) a control can use; others are not offered.
 fn families(input: mappings::Input) -> Vec<usize> {
     match input {
-        mappings::Input::Pad | mappings::Input::Piano => (0..6).collect(),
+        mappings::Input::Pad | mappings::Input::Piano => (0..6).chain([8]).collect(),
         mappings::Input::Knob { .. } => vec![0, 2, 6, 7],
         mappings::Input::RelativeKnob { .. } => vec![0, 2],
         mappings::Input::Joystick { .. } => vec![0],
     }
 }
 
-const FAMILIES: [&str; 8] = [
+const FAMILIES: [&str; 9] = [
     "Keyboard shortcut",
     "Launch application",
     "Fedora system action",
@@ -5087,10 +5101,59 @@ const FAMILIES: [&str; 8] = [
     "Sequence of steps",
     "Choice knob (one prompt per zone)",
     "Value knob (number written to a file)",
+    "Orca (needs me, jump to an agent, its shortcuts)",
 ];
 
 fn configure(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) -> Result<()> {
     configure_for(ui, path, current, None)
+}
+
+/// The Orca family (v7 ticket 15): Orca's Linux default keys, "needs me" (the jump
+/// palette's first row: the agent waiting on you) and a jump to one agent's tab.
+fn orca_mapping(ui: &mut impl Ui, pad: Control, input: mappings::Input) -> Result<Option<Mapping>> {
+    const SHORTCUTS: [(&str, &str); 5] = [
+        ("Jump palette", "Ctrl+J"),
+        ("Next tab", "Ctrl+Shift+RightBracket"),
+        ("Previous tab", "Ctrl+Shift+LeftBracket"),
+        ("Last tab", "Ctrl+Tab"),
+        ("New terminal tab", "Ctrl+T"),
+    ];
+    let mut items = vec![
+        "Needs me: the agent waiting on you (Ctrl+J, then Ctrl+1)".to_owned(),
+        "Jump to an agent…".to_owned(),
+    ];
+    items.extend(
+        SHORTCUTS
+            .iter()
+            .map(|(name, keys)| format!("{name} ({keys})")),
+    );
+    let Some(choice) = choose(ui, "Orca (its Linux default keys)", &items)? else {
+        return Ok(None);
+    };
+    let action = match choice {
+        0 => crate::actions::Action::Sequence(vec![
+            crate::actions::Step::Keys(mappings::parse_shortcut("Ctrl+J")?),
+            crate::actions::Step::Wait(150),
+            crate::actions::Step::Keys(mappings::parse_shortcut("Ctrl+1")?),
+        ]),
+        1 => {
+            let agents = ui.orca_agents()?;
+            if agents.is_empty() {
+                return Err("Orca has no agent terminals open; start one first".into());
+            }
+            let names = agents
+                .iter()
+                .map(|(agent, folder)| format!("{agent} in {folder}"))
+                .collect::<Vec<_>>();
+            let Some(index) = choose(ui, "Jump to which agent?", &names)? else {
+                return Ok(None);
+            };
+            let (agent, folder) = agents[index].clone();
+            crate::actions::Action::OrcaJump { agent, folder }
+        }
+        n => return Ok(Some(Mapping::new(pad, SHORTCUTS[n - 2].1, "hold")?)),
+    };
+    Ok(Some(Mapping::new_action(pad, input, action)?))
 }
 /// /configure for Default (`None`) or one app profile's overrides (v7 ticket 12).
 fn configure_for(
@@ -5308,6 +5371,11 @@ fn configure_steps(
                 }
             };
             Mapping::new(pad, &keys.join("+"), behavior)?
+        } else if family == 8 {
+            let Some(mapping) = orca_mapping(ui, pad, input)? else {
+                continue;
+            };
+            mapping
         } else if family == 3 {
             if !matches!(input, mappings::Input::Pad | mappings::Input::Piano) {
                 return Err("prompts require a pad or piano press".into());
@@ -6096,10 +6164,15 @@ mod tests {
         context: u8,
         /// Installed apps offered by the app list, when set (v7 ticket 12).
         apps: Vec<(String, String)>,
+        /// Orca's agent terminals (v7 ticket 15).
+        orca: Vec<(String, String)>,
     }
     impl Ui for Script {
         fn midi_devices(&mut self) -> Result<Vec<String>> {
             Ok(self.midi_devices.clone())
+        }
+        fn orca_agents(&mut self) -> Result<Vec<(String, String)>> {
+            Ok(self.orca.clone())
         }
         fn context(&self) -> u8 {
             self.context
@@ -7304,6 +7377,60 @@ mod tests {
                 .any(|s| s.contains("Not saved: Bad.profile:") && s.contains("nothing imported"))
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 15: the Orca family maps "needs me", a jump to an agent picked from Orca's
+    /// own list, and Orca's shortcuts.
+    #[test]
+    fn orca_family_maps_needs_me_jump_and_shortcuts() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-orca-ui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let pads = [36, 37, 38].map(|n| Control::from_note(10, n).unwrap());
+        let family = vec![Down; 6]; // Orca is the 7th family offered for a pad
+        let save = [Enter, Enter, Enter]; // fire when pressed, no status, save and another
+        let mut keys = vec![Enter];
+        keys.extend(family.clone());
+        keys.extend([Enter, Enter]); // Orca, needs me
+        keys.extend(save);
+        keys.push(Enter);
+        keys.extend(family.clone());
+        keys.extend([Enter, Down, Enter, Down, Enter]); // jump, second agent
+        keys.extend([Enter, Enter]); // fire when pressed, save (a jump has no status)
+        keys.push(Enter);
+        keys.extend(family);
+        keys.extend([Enter, Down, Down, Down, Enter]); // next tab
+        keys.extend([Enter, Enter, Enter]); // fire when, no feedback, save
+        keys.extend([Tab, Tab, Enter]);
+        let mut ui = Script {
+            keys: keys.into(),
+            pads: pads.into(),
+            orca: vec![
+                ("claude".into(), "/work/a".into()),
+                ("codex".into(), "/work/b".into()),
+            ],
+            ..Default::default()
+        };
+        let mut current = Vec::new();
+        configure(&mut ui, &path, &mut current).unwrap();
+        assert!(ui.keys.is_empty());
+        let saved = mappings::load(&path).unwrap();
+        assert_eq!(
+            saved[0].action.encode(),
+            "sequence:keys:Ctrl+J\u{1f}wait:150\u{1f}keys:Ctrl+1".replace("\\u{1f}", "\u{1f}")
+        );
+        assert_eq!(
+            saved[1].action,
+            crate::actions::Action::OrcaJump {
+                agent: "codex".into(),
+                folder: "/work/b".into()
+            }
+        );
+        assert_eq!(saved[2].keys, ["Ctrl", "Shift", "RightBracket"]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
