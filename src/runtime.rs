@@ -1,50 +1,13 @@
 use crate::Result;
 use std::{
     fs::{self, File, OpenOptions},
-    os::{
-        fd::AsRawFd,
-        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-    },
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Command,
     sync::atomic::{AtomicBool, Ordering},
 };
 
-pub struct Owner {
-    _file: File,
-}
-impl Owner {
-    fn at(path: &Path) -> Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)?;
-        // SAFETY: borrowed descriptor; flock releases automatically when the owner closes it.
-        if file.metadata()?.uid() != unsafe { libc::geteuid() } {
-            return Err(
-                "runtime lock belongs to another user; check XDG_RUNTIME_DIR permissions".into(),
-            );
-        }
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err("another VibeConsole session owns MIDI/keyboard/configuration; keep that session for editing, or explicitly stop it first (vibeconsole startup-stop). No keyboard was replaced".into());
-        }
-        Ok(Self { _file: file })
-    }
-    pub fn acquire() -> Result<Self> {
-        if unsafe { libc::geteuid() } == 0 {
-            return Err("run VibeConsole as your desktop user, not root".into());
-        }
-        let dir = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .ok_or("XDG_RUNTIME_DIR is unavailable; run in your desktop session")?;
-        Self::at(&dir.join("vibeconsole.lock"))
-    }
-}
+pub use vibeconsole_core::owner::Owner;
 
 const UNIT: &str = "vibeconsole.service";
 /// Start the login service when this session closes: set by a handover (ticket 20) or by
@@ -104,7 +67,11 @@ fn take_over<O, F: FnMut(&[&str]) -> Result<()>>(
     Ok(session)
 }
 pub fn session() -> Result<Session<Owner, fn(&[&str]) -> Result<()>>> {
-    take_over(Owner::acquire, systemctl, &RUN_ON_QUIT)
+    take_over(
+        || Owner::acquire("terminal session"),
+        systemctl,
+        &RUN_ON_QUIT,
+    )
 }
 
 fn home() -> Result<PathBuf> {
@@ -241,7 +208,7 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
     let binary = binary()?;
     match command {
         "install" => {
-            let _owner = Owner::acquire()?;
+            let _owner = Owner::acquire("installer")?;
             fs::create_dir_all(binary.parent().unwrap())?;
             let source = std::env::current_exe()?;
             if source != binary {
@@ -312,7 +279,7 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                 fs::remove_file(unit()?)?;
                 systemctl(&["daemon-reload"])?;
             }
-            let _owner = Owner::acquire()?;
+            let _owner = Owner::acquire("installer")?;
             if binary.exists() {
                 fs::remove_file(&binary)?;
             }
@@ -500,10 +467,10 @@ mod tests {
     #[test]
     fn one_owner_and_opt_in_unit_do_not_mutate_desktop() {
         let path = std::env::temp_dir().join(format!("vibeconsole-owner-{}", std::process::id()));
-        let owner = Owner::at(&path).unwrap();
-        assert!(Owner::at(&path).is_err());
+        let owner = Owner::at(&path, "test").unwrap();
+        assert!(Owner::at(&path, "test").is_err());
         drop(owner);
-        drop(Owner::at(&path).unwrap());
+        drop(Owner::at(&path, "test").unwrap());
         fs::remove_file(path).unwrap();
         assert!(service().contains("\" daemon\n"));
         assert!(!service().contains("--feedback") && !service().contains("--start-flow"));

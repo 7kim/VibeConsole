@@ -7,6 +7,7 @@ pub mod keyboard;
 pub mod mappings;
 pub mod midi;
 pub mod motion;
+pub mod owner;
 pub mod recording;
 pub mod screen;
 pub mod status;

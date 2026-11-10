@@ -507,6 +507,41 @@ mod tests {
         assert_eq!(*sent.borrow(), [(KeyCode::KEY_F7, true)]);
     }
 
+    /// v7 ticket 10: Akai pads and Xbox buttons share one keyboard; interleaved presses
+    /// each fire once and release their own key.
+    #[test]
+    fn midi_pads_and_xbox_buttons_interleave_in_one_keyboard() {
+        use evdev::KeyCode;
+        let pad = Control::from_note(10, 36).unwrap();
+        let a = control(gilrs::Button::South).unwrap();
+        let mut all = vec![Mapping::new(pad, "Shift", "hold").unwrap()];
+        all.extend(layout(&[]));
+        let mut keyboard = crate::keyboard::Keyboard::new(&all).unwrap();
+        keyboard.resume();
+        let mut sent = Vec::new();
+        let mut emit = |key, down| {
+            sent.push((key, down));
+            Ok(())
+        };
+        for event in [
+            Event::Press(pad),
+            Event::Press(a),
+            Event::Release(pad, ReleaseType::NoteOff),
+            Event::Release(a, ReleaseType::ButtonUp),
+        ] {
+            keyboard.observe(event, &mut emit).unwrap();
+        }
+        assert_eq!(
+            sent,
+            [
+                (KeyCode::KEY_LEFTSHIFT, true),
+                (KeyCode::KEY_ENTER, true),
+                (KeyCode::KEY_LEFTSHIFT, false),
+                (KeyCode::KEY_ENTER, false),
+            ]
+        );
+    }
+
     #[test]
     fn default_layout_applies_until_a_button_is_mapped() {
         let defaults = layout(&[]);

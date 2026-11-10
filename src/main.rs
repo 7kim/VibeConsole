@@ -184,7 +184,7 @@ fn main() -> Result<()> {
                 "Legacy daemon flags ignored; saved Flow setting and verified program now control startup."
             );
         }
-        let _owner = runtime::Owner::acquire()?;
+        let _owner = runtime::Owner::acquire("login service")?;
         let path = config_path()?;
         return terminal::daemon(&path, load(&path)?);
     }
