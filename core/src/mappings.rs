@@ -162,9 +162,16 @@ pub struct Mapping {
 pub const DEVICE_CONTEXT: u8 = 240;
 /// Xbox controller mappings (v7 ticket 07): one set, active beside whichever MIDI context.
 pub const GAMEPAD_CONTEXT: u8 = 239;
+/// Xbox layer 2 (v7 ticket 09): what each button does while LB is held.
+pub const GAMEPAD_LAYER_2: u8 = 238;
+pub fn gamepad_context(context: u8) -> bool {
+    matches!(context, GAMEPAD_CONTEXT | GAMEPAD_LAYER_2)
+}
 pub fn program_label(context: u8) -> String {
     if context == GAMEPAD_CONTEXT {
         "Xbox controller".into()
+    } else if context == GAMEPAD_LAYER_2 {
+        "Xbox controller, layer 2 (LB held)".into()
     } else if context >= DEVICE_CONTEXT {
         format!("Other MIDI device {}", context - DEVICE_CONTEXT + 1)
     } else if context < 8 {
@@ -310,8 +317,9 @@ impl Mapping {
                 "application/system actions require Trigger, empty keys, and no feedback".into(),
             );
         }
-        if (self.context > 16 && self.context < GAMEPAD_CONTEXT)
-            || (self.context == GAMEPAD_CONTEXT) != (self.control.message == crate::Message::Button)
+        if (self.context > 16 && self.context < GAMEPAD_LAYER_2)
+            || gamepad_context(self.context) != (self.control.message == crate::Message::Button)
+            || (gamepad_context(self.context) && crate::gamepad::is_layer_key(self.control))
             || self.label.is_empty()
             || self.label.len() > 80
             || self.label.chars().any(char::is_control)
@@ -600,7 +608,7 @@ impl Default for Config {
 /// The device column of a mapping line: the Akai's USB id, `midi` or `xbox`.
 fn device_field(context: u8) -> &'static str {
     match context {
-        GAMEPAD_CONTEXT => "xbox",
+        GAMEPAD_CONTEXT | GAMEPAD_LAYER_2 => "xbox",
         c if c >= DEVICE_CONTEXT => "midi",
         _ => DEVICE,
     }

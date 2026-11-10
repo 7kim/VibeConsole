@@ -140,6 +140,8 @@ struct Terminal {
     device: Option<String>,
     /// Xbox controllers (v7 ticket 07), opened by real sessions only.
     gamepad: Option<crate::gamepad::Pad>,
+    /// LB held: Xbox buttons use layer 2 (v7 ticket 09).
+    layer2: bool,
     context_verified: bool,
     follow_programs: bool,
     follow_retry: Instant,
@@ -604,6 +606,7 @@ impl Terminal {
             context: 0,
             device: None,
             gamepad: None,
+            layer2: false,
             context_verified: true,
             follow_programs: false,
             follow_retry: Instant::now(),
@@ -1070,8 +1073,9 @@ impl Terminal {
     fn with_gamepad(&self, mappings: &[Mapping]) -> Result<Vec<Mapping>> {
         let mut all = mappings.to_vec();
         if self.gamepad.is_some() {
-            all.extend(crate::gamepad::layout(
+            all.extend(crate::gamepad::layer(
                 &mappings::load_config(&self.path)?.mappings,
+                self.layer2,
             ));
         }
         Ok(all)
@@ -1093,6 +1097,7 @@ impl Terminal {
     /// Plugging or unplugging a controller is a transition: held keys are released, queued
     /// buttons dropped, and the next fresh press fires.
     fn gamepad_transition(&mut self, notice: String) -> Result<()> {
+        self.set_layer(false)?;
         self.release_all()?;
         if let Some(pad) = &mut self.gamepad {
             pad.drain();
@@ -1126,6 +1131,32 @@ impl Terminal {
                 }
             }
         }
+        Ok(())
+    }
+    /// LB pressed or let go (v7 ticket 09): a transition. Held keys are released, held pads
+    /// and buttons wait for a fresh press, and the keyboard gets the other layer.
+    fn set_layer(&mut self, second: bool) -> Result<()> {
+        if self.layer2 == second {
+            return Ok(());
+        }
+        self.release_all()?;
+        self.layer2 = second;
+        let all = self.with_gamepad(&self.run_mappings)?;
+        let resume = self.wanted_run && !self.suspended && self.context_verified;
+        if let Some(output) = &mut self.output {
+            output.pause()?;
+            output
+                .keyboard
+                .prepare_connection(&all, &self.detector.down, &mut false)?;
+            if resume {
+                output.keyboard.resume();
+            }
+        }
+        self.notice = if second {
+            "Xbox layer 2 (LB held)".into()
+        } else {
+            "Xbox layer 1".into()
+        };
         Ok(())
     }
     fn open_input(&self) -> Result<midi::Input> {
@@ -1825,6 +1856,18 @@ impl Terminal {
             .unwrap_or_default();
         for change in changes {
             match change {
+                crate::gamepad::Change::Event(
+                    Event::Press(control) | Event::Release(control, _),
+                ) if crate::gamepad::is_layer_key(control) => {
+                    self.set_layer(
+                        self.gamepad
+                            .as_ref()
+                            .is_some_and(|p| p.down.contains(&control)),
+                    )?;
+                }
+                crate::gamepad::Change::Event(
+                    Event::DuplicatePress(control) | Event::UnmatchedRelease(control),
+                ) if crate::gamepad::is_layer_key(control) => {}
                 crate::gamepad::Change::Event(event) => self.handle_events(vec![event])?,
                 crate::gamepad::Change::Connected(name) => self.gamepad_transition(format!(
                     "Xbox controller connected: {name}; buttons fire on their next press"
@@ -4948,7 +4991,16 @@ fn configure_steps(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) ->
             Mapping::new_action(pad, input, action)?
         };
         mapping.context = if pad.message == crate::Message::Button {
-            mappings::GAMEPAD_CONTEXT
+            // v7 ticket 09: layer 2 is what the button does while LB is held.
+            match choose(
+                ui,
+                &format!("Which layer is {} on?", pad.label()),
+                &options(&["Layer 1 (normal)", "Layer 2 (while LB is held)"]),
+            )? {
+                Some(1) => mappings::GAMEPAD_LAYER_2,
+                Some(_) => mappings::GAMEPAD_CONTEXT,
+                None => continue,
+            }
         } else {
             ui.context()
         };
@@ -6609,7 +6661,8 @@ mod tests {
         assert_eq!(a.label(), "Xbox A");
         let mut keys = vec![Enter, Enter, Enter, Enter, Space, Enter];
         keys.extend(std::iter::repeat_n(Down, 7));
-        keys.extend([Enter, Enter, Enter]); // done, hold, fire when pressed: no feedback step
+        keys.extend([Enter, Enter, Enter]); // done, hold, layer 1
+        keys.push(Enter); // fire when pressed: no feedback step
         keys.extend([Enter, Tab, Tab, Enter]); // save, finish
         let mut ui = Script {
             keys: keys.into(),
@@ -6678,6 +6731,47 @@ mod tests {
         settings_menu(&mut ui, &path).unwrap();
         assert!(ui.screens.iter().any(|s| s.contains("Not saved")));
         assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 09: an Xbox button mapped on layer 2 is saved for "LB held" only.
+    #[test]
+    fn xbox_button_is_mapped_on_layer_2() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-layer-ui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let a = Control::button(0);
+        let mut keys = vec![Enter, Enter, Enter, Enter, Space, Enter];
+        keys.extend(std::iter::repeat_n(Down, 7));
+        keys.extend([Enter, Enter]); // done selecting keys, hold
+        keys.extend([Down, Enter]); // layer 2
+        keys.push(Enter); // fire when pressed
+        keys.extend([Enter, Tab, Tab, Enter]);
+        let mut ui = Script {
+            keys: keys.into(),
+            pads: [a].into(),
+            ..Default::default()
+        };
+        let mut current = Vec::new();
+        configure(&mut ui, &path, &mut current).unwrap();
+        assert!(ui.keys.is_empty());
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains("Which layer is Xbox A on?"))
+        );
+        let saved = mappings::load_config(&path).unwrap().mappings;
+        assert_eq!(saved[0].context, mappings::GAMEPAD_LAYER_2);
+        assert_eq!(crate::gamepad::layer(&saved, true).len(), 1);
+        // Layer 1 keeps A's default.
+        let first = crate::gamepad::layer(&saved, false);
+        assert_eq!(
+            first.iter().find(|m| m.control == a).unwrap().keys,
+            ["Enter"]
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

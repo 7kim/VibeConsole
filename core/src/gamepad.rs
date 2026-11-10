@@ -64,7 +64,6 @@ pub fn default_layout() -> Vec<Mapping> {
         (gilrs::Button::East, "Escape"),
         (gilrs::Button::West, "Backspace"),
         (gilrs::Button::North, "Tab"),
-        (gilrs::Button::LeftTrigger, "Ctrl+Shift+Tab"),
         (gilrs::Button::RightTrigger, "Ctrl+Tab"),
         (gilrs::Button::DPadUp, "Up"),
         (gilrs::Button::DPadDown, "Down"),
@@ -80,6 +79,23 @@ pub fn default_layout() -> Vec<Mapping> {
         mapping
     })
     .collect()
+}
+/// LB is the layer key (v7 ticket 09): held, every other button uses layer 2.
+pub fn is_layer_key(control: Control) -> bool {
+    Some(control) == self::control(gilrs::Button::LeftTrigger)
+}
+/// The mappings for a layer: layer 1 is the layout (defaults plus saved), layer 2 only
+/// what was saved for it.
+pub fn layer(saved: &[Mapping], second: bool) -> Vec<Mapping> {
+    if second {
+        saved
+            .iter()
+            .filter(|m| m.context == crate::mappings::GAMEPAD_LAYER_2)
+            .cloned()
+            .collect()
+    } else {
+        layout(saved)
+    }
 }
 /// The layout in use: each saved Xbox mapping replaces that button's default.
 /// ponytail: a default can be replaced but not removed; add "unassigned" if asked.
@@ -450,6 +466,45 @@ mod tests {
         );
         assert_eq!(pad.left, (0.0, -0.05));
         assert_eq!(pad.lt, 0.31);
+    }
+
+    /// v7 ticket 09: holding LB switches to layer 2. The switch is a transition: a button
+    /// held across it is released, doesn't fire on release, and fires its layer-2 action on
+    /// its next press. LB itself is the layer key, never a mapping.
+    #[test]
+    fn holding_lb_switches_layers_as_a_transition() {
+        use evdev::KeyCode;
+        use std::cell::RefCell;
+        let a = control(gilrs::Button::South).unwrap();
+        assert!(is_layer_key(control(gilrs::Button::LeftTrigger).unwrap()));
+        assert!(layer(&[], false).iter().all(|m| !is_layer_key(m.control)));
+        let mut second = Mapping::new(a, "F7", "hold").unwrap();
+        second.context = crate::mappings::GAMEPAD_LAYER_2;
+        let saved = [second];
+        assert_eq!(layer(&saved, true).len(), 1, "layer 2 has no defaults");
+        let sent = RefCell::new(Vec::new());
+        let mut emit = |key, down| {
+            sent.borrow_mut().push((key, down));
+            Ok(())
+        };
+        let mut keyboard = crate::keyboard::Keyboard::new(&layer(&saved, false)).unwrap();
+        keyboard.resume();
+        keyboard.observe(Event::Press(a), &mut emit).unwrap();
+        // LB pressed: what the session does on a layer change.
+        keyboard.pause(&mut emit).unwrap();
+        keyboard.replace(&layer(&saved, true)).unwrap();
+        keyboard.resume();
+        assert_eq!(
+            *sent.borrow(),
+            [(KeyCode::KEY_ENTER, true), (KeyCode::KEY_ENTER, false)]
+        );
+        sent.borrow_mut().clear();
+        keyboard
+            .observe(Event::Release(a, ReleaseType::ButtonUp), &mut emit)
+            .unwrap();
+        assert!(sent.borrow().is_empty());
+        keyboard.observe(Event::Press(a), &mut emit).unwrap();
+        assert_eq!(*sent.borrow(), [(KeyCode::KEY_F7, true)]);
     }
 
     #[test]
