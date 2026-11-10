@@ -86,6 +86,14 @@ fn csi_key(sequence: &[u8]) -> Key {
     }
 }
 
+/// What a Learn page saw (v7 ticket 45): a press (a pad, a piano key, an Xbox button, or a
+/// first movement of a knob or the joystick), or a calibrated knob or joystick.
+#[derive(Clone, Debug, PartialEq)]
+enum Learned {
+    Press(Control),
+    Motion(Control, mappings::Input, String),
+}
+
 trait Ui {
     fn draw(&mut self, text: &str) -> Result<()>;
     fn key(&mut self) -> Result<Option<Key>>;
@@ -110,11 +118,16 @@ trait Ui {
     fn applications(&self) -> Result<Vec<(String, String)>> {
         crate::actions::catalog()
     }
+    /// The first control pressed (a note or an Xbox button) or moved (a CC or pitch bend).
     fn learn(&mut self) -> Result<Option<Control>>;
-    fn learn_knob(&mut self) -> Result<Option<(Control, mappings::Input, String)>> {
+    /// "Learn an Xbox button" (v7 ticket 45): like `learn`, under its own title.
+    fn learn_button(&mut self) -> Result<Option<Control>> {
+        self.learn()
+    }
+    fn learn_knob(&mut self) -> Result<Option<Learned>> {
         Err("knob learning unavailable".into())
     }
-    fn learn_joystick(&mut self) -> Result<Option<(Control, mappings::Input, String)>> {
+    fn learn_joystick(&mut self) -> Result<Option<Learned>> {
         Err("joystick learning unavailable".into())
     }
     fn learn_piano(&mut self) -> Result<Option<Control>> {
@@ -2454,7 +2467,7 @@ Changing musical settings while running is unsupported.",
         Ok(())
     }
 
-    fn learn_motion(&mut self, knob: bool) -> Result<Option<(Control, mappings::Input, String)>> {
+    fn learn_motion(&mut self, knob: bool) -> Result<Option<Learned>> {
         self.suspend()?;
         let relative = if knob {
             match choose(self, "Knob mode", &options(&["Absolute", "Relative"]))? {
@@ -2471,10 +2484,18 @@ Changing musical settings while running is unsupported.",
             self.input = Some(self.open_input()?);
         }
         self.tick()?;
-        let result = (|| -> Result<Option<(Control, mappings::Input, String)>> {
+        self.last_press = None;
+        let motion = |learned: Option<(Control, mappings::Input, String)>| {
+            learned.map(|(control, input, label)| Learned::Motion(control, input, label))
+        };
+        let result = (|| -> Result<Option<Learned>> {
             loop {
                 self.capture = Some(Vec::new());
                 loop {
+                    // v7 ticket 45: a pad, key or button pressed here goes to its own page.
+                    if let Some(control) = self.last_press.take() {
+                        return Ok(Some(Learned::Press(control)));
+                    }
                     self.draw(&format!(
                         "{}\n{}\nEnter finishes observation; Esc cancels. Shortcuts remain paused.",
                         if knob {
@@ -2499,7 +2520,7 @@ Changing musical settings while running is unsupported.",
                 }
                 let samples = self.capture.take().unwrap();
                 if relative {
-                    return self.learn_relative_knob(samples);
+                    return self.learn_relative_knob(samples).map(motion);
                 }
                 // A rejected movement is not an operation failure: nothing changed, so offer a retry.
                 match calibrate_motion(self, samples, knob) {
@@ -2515,7 +2536,7 @@ Changing musical settings while running is unsupported.",
                             return Ok(None);
                         }
                     }
-                    learned => return learned,
+                    learned => return learned.map(motion),
                 }
             }
         })();
@@ -2644,7 +2665,7 @@ Changing musical settings while running is unsupported.",
         learned
     }
 
-    fn learn_note(&mut self, piano: bool) -> Result<Option<Control>> {
+    fn learn_note(&mut self, piano: bool, title: &str) -> Result<Option<Control>> {
         self.suspend()?;
         if self.input.is_none() {
             match self.open_input() {
@@ -2656,14 +2677,36 @@ Changing musical settings while running is unsupported.",
         }
         self.tick()?;
         self.last_press = None;
+        // v7 ticket 45: a knob or the joystick moved here goes to its own page.
+        let (cc_before, bend_before) = (self.cc_values.clone(), self.bend);
         let mut learned = None;
         loop {
-            self.draw(&format!("{}: press then release one control.\nTurn arpeggiator OFF for piano input; hold/release must be observed.\nCC/Program Change pad mode is unsupported. Esc cancels.\n{}", if piano { "Learn piano key" } else { "Learn pad in either bank" }, self.last_event))?;
+            self.draw(&format!("{title}: press then release one control (or move a knob or the joystick).\nTurn arpeggiator OFF for piano input; hold/release must be observed.\nCC/Program Change pad mode is unsupported. Esc cancels.\n{}", self.last_event))?;
             if self.input.is_none() && self.gamepad.is_none() {
                 return Err(self.error.clone().into());
             }
             if learned.is_none() {
                 learned = self.last_press.take();
+            }
+            if learned.is_none() {
+                let moved = self
+                    .cc_values
+                    .iter()
+                    .find(|(key, value)| cc_before.get(key) != Some(value))
+                    .map(|((channel, id), _)| (*channel, *id, crate::Message::Cc))
+                    .or_else(|| {
+                        self.bend
+                            .filter(|_| self.bend != bend_before)
+                            .map(|(channel, _)| (channel, 0, crate::Message::Bend))
+                    });
+                if let Some((channel, id, message)) = moved {
+                    return Ok(Some(Control {
+                        channel,
+                        id,
+                        message,
+                        direction: 0,
+                    }));
+                }
             }
             if let Some(control) = learned {
                 let held = self.detector.down.contains(&control)
@@ -2675,7 +2718,7 @@ Changing musical settings while running is unsupported.",
                     if choose(
                         self,
                         &format!(
-                            "Observed Note press/release: {} (channel {} note {}).\nConfirm this was a {}. Identical pad/piano messages cannot be separate assignments.",
+                            "Observed press/release: {} (channel {} {} {}).\nConfirm this control. Identical pad/piano messages cannot be separate assignments.",
                             mappings::control_name(
                                 control,
                                 piano.then_some(mappings::Input::Piano),
@@ -2683,8 +2726,8 @@ Changing musical settings while running is unsupported.",
                                 self.program().as_ref()
                             ),
                             control.channel,
+                            control.message.text(),
                             control.id,
-                            if piano { "piano key" } else { "pad" }
                         ),
                         &options(&["Cancel", "Use observed control"]),
                     )? == Some(1)
@@ -2932,17 +2975,20 @@ Labels assigned to other controls in this program are omitted.",
         )?
         .map(|i| labels[i].clone()))
     }
-    fn learn_knob(&mut self) -> Result<Option<(Control, mappings::Input, String)>> {
+    fn learn_knob(&mut self) -> Result<Option<Learned>> {
         self.learn_motion(true)
     }
-    fn learn_joystick(&mut self) -> Result<Option<(Control, mappings::Input, String)>> {
+    fn learn_joystick(&mut self) -> Result<Option<Learned>> {
         self.learn_motion(false)
     }
     fn learn(&mut self) -> Result<Option<Control>> {
-        self.learn_note(false)
+        self.learn_note(false, "Learn a pad in either bank")
+    }
+    fn learn_button(&mut self) -> Result<Option<Control>> {
+        self.learn_note(false, "Learn an Xbox button")
     }
     fn learn_piano(&mut self) -> Result<Option<Control>> {
-        self.learn_note(true)
+        self.learn_note(true, "Learn a piano key")
     }
 }
 
@@ -5420,6 +5466,7 @@ fn configure_choice(ui: &mut impl Ui) -> Result<Option<usize>> {
         "Learn a piano key",
         "Learn a knob",
         "Learn joystick",
+        "Learn an Xbox button",
         "Edit saved assignment",
         "Remove saved assignment",
         "Finish",
@@ -5438,7 +5485,7 @@ fn configure_choice(ui: &mut impl Ui) -> Result<Option<usize>> {
         if ui.height() < 18 {
             let visible = ui.height().saturating_sub(10).max(1);
             let first = cursor.saturating_sub(visible - 1);
-            rows.extend((first..7).take(visible).map(item));
+            rows.extend((first..8).take(visible).map(item));
         } else if width >= 66 && ui.height() >= 19 {
             let left = (width - 3) / 2;
             let right = width - left - 3;
@@ -5447,10 +5494,11 @@ fn configure_choice(ui: &mut impl Ui) -> Result<Option<usize>> {
             rows.push(format!("╭{}╮   ╭{}╮", border(left), border(right)));
             for (a, b) in [
                 ("Learn controls".into(), "Saved assignments".into()),
-                (item(0), item(4)),
-                (item(1), item(5)),
+                (item(0), item(5)),
+                (item(1), item(6)),
                 (item(2), String::new()),
                 (item(3), String::new()),
+                (item(4), String::new()),
             ] {
                 rows.push(format!(
                     "│{}│   │{}│",
@@ -5463,13 +5511,13 @@ fn configure_choice(ui: &mut impl Ui) -> Result<Option<usize>> {
             if ui.height() >= 22 {
                 rows.push("Learn controls".into());
             }
-            rows.extend((0..4).map(item));
+            rows.extend((0..5).map(item));
             rows.push("─ Saved assignments ─".into());
-            rows.extend((4..6).map(item));
+            rows.extend((5..7).map(item));
         }
         if ui.height() >= 18 {
             rows.resize(ui.height().saturating_sub(10), String::new());
-            let finish = item(6);
+            let finish = item(7);
             rows.push(format!(
                 "{}{}",
                 " ".repeat(width.saturating_sub(finish.len()) / 2),
@@ -5479,19 +5527,19 @@ fn configure_choice(ui: &mut impl Ui) -> Result<Option<usize>> {
         rows.push("Tab / Left / Right: switch pane".into());
         ui.draw(&rows.join("\n"))?;
         match ui.key()? {
-            Some(Key::Up) => cursor = (cursor + 6) % 7,
-            Some(Key::Down) => cursor = (cursor + 1) % 7,
+            Some(Key::Up) => cursor = (cursor + 7) % 8,
+            Some(Key::Down) => cursor = (cursor + 1) % 8,
             Some(Key::Tab) => {
-                cursor = if cursor < 4 {
-                    4
-                } else if cursor < 6 {
-                    6
+                cursor = if cursor < 5 {
+                    5
+                } else if cursor < 7 {
+                    7
                 } else {
                     0
                 }
             }
-            Some(Key::Left) => cursor = if cursor == 5 { 1 } else { 0 },
-            Some(Key::Right) => cursor = if cursor == 1 { 5 } else { 4 },
+            Some(Key::Left) => cursor = if cursor == 6 { 1 } else { 0 },
+            Some(Key::Right) => cursor = if cursor == 1 { 6 } else { 5 },
             Some(Key::Enter) => return Ok(Some(cursor)),
             Some(Key::Escape) => return Ok(None),
             _ => {}
@@ -5757,6 +5805,75 @@ fn saved_list<'a>(
     list
 }
 
+/// One Learn page's observation (v7 ticket 45).
+fn learn_on(ui: &mut impl Ui, page: usize) -> Result<Option<Learned>> {
+    let press = |control: Option<Control>| control.map(Learned::Press);
+    match page {
+        0 => ui.learn().map(press),
+        1 => ui.learn_piano().map(press),
+        2 => ui.learn_knob(),
+        3 => ui.learn_joystick(),
+        _ => ui.learn_button().map(press),
+    }
+    .map_err(stage("controller I/O"))
+}
+
+/// The page a learned control belongs on (v7 ticket 45): an Xbox button is an Xbox button; a
+/// note is a pad or a piano key by the verified program's pad table; a knob or the joystick
+/// moved on a press page is calibrated on its own page. Without a program, a note keeps the
+/// pad or piano page it was pressed on; anything the program can't place is refused by name.
+fn settle(
+    ui: &mut impl Ui,
+    mut page: usize,
+    mut learned: Learned,
+) -> Result<Option<(usize, Learned)>> {
+    use crate::Message;
+    loop {
+        let Learned::Press(control) = learned else {
+            return Ok(Some((page, learned)));
+        };
+        let program = ui.program();
+        let name = mappings::control_name(control, None, ui.context(), program.as_ref());
+        let next = match control.message {
+            Message::Button => 4,
+            Message::Note => match &program {
+                Some((_, payload)) if mappings::pad_controls(payload).contains(&Some(control)) => 0,
+                Some(_) => 1,
+                None if page <= 1 => page,
+                None => {
+                    return Err(format!(
+                        "validation: {name}: without a verified program a note can't be told apart as a pad or a piano key; use Learn a pad or Learn a piano key"
+                    )
+                    .into());
+                }
+            },
+            Message::Cc | Message::Bend => {
+                let knob = control.message == Message::Cc
+                    && program
+                        .as_ref()
+                        .is_some_and(|(_, p)| (0..8).any(|k| p[0x55 + 20 * k] == control.id));
+                let next = if knob {
+                    2
+                } else if control.message == Message::Bend || control.id == 1 {
+                    3
+                } else {
+                    return Err(format!(
+                        "validation: {name} is neither a knob of this program nor the joystick"
+                    )
+                    .into());
+                };
+                let Some(again) = learn_on(ui, next)? else {
+                    return Ok(None);
+                };
+                page = next;
+                learned = again;
+                continue;
+            }
+        };
+        return Ok(Some((next, learned)));
+    }
+}
+
 fn configure_steps(
     ui: &mut impl Ui,
     path: &Path,
@@ -5767,29 +5884,32 @@ fn configure_steps(
         let Some(action) = configure_choice(ui)? else {
             return Ok(());
         };
-        if action == 6 {
+        if action == 7 {
             return Ok(());
         }
-        let motion = match action {
-            2 => ui.learn_knob().map_err(stage("controller I/O"))?,
-            3 => ui.learn_joystick().map_err(stage("controller I/O"))?,
-            _ => None,
-        };
-        if matches!(action, 2 | 3) && motion.is_none() {
-            continue;
-        }
-        let (pad, pad_context) = if let Some((control, _, _)) = &motion {
-            (*control, ui.context())
-        } else if action == 0 || action == 1 {
-            let Some(pad) = (if action == 1 {
-                ui.learn_piano()
-            } else {
-                ui.learn()
-            })
-            .map_err(stage("controller I/O"))?
-            else {
+        // v7 ticket 45: a Learn page (0 pad, 1 piano key, 2 knob, 3 joystick, 4 Xbox button)
+        // takes whatever is pressed or moved and goes on as that kind.
+        let mut page = action;
+        let mut motion = None;
+        let learned = if page < 5 {
+            let Some(learned) = learn_on(ui, page)? else {
                 continue;
             };
+            let Some((settled, learned)) = settle(ui, page, learned)? else {
+                continue;
+            };
+            page = settled;
+            match learned {
+                Learned::Press(control) => Some(control),
+                Learned::Motion(control, input, label) => {
+                    motion = Some((control, input, label));
+                    Some(control)
+                }
+            }
+        } else {
+            None
+        };
+        let (pad, pad_context) = if let Some(pad) = learned {
             // An Xbox button's saved mapping is looked up on layer 1; its layer is asked below.
             let context = if pad.message == crate::Message::Button {
                 mappings::GAMEPAD_CONTEXT
@@ -5829,7 +5949,7 @@ fn configure_steps(
                 let name = mappings::control_name(pad, None, ui.context(), ui.program().as_ref());
                 format!("{name}: unassigned")
             });
-        if action == 5 {
+        if action == 6 {
             if choose(
                 ui,
                 &format!("Remove {existing}?"),
@@ -5854,13 +5974,13 @@ fn configure_steps(
                     .find(|m| m.context == pad_context && m.control == pad)
                     .map(|m| m.input)
             })
-            .unwrap_or(if action == 1 {
+            .unwrap_or(if page == 1 {
                 mappings::Input::Piano
             } else {
                 mappings::Input::Pad
             });
-        if (action == 1 && input != mappings::Input::Piano)
-            || (action == 0 && input != mappings::Input::Pad)
+        if (page == 1 && input != mappings::Input::Piano)
+            || (page == 0 && input != mappings::Input::Pad)
         {
             return Err("validation: pad/piano source collision; this emitted note is already assigned as another control family".into());
         }
@@ -5890,7 +6010,7 @@ fn configure_steps(
             }
         }
         // Learning an assigned control replaces it only after an explicit choice (ticket 05).
-        if action != 4
+        if action != 5 // editing asks nothing; learning an assigned control asks first
             && saved.is_some()
             && choose(
                 ui,
@@ -6787,6 +6907,8 @@ mod tests {
         herdr: Vec<String>,
         /// Claude's reply (v7 ticket 26).
         claude: String,
+        /// The verified program, when a test needs its pad and knob table (v7 ticket 45).
+        program: Option<(u8, crate::feedback::Payload)>,
     }
     impl Ui for Script {
         fn midi_devices(&mut self) -> Result<Vec<String>> {
@@ -6811,6 +6933,9 @@ mod tests {
         }
         fn context(&self) -> u8 {
             self.context
+        }
+        fn program(&self) -> Option<(u8, crate::feedback::Payload)> {
+            self.program
         }
         fn login(&mut self, request: crate::runtime::Login) -> Result<bool> {
             use crate::runtime::Login;
@@ -6861,13 +6986,17 @@ mod tests {
         fn learn_piano(&mut self) -> Result<Option<Control>> {
             Ok(self.pads.pop_front())
         }
-        fn learn_knob(&mut self) -> Result<Option<(Control, mappings::Input, String)>> {
-            self.motions
+        fn learn_knob(&mut self) -> Result<Option<Learned>> {
+            if let Some((control, input, label)) = self.motions.pop_front() {
+                return Ok(Some(Learned::Motion(control, input, label)));
+            }
+            // A press on the knob or joystick page (v7 ticket 45).
+            self.pads
                 .pop_front()
-                .map(Some)
+                .map(|pad| Some(Learned::Press(pad)))
                 .ok_or_else(|| "MIDI input unavailable".into())
         }
-        fn learn_joystick(&mut self) -> Result<Option<(Control, mappings::Input, String)>> {
+        fn learn_joystick(&mut self) -> Result<Option<Learned>> {
             self.learn_knob()
         }
         fn edit_file(&mut self, path: &Path) -> Result<()> {
@@ -7104,6 +7233,155 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Stored Program 2 of the recorded MPK Mini MK3 (testdata), as a verified program.
+    fn recorded_program() -> (u8, crate::feedback::Payload) {
+        let capture = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/mpk-mini3-programs.hex"
+        ));
+        let line = capture
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .nth(2)
+            .unwrap();
+        let bytes = line
+            .split_whitespace()
+            .map(|b| u8::from_str_radix(b, 16).unwrap())
+            .collect::<Vec<_>>();
+        (1, bytes.try_into().unwrap())
+    }
+
+    /// v7 ticket 45: every Learn page takes whatever control is pressed or moved and goes on
+    /// as that kind: an Xbox button from "Learn a pad", a pad from "Learn an Xbox button" or
+    /// from "Learn a knob", a knob turned on "Learn a pad". A control the program can't place
+    /// is refused by name and nothing is saved.
+    #[test]
+    fn learn_pages_switch_to_the_kind_you_press() {
+        use Key::*;
+        let (context, payload) = recorded_program();
+        let pad = mappings::pad_controls(&payload)[0].unwrap();
+        let knob_cc = payload[0x55];
+        let knob = Control {
+            channel: payload[0x10] + 1,
+            id: knob_cc,
+            message: crate::Message::Cc,
+            direction: 0,
+        };
+        let dir = std::env::temp_dir().join(format!("vibeconsole-switch-{}", std::process::id()));
+        let run = |keys: Vec<Key>,
+                   pads: Vec<Control>,
+                   motions: Vec<(Control, mappings::Input, String)>| {
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("mappings.tsv");
+            mappings::save(&path, &[]).unwrap();
+            let mut ui = Script {
+                keys: keys.into(),
+                pads: pads.into(),
+                motions: motions.into(),
+                context,
+                program: Some((context, payload)),
+                ..Default::default()
+            };
+            let mut current = Vec::new();
+            let result = configure(&mut ui, &path, &mut current);
+            let screens = ui.screens.join("\n----\n");
+            assert!(result.is_ok(), "{result:?}\n{screens}");
+            assert!(ui.keys.is_empty(), "keys left\n{screens}");
+            (mappings::load_config(&path).unwrap().mappings, screens)
+        };
+        let shortcut = |mut keys: Vec<Key>| {
+            keys.extend([Enter, Enter, Enter, Space, Enter]); // shortcut, Select keys, Modifiers, Ctrl
+            keys.extend(std::iter::repeat_n(Down, 7));
+            keys.extend([Enter, Enter]); // done, hold
+            keys
+        };
+        let finish = [Enter, Enter, Tab, Tab, Enter]; // fire when, save, finish
+        let akai_finish = [Enter, Enter, Enter, Tab, Tab, Enter]; // + no hardware feedback
+
+        // "Learn a pad", then an Xbox button: saved as that Xbox button on its layer.
+        let mut keys = shortcut(vec![Enter]);
+        keys.push(Enter); // layer 1
+        keys.extend(finish);
+        let (saved, screens) = run(keys, vec![Control::button(3)], vec![]);
+        assert!(screens.contains("Which layer is Xbox Y on?"), "{screens}");
+        assert_eq!(saved[0].context, mappings::GAMEPAD_CONTEXT);
+
+        // "Learn an Xbox button", then an Akai pad: saved as that pad in the program.
+        let mut keys = shortcut(vec![Down, Down, Down, Down, Enter]);
+        keys.extend(akai_finish);
+        let (saved, screens) = run(keys, vec![pad], vec![]);
+        assert!(screens.contains("Learn an Xbox button"), "{screens}");
+        assert_eq!((saved[0].control, saved[0].context), (pad, context));
+        assert_eq!(saved[0].input, mappings::Input::Pad);
+
+        // "Learn a knob", then a pad press: saved as the pad.
+        let mut keys = shortcut(vec![Down, Down, Enter]);
+        keys.extend(akai_finish);
+        let (saved, _) = run(keys, vec![pad], vec![]);
+        assert_eq!(
+            (saved[0].control, saved[0].input),
+            (pad, mappings::Input::Pad)
+        );
+
+        // "Learn a pad", then a knob turned: the knob is calibrated and saved as a knob.
+        let mut keys = vec![Enter, Down, Enter, Enter]; // pad page, Fedora system action, volume up
+        keys.extend([Enter]); // step 5
+        keys.extend([Enter, Enter, Tab, Tab, Enter]);
+        let increase = Control {
+            direction: 1,
+            ..knob
+        }; // calibration names the direction
+        let turned = (
+            increase,
+            mappings::Input::Knob { step: 4 },
+            "Knob 1 increase".to_string(),
+        );
+        let (saved, screens) = run(keys, vec![knob], vec![turned]);
+        assert!(
+            matches!(
+                saved.first().map(|m| m.input),
+                Some(mappings::Input::Knob { .. })
+            ),
+            "{saved:?}\n{screens}"
+        );
+
+        // "Learn a pad", then a piano key (a note off the pad table): saved as a piano key.
+        let key = Control::note(payload[0x10] + 1, 60).unwrap();
+        assert!(!mappings::pad_controls(&payload).contains(&Some(key)));
+        let mut keys = shortcut(vec![Enter]);
+        keys.extend(akai_finish);
+        let (saved, _) = run(keys, vec![key], vec![]);
+        assert_eq!(
+            (saved[0].control, saved[0].input),
+            (key, mappings::Input::Piano)
+        );
+
+        // "Learn joystick", then an Xbox button: saved as the button.
+        let mut keys = shortcut(vec![Down, Down, Down, Enter]);
+        keys.push(Enter); // layer 1
+        keys.extend(finish);
+        let (saved, _) = run(keys, vec![Control::button(1)], vec![]);
+        assert_eq!(saved[0].control, Control::button(1));
+
+        // "Learn an Xbox button" on layer 2.
+        let mut keys = shortcut(vec![Down, Down, Down, Down, Enter]);
+        keys.extend([Down, Enter]); // layer 2
+        keys.extend(finish);
+        let (saved, _) = run(keys, vec![Control::button(2)], vec![]);
+        assert_eq!(saved[0].context, mappings::GAMEPAD_LAYER_2);
+
+        // A CC that is neither a knob of this program nor the joystick is refused by name.
+        let stray = Control { id: 64, ..knob };
+        let (saved, screens) = run(vec![Enter, Enter, Tab, Tab, Enter], vec![stray], vec![]);
+        assert!(saved.is_empty());
+        assert!(
+            screens.contains("Not saved: validation: CC ch1 #64"),
+            "{screens}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn detection_splits_banks_by_verified_program_and_falls_back_to_unidentified() {
         let mut ui =
@@ -7207,13 +7485,14 @@ mod tests {
             keys: [Down, Right, Left, Tab, Tab, Enter].into(),
             ..Default::default()
         };
-        assert_eq!(configure_choice(&mut ui).unwrap(), Some(6));
+        assert_eq!(configure_choice(&mut ui).unwrap(), Some(7)); // Finish
         let first = &ui.screens[0];
         let learning = [
             "Learn a pad",
             "Learn a piano key",
             "Learn a knob",
             "Learn joystick",
+            "Learn an Xbox button",
         ]
         .map(|label| first.find(label).unwrap());
         assert!(learning.windows(2).all(|pair| pair[0] < pair[1]));
