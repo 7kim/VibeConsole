@@ -7007,7 +7007,8 @@ mod tests {
         )));
         // Ticket 17: a v14 file's per-agent tempos become the shared slow/fast tempos.
         let v14 = saved
-            .replace("vibeconsole-mappings-v15", "vibeconsole-mappings-v14")
+            .replace("vibeconsole-mappings-v16", "vibeconsole-mappings-v14")
+            .replace("tuning\t15\t30\t10\toff\n", "")
             .replace(
                 "light-tempos\t50\t240\nlight-pattern\tneeds-decision\tfast\talternate\nlight-pattern\tneeds-input\tfast\tsteady\nlight-pattern\tthinking\tslow\toff\nlight-pattern\tfinished\toff\tblink\n",
                 "",

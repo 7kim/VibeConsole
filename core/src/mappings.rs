@@ -517,6 +517,41 @@ pub struct Config {
     pub light_other_on: bool,
     /// Ticket 17: what each busy state shows on the tempo and octave lights.
     pub light_patterns: crate::status::Patterns,
+    /// v7: gamepad stick/trigger tuning, mouse speed and rumble (config v16).
+    pub tuning: Tuning,
+}
+/// Gamepad tuning (v7 config v16): stick dead zone and trigger fire point in percent of
+/// travel, mouse speed 1–50, rumble on/off. Defaults are safe: rumble off.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Tuning {
+    pub dead_zone: u8,
+    pub trigger: u8,
+    pub mouse_speed: u8,
+    pub rumble: bool,
+}
+impl Default for Tuning {
+    fn default() -> Self {
+        Self {
+            dead_zone: 15,
+            trigger: 30,
+            mouse_speed: 10,
+            rumble: false,
+        }
+    }
+}
+impl Tuning {
+    pub fn validate(self) -> Result<Self> {
+        if self.dead_zone > 90 {
+            return Err("tuning: dead zone must be 0–90%".into());
+        }
+        if !(1..=100).contains(&self.trigger) {
+            return Err("tuning: trigger fire point must be 1–100%".into());
+        }
+        if !(1..=50).contains(&self.mouse_speed) {
+            return Err("tuning: mouse speed must be 1–50".into());
+        }
+        Ok(self)
+    }
 }
 impl Default for Config {
     fn default() -> Self {
@@ -537,6 +572,7 @@ impl Default for Config {
             light_other: 2,
             light_other_on: false,
             light_patterns: crate::status::Patterns::default(),
+            tuning: Tuning::default(),
         }
     }
 }
@@ -776,9 +812,10 @@ fn parse_config(contents: &str) -> Result<Config> {
         Some("13") => 13,
         Some("14") => 14,
         Some("15") => 15,
+        Some("16") => 16,
         _ => {
             return Err(
-                "invalid configuration header; expected vibeconsole-mappings-v1..v15".into(),
+                "invalid configuration header; expected vibeconsole-mappings-v1..v16".into(),
             );
         }
     };
@@ -1009,6 +1046,27 @@ fn parse_config(contents: &str) -> Result<Config> {
         Config::default().agents
     };
     validate_agents(&agents)?;
+    let tuning = if version >= 16 {
+        let line = lines.next().ok_or("missing tuning")?;
+        let ["tuning", dead_zone, trigger, speed, rumble] =
+            line.split('\t').collect::<Vec<_>>()[..]
+        else {
+            return Err("expected tuning dead-zone/trigger/mouse-speed/rumble fields".into());
+        };
+        Tuning {
+            dead_zone: dead_zone.parse()?,
+            trigger: trigger.parse()?,
+            mouse_speed: speed.parse()?,
+            rumble: match rumble {
+                "on" => true,
+                "off" => false,
+                _ => return Err("tuning rumble must be on or off".into()),
+            },
+        }
+        .validate()?
+    } else {
+        Tuning::default()
+    };
     let mut mappings = Vec::new();
     let mut seen = HashSet::new();
     let mut labels = HashSet::new();
@@ -1162,6 +1220,7 @@ fn parse_config(contents: &str) -> Result<Config> {
         light_other,
         light_other_on,
         light_patterns: light_patterns.validate()?,
+        tuning,
     })
 }
 
@@ -1209,7 +1268,7 @@ pub fn save_config(path: &Path, config: &Config) -> Result<()> {
     validate_variables(&config.vars, "user")?;
     config.validate_references()?;
     let mut contents = format!(
-        "vibeconsole-mappings-v15\nidle\t{}\t{}\t{}\n",
+        "vibeconsole-mappings-v16\nidle\t{}\t{}\t{}\n",
         opt_text(config.idle.octave),
         opt_text(config.idle.tempo),
         arp_text(config.idle.arp)
@@ -1283,6 +1342,14 @@ pub fn save_config(path: &Path, config: &Config) -> Result<()> {
             agent.octave
         ));
     }
+    let tuning = config.tuning.validate()?;
+    contents.push_str(&format!(
+        "tuning\t{}\t{}\t{}\t{}\n",
+        tuning.dead_zone,
+        tuning.trigger,
+        tuning.mouse_speed,
+        if tuning.rumble { "on" } else { "off" }
+    ));
     for mapping in &config.mappings {
         mapping.validate()?;
         let feedback = mapping.feedback;
@@ -1663,7 +1730,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v15\n")
+                .starts_with("vibeconsole-mappings-v16\n")
         );
         assert!(
             load_config(&path)
@@ -1806,6 +1873,80 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7 ticket 04: a v15 file loads unchanged with safe tuning defaults and saves as v16;
+    /// tuning round-trips; invalid tuning is refused; a failed save keeps the v15 file.
+    #[test]
+    fn v15_config_migrates_to_v16_with_safe_tuning() {
+        const V15: &str = "vibeconsole-mappings-v15\nidle\t-\t-\t-\nprogram-idle\t1\t-\t-\t-\nprogram-idle\t2\t-\t-\t-\nprogram-idle\t3\t-\t-\t-\nprogram-idle\t4\t-\t-\t-\nprogram-idle\t5\t-\t-\t-\nprogram-idle\t6\t-\t-\t-\nprogram-idle\t7\t-\t-\t-\nstart-flow\ton\nagent-dir\t-\nenv\t0\nvars\t0\nstatus-lights\ton\nlight-tempos\t50\t240\nlight-pattern\tneeds-decision\tfast\talternate\nlight-pattern\tneeds-input\tfast\tsteady\nlight-pattern\tthinking\tslow\toff\nlight-pattern\tfinished\toff\tblink\nlight-other\toff\t2\nlight-folders\t0\nagents\t2\nagent\tclaude\tclaude\tclaude\t-\t1\nagent\tcodex\tcodex\tcodex\t-\t-1\n0\tBank A Pad 1\tpad\t09e8:1049\tnote\t10\t36\t0\thold\tShift\t-\t-\t-\tshortcut\t-\t-\n";
+        let dir = std::env::temp_dir().join(format!("vibeconsole-v16-test-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        fs::write(&path, V15).unwrap();
+        let config = load_config(&path).unwrap();
+        assert_eq!(config.mappings.len(), 1);
+        assert_eq!(config.mappings[0].keys, ["Shift"]);
+        // Safe defaults: rumble off.
+        assert_eq!(
+            config.tuning,
+            Tuning {
+                dead_zone: 15,
+                trigger: 30,
+                mouse_speed: 10,
+                rumble: false
+            }
+        );
+        // A failed save leaves the v15 file byte-identical.
+        let mut bad = config.clone();
+        bad.tuning.dead_zone = 95;
+        assert!(save_config(&path, &bad).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), V15);
+        // Saving writes v16 with the tuning line; it round-trips.
+        let mut tuned = config.clone();
+        tuned.tuning = Tuning {
+            dead_zone: 20,
+            trigger: 60,
+            mouse_speed: 25,
+            rumble: true,
+        };
+        save_config(&path, &tuned).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("vibeconsole-mappings-v16\n"));
+        assert!(text.contains("\ntuning\t20\t60\t25\ton\n"));
+        assert_eq!(load_config(&path).unwrap(), tuned);
+        for bad in [
+            Tuning {
+                dead_zone: 91,
+                ..tuned.tuning
+            },
+            Tuning {
+                trigger: 0,
+                ..tuned.tuning
+            },
+            Tuning {
+                trigger: 101,
+                ..tuned.tuning
+            },
+            Tuning {
+                mouse_speed: 0,
+                ..tuned.tuning
+            },
+            Tuning {
+                mouse_speed: 51,
+                ..tuned.tuning
+            },
+        ] {
+            assert!(bad.validate().is_err(), "{bad:?}");
+        }
+        // A v16 file without its tuning line, or with a bad one, is refused.
+        let v16 = text.clone();
+        assert!(parse_config(&v16.replace("tuning\t20\t60\t25\ton\n", "")).is_err());
+        assert!(
+            parse_config(&v16.replace("tuning\t20\t60\t25\ton", "tuning\t20\t60\t25\tmaybe"))
+                .is_err()
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn round_trip_replacement_and_failures_preserve_saved_mappings() {
         let directory =
@@ -1886,7 +2027,7 @@ mod tests {
         let path = dir.join("mappings.tsv");
         save_config(&path, &config).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
-        assert!(saved.starts_with("vibeconsole-mappings-v15\n"));
+        assert!(saved.starts_with("vibeconsole-mappings-v16\n"));
         assert!(saved.contains("\tflow\t") && !saved.contains("flow-start"));
         assert_eq!(load_config(&path).unwrap(), config);
         fs::remove_dir_all(dir).unwrap();
@@ -1912,7 +2053,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v15\n")
+                .starts_with("vibeconsole-mappings-v16\n")
         );
         assert_eq!(load_config(&path).unwrap(), config);
         fs::remove_dir_all(dir).unwrap();
@@ -1933,7 +2074,7 @@ mod tests {
         let path = dir.join("mappings.tsv");
         save_config(&path, &config).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v15\n") && text.contains("\tstatus\n"));
+        assert!(text.starts_with("vibeconsole-mappings-v16\n") && text.contains("\tstatus\n"));
         assert_eq!(load_config(&path).unwrap(), config);
         let pad = Control::from_note(10, 37).unwrap();
         for (action, observable) in [
@@ -2010,7 +2151,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v15\n")
+                .starts_with("vibeconsole-mappings-v16\n")
         );
         assert_eq!(load_config(&path).unwrap(), config);
         // ${NAME}: user variable, then startup variable; other text stays; no environment.
