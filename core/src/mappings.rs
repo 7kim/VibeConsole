@@ -703,6 +703,42 @@ pub fn import_profile(text: &str, config: &Config) -> Result<Profile> {
     validate_profiles(&all)?;
     Ok(profile)
 }
+/// v7 ticket 26: the profile file inside Claude's reply (prose and code fences around it
+/// are dropped), or None when there is none. Whatever comes back still goes through
+/// `import_profile`, so nothing unchecked is ever saved.
+pub fn profile_text_from_reply(reply: &str) -> Option<String> {
+    let lines = reply.lines().collect::<Vec<_>>();
+    let start = lines.iter().position(|l| l.trim() == PROFILE_HEADER)?;
+    let mut text = String::new();
+    for line in &lines[start..] {
+        if line.trim_start().starts_with("```") {
+            break;
+        }
+        text.push_str(line.trim_end_matches('\r'));
+        text.push('\n');
+    }
+    Some(text.trim_end().to_owned() + "\n")
+}
+/// The request sent to Claude for a profile: the format by example and the controls the
+/// user has, so its overrides land on real pads.
+pub fn profile_request(config: &Config, app: &str, wish: &str) -> Result<String> {
+    let example = Profile {
+        name: "Example".into(),
+        apps: vec![app.to_owned()],
+        mappings: config.mappings.iter().take(2).cloned().collect(),
+    };
+    let controls = config
+        .mappings
+        .iter()
+        .map(|m| format!("- {} (now: {})", m.label, m.action_label()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(format!(
+        "Write one VibeConsole app profile for the app `{app}`. {wish}\n\n         Reply with only the profile file, in exactly this tab-separated format (the first          line is the header, then one profile line whose last field is the number of override          lines, then the override lines, each with exactly the same 16 fields as this example):\n\n         {}\n         Rules: a profile name of 1–32 characters (not Default); overrides only for pads or Xbox          buttons, behaviour hold or toggle, keyboard shortcuts as Key+Key names, no feedback.          The controls this setup has:\n{controls}\n",
+        export_profile(&example)?
+    ))
+}
+
 /// A profile's export file name: letters, digits, `-` and `_` only, so it stays in its
 /// folder whatever the profile is called.
 pub fn profile_file_name(name: &str) -> String {
@@ -2764,6 +2800,30 @@ mod tests {
         assert!(!next.start_flow, "settings stay");
         assert_eq!(preset_file_name("Work: day"), "Work-day.preset");
         assert_eq!(preset_file_name("../x"), "x.preset");
+    }
+
+    /// v7 ticket 26: the profile is cut out of Claude's reply and checked like an import.
+    #[test]
+    fn claudes_reply_is_cut_to_the_profile_and_checked_like_an_import() {
+        let pad = Control::from_note(10, 36).unwrap();
+        let profile = Profile {
+            name: "Firefox".into(),
+            apps: vec!["firefox.desktop".into()],
+            mappings: vec![Mapping::new(pad, "Ctrl+T", "hold").unwrap()],
+        };
+        let file = export_profile(&profile).unwrap();
+        let reply = format!("Here is your profile:\n\n```\n{file}```\nEnjoy!\n");
+        let text = profile_text_from_reply(&reply).unwrap();
+        assert_eq!(text, file);
+        let config = Config::default();
+        assert_eq!(import_profile(&text, &config).unwrap(), profile);
+        assert_eq!(profile_text_from_reply("Sorry, I can't."), None);
+        let broken = reply.replace("Ctrl+T", "Ctrl+Nope");
+        assert!(import_profile(&profile_text_from_reply(&broken).unwrap(), &config).is_err());
+        let mut with_pads = Config::default();
+        with_pads.mappings = vec![Mapping::new(pad, "F1", "hold").unwrap()];
+        let request = profile_request(&with_pads, "firefox.desktop", "Tabs on the pads.").unwrap();
+        assert!(request.contains("vibeconsole-profile-v1") && request.contains("Bank A Pad 1"));
     }
 
     #[test]

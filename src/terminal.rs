@@ -127,6 +127,23 @@ trait Ui {
     fn login(&mut self, _request: crate::runtime::Login) -> Result<bool> {
         Err("login service unavailable".into())
     }
+    /// v7 ticket 26: the user's own `claude -p` (their login, no key stored), 3 minutes at
+    /// most. Tests answer with a fake reply.
+    fn ask_claude(&mut self, request: &str) -> Result<String> {
+        let output = std::process::Command::new("timeout")
+            .args(["180", "claude", "-p", request])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| format!("Claude CLI unavailable: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "claude -p failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+            .into());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
     /// The free-key helper's write (v7 ticket 19): backup first, then an atomic write.
     fn write_t3_key_file(&mut self, text: &str) -> Result<String> {
         crate::actions::write_t3_key_file(text).map(|backup| backup.display().to_string())
@@ -3535,6 +3552,7 @@ fn profiles_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
             "Import a profile file (from {})",
             profiles_dir(path).display()
         ));
+        items.push("Ask Claude for a profile…".into());
         let Some(choice) = choose(
             ui,
             "App profiles: apps without a profile use Default",
@@ -3546,7 +3564,8 @@ fn profiles_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
         let result = match config.profiles.get(choice) {
             Some(profile) => profile_menu(ui, path, &profile.name),
             None if choice == config.profiles.len() => new_profile(ui, path),
-            None => import_profile_file(ui, path),
+            None if choice == config.profiles.len() + 1 => import_profile_file(ui, path),
+            None => ai_profile(ui, path),
         };
         if let Err(error) = result {
             not_saved(ui, &error)?;
@@ -3713,6 +3732,44 @@ fn import_profile_file(ui: &mut impl Ui, path: &Path) -> Result<()> {
     let mut config = mappings::load_config(path)?;
     let profile = mappings::import_profile(&text, &config)
         .map_err(|e| format!("{}: {e}; nothing imported", files[index]))?;
+    config.profiles.push(profile);
+    mappings::save_config(path, &config)
+}
+/// v7 ticket 26: ask Claude for a profile; its reply is checked in full like an import and
+/// shown for review; nothing is saved unless confirmed.
+fn ai_profile(ui: &mut impl Ui, path: &Path) -> Result<()> {
+    let Some(app) = pick_app(ui)? else {
+        return Ok(());
+    };
+    let Some(wish) = text_entry(ui, "What should the pads do in this app? (optional)", "")? else {
+        return Ok(());
+    };
+    let mut config = mappings::load_config(path)?;
+    let request = mappings::profile_request(&config, &app, &wish)?;
+    ui.draw("Asking Claude (claude -p)… this can take a minute.")?;
+    let reply = ui.ask_claude(&request)?;
+    let text = mappings::profile_text_from_reply(&reply)
+        .ok_or("Claude's reply has no profile in VibeConsole's format; nothing saved")?;
+    let profile = mappings::import_profile(&text, &config)
+        .map_err(|e| format!("Claude's profile: {e}; nothing saved"))?;
+    let summary = profile
+        .mappings
+        .iter()
+        .map(|m| format!("  {}: {}", m.label, m.action_label()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if choose(
+        ui,
+        &format!(
+            "Claude suggests profile {} for {}:\n{summary}",
+            profile.name,
+            profile.apps.join(", ")
+        ),
+        &options(&["Cancel", "Save this profile"]),
+    )? != Some(1)
+    {
+        return Ok(());
+    }
     config.profiles.push(profile);
     mappings::save_config(path, &config)
 }
@@ -6633,6 +6690,8 @@ mod tests {
         t3: String,
         /// herdr's agents (v7 ticket 18).
         herdr: Vec<String>,
+        /// Claude's reply (v7 ticket 26).
+        claude: String,
     }
     impl Ui for Script {
         fn midi_devices(&mut self) -> Result<Vec<String>> {
@@ -6643,6 +6702,10 @@ mod tests {
         }
         fn t3_key_file(&mut self) -> Result<String> {
             Ok(self.t3.clone())
+        }
+        fn ask_claude(&mut self, request: &str) -> Result<String> {
+            assert!(request.contains("vibeconsole-profile-v1"));
+            Ok(self.claude.clone())
         }
         fn write_t3_key_file(&mut self, text: &str) -> Result<String> {
             self.t3 = text.to_owned();
@@ -8220,6 +8283,65 @@ mod tests {
                 .any(|s| s.contains("Bad.preset") && s.contains("nothing loaded"))
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 26: Claude's profile is shown for review and saved only when confirmed; a
+    /// reply that fails the checks saves nothing.
+    #[test]
+    fn claude_profiles_are_reviewed_and_bad_replies_save_nothing() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-ai-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let pad = Control::from_note(10, 36).unwrap();
+        mappings::save(&path, &[Mapping::new(pad, "F1", "hold").unwrap()]).unwrap();
+        let profile = mappings::Profile {
+            name: "Firefox".into(),
+            apps: vec!["firefox.desktop".into()],
+            mappings: vec![Mapping::new(pad, "Ctrl+T", "hold").unwrap()],
+        };
+        let reply = format!(
+            "Sure!\n```\n{}```\n",
+            mappings::export_profile(&profile).unwrap()
+        );
+        let ask = |claude: String, confirm: Vec<Key>| {
+            let mut keys = vec![Down; 9];
+            keys.extend([Enter, Down, Down, Enter]); // App profiles -> Ask Claude
+            keys.extend([Enter, Enter]); // the app, no wish
+            keys.extend(confirm);
+            keys.extend([Escape, Escape]);
+            let mut ui = Script {
+                keys: keys.into(),
+                claude,
+                apps: vec![(
+                    "Firefox".into(),
+                    "/usr/share/applications/firefox.desktop".into(),
+                )],
+                ..Default::default()
+            };
+            settings_menu(&mut ui, &path).unwrap();
+            assert!(ui.keys.is_empty());
+            ui.screens
+        };
+        let before = std::fs::read(&path).unwrap();
+        let screens = ask(reply.replace("Ctrl+T", "Ctrl+Nope"), vec![Enter]);
+        assert!(
+            screens
+                .iter()
+                .any(|s| s.contains("Claude's profile:") && s.contains("nothing saved"))
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let screens = ask(reply.clone(), vec![Enter]); // Cancel
+        assert!(
+            screens
+                .iter()
+                .any(|s| s.starts_with("Claude suggests profile Firefox"))
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        ask(reply, vec![Down, Enter]); // Save this profile
+        assert_eq!(mappings::load_config(&path).unwrap().profiles, [profile]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
