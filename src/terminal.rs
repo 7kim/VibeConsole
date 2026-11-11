@@ -3707,10 +3707,12 @@ fn pick_app(ui: &mut impl Ui) -> Result<Option<String>> {
 fn presets_dir(path: &Path) -> PathBuf {
     path.parent().unwrap_or(Path::new(".")).join("presets")
 }
-/// Settings -> Presets (v7 ticket 25): the whole setup (mappings, app profiles and their
-/// MIDI devices) saved by name and loaded later. Loading replaces the setup and keeps
-/// settings; a bad preset file is refused whole.
+/// Settings -> Presets (v7 tickets 25, 47): a program preset is the selected program's
+/// mappings and loads back into the selected program only; an all-programs preset is the
+/// whole setup (mappings, app profiles and their MIDI devices) and replaces it, keeping
+/// settings. A bad or wrong-kind file is refused whole; a load says it succeeded.
 fn presets_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
+    const PROGRAM: &str = ".program-preset";
     loop {
         let dir = presets_dir(path);
         let mut files = std::fs::read_dir(&dir)
@@ -3719,17 +3721,31 @@ fn presets_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                     .flatten()
                     .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
                     .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .filter(|name| name.ends_with(".preset"))
+                    .filter(|name| name.ends_with(".preset") || name.ends_with(PROGRAM))
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
         files.sort();
-        let mut items = files.clone();
-        items.push("Save the current setup as a preset".into());
+        let context = ui.context();
+        let program = mappings::program_label(context);
+        let mut items = files
+            .iter()
+            .map(|file| {
+                let kind = if file.ends_with(PROGRAM) {
+                    "one program"
+                } else {
+                    "all programs"
+                };
+                format!("{file} ({kind})")
+            })
+            .collect::<Vec<_>>();
+        items.push(format!("Save Program Preset ({program})"));
+        items.push("Save All Programs Preset".into());
         let Some(choice) = choose(ui, &format!("Presets ({})", dir.display()), &items)? else {
             return Ok(());
         };
-        let result = if choice == files.len() {
+        let result = if choice >= files.len() {
+            let one = choice == files.len();
             (|| {
                 let Some(name) = text_entry(ui, "Preset name", "")? else {
                     return Ok(());
@@ -3738,27 +3754,55 @@ fn presets_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                     return Err("a preset name is 1–32 printable characters".into());
                 }
                 std::fs::create_dir_all(&dir)?;
-                mappings::save_config(
-                    &dir.join(mappings::preset_file_name(name.trim())),
-                    &mappings::load_config(path)?,
-                )
+                let config = mappings::load_config(path)?;
+                if one {
+                    mappings::save_config(
+                        &dir.join(mappings::program_preset_file_name(name.trim())),
+                        &mappings::program_preset(&config, context),
+                    )
+                } else {
+                    mappings::save_config(
+                        &dir.join(mappings::preset_file_name(name.trim())),
+                        &config,
+                    )
+                }
             })()
         } else {
             let file = dir.join(&files[choice]);
+            let one = files[choice].ends_with(PROGRAM);
+            let name = files[choice]
+                .trim_end_matches(PROGRAM)
+                .trim_end_matches(".preset")
+                .to_owned();
+            let load = if one {
+                format!("Load it into {program} (replaces this program's mappings only)")
+            } else {
+                "Load it (replaces mappings and app profiles; settings stay)".into()
+            };
             match choose(
                 ui,
                 &format!("Preset {}", files[choice]),
-                &options(&[
-                    "Load it (replaces mappings and app profiles; settings stay)",
-                    "Delete it",
-                    "Back",
-                ]),
+                &[load, "Delete it".into(), "Back".into()],
             )? {
                 Some(0) => (|| {
-                    let preset = mappings::load_config(&file)
-                        .map_err(|e| format!("{}: {e}; nothing loaded", files[choice]))?;
+                    let refused = |e: &dyn std::fmt::Display| {
+                        format!("{}: {e}; nothing loaded", files[choice])
+                    };
+                    let preset = mappings::load_config(&file).map_err(|e| refused(&e))?;
                     let config = mappings::load_config(path)?;
-                    mappings::save_config(path, &mappings::apply_preset(&config, &preset))
+                    let next = if one {
+                        mappings::apply_program_preset(&config, &preset, context)
+                            .map_err(|e| refused(&e))?
+                    } else {
+                        mappings::apply_preset(&config, &preset)
+                    };
+                    mappings::save_config(path, &next)?;
+                    choose(
+                        ui,
+                        &format!("Loaded {name} preset successfully"),
+                        &options(&["Back"]),
+                    )?;
+                    Ok(())
                 })(),
                 Some(1) => std::fs::remove_file(&file).map_err(Into::into),
                 _ => Ok(()),
@@ -9135,14 +9179,14 @@ mod tests {
             assert!(ui.keys.is_empty());
             ui.screens
         };
-        let mut save = vec![Enter];
+        let mut save = vec![Down, Enter]; // Save All Programs Preset
         save.extend(b"Work".map(Character));
         save.push(Enter);
         presets(save);
         assert!(dir.join("presets/Work.preset").exists());
         let b = Mapping::new(Control::from_note(10, 37).unwrap(), "F2", "hold").unwrap();
         mappings::save(&path, &[b]).unwrap();
-        presets(vec![Enter, Enter]); // Work.preset -> Load it
+        presets(vec![Enter, Enter, Enter]); // Work.preset -> Load it -> Back
         assert_eq!(mappings::load(&path).unwrap(), [a]);
         std::fs::write(dir.join("presets/Bad.preset"), "not a config").unwrap();
         let before = std::fs::read(&path).unwrap();
@@ -9152,6 +9196,120 @@ mod tests {
                 .iter()
                 .any(|s| s.contains("Bad.preset") && s.contains("nothing loaded"))
         );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 47: Save Program Preset keeps the selected program only and loads back into
+    /// it alone; Save All Programs Preset keeps everything; each load says so. A program
+    /// preset holding more than one program is refused whole.
+    #[test]
+    fn program_and_all_programs_presets() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-presets2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let pad = Control::from_note(10, 36).unwrap();
+        let on = |context: u8, keys: &str| {
+            let mut m = Mapping::new(pad, keys, "hold").unwrap();
+            m.context = context;
+            m
+        };
+        let y = Mapping::new(Control::button(3), "Left", "hold").unwrap();
+        let setup = |p1: &str, p2: &str| {
+            let mut all = vec![on(0, p1), on(1, p2), y.clone()];
+            all.sort_by_key(|m| (m.context, m.control));
+            mappings::save(&path, &all).unwrap();
+        };
+        let keys_of = |context: u8| {
+            mappings::load(&path)
+                .unwrap()
+                .into_iter()
+                .find(|m| m.context == context && m.control == pad)
+                .map(|m| m.keys.join("+"))
+        };
+        let presets = |keys: Vec<Key>| {
+            let mut all = vec![Down; 11];
+            all.push(Enter);
+            all.extend(keys);
+            all.extend([Escape, Escape]);
+            let mut ui = Script {
+                keys: all.into(),
+                context: 1, // Program 2 selected
+                ..Default::default()
+            };
+            settings_menu(&mut ui, &path).unwrap();
+            assert!(ui.keys.is_empty(), "{}", ui.screens.join("\n----\n"));
+            ui.screens.join("\n----\n")
+        };
+        let name = |text: &[u8], mut keys: Vec<Key>| {
+            keys.extend(text.iter().map(|c| Character(*c)));
+            keys.push(Enter);
+            keys
+        };
+        setup("F1", "F2");
+        let mut config = mappings::load_config(&path).unwrap();
+        config.profiles.push(mappings::Profile {
+            name: "Firefox".into(),
+            apps: vec!["firefox.desktop".into()],
+            mappings: vec![Mapping::new(pad, "Ctrl+T", "hold").unwrap()],
+        });
+        mappings::save_config(&path, &config).unwrap();
+        let screens = presets(name(b"Live", vec![Enter])); // Save Program Preset
+        assert!(
+            screens.contains("Save Program Preset (Program 2)"),
+            "{screens}"
+        );
+        assert!(dir.join("presets/Live.program-preset").exists());
+        setup("F4", "F3");
+        let screens = presets(vec![Enter, Enter, Enter]); // Live -> Load it -> Back
+        assert!(
+            screens.contains("Loaded Live preset successfully"),
+            "{screens}"
+        );
+        assert_eq!(keys_of(1).as_deref(), Some("F2"), "Program 2 comes back");
+        assert_eq!(keys_of(0).as_deref(), Some("F4"), "Program 1 stays");
+        assert!(mappings::load(&path).unwrap().contains(&y), "Xbox stays");
+        let mut config = mappings::load_config(&path).unwrap();
+        assert!(config.profile("Firefox").is_some(), "profiles stay");
+
+        presets(name(b"All", vec![Down, Down, Enter])); // Save All Programs Preset
+        assert!(dir.join("presets/All.preset").exists());
+        config.profiles.clear();
+        mappings::save_config(&path, &config).unwrap();
+        setup("F5", "F6");
+        let screens = presets(vec![Enter, Enter, Enter]); // All -> Load it -> Back
+        assert!(
+            screens.contains("Loaded All preset successfully"),
+            "{screens}"
+        );
+        assert_eq!(
+            (keys_of(0), keys_of(1)),
+            (Some("F4".into()), Some("F2".into()))
+        );
+        assert!(
+            mappings::load(&path).unwrap().contains(&y),
+            "Xbox comes back"
+        );
+        assert!(
+            mappings::load_config(&path)
+                .unwrap()
+                .profile("Firefox")
+                .is_some(),
+            "profiles come back"
+        );
+        assert!(screens.contains("All.preset (all programs)"), "{screens}");
+        assert!(
+            screens.contains("Live.program-preset (one program)"),
+            "{screens}"
+        );
+
+        // A "program preset" holding two programs is refused whole.
+        std::fs::copy(&path, dir.join("presets/Two.program-preset")).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let screens = presets(vec![Down, Down, Enter, Enter, Enter]); // Two -> Load -> Back
+        assert!(screens.contains("nothing loaded"), "{screens}");
         assert_eq!(std::fs::read(&path).unwrap(), before);
         std::fs::remove_dir_all(dir).unwrap();
     }

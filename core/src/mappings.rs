@@ -754,6 +754,46 @@ pub fn profile_file_name(name: &str) -> String {
 pub fn preset_file_name(name: &str) -> String {
     safe_file_name(name, "preset")
 }
+/// A program preset's file name (v7 ticket 47): one program's mappings only.
+pub fn program_preset_file_name(name: &str) -> String {
+    safe_file_name(name, "program-preset")
+}
+/// v7 ticket 47: a program preset is the mappings of one program (`context`), both banks;
+/// nothing else of the setup.
+pub fn program_preset(config: &Config, context: u8) -> Config {
+    Config {
+        mappings: config
+            .mappings
+            .iter()
+            .filter(|m| m.context == context)
+            .cloned()
+            .collect(),
+        ..Config::default()
+    }
+}
+/// v7 ticket 47: load a program preset into the program `context`: that program's mappings
+/// are replaced and nothing else changes. A file holding more than one program, Xbox
+/// mappings or profiles isn't a program preset and is refused whole.
+pub fn apply_program_preset(config: &Config, preset: &Config, context: u8) -> Result<Config> {
+    let mut contexts = preset.mappings.iter().map(|m| m.context);
+    let first = contexts.next();
+    if contexts.any(|c| Some(c) != first)
+        || first.is_some_and(gamepad_context)
+        || !preset.profiles.is_empty()
+    {
+        return Err("not a program preset: it holds more than one program's mappings".into());
+    }
+    let mut next = config.clone();
+    next.mappings.retain(|m| m.context != context);
+    for mapping in &preset.mappings {
+        let mut mapping = mapping.clone();
+        mapping.context = context;
+        mapping.validate()?;
+        next.mappings.push(mapping);
+    }
+    next.mappings.sort_by_key(|m| (m.context, m.control));
+    Ok(next)
+}
 fn safe_file_name(name: &str, extension: &str) -> String {
     let mut file = String::new();
     for c in name.chars() {
