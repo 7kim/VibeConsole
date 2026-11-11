@@ -470,17 +470,11 @@ pub const OCTAVES: [(&str, Octave); 4] = [
     ("blink", Octave::Blink),
     ("alternate", Octave::Alternate),
 ];
-pub fn tempo_word(tempo: Tempo) -> &'static str {
-    TEMPOS
-        .iter()
-        .find(|(_, t)| *t == tempo)
-        .map_or("off", |(w, _)| w)
+pub fn tempo_word(value: Tempo) -> &'static str {
+    word(&TEMPOS, value)
 }
-pub fn octave_word(octave: Octave) -> &'static str {
-    OCTAVES
-        .iter()
-        .find(|(_, o)| *o == octave)
-        .map_or("off", |(w, _)| w)
+pub fn octave_word(value: Octave) -> &'static str {
+    word(&OCTAVES, value)
 }
 /// Busy states, most urgent first: the order that decides the shared tempo light.
 pub const BUSY: [&str; 4] = ["needs-decision", "needs-input", "thinking", "finished"];
@@ -502,7 +496,7 @@ pub const LIGHTS: [(&str, Light); 5] = [
     ("fast-blink", Light::FastBlink),
     ("blink", Light::Blink),
 ];
-/// v7 ticket 86: a rumble as a state begins.
+/// v7 ticket 86: a rumble as a state begins. Declared shortest first: `max` picks the longest.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Rumble {
     Off,
@@ -567,18 +561,12 @@ impl DevicePatterns {
         }
     }
 }
-/// Busy states from most to least urgent, as `BUSY` indexes: decision, input, finished,
-/// thinking.
-const URGENT: [usize; 4] = [0, 1, 3, 2];
-/// The Xbox button light for these source states: the most urgent busy state whose pattern
-/// lights it; Off when none does.
-pub fn xbox_light(states: &[&str], patterns: &DevicePatterns) -> Light {
-    URGENT
-        .iter()
-        .filter(|&&i| states.contains(&BUSY[i]))
-        .map(|&i| patterns.xbox[i].0)
-        .find(|light| *light != Light::Off)
-        .unwrap_or(Light::Off)
+/// The Xbox button light for these source states (v7 ticket 86): the pattern of the most
+/// urgent busy state, in `BUSY` order as on the MPK; "off" turns it off. None when no source
+/// is busy: the plain running light shows.
+pub fn xbox_light(states: &[&str], patterns: &DevicePatterns) -> Option<Light> {
+    let busy = BUSY.iter().position(|s| states.contains(s))?;
+    Some(patterns.xbox[busy].0)
 }
 /// The rumble due now: the longest of the states that sources newly entered.
 pub fn rumble_for(
@@ -914,25 +902,33 @@ mod tests {
             ]
         );
         assert_eq!(p.ps5[0], ("red", Light::FastBlink, Rumble::Short));
-        assert_eq!(xbox_light(&["idle"], &p), Light::Off);
-        assert_eq!(xbox_light(&["thinking", "idle"], &p), Light::SlowPulse);
         assert_eq!(
-            xbox_light(&["thinking", "finished"], &p),
-            Light::Blink,
-            "finished outranks thinking"
+            xbox_light(&["idle"], &p),
+            None,
+            "nothing busy: the running light"
+        );
+        assert_eq!(
+            xbox_light(&["thinking", "idle"], &p),
+            Some(Light::SlowPulse)
+        );
+        assert_eq!(
+            xbox_light(&["finished", "thinking"], &p),
+            Some(Light::SlowPulse),
+            "BUSY order, as the MPK"
         );
         assert_eq!(
             xbox_light(&["finished", "needs-decision"], &p),
-            Light::FastBlink
+            Some(Light::FastBlink)
         );
         let mut quiet = p.clone();
         quiet.xbox[0].0 = Light::Off;
         assert_eq!(
             xbox_light(&["needs-decision", "thinking"], &quiet),
-            Light::SlowPulse,
-            "a state whose light is off gives way"
+            Some(Light::Off),
+            "a state set to off turns the light off"
         );
         let src = |s: &'static str| ("claude".to_string(), s);
+        let codex = |s: &'static str| ("codex".to_string(), s);
         assert_eq!(
             rumble_for(&[src("thinking")], &[src("finished")], &p),
             Rumble::Short
@@ -946,15 +942,36 @@ mod tests {
             rumble_for(&[src("thinking")], &[src("needs-input")], &p),
             Rumble::Off
         );
+        assert_eq!(rumble_for(&[], &[src("idle")], &p), Rumble::Off);
+        // One source staying put while another changes: only the change counts.
+        let before = [src("finished"), codex("thinking")];
+        assert_eq!(
+            rumble_for(&before, &[src("finished"), codex("needs-input")], &p),
+            Rumble::Off
+        );
+        assert_eq!(
+            rumble_for(&before, &[src("finished"), codex("needs-decision")], &p),
+            Rumble::Short
+        );
+        // Going busy again rumbles only if that state's pattern says so; the longest wins.
+        let mut busy = p.clone();
+        busy.xbox[2].1 = Rumble::Short;
+        assert_eq!(
+            rumble_for(&[src("finished")], &[src("thinking")], &p),
+            Rumble::Off
+        );
+        assert_eq!(
+            rumble_for(&[src("finished")], &[src("thinking")], &busy),
+            Rumble::Short
+        );
         let mut long = p.clone();
         long.xbox[3].1 = Rumble::Long;
-        let both = [src("finished"), ("codex".to_string(), "needs-decision")];
+        let both = [src("finished"), codex("needs-decision")];
         assert_eq!(
             rumble_for(&[], &both, &long),
             Rumble::Long,
             "the longest wins"
         );
-        assert_eq!(rumble_for(&[], &[src("idle")], &p), Rumble::Off);
     }
 
     use super::*;

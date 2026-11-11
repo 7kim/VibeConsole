@@ -1449,11 +1449,10 @@ impl Terminal {
             std::path::Path::new(crate::gamepad::LEDS),
         );
     }
-    /// Shows running or paused on the Xbox button light; a failed write gives the light up
-    /// (restoring what it can) and says why.
     /// The Xbox button light (v7 tickets 64 and 86): paused shows paused; running shows the
-    /// most urgent agent state's Xbox pattern, or the plain running light when none lights it
-    /// or its switches are off.
+    /// most urgent busy agent state's Xbox pattern, or the plain running light when nothing is
+    /// busy or its switches are off. A failed write gives the light up (restoring what it
+    /// can) and says why.
     fn show_button_light(&mut self) {
         use crate::gamepad::Light;
         let states = self.alert_states();
@@ -1462,15 +1461,11 @@ impl Terminal {
             .device_lights
             .as_ref()
             .filter(|p| p.on[1])
-            .map_or(crate::status::Light::Off, |p| {
-                crate::status::xbox_light(&states, p)
-            });
-        let light = if !(self.output.is_some() && !self.suspended) {
-            Light::Paused
-        } else if pattern == crate::status::Light::Off {
-            Light::Running
-        } else {
-            Light::Agent(pattern)
+            .and_then(|p| crate::status::xbox_light(&states, p));
+        let light = match pattern {
+            _ if !(self.output.is_some() && !self.suspended) => Light::Paused,
+            Some(pattern) => Light::Agent(pattern),
+            None => Light::Running,
         };
         let result = self.button_light.as_mut().map(|l| l.show(light));
         if let Some(Err(error)) = result {
@@ -4526,6 +4521,8 @@ fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 blind.join(", ")
             )
         };
+        // v7 ticket 86: the Xbox rows do nothing without xone's light; say so, never guess.
+        let title = format!("{title}\n{}", crate::gamepad::ButtonLight::status());
         let Some(index) = choose(ui, &title, &rows)? else {
             return Ok(());
         };
@@ -11728,9 +11725,6 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// Ticket 14: status lights show only in a running interactive session on a verified,
-    /// non-piano program with Status lights On; the toggle saves, and v12 files load with the
-    /// spec defaults.
     /// v7 ticket 86: Status light patterns also switches the MPK and the Xbox on or off, and
     /// sets the Xbox light and rumble per state; both are saved.
     #[test]
@@ -11757,6 +11751,10 @@ mod tests {
             ui.screens
                 .iter()
                 .any(|s| s.contains("Xbox · Thinking: light slow-pulse, rumble off"))
+        );
+        assert!(
+            ui.screens.iter().any(|s| s.contains("Xbox button light: ")),
+            "available, or why not"
         );
         let lights = mappings::load_config(&path).unwrap().device_lights;
         assert_eq!(lights.on, [true, false, true]);
@@ -11807,6 +11805,9 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Ticket 14: status lights show only in a running interactive session on a verified,
+    /// non-piano program with Status lights On; the toggle saves, and v12 files load with the
+    /// spec defaults.
     #[test]
     fn status_lights_need_a_running_interactive_non_piano_session_and_can_be_turned_off() {
         let dir = std::env::temp_dir().join(format!("vibeconsole-lights-{}", std::process::id()));
