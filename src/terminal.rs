@@ -1228,7 +1228,12 @@ impl Terminal {
     /// The keyboard's mappings: the MIDI context's plus, with a controller open, the Xbox
     /// layout (saved buttons over the defaults), active beside any program.
     fn with_gamepad(&self, mappings: &[Mapping]) -> Result<Vec<Mapping>> {
-        let mut all = mappings.to_vec();
+        // v7 ticket 40: until a program is verified, MIDI pads stay out of the keyboard.
+        let mut all = if self.context_verified {
+            mappings.to_vec()
+        } else {
+            Vec::new()
+        };
         if self.gamepad.is_some() {
             all.extend(self.xbox_layout()?);
         }
@@ -1283,7 +1288,8 @@ impl Terminal {
     /// keys are released, held pads and buttons wait for a fresh press.
     fn reload_keyboard(&mut self) -> Result<()> {
         let all = self.with_gamepad(&self.run_mappings)?;
-        let resume = self.wanted_run && !self.suspended && self.context_verified;
+        // Unverified, `all` holds the Xbox layout only (ticket 40), so it may run.
+        let resume = self.wanted_run && !self.suspended;
         if let Some(output) = &mut self.output {
             output.pause()?;
             output
@@ -1373,6 +1379,32 @@ impl Terminal {
             }
             Err(error) => self.notice = error.to_string(),
         }
+    }
+    /// v7 ticket 40: Run with no verified MIDI program (none connected, or not detected yet)
+    /// still drives a connected Xbox controller, with the Xbox layout only, so MIDI pads
+    /// can't fire. A program verified later suspends first (held keys released) and Run takes
+    /// over with the full set. Only on the command list, as every resume.
+    fn gamepad_only(&mut self, connected: bool) -> Result<()> {
+        let idle = self.output.is_none() || self.suspended;
+        if !(connected && idle && self.wanted_run && self.at_menu)
+            || self.context_verified
+            || self.flow_pending
+        {
+            return Ok(());
+        }
+        let layout = self.xbox_layout()?;
+        match &mut self.output {
+            Some(output) => output.keyboard.replace(&layout)?,
+            None => self.output = Some(crate::keyboard::Output::new(&layout)?),
+        }
+        if let Some(output) = &mut self.output {
+            output.keyboard.resume();
+        }
+        self.suspended = false;
+        self.notice =
+            "No verified MIDI program: the Xbox controller runs on its own; pads wait for their program."
+                .into();
+        Ok(())
     }
     /// Plugging or unplugging a controller is a transition: held keys are released, queued
     /// buttons dropped, and the next fresh press fires.
@@ -2231,6 +2263,14 @@ impl Terminal {
                     "Xbox controller disconnected: {name}; held keys released"
                 ))?,
             }
+        }
+        let connected = self
+            .gamepad
+            .as_ref()
+            .is_some_and(|pad| !pad.connected().is_empty());
+        if let Err(error) = self.gamepad_only(connected) {
+            self.pause()?;
+            self.error = format!("Xbox-only run failed: {error}; paused");
         }
         self.quit_holds();
         self.move_pointer();
@@ -10171,6 +10211,85 @@ mod tests {
             }
         }
         assert!(held.is_empty(), "still held: {held:?}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 40: with no verified MIDI program, Run drives a connected Xbox controller on
+    /// its own: its buttons type, an Akai pad types nothing, and a program verified later
+    /// suspends first, releasing a held Xbox key, before the full set takes over.
+    #[test]
+    fn xbox_runs_alone_until_a_midi_program_is_verified() {
+        use evdev::KeyCode;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-xbox-alone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let pad = Control::from_note(10, 36).unwrap();
+        let y = Mapping::new(Control::button(3), "Left", "hold").unwrap();
+        mappings::save(
+            &path,
+            &[Mapping::new(pad, "F1", "hold").unwrap(), y.clone()],
+        )
+        .unwrap();
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        let saved = mappings::load_config(&path).unwrap().mappings;
+        ui.run_mappings = ui.context_mappings(&saved);
+        ui.context_verified = false; // no MIDI device: no program detected
+        ui.wanted_run = true;
+        ui.at_menu = true;
+        ui.suspended = true;
+        ui.output = Some(crate::keyboard::Output::recording(&[]).unwrap());
+        ui.gamepad_only(false).unwrap();
+        assert!(ui.suspended, "no controller connected: nothing runs");
+        ui.gamepad_only(true).unwrap();
+        assert!(!ui.suspended && ui.error.is_empty(), "{}", ui.error);
+        let tap = |ui: &mut Terminal, control: Control| {
+            ui.handle_events(vec![
+                Event::Press(control),
+                Event::Release(control, crate::ReleaseType::ButtonUp),
+            ])
+            .unwrap()
+        };
+        tap(&mut ui, y.control);
+        tap(&mut ui, pad);
+        ui.handle_events(vec![Event::Press(Control::button(0))])
+            .unwrap(); // A held
+        let recorded = ui.output.as_ref().unwrap().recorded.clone();
+        assert!(
+            recorded.contains(&(KeyCode::KEY_LEFT, true)),
+            "{recorded:?}"
+        );
+        assert!(
+            recorded.contains(&(KeyCode::KEY_ENTER, true)),
+            "{recorded:?}"
+        );
+        assert!(
+            !recorded.contains(&(KeyCode::KEY_F1, true)),
+            "the unverified pad typed: {recorded:?}"
+        );
+        // The program is verified: a transition first (observe_program suspends).
+        ui.suspend().unwrap();
+        ui.context_verified = true;
+        ui.gamepad_only(true).unwrap();
+        assert!(
+            ui.suspended,
+            "verified: Run, not the Xbox-only path, resumes"
+        );
+        let mut held = std::collections::HashSet::new();
+        for &(key, down) in &ui.output.as_ref().unwrap().recorded {
+            if down {
+                held.insert(key);
+            } else {
+                held.remove(&key);
+            }
+        }
+        assert!(held.is_empty(), "still held: {held:?}");
+        assert_eq!(
+            ui.with_gamepad(&ui.run_mappings).unwrap().first(),
+            ui.run_mappings.first(),
+            "verified: the pads are back in the set"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
