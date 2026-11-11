@@ -2017,9 +2017,6 @@ fn send_prompt(
     enter: bool,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<String> {
-    if !crate::mappings::simple_name(file) || !crate::mappings::simple_name(agent_name) {
-        return Err("invalid prompt file or agent".into());
-    }
     send_prompt_at(
         &prompts_dir()?.join(file),
         file,
@@ -2029,19 +2026,18 @@ fn send_prompt(
     )
 }
 
-/// A sequence step's own text (v7 ticket 81), written where only this user can read it and
-/// sent like a saved prompt; the saved prompt file is never touched.
-fn own_text_file(text: &str) -> Result<PathBuf> {
-    let dir = PathBuf::from(
-        std::env::var_os("XDG_RUNTIME_DIR")
-            .filter(|v| !v.is_empty())
-            .ok_or("XDG_RUNTIME_DIR is not set")?,
-    )
-    .join("vibeconsole");
+/// Sends a sequence step's own text (v7 ticket 81) like a saved prompt, from a file of its
+/// own in the user's runtime directory, deleted once sent; the saved prompt is never touched.
+fn with_own_text(text: &str, send: impl FnOnce(&Path) -> Result<String>) -> Result<String> {
+    static SENT: AtomicU64 = AtomicU64::new(0);
+    let dir = crate::status::dir()?;
     fs::create_dir_all(&dir)?;
-    let path = dir.join("sequence-step-prompt");
+    let n = SENT.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!("step-prompt-{}-{n}", std::process::id()));
     write_atomic(&path, text)?;
-    Ok(path)
+    let sent = send(&path);
+    let _ = fs::remove_file(&path);
+    sent
 }
 
 fn send_prompt_at(
@@ -2051,8 +2047,10 @@ fn send_prompt_at(
     enter: bool,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<String> {
-    let path = path.to_path_buf();
-    read_prompt(&path)?;
+    if !crate::mappings::simple_name(file) || !crate::mappings::simple_name(agent_name) {
+        return Err("invalid prompt file or agent".into());
+    }
+    read_prompt(path)?;
     if cancelled() {
         return Err("prompt cancelled".into());
     }
@@ -2306,15 +2304,19 @@ fn perform(
             target: Target::Agent(agent),
             enter,
             text,
-        } => send_prompt_at(&own_text_file(text)?, file, agent, *enter, cancelled)
-            .map(|done| format!("{done} (this sequence’s version)")),
+        } => with_own_text(text, |path| {
+            send_prompt_at(path, file, agent, *enter, cancelled)
+        })
+        .map(|done| format!("{done} (this sequence’s version)")),
         Action::PromptOwn {
             file,
             target: Target::Focused { shift },
             enter,
             text,
         } => {
-            copy_prompt(&own_text_file(text)?, wl_copy(in_unit()))?;
+            with_own_text(text, |path| {
+                copy_prompt(path, wl_copy(in_unit())).map(|()| String::new())
+            })?;
             tap(crate::keyboard::paste_keys(*shift))?;
             if *enter {
                 wait(PASTE_SETTLE, cancelled)?;

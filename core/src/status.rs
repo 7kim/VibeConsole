@@ -13,7 +13,7 @@ pub const STATES: [&str; 5] = [
 /// Set in every tmux window VibeConsole launches, so hooks from other sessions are ignored.
 pub const AGENT_ENV: &str = "VIBECONSOLE_AGENT";
 
-fn dir() -> Result<PathBuf> {
+pub(crate) fn dir() -> Result<PathBuf> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .filter(|v| !v.is_empty())
         .ok_or("XDG_RUNTIME_DIR is not set")?;

@@ -6087,26 +6087,34 @@ fn edit_step(
     };
     let dir = crate::actions::prompts_dir_for(path)?;
     let scratch = dir.join(format!(".{file}.sequence-edit"));
-    let result = (|| -> Result<Action> {
+    let edited = (|| -> Result<String> {
+        // A missing prompt starts empty; one that can't be read is never edited blind.
         let start = match step {
             Action::PromptOwn { text, .. } => text.clone(),
-            _ => std::fs::read_to_string(dir.join(file)).unwrap_or_default(),
+            _ => match std::fs::read_to_string(dir.join(file)) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                other => other?,
+            },
         };
         std::fs::create_dir_all(&dir)?;
-        std::fs::write(&scratch, start)?;
+        std::fs::write(&scratch, &start)?;
         ui.edit_file(&scratch)?;
         let text = std::fs::read_to_string(&scratch)?;
-        let edited = Action::PromptOwn {
-            file: file.clone(),
-            target: target.clone(),
-            enter,
-            text,
-        };
-        edited.validate()?;
-        Ok(edited)
+        Ok(if text == start { String::new() } else { text })
     })();
     let _ = std::fs::remove_file(&scratch);
-    result.map_err(stage("file I/O"))
+    let text = edited.map_err(stage("file I/O"))?;
+    if text.is_empty() {
+        return Ok(step.clone()); // nothing changed: the step stays as it was
+    }
+    let edited = Action::PromptOwn {
+        file: file.clone(),
+        target: target.clone(),
+        enter,
+        text,
+    };
+    edited.validate().map_err(stage("validation"))?;
+    Ok(edited)
 }
 
 /// The T3 Code family (v7 ticket 17): each command shows the key T3's own file binds it
