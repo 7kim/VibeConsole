@@ -407,19 +407,6 @@ pub fn retune(
     changed.contains(&true)
 }
 
-/// v7 ticket 11: rumble when a source (agent or folder) newly finishes or needs the user;
-/// staying in that state, or going busy/idle, doesn't rumble again.
-pub fn rumble_due(before: &[(String, &str)], now: &[(String, &str)]) -> bool {
-    let alerting = |state: &str| matches!(state, "finished" | "needs-input" | "needs-decision");
-    now.iter().any(|(name, state)| {
-        alerting(state)
-            && before
-                .iter()
-                .find(|(n, _)| n == name)
-                .is_none_or(|(_, was)| was != state)
-    })
-}
-
 /// v7 ticket 27: whether headset audio through the controller's 3.5 mm jack can work, from
 /// which driver holds the controller (`bound`: driver names with a device bound) and ALSA's
 /// card list. Only `xone` carries controller audio; VibeConsole never loads or unloads a
@@ -593,8 +580,15 @@ impl Pad {
     }
     /// One short rumble on every controller that supports it, when Tuning has it on.
     /// Rumble is hardware feedback: it plays only while VibeConsole owns the controller.
-    pub fn rumble(&mut self) -> crate::Result<()> {
+    /// v7 ticket 86: a short (300 ms) or long (900 ms) rumble; Off, or rumble turned off in
+    /// Xbox tuning, plays nothing.
+    pub fn rumble(&mut self, rumble: crate::status::Rumble) -> crate::Result<()> {
         use gilrs::ff::{BaseEffect, BaseEffectType, EffectBuilder, Repeat, Replay, Ticks};
+        let ms = match rumble {
+            crate::status::Rumble::Off => return Ok(()),
+            crate::status::Rumble::Short => 300,
+            crate::status::Rumble::Long => 900,
+        };
         if !self.tuning.rumble {
             return Ok(());
         }
@@ -607,7 +601,7 @@ impl Pad {
         if ids.is_empty() {
             return Ok(());
         }
-        let length = Ticks::from_ms(300);
+        let length = Ticks::from_ms(ms);
         let effect = EffectBuilder::new()
             .add_effect(BaseEffect {
                 kind: BaseEffectType::Strong { magnitude: 40_000 },
@@ -653,6 +647,8 @@ pub enum Light {
     Running,
     /// Paused, or not running yet: slow blink.
     Paused,
+    /// v7 ticket 86: running, showing the most urgent agent state's pattern.
+    Agent(crate::status::Light),
 }
 
 /// Where the kernel lists LEDs; xone's controller lights are the `gip*` folders.
@@ -749,9 +745,14 @@ impl ButtonLight {
         if self.shown == Some(light) {
             return Ok(());
         }
+        use crate::status::Light as Pattern;
         let mode = match light {
-            Light::Running => "1",
+            Light::Running | Light::Agent(Pattern::Steady) => "1",
             Light::Paused => "4",
+            Light::Agent(Pattern::Off) => "0",
+            Light::Agent(Pattern::FastBlink) => "2",
+            Light::Agent(Pattern::Blink) => "3",
+            Light::Agent(Pattern::SlowPulse) => "8",
         };
         for (dir, ..) in &self.saved {
             std::fs::write(dir.join("mode"), mode)
@@ -1113,28 +1114,6 @@ mod tests {
     }
 
     #[test]
-    fn rumble_once_when_a_source_newly_finishes_or_needs_you() {
-        let state = |pairs: &[(&str, &'static str)]| {
-            pairs
-                .iter()
-                .map(|(n, s)| (n.to_string(), *s))
-                .collect::<Vec<(String, &str)>>()
-        };
-        let busy = state(&[("claude", "thinking"), ("/work", "thinking")]);
-        let done = state(&[("claude", "finished"), ("/work", "thinking")]);
-        assert!(rumble_due(&busy, &done));
-        assert!(
-            !rumble_due(&done, &done),
-            "still finished: no second rumble"
-        );
-        let asks = state(&[("claude", "finished"), ("/work", "needs-input")]);
-        assert!(rumble_due(&done, &asks));
-        assert!(!rumble_due(&asks, &busy), "going busy again doesn't rumble");
-        assert!(rumble_due(&[], &state(&[("codex", "needs-decision")])));
-        assert!(!rumble_due(&[], &state(&[("codex", "idle")])));
-    }
-
-    #[test]
     fn xbox_button_with_the_dpad_cycles_and_a_one_second_hold_toggles_the_lock() {
         use std::time::{Duration, Instant};
         let at = Instant::now();
@@ -1337,6 +1316,30 @@ mod tests {
             "x\n",
             "other lights untouched"
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// v7 ticket 86: the button light shows each agent pattern as xone's GIP mode (0 off,
+    /// 1 steady, 2 fast blink, 3 blink, 8 fade for the slow pulse) and is restored on quit.
+    #[test]
+    fn button_light_shows_agent_patterns_and_is_restored_on_quit() {
+        use crate::status::Light as Pattern;
+        let root = leds("agents", "3");
+        let mut light = ButtonLight::open(&root).unwrap();
+        for (pattern, gip) in [
+            (Pattern::FastBlink, "2"),
+            (Pattern::SlowPulse, "8"),
+            (Pattern::Blink, "3"),
+            (Pattern::Steady, "1"),
+            (Pattern::Off, "0"),
+        ] {
+            light.show(Light::Agent(pattern)).unwrap();
+            assert_eq!(mode(&root, "gip0"), gip, "{pattern:?}");
+        }
+        light.show(Light::Paused).unwrap();
+        assert_eq!(mode(&root, "gip0"), "4", "paused still shows paused");
+        drop(light);
+        assert_eq!(mode(&root, "gip0"), "3", "quit puts the old mode back");
         std::fs::remove_dir_all(root).unwrap();
     }
 

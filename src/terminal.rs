@@ -257,6 +257,8 @@ struct Terminal {
     flow_resume: bool,
     /// (agent, tmux window, state), refreshed every `STATUS_EVERY`.
     agent_states: Vec<(String, String, &'static str)>,
+    /// v7 ticket 86: each device's switch and patterns; None while Status lights is off.
+    device_lights: Option<crate::status::DevicePatterns>,
     /// Agents' status-light settings, in `agent_states` order; None while Status lights is Off.
     light_agents: Option<Vec<mappings::Agent>>,
     /// Ticket 16: busy folder sources from sessions VibeConsole did not start
@@ -758,6 +760,7 @@ impl Terminal {
             xbox_status: Vec::new(),
             probe: None,
             agent_states: Vec::new(),
+            device_lights: None,
             light_agents: None,
             light_sessions: Vec::new(),
             light_patterns: crate::status::Patterns::default(),
@@ -891,6 +894,7 @@ impl Terminal {
         };
         let before = self.alert_states();
         self.light_agents = config.status_lights.then(|| config.agents.clone());
+        self.device_lights = config.status_lights.then(|| config.device_lights.clone());
         // Settings -> Xbox tuning applies within a status refresh; a stick mode change is a
         // transition (v7 ticket 75).
         let modes =
@@ -946,12 +950,18 @@ impl Terminal {
                     .collect::<Vec<_>>();
             self.clear_finished(&attended);
         }
-        // v7 ticket 11: a short rumble when something newly finishes or needs you.
-        if crate::gamepad::rumble_due(&before, &self.alert_states()) {
-            if let Some(pad) = &mut self.gamepad {
-                if let Err(error) = pad.rumble() {
-                    self.notice = error.to_string();
-                }
+        // v7 tickets 11 and 86: rumble as a source newly enters a state whose Xbox pattern
+        // rumbles, under the Status lights and Xbox switches.
+        let rumble = self
+            .device_lights
+            .as_ref()
+            .filter(|p| p.on[1])
+            .map_or(crate::status::Rumble::Off, |p| {
+                crate::status::rumble_for(&before, &self.alert_states(), p)
+            });
+        if let Some(pad) = &mut self.gamepad {
+            if let Err(error) = pad.rumble(rumble) {
+                self.notice = error.to_string();
             }
         }
     }
@@ -984,7 +994,8 @@ impl Terminal {
     /// service (`interactive` false).
     fn wanted_lights(&self, interactive: bool) -> Option<crate::feedback::Settings> {
         let agents = self.light_agents.as_ref()?;
-        if !interactive
+        if !self.device_lights.as_ref().is_some_and(|p| p.on[0]) // the MPK's own switch
+            || !interactive
             || !self.wanted_run
             || self.suspended
             || !self.context_verified
@@ -1440,11 +1451,26 @@ impl Terminal {
     }
     /// Shows running or paused on the Xbox button light; a failed write gives the light up
     /// (restoring what it can) and says why.
+    /// The Xbox button light (v7 tickets 64 and 86): paused shows paused; running shows the
+    /// most urgent agent state's Xbox pattern, or the plain running light when none lights it
+    /// or its switches are off.
     fn show_button_light(&mut self) {
-        let light = if self.output.is_some() && !self.suspended {
-            crate::gamepad::Light::Running
+        use crate::gamepad::Light;
+        let states = self.alert_states();
+        let states = states.iter().map(|(_, s)| *s).collect::<Vec<_>>();
+        let pattern = self
+            .device_lights
+            .as_ref()
+            .filter(|p| p.on[1])
+            .map_or(crate::status::Light::Off, |p| {
+                crate::status::xbox_light(&states, p)
+            });
+        let light = if !(self.output.is_some() && !self.suspended) {
+            Light::Paused
+        } else if pattern == crate::status::Light::Off {
+            Light::Running
         } else {
-            crate::gamepad::Light::Paused
+            Light::Agent(pattern)
         };
         let result = self.button_light.as_mut().map(|l| l.show(light));
         if let Some(Err(error)) = result {
@@ -4473,6 +4499,19 @@ fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
             .collect::<Vec<_>>();
         rows.push(format!("Slow tempo: {} BPM", patterns.slow));
         rows.push(format!("Fast tempo: {} BPM", patterns.fast));
+        // v7 ticket 86: each device's switch, then the Xbox light and rumble per state.
+        let devices = config.device_lights.clone();
+        let on = |b: bool| if b { "On" } else { "Off" };
+        rows.push(format!("MPK lights: {}", on(devices.on[0])));
+        rows.push(format!("Xbox lights and rumble: {}", on(devices.on[1])));
+        for (name, (light, rumble)) in NAMES.iter().zip(devices.xbox) {
+            rows.push(format!(
+                "Xbox · {}: light {}, rumble {}",
+                name.split(" (").next().unwrap_or(name),
+                crate::status::word(&crate::status::LIGHTS, light),
+                crate::status::word(&crate::status::RUMBLES, rumble)
+            ));
+        }
         let blind = NAMES
             .iter()
             .zip(patterns.states)
@@ -4524,6 +4563,39 @@ fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 };
                 config.light_patterns.states[index] =
                     (crate::status::TEMPOS[t].1, crate::status::OCTAVES[o].1);
+            } else if index == 6 || index == 7 {
+                config.device_lights.on[index - 6] = !devices.on[index - 6];
+            } else if index >= 8 {
+                let state = index - 8;
+                let (light, rumble) = devices.xbox[state];
+                let lights = crate::status::LIGHTS.map(|(w, _)| w);
+                let Some(l) = choose_at(
+                    ui,
+                    &format!("Xbox · {}: button light", NAMES[state]),
+                    &options(&lights),
+                    crate::status::LIGHTS
+                        .iter()
+                        .position(|(_, v)| *v == light)
+                        .unwrap_or(0),
+                )?
+                else {
+                    return Ok(());
+                };
+                let rumbles = crate::status::RUMBLES.map(|(w, _)| w);
+                let Some(r) = choose_at(
+                    ui,
+                    &format!("Xbox · {}: rumble as it begins", NAMES[state]),
+                    &options(&rumbles),
+                    crate::status::RUMBLES
+                        .iter()
+                        .position(|(_, v)| *v == rumble)
+                        .unwrap_or(0),
+                )?
+                else {
+                    return Ok(());
+                };
+                config.device_lights.xbox[state] =
+                    (crate::status::LIGHTS[l].1, crate::status::RUMBLES[r].1);
             } else {
                 let fast = index == 5;
                 let current = if fast { patterns.fast } else { patterns.slow };
@@ -11659,6 +11731,82 @@ mod tests {
     /// Ticket 14: status lights show only in a running interactive session on a verified,
     /// non-piano program with Status lights On; the toggle saves, and v12 files load with the
     /// spec defaults.
+    /// v7 ticket 86: Status light patterns also switches the MPK and the Xbox on or off, and
+    /// sets the Xbox light and rumble per state; both are saved.
+    #[test]
+    fn status_light_patterns_menu_sets_device_switches_and_xbox_patterns() {
+        use crate::status::{Light, Rumble};
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-dev-menu-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut keys = vec![Down; 7];
+        keys.push(Enter); // Xbox lights and rumble: On -> Off
+        keys.extend(vec![Down; 10]);
+        keys.extend([Enter, Down, Enter, Down, Down, Enter]); // Xbox thinking: fast-blink, long
+        keys.push(Escape);
+        let mut ui = Script {
+            keys: keys.into(),
+            ..Default::default()
+        };
+        light_patterns_menu(&mut ui, &path).unwrap();
+        assert!(ui.keys.is_empty(), "keys left: {:?}", ui.keys);
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains("Xbox · Thinking: light slow-pulse, rumble off"))
+        );
+        let lights = mappings::load_config(&path).unwrap().device_lights;
+        assert_eq!(lights.on, [true, false, true]);
+        assert_eq!(lights.xbox[2], (Light::FastBlink, Rumble::Long));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 86: while running, the Xbox button light shows the most urgent agent
+    /// state's Xbox pattern; the Xbox switch or the master Status lights switch off gives
+    /// back the plain running light; paused stays paused; quitting restores the light.
+    #[test]
+    fn xbox_light_shows_agent_patterns_under_its_switches() {
+        let dir = std::env::temp_dir().join(format!("vibeconsole-xbox-pat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let gip = dir.join("leds/gip0");
+        std::fs::create_dir_all(&gip).unwrap();
+        std::fs::write(gip.join("mode"), "3\n").unwrap();
+        std::fs::write(gip.join("brightness"), "20\n").unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        ui.button_light = Some(crate::gamepad::ButtonLight::open(&dir.join("leds")).unwrap());
+        ui.output = Some(crate::keyboard::Output::recording(&[]).unwrap());
+        ui.suspended = false;
+        ui.device_lights = Some(crate::status::DevicePatterns::default());
+        ui.agent_states = vec![
+            ("claude".into(), "claude".into(), "thinking"),
+            ("codex".into(), "codex".into(), "needs-decision"),
+        ];
+        let mode = || std::fs::read_to_string(gip.join("mode")).unwrap();
+        ui.show_button_light();
+        assert_eq!(mode(), "2", "needs a decision: fast blink");
+        ui.agent_states[1].2 = "idle";
+        ui.show_button_light();
+        assert_eq!(mode(), "8", "thinking: slow pulse");
+        ui.device_lights.as_mut().unwrap().on[1] = false;
+        ui.show_button_light();
+        assert_eq!(mode(), "1", "Xbox switch off: plain running light");
+        ui.device_lights = None; // master Status lights off
+        ui.show_button_light();
+        assert_eq!(mode(), "1");
+        ui.device_lights = Some(crate::status::DevicePatterns::default());
+        ui.suspended = true;
+        ui.show_button_light();
+        assert_eq!(mode(), "4", "paused stays paused");
+        drop(ui);
+        assert_eq!(mode(), "3", "quit restores the light");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn status_lights_need_a_running_interactive_non_piano_session_and_can_be_turned_off() {
         let dir = std::env::temp_dir().join(format!("vibeconsole-lights-{}", std::process::id()));
@@ -11668,6 +11816,7 @@ mod tests {
         mappings::save(&path, &[]).unwrap();
         let mut ui = Terminal::open_mode(&path, true).unwrap();
         ui.light_agents = Some(mappings::Config::default().agents);
+        ui.device_lights = Some(crate::status::DevicePatterns::default());
         ui.agent_states = vec![
             ("claude".into(), "claude".into(), "needs-input"),
             ("codex".into(), "codex".into(), "idle"),
@@ -11676,6 +11825,10 @@ mod tests {
         (ui.context_verified, ui.feedback_allowed) = (true, true);
         let shown = ui.wanted_lights(true).unwrap();
         assert_eq!((shown.octave, shown.tempo), (Some(1), Some(240)));
+        // v7 ticket 86: the MPK's own switch off gives the program its feedback back.
+        ui.device_lights.as_mut().unwrap().on[0] = false;
+        assert_eq!(ui.wanted_lights(true), None);
+        ui.device_lights.as_mut().unwrap().on[0] = true;
         assert_eq!(ui.wanted_lights(false), None); // the login service never lights them
         ui.suspended = true; // paused
         assert_eq!(ui.wanted_lights(true), None);
@@ -11746,7 +11899,15 @@ mod tests {
         )));
         // Ticket 17: a v14 file's per-agent tempos become the shared slow/fast tempos.
         let v14 = saved
-            .replace("vibeconsole-mappings-v19", "vibeconsole-mappings-v14")
+            .lines()
+            .filter(|l| {
+                !["device-lights\t", "xbox-pattern\t", "ps5-pattern\t"]
+                    .iter()
+                    .any(|p| l.starts_with(p))
+            })
+            .map(|l| format!("{l}\n"))
+            .collect::<String>()
+            .replace("vibeconsole-mappings-v20", "vibeconsole-mappings-v14")
             .replace(
                 "tuning\t15\t30\t10\toff\toff\nsticks\tlinear\tlinear\nmidi-devices\t0\nmidi-active\t-\nprofiles\t0\nprofile-lock\t-\nfavourites\t0\n",
                 "",

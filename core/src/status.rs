@@ -485,6 +485,120 @@ pub fn octave_word(octave: Octave) -> &'static str {
 /// Busy states, most urgent first: the order that decides the shared tempo light.
 pub const BUSY: [&str; 4] = ["needs-decision", "needs-input", "thinking", "finished"];
 
+/// v7 ticket 86: what a controller's own light shows for a state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Light {
+    Off,
+    Steady,
+    SlowPulse,
+    FastBlink,
+    /// Once a second.
+    Blink,
+}
+pub const LIGHTS: [(&str, Light); 5] = [
+    ("off", Light::Off),
+    ("steady", Light::Steady),
+    ("slow-pulse", Light::SlowPulse),
+    ("fast-blink", Light::FastBlink),
+    ("blink", Light::Blink),
+];
+/// v7 ticket 86: a rumble as a state begins.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum Rumble {
+    Off,
+    Short,
+    Long,
+}
+pub const RUMBLES: [(&str, Rumble); 3] = [
+    ("off", Rumble::Off),
+    ("short", Rumble::Short),
+    ("long", Rumble::Long),
+];
+/// The config word for a pattern value (`LIGHTS`, `RUMBLES`, …).
+pub fn word<T: PartialEq>(list: &[(&'static str, T)], value: T) -> &'static str {
+    list.iter()
+        .find(|(_, v)| *v == value)
+        .map_or("off", |(w, _)| w)
+}
+/// The DualSense light-bar colours offered (v7 ticket 86).
+pub const COLOURS: [&str; 6] = ["blue", "orange", "red", "green", "purple", "white"];
+/// v7 ticket 86: status-light patterns per device, in `BUSY` order, each device with its own
+/// switch under the master Status lights switch. The MPK's are `Patterns`.
+/// ponytail: the DualSense rows are kept but drive nothing until VibeConsole reads it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DevicePatterns {
+    /// MPK, Xbox, DualSense.
+    pub on: [bool; 3],
+    pub xbox: [(Light, Rumble); 4],
+    pub ps5: [(&'static str, Light, Rumble); 4],
+}
+impl Default for DevicePatterns {
+    /// The design board's (version 34).
+    fn default() -> Self {
+        use Light::{Blink, FastBlink, SlowPulse};
+        use Rumble::Short;
+        let quiet = Rumble::Off;
+        Self {
+            on: [true; 3],
+            xbox: [
+                (FastBlink, Short),
+                (FastBlink, quiet),
+                (SlowPulse, quiet),
+                (Blink, Short),
+            ],
+            ps5: [
+                ("red", FastBlink, Short),
+                ("orange", FastBlink, quiet),
+                ("blue", SlowPulse, quiet),
+                ("green", Blink, Short),
+            ],
+        }
+    }
+}
+impl DevicePatterns {
+    pub fn validate(&self) -> Result<()> {
+        match self.ps5.iter().find(|(c, ..)| !COLOURS.contains(c)) {
+            Some((c, ..)) => Err(format!(
+                "light-bar colour must be one of {}, not {c}",
+                COLOURS.join(", ")
+            )
+            .into()),
+            None => Ok(()),
+        }
+    }
+}
+/// Busy states from most to least urgent, as `BUSY` indexes: decision, input, finished,
+/// thinking.
+const URGENT: [usize; 4] = [0, 1, 3, 2];
+/// The Xbox button light for these source states: the most urgent busy state whose pattern
+/// lights it; Off when none does.
+pub fn xbox_light(states: &[&str], patterns: &DevicePatterns) -> Light {
+    URGENT
+        .iter()
+        .filter(|&&i| states.contains(&BUSY[i]))
+        .map(|&i| patterns.xbox[i].0)
+        .find(|light| *light != Light::Off)
+        .unwrap_or(Light::Off)
+}
+/// The rumble due now: the longest of the states that sources newly entered.
+pub fn rumble_for(
+    before: &[(String, &str)],
+    now: &[(String, &str)],
+    patterns: &DevicePatterns,
+) -> Rumble {
+    now.iter()
+        .filter(|(name, state)| {
+            before
+                .iter()
+                .find(|(n, _)| n == name)
+                .is_none_or(|(_, was)| was != state)
+        })
+        .filter_map(|(_, state)| BUSY.iter().position(|s| s == state))
+        .map(|i| patterns.xbox[i].1)
+        .max()
+        .unwrap_or(Rumble::Off)
+}
+
 /// Ticket 17: what each busy state shows, in `BUSY` order, and the two tempos.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Patterns {
@@ -783,6 +897,66 @@ fn hooks(events: &[(&str, Option<&str>, &str)]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// v7 ticket 86: the Xbox button light shows the most urgent busy state whose pattern
+    /// lights it; rumble fires once for a source newly in a state that rumbles, the longest
+    /// winning; the defaults are the board's (version 34).
+    #[test]
+    fn xbox_light_and_rumble_follow_each_states_pattern() {
+        let p = DevicePatterns::default();
+        assert_eq!(p.on, [true, true, true]);
+        assert_eq!(
+            p.xbox,
+            [
+                (Light::FastBlink, Rumble::Short), // needs a decision
+                (Light::FastBlink, Rumble::Off),   // needs input
+                (Light::SlowPulse, Rumble::Off),   // thinking
+                (Light::Blink, Rumble::Short),     // finished
+            ]
+        );
+        assert_eq!(p.ps5[0], ("red", Light::FastBlink, Rumble::Short));
+        assert_eq!(xbox_light(&["idle"], &p), Light::Off);
+        assert_eq!(xbox_light(&["thinking", "idle"], &p), Light::SlowPulse);
+        assert_eq!(
+            xbox_light(&["thinking", "finished"], &p),
+            Light::Blink,
+            "finished outranks thinking"
+        );
+        assert_eq!(
+            xbox_light(&["finished", "needs-decision"], &p),
+            Light::FastBlink
+        );
+        let mut quiet = p.clone();
+        quiet.xbox[0].0 = Light::Off;
+        assert_eq!(
+            xbox_light(&["needs-decision", "thinking"], &quiet),
+            Light::SlowPulse,
+            "a state whose light is off gives way"
+        );
+        let src = |s: &'static str| ("claude".to_string(), s);
+        assert_eq!(
+            rumble_for(&[src("thinking")], &[src("finished")], &p),
+            Rumble::Short
+        );
+        assert_eq!(
+            rumble_for(&[src("finished")], &[src("finished")], &p),
+            Rumble::Off,
+            "once"
+        );
+        assert_eq!(
+            rumble_for(&[src("thinking")], &[src("needs-input")], &p),
+            Rumble::Off
+        );
+        let mut long = p.clone();
+        long.xbox[3].1 = Rumble::Long;
+        let both = [src("finished"), ("codex".to_string(), "needs-decision")];
+        assert_eq!(
+            rumble_for(&[], &both, &long),
+            Rumble::Long,
+            "the longest wins"
+        );
+        assert_eq!(rumble_for(&[], &[src("idle")], &p), Rumble::Off);
+    }
+
     use super::*;
 
     #[test]

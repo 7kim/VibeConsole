@@ -548,6 +548,8 @@ pub struct Config {
     pub light_patterns: crate::status::Patterns,
     /// v7: gamepad stick/trigger tuning, mouse speed and rumble (config v16).
     pub tuning: Tuning,
+    /// v7 ticket 86 (config v20): each device's status-light switch and patterns.
+    pub device_lights: crate::status::DevicePatterns,
     /// v7: other MIDI devices by device name; the n-th uses context `DEVICE_CONTEXT + n`.
     pub midi_devices: Vec<String>,
     /// The MIDI device the session uses: None is the Akai.
@@ -1026,6 +1028,7 @@ impl Default for Config {
             light_other_on: false,
             light_patterns: crate::status::Patterns::default(),
             tuning: Tuning::default(),
+            device_lights: Default::default(),
             midi_devices: Vec::new(),
             midi_active: None,
             profiles: Vec::new(),
@@ -1474,6 +1477,98 @@ fn parse_mapping_line(line: &str, version: u32, midi_devices: &[String]) -> Resu
     Ok(mapping)
 }
 
+/// v7 ticket 86: `device-lights` (MPK, Xbox, DualSense switches), then an `xbox-pattern`
+/// and a `ps5-pattern` per busy state, in `status::BUSY` order.
+fn device_lights_text(p: &crate::status::DevicePatterns) -> String {
+    use crate::status::{BUSY, LIGHTS, RUMBLES, word};
+    let light = |l| word(&LIGHTS, l);
+    let rumble = |r| word(&RUMBLES, r);
+    let on = |b: bool| if b { "on" } else { "off" };
+    let mut text = format!(
+        "device-lights\t{}\t{}\t{}\n",
+        on(p.on[0]),
+        on(p.on[1]),
+        on(p.on[2])
+    );
+    for (state, (l, r)) in BUSY.iter().zip(p.xbox) {
+        text.push_str(&format!(
+            "xbox-pattern\t{state}\t{}\t{}\n",
+            light(l),
+            rumble(r)
+        ));
+    }
+    for (state, (c, l, r)) in BUSY.iter().zip(p.ps5) {
+        text.push_str(&format!(
+            "ps5-pattern\t{state}\t{c}\t{}\t{}\n",
+            light(l),
+            rumble(r)
+        ));
+    }
+    text
+}
+fn parse_device_lights(
+    lines: &mut std::iter::Peekable<std::str::Lines>,
+) -> Result<crate::status::DevicePatterns> {
+    use crate::status::{BUSY, COLOURS, LIGHTS, RUMBLES};
+    let mut next = |record: &str| -> Result<Vec<String>> {
+        let line = lines.next().ok_or(format!("missing {record}"))?;
+        let fields = line.split('\t').map(str::to_owned).collect::<Vec<_>>();
+        if fields[0] != record {
+            return Err(format!("expected {record}, found {}", fields[0]).into());
+        }
+        Ok(fields[1..].to_vec())
+    };
+    let word = |w: &str| match w {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => Err(format!("device-lights must be on or off, not {w}")),
+    };
+    let light = |w: &str| {
+        LIGHTS
+            .iter()
+            .find(|(x, _)| *x == w)
+            .map(|(_, l)| *l)
+            .ok_or_else(|| {
+                format!("light must be off, steady, slow-pulse, fast-blink or blink, not {w}")
+            })
+    };
+    let rumble = |w: &str| {
+        RUMBLES
+            .iter()
+            .find(|(x, _)| *x == w)
+            .map(|(_, r)| *r)
+            .ok_or_else(|| format!("rumble must be off, short or long, not {w}"))
+    };
+    let mut p = crate::status::DevicePatterns::default();
+    let [mpk, xbox, ps5] = &next("device-lights")?[..] else {
+        return Err("expected device-lights MPK/Xbox/DualSense switches".into());
+    };
+    p.on = [word(mpk)?, word(xbox)?, word(ps5)?];
+    for (i, state) in BUSY.iter().enumerate() {
+        let [name, l, r] = &next("xbox-pattern")?[..] else {
+            return Err("expected xbox-pattern state/light/rumble".into());
+        };
+        if name != state {
+            return Err(format!("xbox-pattern {state} expected, found {name}").into());
+        }
+        p.xbox[i] = (light(l)?, rumble(r)?);
+    }
+    for (i, state) in BUSY.iter().enumerate() {
+        let [name, c, l, r] = &next("ps5-pattern")?[..] else {
+            return Err("expected ps5-pattern state/colour/light/rumble".into());
+        };
+        if name != state {
+            return Err(format!("ps5-pattern {state} expected, found {name}").into());
+        }
+        let colour = COLOURS.iter().find(|x| **x == c).ok_or(format!(
+            "light-bar colour must be one of {}, not {c}",
+            COLOURS.join(", ")
+        ))?;
+        p.ps5[i] = (colour, light(l)?, rumble(r)?);
+    }
+    Ok(p)
+}
+
 fn parse_config(contents: &str) -> Result<Config> {
     let mut lines = contents.lines().peekable();
     // Files saved before the KeyAI → VibeConsole rename keep their old header.
@@ -1503,9 +1598,11 @@ fn parse_config(contents: &str) -> Result<Config> {
         Some("18") => 18,
         // v19 (v7 ticket 81): a prompt-sequence step may carry its own text (`prompt-own:`).
         Some("19") => 19,
+        // v20 (v7 ticket 86): status-light switches and patterns per device.
+        Some("20") => 20,
         _ => {
             return Err(
-                "invalid configuration header; expected vibeconsole-mappings-v1..v19".into(),
+                "invalid configuration header; expected vibeconsole-mappings-v1..v20".into(),
             );
         }
     };
@@ -1778,6 +1875,11 @@ fn parse_config(contents: &str) -> Result<Config> {
     } else {
         Tuning::default()
     };
+    let device_lights = if version >= 20 {
+        parse_device_lights(&mut lines)?
+    } else {
+        Default::default()
+    };
     // v16 grew record by record during v7 (devices, profiles, lock, favourites): a v16 file
     // written before one existed loads it with its safe default instead of failing.
     let has = |lines: &mut std::iter::Peekable<std::str::Lines>, record: &str| {
@@ -1939,6 +2041,7 @@ fn parse_config(contents: &str) -> Result<Config> {
         light_other_on,
         light_patterns: light_patterns.validate()?,
         tuning,
+        device_lights,
         midi_devices,
         midi_active,
         profiles,
@@ -2040,7 +2143,7 @@ pub fn serialize_config(config: &Config) -> Result<String> {
     validate_variables(&config.vars, "user")?;
     config.validate_references()?;
     let mut contents = format!(
-        "vibeconsole-mappings-v19\nidle\t{}\t{}\t{}\n",
+        "vibeconsole-mappings-v20\nidle\t{}\t{}\t{}\n",
         opt_text(config.idle.octave),
         opt_text(config.idle.tempo),
         arp_text(config.idle.arp)
@@ -2126,6 +2229,8 @@ pub fn serialize_config(config: &Config) -> Result<String> {
         tuning.sticks[0].text(),
         tuning.sticks[1].text()
     ));
+    config.device_lights.validate()?;
+    contents.push_str(&device_lights_text(&config.device_lights));
     contents.push_str(&format!("midi-devices\t{}\n", config.midi_devices.len()));
     for name in &config.midi_devices {
         contents.push_str(&format!("midi-device\t{name}\n"));
@@ -2523,7 +2628,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v19\n")
+                .starts_with("vibeconsole-mappings-v20\n")
         );
         assert!(
             load_config(&path)
@@ -2707,7 +2812,7 @@ mod tests {
         };
         save_config(&path, &tuned).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v19\n"));
+        assert!(text.starts_with("vibeconsole-mappings-v20\n"));
         assert!(text.contains("\ntuning\t20\t60\t25\ton\toff\n"));
         assert_eq!(load_config(&path).unwrap(), tuned);
         for bad in [
@@ -2744,6 +2849,80 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A line only a v20 file has (v7 ticket 86), dropped when a test writes an older one.
+    fn v20_record(line: &str) -> bool {
+        ["device-lights\t", "xbox-pattern\t", "ps5-pattern\t"]
+            .iter()
+            .any(|p| line.starts_with(p))
+    }
+
+    /// v7 ticket 86: per-device light switches and patterns round-trip in v20; a v19 file
+    /// loads today's MPK patterns and the board's Xbox and DualSense defaults; a bad word is
+    /// refused and a refused save keeps the last file.
+    #[test]
+    fn device_light_patterns_round_trip_in_v20() {
+        use crate::status::{DevicePatterns, Light, Rumble};
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-dev-lights-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let mut config = Config::default();
+        assert_eq!(config.device_lights, DevicePatterns::default());
+        save_config(&path, &config).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("vibeconsole-mappings-v20\n"), "{text}");
+        assert!(
+            text.contains(concat!(
+                "device-lights\ton\ton\ton\n",
+                "xbox-pattern\tneeds-decision\tfast-blink\tshort\n",
+                "xbox-pattern\tneeds-input\tfast-blink\toff\n",
+                "xbox-pattern\tthinking\tslow-pulse\toff\n",
+                "xbox-pattern\tfinished\tblink\tshort\n",
+                "ps5-pattern\tneeds-decision\tred\tfast-blink\tshort\n",
+            )),
+            "{text}"
+        );
+        let v19 = text
+            .replace("vibeconsole-mappings-v20", "vibeconsole-mappings-v19")
+            .lines()
+            .filter(|l| !v20_record(l))
+            .map(|l| format!("{l}\n"))
+            .collect::<String>();
+        assert_eq!(
+            parse_config(&v19).unwrap(),
+            config,
+            "v19 loads the defaults"
+        );
+        config.device_lights.on[1] = false;
+        config.device_lights.xbox[2] = (Light::Steady, Rumble::Long);
+        config.device_lights.ps5[3] = ("purple", Light::Off, Rumble::Off);
+        save_config(&path, &config).unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        assert_eq!(load_config(&path).unwrap(), config);
+        for (from, to) in [
+            (
+                "xbox-pattern\tthinking\tsteady",
+                "xbox-pattern\tthinking\tdisco",
+            ),
+            ("\tlong\n", "\tforever\n"),
+            ("\tpurple\t", "\tbeige\t"),
+            ("device-lights\ton\toff", "device-lights\ton\tmaybe"),
+            ("xbox-pattern\tthinking", "xbox-pattern\tidle"),
+        ] {
+            assert!(parse_config(&saved.replace(from, to)).is_err(), "{to}");
+        }
+        let mut bad = config.clone();
+        bad.device_lights.ps5[0].0 = "beige";
+        assert!(save_config(&path, &bad).is_err());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            saved,
+            "the last valid file stays"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// v7 ticket 81: a sequence step's own text is saved with the sequence (config v19) and
     /// round-trips; a v18 file loads with no step text; a refused save keeps the last file.
     #[test]
@@ -2766,7 +2945,11 @@ mod tests {
         save_config(&path, &config).unwrap();
         let v18 = fs::read_to_string(&path)
             .unwrap()
-            .replace("vibeconsole-mappings-v19", "vibeconsole-mappings-v18");
+            .replace("vibeconsole-mappings-v20", "vibeconsole-mappings-v18")
+            .lines()
+            .filter(|l| !v20_record(l))
+            .map(|l| format!("{l}\n"))
+            .collect::<String>();
         assert_eq!(
             parse_config(&v18).unwrap(),
             config,
@@ -2781,7 +2964,7 @@ mod tests {
         config.mappings[0].action = Action::PromptSequence(vec![own, saved("build")]);
         save_config(&path, &config).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v19\n"), "{text}");
+        assert!(text.starts_with("vibeconsole-mappings-v20\n"), "{text}");
         assert_eq!(load_config(&path).unwrap(), config);
         let mut bad = config.clone();
         bad.mappings[0].action = Action::PromptSequence(vec![Action::PromptOwn {
@@ -2820,7 +3003,11 @@ mod tests {
         ));
         assert_eq!(load_config(&path).unwrap(), config);
         let v17 = text
-            .replace("vibeconsole-mappings-v19", "vibeconsole-mappings-v17")
+            .replace("vibeconsole-mappings-v20", "vibeconsole-mappings-v17")
+            .lines()
+            .filter(|l| !v20_record(l))
+            .map(|l| format!("{l}\n"))
+            .collect::<String>()
             .lines()
             .filter(|l| !l.starts_with("sticks\t"))
             .map(|l| format!("{l}\n"))
@@ -2900,7 +3087,11 @@ mod tests {
         config.agents = vec![Agent::new("claude", "claude", "claude").unwrap()];
         let v16 = serialize_config(&config)
             .unwrap()
-            .replace("vibeconsole-mappings-v19", "vibeconsole-mappings-v16")
+            .replace("vibeconsole-mappings-v20", "vibeconsole-mappings-v16")
+            .lines()
+            .filter(|l| !v20_record(l))
+            .map(|l| format!("{l}\n"))
+            .collect::<String>()
             .replace("sticks\tlinear\tlinear\n", "")
             .replace("\t1\ttmux\n", "\t1\n");
         let old = parse_config(&v16).unwrap();
@@ -2912,7 +3103,7 @@ mod tests {
         herdr.host = Host::Herdr;
         config.agents.extend([orca, herdr]);
         let text = serialize_config(&config).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v19\n"), "{text}");
+        assert!(text.starts_with("vibeconsole-mappings-v20\n"), "{text}");
         assert!(
             text.contains("\nagent\tclaude\tclaude\tclaude\t-\t1\ttmux\n"),
             "{text}"
@@ -3359,7 +3550,7 @@ mod tests {
         let path = dir.join("mappings.tsv");
         save_config(&path, &config).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
-        assert!(saved.starts_with("vibeconsole-mappings-v19\n"));
+        assert!(saved.starts_with("vibeconsole-mappings-v20\n"));
         assert!(saved.contains("\tflow\t") && !saved.contains("flow-start"));
         assert_eq!(load_config(&path).unwrap(), config);
         fs::remove_dir_all(dir).unwrap();
@@ -3385,7 +3576,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v19\n")
+                .starts_with("vibeconsole-mappings-v20\n")
         );
         assert_eq!(load_config(&path).unwrap(), config);
         fs::remove_dir_all(dir).unwrap();
@@ -3406,7 +3597,7 @@ mod tests {
         let path = dir.join("mappings.tsv");
         save_config(&path, &config).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v19\n") && text.contains("\tstatus\n"));
+        assert!(text.starts_with("vibeconsole-mappings-v20\n") && text.contains("\tstatus\n"));
         assert_eq!(load_config(&path).unwrap(), config);
         let pad = Control::from_note(10, 37).unwrap();
         for (action, observable) in [
@@ -3483,7 +3674,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v19\n")
+                .starts_with("vibeconsole-mappings-v20\n")
         );
         assert_eq!(load_config(&path).unwrap(), config);
         // ${NAME}: user variable, then startup variable; other text stays; no environment.
