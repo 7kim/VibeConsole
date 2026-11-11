@@ -8552,6 +8552,212 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7 ticket 50: every control kind (pad, piano key, knob, joystick, Xbox button) saves
+    /// through every action family it is offered, and is offered exactly the families it can
+    /// take; a favourite it can't take is refused by name and saves nothing.
+    #[test]
+    fn every_kind_saves_through_every_family_it_offers() {
+        use Key::*;
+        use mappings::Input;
+        fn text(s: &str) -> Vec<Key> {
+            s.bytes()
+                .map(|b| if b == b' ' { Space } else { Character(b) })
+                .collect()
+        }
+        let dir = std::env::temp_dir().join(format!("vibeconsole-matrix-{}", std::process::id()));
+        let work = dir.to_string_lossy().into_owned();
+        let command = |line: &str| [text(line), vec![Enter], text(&work), vec![Enter]].concat();
+        let prompt = [vec![Enter], text("review"), vec![Enter, Enter, Enter]].concat();
+        let shortcut = vec![
+            Enter, Enter, Space, Enter, Down, Down, Down, Down, Down, Down, Down, Enter,
+        ];
+        // What the family needs, then the steps up to Review (behaviour, pad light, layer,
+        // fire when, status: each a plain Enter, so only their number matters).
+        let family_keys = |family: usize, kind: &str| -> Vec<Key> {
+            match family {
+                0 => {
+                    let after = match kind {
+                        "pad" => 3,  // behaviour, hardware feedback, fire when
+                        "knob" => 1, // knob step
+                        "joystick" => 0,
+                        _ => 2, // behaviour, fire when
+                    };
+                    [shortcut.clone(), vec![Enter; after]].concat()
+                }
+                1 => vec![Enter; 4], // app, second press, fire when, status
+                2 => vec![Enter; 3],
+                3 => [prompt.clone(), vec![Enter, Enter]].concat(),
+                4 => [command("claude"), vec![Enter, Enter]].concat(),
+                5 => vec![
+                    Enter, Down, Enter, Enter, Enter, Enter, Enter, Down, Down, Enter, Enter, Enter,
+                ],
+                6 => [
+                    vec![Enter],
+                    prompt.clone(),
+                    vec![Down, Enter],
+                    prompt.clone(),
+                    vec![Down, Down, Down, Enter],
+                ]
+                .concat(),
+                7 => [
+                    text(&format!("{work}/value")),
+                    vec![Enter, Enter, Enter, Enter],
+                ]
+                .concat(),
+                8 => vec![Enter, Enter, Enter],
+                9 => vec![Down, Down, Enter, Enter],
+                10 => vec![Down, Enter, Enter],
+                11 => vec![
+                    Enter, Enter, Enter, Enter, Down, Enter, Down, Down, Enter, Enter,
+                ],
+                12 => [command("sudo dnf update"), vec![Enter]].concat(),
+                _ if kind == "knob" => vec![Enter, Enter], // 13: the favourite, knob step
+                _ => vec![Enter],                          // 13: the starred favourite
+            }
+        };
+        let knob = Control {
+            channel: 1,
+            id: 70,
+            message: crate::Message::Cc,
+            direction: 1,
+        };
+        let joystick = Control {
+            message: crate::Message::Bend,
+            channel: 1,
+            id: 0,
+            direction: 1,
+        };
+        let stick = Input::Joystick {
+            center: 8192,
+            min: 0,
+            max: 16383,
+            deadzone: 1024,
+            hysteresis: 128,
+        };
+        let pressed = vec![0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13];
+        // (kind, learn page, control, motion, families offered)
+        let kinds: Vec<(&str, usize, Control, Option<Input>, Vec<usize>)> = vec![
+            (
+                "pad",
+                0,
+                Control::from_note(10, 40).unwrap(),
+                None,
+                pressed.clone(),
+            ),
+            (
+                "piano key",
+                1,
+                Control::note(1, 60).unwrap(),
+                None,
+                pressed.clone(),
+            ),
+            (
+                "knob",
+                2,
+                knob,
+                Some(Input::Knob { step: 4 }),
+                vec![0, 2, 6, 7, 13],
+            ),
+            ("joystick", 3, joystick, Some(stick), vec![0, 13]),
+            ("Xbox button", 4, Control::button(0), None, pressed),
+        ];
+        // The favourite: Output mute on another pad.
+        let starred = Mapping::new_action(
+            Control::from_note(10, 51).unwrap(),
+            Input::Pad,
+            crate::actions::Action::OutputMute,
+        )
+        .unwrap();
+        let mut failures = Vec::new();
+        for (kind, page, control, motion, offered) in kinds {
+            for (i, &family) in offered.iter().enumerate() {
+                let _ = std::fs::remove_dir_all(&dir);
+                std::fs::create_dir_all(dir.join("prompts")).unwrap();
+                std::fs::write(dir.join("prompts/review"), "Review this change.\n").unwrap();
+                let path = dir.join("mappings.tsv");
+                let mut config = mappings::Config::default();
+                config.mappings = vec![starred.clone()];
+                config.favourites = vec![mappings::favourite_key(&starred)];
+                mappings::save_config(&path, &config).unwrap();
+                let mut keys = vec![Down; page];
+                keys.push(Enter);
+                keys.extend(vec![Down; i]);
+                keys.push(Enter);
+                keys.extend(family_keys(family, kind));
+                if kind == "Xbox button" {
+                    keys.push(Enter); // its layer
+                }
+                keys.extend([Enter, Escape]); // save and configure another, leave
+                let (pads, motions) = match motion {
+                    Some(input) => (VecDeque::new(), [(control, input, kind.into())].into()),
+                    None => ([control].into(), VecDeque::new()),
+                };
+                let mut ui = Script {
+                    keys: keys.into(),
+                    pads,
+                    motions,
+                    orca: vec![("claude".into(), "/work/a".into())],
+                    t3: r#"[{"key":"mod+]","command":"thread.next"}]"#.into(),
+                    herdr: vec!["api".into()],
+                    ..Default::default()
+                };
+                let mut current = config.mappings.clone();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    configure(&mut ui, &path, &mut current)
+                }));
+                let screens = ui.screens.join("\n----\n");
+                let menu = ui.screens.iter().find(|s| s.starts_with("Action family"));
+                // The families offered, read off the menu's rows.
+                let listed = menu.map_or(vec![], |m| {
+                    m.lines()
+                        .filter_map(|l| {
+                            let row = l.trim_start_matches(['>', ' ']);
+                            FAMILIES.iter().position(|f| *f == row)
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let saved = mappings::load_config(&path).unwrap().mappings;
+                let copy = saved.iter().find(|m| m.control == control);
+                let want = if family == 13 {
+                    2
+                } else if family == 8 {
+                    5
+                } else {
+                    family
+                };
+                // A joystick can't take the starred Output mute: refused by name, nothing saved.
+                let refused = kind == "joystick" && family == 13;
+                let ok = matches!(result, Ok(Ok(())))
+                    && ui.keys.is_empty()
+                    && listed == offered
+                    && if refused {
+                        copy.is_none() && screens.contains("which Joystick X increase can't take")
+                    } else {
+                        copy.is_some_and(|m| action_family(m) == want)
+                    };
+                if !ok {
+                    let titles = ui
+                        .screens
+                        .iter()
+                        .map(|s| s.lines().next().unwrap_or(""))
+                        .collect::<Vec<_>>();
+                    failures.push(format!(
+                        "{kind} / {}: {:?} keys left {}, listed {listed:?}, saved {:?}\n{}",
+                        FAMILIES[family],
+                        result
+                            .as_ref()
+                            .map(|r| r.as_ref().map_err(|e| e.to_string())),
+                        ui.keys.len(),
+                        copy.map(|m| &m.action),
+                        titles.join(" | ")
+                    ));
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(failures.is_empty(), "{}", failures.join("\n=========\n"));
+    }
+
     /// v7 ticket 42: a refused assignment is a "Not saved" note that stays in /configure: the
     /// session isn't paused and the saved file is untouched.
     #[test]
