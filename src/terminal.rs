@@ -4879,6 +4879,26 @@ fn prompt_action(
             return Ok(None); // back to the menu that asked; nothing else is lost
         }
     }
+    let saved_target = match saved {
+        Some(crate::actions::Action::Prompt { target, .. }) => Some(target),
+        _ => None,
+    };
+    let Some((target, enter)) = prompt_target(ui, path, saved_target)? else {
+        return Ok(None);
+    };
+    Ok(Some(crate::actions::Action::Prompt {
+        file,
+        target,
+        enter,
+    }))
+}
+
+/// Where a prompt goes and whether Enter follows (a prompt pad, or a sequence step).
+fn prompt_target(
+    ui: &mut impl Ui,
+    path: &Path,
+    saved: Option<&crate::actions::Target>,
+) -> Result<Option<(crate::actions::Target, bool)>> {
     use crate::actions::Target;
     let mut targets = mappings::load_config(path)
         .map_err(stage("file I/O"))?
@@ -4888,12 +4908,7 @@ fn prompt_action(
         .collect::<Vec<_>>();
     targets.push(Target::Focused { shift: false });
     targets.push(Target::Focused { shift: true });
-    let saved_target = match saved {
-        Some(crate::actions::Action::Prompt { target, .. }) => {
-            targets.iter().position(|t| t == target)
-        }
-        _ => None,
-    };
+    let saved_target = saved.and_then(|saved| targets.iter().position(|t| t == saved));
     let Some(target_index) = choose_saved(
         ui,
         "Target: tmux agent, or the focused window (Ctrl+V browser/Claude app, Ctrl+Shift+V terminals; lands wherever focus is)",
@@ -4911,11 +4926,7 @@ fn prompt_action(
     else {
         return Ok(None);
     };
-    Ok(Some(crate::actions::Action::Prompt {
-        file,
-        target: targets.swap_remove(target_index),
-        enter: mode == 1,
-    }))
+    Ok(Some((targets.swap_remove(target_index), mode == 1)))
 }
 
 fn reset_file(path: &Path) -> Result<PathBuf> {
@@ -5981,6 +5992,10 @@ fn prompt_sequence_action(
             .collect::<Vec<_>>();
         items.push(format!("Add step {}", steps.len() + 1));
         items.push("Done".into());
+        items.push(format!(
+            "Write step {} for this sequence only",
+            steps.len() + 1
+        ));
         let Some(choice) = choose(
             ui,
             "Prompt sequence: tap 1 sends step 1, tap 2 step 2, …; after the last it stops until the pad is held 1 s",
@@ -5993,6 +6008,12 @@ fn prompt_sequence_action(
             if let Some(step) = prompt_action(ui, path, None)? {
                 steps.push(step);
             }
+        } else if choice == steps.len() + 2 {
+            match new_step(ui, path) {
+                Ok(Some(step)) => steps.push(step),
+                Ok(None) => {}
+                Err(error) => not_saved(ui, &error)?,
+            }
         } else if choice > steps.len() {
             if !steps.is_empty() {
                 return Ok(Some(crate::actions::Action::PromptSequence(steps)));
@@ -6003,8 +6024,15 @@ fn prompt_sequence_action(
                 _ => None,
             };
             let own = own_text.is_some();
+            let file = steps[choice].prompt_files().first().map(|f| f.to_string());
+            let dir = crate::actions::prompts_dir_for(path)?;
+            // A step written only in the sequence names a prompt that doesn't exist yet.
+            let unsaved = own && file.as_ref().is_some_and(|f| !dir.join(f).exists());
+            let save_new = format!("Save as new prompt {}", file.as_deref().unwrap_or(""));
             let mut items = vec!["Move up", "Remove", "Edit for this sequence only"];
-            if own {
+            if unsaved {
+                items.push(&save_new);
+            } else if own {
                 items.extend(["Discard sequence edit", "Update prompt to match"]);
             }
             items.push("Back");
@@ -6018,6 +6046,10 @@ fn prompt_sequence_action(
                     steps.remove(choice);
                 }
                 Some(2) => steps[choice] = edit_step(ui, path, &steps[choice])?,
+                Some(3) if unsaved => match save_new_prompt(&dir, &steps[choice]) {
+                    Ok(saved) => steps[choice] = saved,
+                    Err(error) => not_saved(ui, &error)?,
+                },
                 Some(3) if own => steps[choice] = saved_step(&steps[choice]),
                 Some(4) if let Some(text) = &own_text => {
                     let file = steps[choice].prompt_files()[0].to_owned();
@@ -6043,6 +6075,67 @@ fn prompt_sequence_action(
             }
         }
     }
+}
+
+/// A step written only in this sequence (v7 ticket 81): a new prompt name (never one that
+/// exists), its target, then its text in the editor. Nothing is written to the prompts.
+fn new_step(ui: &mut impl Ui, path: &Path) -> Result<Option<crate::actions::Action>> {
+    let Some(name) = text_entry(
+        ui,
+        "Name for this step's prompt (saved only if you later choose Save as new prompt)",
+        "",
+    )?
+    else {
+        return Ok(None);
+    };
+    if !mappings::simple_name(&name) {
+        return Err(
+            "validation: prompt names are letters, digits, '-', '_' and '.', not starting with '.'"
+                .into(),
+        );
+    }
+    if crate::actions::prompts_dir_for(path)?.join(&name).exists() {
+        return Err(format!(
+            "validation: a prompt named {name} already exists; add it with Add step"
+        )
+        .into());
+    }
+    let Some((target, enter)) = prompt_target(ui, path, None)? else {
+        return Ok(None);
+    };
+    let step = crate::actions::Action::Prompt {
+        file: name,
+        target,
+        enter,
+    };
+    // An empty or untouched editor adds nothing.
+    Ok(Some(edit_step(ui, path, &step)?)
+        .filter(|s| matches!(s, crate::actions::Action::PromptOwn { .. })))
+}
+
+/// "Save as new prompt" (v7 ticket 81): the step's text becomes a new prompt file, written
+/// atomically and never over an existing one; the step then points at it.
+fn save_new_prompt(dir: &Path, step: &crate::actions::Action) -> Result<crate::actions::Action> {
+    let crate::actions::Action::PromptOwn { file, text, .. } = step else {
+        return Err("this step has no text of its own".into());
+    };
+    let target = dir.join(file);
+    let scratch = dir.join(format!(".{file}.new"));
+    (|| -> Result<()> {
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(&scratch, text)?;
+        // A hard link fails if the name exists: the prompt appears whole, or not at all.
+        let linked = std::fs::hard_link(&scratch, &target);
+        let _ = std::fs::remove_file(&scratch);
+        match linked {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(format!("prompt {file} already exists; nothing overwritten").into())
+            }
+            other => Ok(other?),
+        }
+    })()
+    .map_err(stage("file I/O"))?;
+    Ok(saved_step(step))
 }
 
 /// A sequence step back on its saved prompt (v7 ticket 81).
@@ -9857,6 +9950,130 @@ mod tests {
         assert_eq!(
             std::fs::read(prompts.join("plan")).unwrap(),
             b"Saved plan.\n"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 81: a step written only in the sequence gets a new prompt name (validated,
+    /// not already taken) and sends its own text; "Save as new prompt" then creates that
+    /// prompt, never overwriting one that appeared meanwhile.
+    #[test]
+    fn a_new_sequence_step_is_saved_as_a_new_prompt_without_overwriting() {
+        use crate::actions::{Action, Target};
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-seq-new-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let prompts = dir.join("prompts");
+        std::fs::create_dir_all(&prompts).unwrap();
+        std::fs::write(prompts.join("plan"), "Saved plan.\n").unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let plan = Action::Prompt {
+            file: "plan".into(),
+            target: Target::Agent("claude".into()),
+            enter: true,
+        };
+        let run = |keys: Vec<Key>, saved: &Action| {
+            let mut ui = Script {
+                keys: keys.into(),
+                ..Default::default()
+            };
+            let result = prompt_sequence_action(&mut ui, &path, Some(saved)).unwrap();
+            assert!(ui.keys.is_empty(), "keys left: {:?}", ui.keys);
+            (result, ui.screens)
+        };
+        let typed = |text: &str| text.bytes().map(Character).collect::<Vec<_>>();
+        // "Write step 2 for this sequence only": name, target (claude), Paste and Enter,
+        // then the editor; Done.
+        let keys = [
+            vec![Down, Down, Down, Enter],
+            typed("follow-up"),
+            vec![Enter, Enter, Down, Enter],
+            vec![Down; 3],
+            vec![Enter],
+        ]
+        .concat();
+        let (result, _) = run(keys, &Action::PromptSequence(vec![plan.clone()]));
+        let new = Action::PromptOwn {
+            file: "follow-up".into(),
+            target: Target::Agent("claude".into()),
+            enter: true,
+            text: "Review this change.\n".into(),
+        };
+        assert_eq!(
+            result,
+            Some(Action::PromptSequence(vec![plan.clone(), new.clone()]))
+        );
+        assert!(!prompts.join("follow-up").exists(), "nothing saved yet");
+        // A taken or bad name is refused with the reason, and no step is added.
+        for name in ["plan", "../escape"] {
+            let keys = [
+                vec![Down, Down, Down, Enter],
+                typed(name),
+                vec![Enter, Enter],
+                vec![Down; 2],
+                vec![Enter],
+            ]
+            .concat();
+            let (result, screens) = run(keys, &Action::PromptSequence(vec![plan.clone()]));
+            assert_eq!(
+                result,
+                Some(Action::PromptSequence(vec![plan.clone()])),
+                "{name}"
+            );
+            assert!(screens.iter().any(|s| s.starts_with("Not saved")), "{name}");
+        }
+        // Step 2 → Save as new prompt: the prompt is created and the step points at it.
+        let seq = Action::PromptSequence(vec![plan.clone(), new.clone()]);
+        let keys = [
+            vec![Down, Enter],
+            vec![Down; 3],
+            vec![Enter],
+            vec![Down; 3],
+            vec![Enter],
+        ]
+        .concat();
+        let (result, screens) = run(keys, &seq);
+        let saved = Action::Prompt {
+            file: "follow-up".into(),
+            target: Target::Agent("claude".into()),
+            enter: true,
+        };
+        assert!(
+            screens
+                .iter()
+                .any(|s| s.contains("Save as new prompt follow-up"))
+        );
+        assert_eq!(
+            result,
+            Some(Action::PromptSequence(vec![plan.clone(), saved]))
+        );
+        assert_eq!(
+            std::fs::read(prompts.join("follow-up")).unwrap(),
+            b"Review this change.\n"
+        );
+        // Once a prompt of that name exists, "Save as new prompt" is no longer offered: only
+        // Update, which asks first (Cancel here) and leaves the other prompt as it is.
+        std::fs::write(prompts.join("follow-up"), "Someone else's.\n").unwrap();
+        let keys = [
+            vec![Down, Enter],
+            vec![Down; 4],
+            vec![Enter, Enter],
+            vec![Down; 3],
+            vec![Enter],
+        ]
+        .concat();
+        let (result, screens) = run(keys, &seq);
+        assert_eq!(result, Some(seq.clone()), "the step keeps its own text");
+        assert!(!screens.iter().any(|s| s.contains("Save as new prompt")));
+        assert!(
+            screens
+                .iter()
+                .any(|s| s.contains("Write this step's text to the saved prompt follow-up?"))
+        );
+        assert_eq!(
+            std::fs::read(prompts.join("follow-up")).unwrap(),
+            b"Someone else's.\n"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
