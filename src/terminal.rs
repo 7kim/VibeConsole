@@ -1191,14 +1191,25 @@ impl Terminal {
                     self.clear_finished(&agents);
                     let status = fired.as_ref().is_some_and(|m| m.status);
                     // v7 ticket 20: a prompt sequence sends its current step, and moves on
-                    // only once that step was sent.
+                    // only once that step was sent. Ticket 88: once finished, a tap sends
+                    // nothing, and a one-second hold starts it over.
                     let sequence = match &action {
-                        crate::actions::Action::PromptSequence(steps) => Some(steps.len()),
+                        crate::actions::Action::PromptSequence(steps) => Some(steps.clone()),
                         _ => None,
                     };
                     let action = match action {
                         crate::actions::Action::PromptSequence(steps) => {
-                            steps[self.positions.current(pad, steps.len())].clone()
+                            match self.positions.current(pad, &steps) {
+                                Some(at) => steps[at].clone(),
+                                None => {
+                                    self.holds.press(pad, Instant::now());
+                                    self.notice = format!(
+                                        "{}: sequence finished · hold 1 s to start over",
+                                        self.name(pad)
+                                    );
+                                    return Ok(());
+                                }
+                            }
                         }
                         action => action,
                     };
@@ -1207,8 +1218,8 @@ impl Terminal {
                     } else {
                         self.actions.submit(action, None)
                     };
-                    if let (Some(len), Ok(_)) = (sequence, &submitted) {
-                        self.positions.sent(pad, len);
+                    if let (Some(steps), Ok(_)) = (sequence, &submitted) {
+                        self.positions.sent(pad, &steps);
                     }
                     let knob = fired.as_ref().is_some_and(|m| {
                         matches!(
@@ -1236,6 +1247,10 @@ impl Terminal {
                         self.phases.insert(pad, phase);
                     }
                     return submitted;
+                }
+                // Letting go before one second cancels a finished sequence's start-over hold.
+                if matches!(action, crate::actions::Action::PromptSequence(_)) {
+                    self.holds.release(pad, Instant::now());
                 }
                 return Ok(());
             }
@@ -1571,15 +1586,19 @@ impl Terminal {
             self.pointer = None;
         }
     }
-    /// Hold-to-quit pads whose hold reached one second (v7 ticket 21).
+    /// Holds that reached one second: hold-to-quit pads quit (v7 ticket 21); a finished
+    /// prompt sequence starts over at step 1, sending nothing (ticket 88).
     fn quit_holds(&mut self) {
         for pad in self.holds.due(Instant::now()) {
-            let path = self.fired(pad).ok().flatten().and_then(|m| match m.action {
-                crate::actions::Action::AppToggleQuit(path) => Some(path),
-                _ => None,
-            });
-            if let Some(path) = path {
-                self.submit_quiet(crate::actions::Action::AppQuit(path));
+            match self.fired(pad).ok().flatten().map(|m| m.action) {
+                Some(crate::actions::Action::AppToggleQuit(path)) => {
+                    self.submit_quiet(crate::actions::Action::AppQuit(path))
+                }
+                Some(crate::actions::Action::PromptSequence(_)) => {
+                    self.positions.restart(pad);
+                    self.notice = format!("{}: sequence starts over at step 1", self.name(pad));
+                }
+                _ => {}
             }
         }
     }
@@ -10372,6 +10391,88 @@ mod tests {
         ui.transition(pad, true).unwrap(); // the Akai pad's own light still works
         let stranger = Control::from_note(10, 37).unwrap();
         assert!(ui.transition(stranger, true).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 88: a prompt sequence sends steps 1, 2, 3 once each, then a tap sends
+    /// nothing and says so; letting go early or a pause cancels the start-over hold; a
+    /// one-second hold starts it over without sending, and the next tap sends step 1.
+    #[test]
+    fn finished_sequence_waits_for_a_one_second_hold() {
+        use crate::actions::{Action, Target};
+        let dir = std::env::temp_dir().join(format!("vibeconsole-seq-end-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let prompt = |file: &str| Action::Prompt {
+            file: file.into(),
+            target: Target::Agent("claude".into()),
+            enter: true,
+        };
+        let steps = vec![prompt("plan"), prompt("build"), prompt("review")];
+        let button = Control::button(1);
+        let seq = Mapping::new_action(
+            button,
+            mappings::Input::Pad,
+            Action::PromptSequence(steps.clone()),
+        )
+        .unwrap();
+        mappings::save(&path, &[seq]).unwrap();
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        let (sent, ran) = std::sync::mpsc::channel();
+        ui.actions = crate::actions::Dispatcher::with(move |action, _, _| {
+            sent.send(action.clone()).unwrap();
+            Ok("done".into())
+        });
+        ui.run_mappings = ui.context_mappings(&mappings::load_config(&path).unwrap().mappings);
+        let tap = |ui: &mut Terminal| {
+            ui.transition(button, true).unwrap();
+            ui.transition(button, false).unwrap();
+        };
+        let nothing = |ran: &std::sync::mpsc::Receiver<Action>| {
+            assert!(
+                ran.recv_timeout(Duration::from_millis(200)).is_err(),
+                "nothing sent"
+            );
+        };
+        for step in &steps {
+            tap(&mut ui);
+            assert_eq!(&ran.recv_timeout(Duration::from_secs(2)).unwrap(), step);
+        }
+        tap(&mut ui);
+        nothing(&ran);
+        assert!(
+            ui.notice
+                .ends_with("sequence finished · hold 1 s to start over"),
+            "{}",
+            ui.notice
+        );
+        // That tap let go early: its hold is cancelled, even once a second has passed.
+        std::thread::sleep(Duration::from_millis(1100));
+        ui.quit_holds();
+        tap(&mut ui);
+        nothing(&ran);
+        // A pause (it releases everything) cancels a hold in progress.
+        ui.transition(button, true).unwrap();
+        ui.release_all().unwrap();
+        std::thread::sleep(Duration::from_millis(1100));
+        ui.quit_holds();
+        ui.transition(button, false).unwrap();
+        tap(&mut ui);
+        nothing(&ran);
+        // A full hold starts it over and sends nothing; the next tap sends step 1.
+        ui.transition(button, true).unwrap();
+        std::thread::sleep(Duration::from_millis(1100));
+        ui.quit_holds();
+        ui.transition(button, false).unwrap();
+        nothing(&ran);
+        assert!(
+            ui.notice.ends_with("sequence starts over at step 1"),
+            "{}",
+            ui.notice
+        );
+        tap(&mut ui);
+        assert_eq!(ran.recv_timeout(Duration::from_secs(2)).unwrap(), steps[0]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

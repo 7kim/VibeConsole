@@ -1192,20 +1192,42 @@ pub fn write_t3_key_file(text: &str) -> Result<std::path::PathBuf> {
 /// Which step of a prompt sequence a pad sends next (v7 ticket 20). Positions live only in
 /// the running session, so they start at step 1 after a restart.
 #[derive(Default)]
-pub struct Positions(std::collections::HashMap<crate::Control, usize>);
+pub struct Positions(std::collections::HashMap<crate::Control, (usize, u64)>);
 impl Positions {
-    /// The step this tap sends, for a sequence of `len` steps.
-    pub fn current(&self, control: crate::Control, len: usize) -> usize {
-        self.0.get(&control).copied().unwrap_or(0) % len.max(1)
+    /// A sequence's identity: editing its steps (add, remove, reorder) starts it at step 1.
+    fn steps_id(steps: &[Action]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        steps
+            .iter()
+            .map(Action::encode)
+            .for_each(|s| s.hash(&mut hash));
+        hash.finish()
     }
-    /// Only a tap that was sent moves on; after the last step it wraps to the first.
-    pub fn sent(&mut self, control: crate::Control, len: usize) {
-        let next = (self.current(control, len) + 1) % len.max(1);
-        self.0.insert(control, next);
+    /// The step this tap sends; None once the last step was sent (v7 ticket 88).
+    pub fn current(&self, control: crate::Control, steps: &[Action]) -> Option<usize> {
+        let at = match self.0.get(&control) {
+            Some(&(at, id)) if id == Self::steps_id(steps) => at,
+            _ => 0,
+        };
+        (at < steps.len()).then_some(at)
     }
-    /// "3/5" for the hints window.
-    pub fn label(&self, control: crate::Control, len: usize) -> String {
-        format!("{}/{len}", self.current(control, len) + 1)
+    /// Only a tap that was sent moves on; after the last step the sequence is finished.
+    pub fn sent(&mut self, control: crate::Control, steps: &[Action]) {
+        if let Some(at) = self.current(control, steps) {
+            self.0.insert(control, (at + 1, Self::steps_id(steps)));
+        }
+    }
+    /// A one-second hold on a finished sequence: the next tap sends step 1.
+    pub fn restart(&mut self, control: crate::Control) {
+        self.0.remove(&control);
+    }
+    /// "3/5", or "done · hold to start over", for the screens.
+    pub fn label(&self, control: crate::Control, steps: &[Action]) -> String {
+        match self.current(control, steps) {
+            Some(at) => format!("{}/{}", at + 1, steps.len()),
+            None => "done · hold to start over".into(),
+        }
     }
 }
 
@@ -2511,14 +2533,14 @@ mod tests {
     /// v7 ticket 20: a prompt sequence sends one step per sent tap, wraps after the last,
     /// and round-trips; only prompts can be steps.
     #[test]
-    fn prompt_sequences_step_once_per_sent_tap_and_wrap() {
+    fn prompt_sequences_send_each_step_once_then_wait_for_a_hold() {
         let prompt = |file: &str| Action::Prompt {
             file: file.into(),
             target: Target::Agent("claude".into()),
             enter: true,
         };
-        let sequence =
-            Action::PromptSequence(vec![prompt("plan"), prompt("build"), prompt("review")]);
+        let steps = vec![prompt("plan"), prompt("build"), prompt("review")];
+        let sequence = Action::PromptSequence(steps.clone());
         assert_eq!(Action::parse(&sequence.encode()).unwrap(), sequence);
         assert!(Action::parse("prompts:").is_err());
         assert!(Action::parse("prompts:output-mute").is_err());
@@ -2526,20 +2548,27 @@ mod tests {
         let pad = crate::Control::from_note(10, 36).unwrap();
         let mut positions = Positions::default();
         let mut sent = Vec::new();
-        for tap in 0..5 {
-            let index = positions.current(pad, 3);
-            sent.push(index);
-            // The fourth tap was rejected (queue full): it doesn't move on.
-            if tap != 3 {
-                positions.sent(pad, 3);
+        for tap in 0..6 {
+            let step = positions.current(pad, &steps);
+            sent.push(step);
+            // The second tap was rejected (queue full): it doesn't move on.
+            if tap != 1 {
+                positions.sent(pad, &steps);
             }
         }
-        assert_eq!(sent, [0, 1, 2, 0, 0]);
-        assert_eq!(positions.label(pad, 3), "2/3");
-        // A sequence edited shorter never points past its end.
-        assert_eq!(positions.current(pad, 1), 0);
-        // A restart starts again at step 1.
-        assert_eq!(Positions::default().label(pad, 3), "1/3");
+        // v7 ticket 88: 1, 2, 3, then nothing until a hold starts it over.
+        assert_eq!(sent, [Some(0), Some(1), Some(1), Some(2), None, None]);
+        assert_eq!(positions.label(pad, &steps), "done · hold to start over");
+        positions.restart(pad);
+        assert_eq!(positions.label(pad, &steps), "1/3");
+        positions.sent(pad, &steps);
+        positions.sent(pad, &steps);
+        assert_eq!(positions.label(pad, &steps), "3/3");
+        // Editing the steps (here a reorder) starts it at step 1; so does a restart.
+        let reordered = vec![prompt("build"), prompt("plan"), prompt("review")];
+        assert_eq!(positions.current(pad, &reordered), Some(0));
+        assert_eq!(positions.current(pad, &steps[..1]), Some(0));
+        assert_eq!(Positions::default().label(pad, &steps), "1/3");
     }
 
     /// v7 ticket 19: the free-key helper picks an unused Ctrl+Alt key, keeps every user
