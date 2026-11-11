@@ -167,6 +167,15 @@ impl Resolver {
         self.order.clear();
         self.update()
     }
+    /// v7 ticket 53: a new mapping set (an app profile change). Nothing stays active, and
+    /// the lights follow the new set from the next press.
+    pub fn replace(&mut self, mappings: &[crate::mappings::Mapping]) -> Result<Option<Settings>> {
+        for mapping in mappings {
+            mapping.validate()?;
+        }
+        self.mappings = mappings.to_vec();
+        self.clear()
+    }
     fn effective(&self) -> Result<Settings> {
         let mut result = Settings::default();
         let mut active_tempo = false;

@@ -1362,6 +1362,14 @@ impl Terminal {
         self.profile = profile;
         let config = mappings::load_config(&self.path)?;
         self.run_mappings = self.context_mappings(&config.mappings);
+        // v7 ticket 53: the Akai lights follow the profile's set, as the keyboard does.
+        if let Some(resolver) = &mut self.resolver {
+            if let Some(settings) = resolver.replace(&self.run_mappings)? {
+                if let Some(controller) = &mut self.controller {
+                    controller.set(settings)?;
+                }
+            }
+        }
         self.reload_keyboard()?;
         self.notice = format!("Profile: {}", self.profile.as_deref().unwrap_or("Default"));
         Ok(())
@@ -10211,6 +10219,63 @@ mod tests {
             }
         }
         assert!(held.is_empty(), "still held: {held:?}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 53: switching app profile hands the Akai lights the profile's set. An
+    /// override on a pad the program doesn't map fires without "unknown active feedback
+    /// owner"; an override on a lit pad sends no lights; back on Default the lights return.
+    #[test]
+    fn profile_switch_rebuilds_the_akai_lights() {
+        use crate::feedback::{Octave, Resolver, Settings, State};
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-profile-lights-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let lit_pad = Control::from_note(10, 36).unwrap();
+        let free_pad = Control::from_note(10, 37).unwrap();
+        let mut lit = Mapping::new(lit_pad, "F1", "hold").unwrap();
+        lit.feedback.octave = Some(Octave::Offset(1));
+        mappings::save(&path, &[lit]).unwrap();
+        let mut config = mappings::load_config(&path).unwrap();
+        config.profiles.push(mappings::Profile {
+            name: "Firefox".into(),
+            apps: vec!["firefox.desktop".into()],
+            mappings: vec![
+                Mapping::new(lit_pad, "F2", "hold").unwrap(),
+                Mapping::new(free_pad, "F3", "hold").unwrap(),
+            ],
+        });
+        mappings::save_config(&path, &config).unwrap();
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        ui.run_mappings = ui.context_mappings(&config.mappings); // Default, as at Run
+        let baseline = State {
+            octave: 0,
+            tempo: 120,
+            arp: false,
+        };
+        ui.resolver = Some(Resolver::new(&ui.run_mappings, baseline, Settings::default()).unwrap());
+        ui.set_profile(Some("Firefox".into())).unwrap();
+        ui.transition(free_pad, true).unwrap(); // was: unknown active feedback owner
+        ui.transition(free_pad, false).unwrap();
+        let lights = |ui: &mut Terminal, pad: Control| {
+            let resolver = ui.resolver.as_mut().unwrap();
+            let on = resolver.transition(pad, true).unwrap();
+            resolver.clear().unwrap();
+            on.and_then(|settings| settings.octave)
+        };
+        assert_eq!(
+            lights(&mut ui, lit_pad),
+            None,
+            "the override carries no lights"
+        );
+        ui.set_profile(None).unwrap();
+        assert_eq!(
+            lights(&mut ui, lit_pad),
+            Some(1),
+            "Default's octave light is back"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
