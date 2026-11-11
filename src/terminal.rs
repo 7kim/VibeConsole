@@ -9003,6 +9003,10 @@ mod tests {
         configure(&mut ui, &path, &mut current).unwrap();
         assert!(ui.keys.is_empty());
         assert!(
+            shown(&ui.screens, "Already assigned:"),
+            "mapping A again asks before replacing"
+        );
+        assert!(
             ui.screens
                 .iter()
                 .any(|s| s.contains("Xbox A") && s.contains("Shift")),
