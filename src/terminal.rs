@@ -4735,13 +4735,15 @@ fn prompt_files(dir: &Path) -> Result<Vec<String>> {
     Ok(files)
 }
 
+/// What a prompt name may be: it can't leave the prompts folder.
+const PROMPT_NAME_RULE: &str =
+    "prompt names are letters, digits, '-', '_' and '.', not starting with '.'";
+
 /// Edit (or create) prompt `name` on a hidden copy, then rename it into place: a failed or
 /// empty edit keeps the old prompt.
 fn edit_prompt(ui: &mut impl Ui, dir: &Path, name: &str) -> Result<()> {
     if !mappings::simple_name(name) {
-        return Err(
-            "prompt names are letters, digits, '-', '_' and '.', not starting with '.'".into(),
-        );
+        return Err(PROMPT_NAME_RULE.into());
     }
     let target = dir.join(name);
     let scratch = dir.join(format!(".{name}.edit"));
@@ -6023,36 +6025,64 @@ fn prompt_sequence_action(
                 crate::actions::Action::PromptOwn { text, .. } => Some(text.clone()),
                 _ => None,
             };
-            let own = own_text.is_some();
-            let file = steps[choice].prompt_files().first().map(|f| f.to_string());
-            let dir = crate::actions::prompts_dir_for(path)?;
-            // A step written only in the sequence names a prompt that doesn't exist yet.
-            let unsaved = own && file.as_ref().is_some_and(|f| !dir.join(f).exists());
-            let save_new = format!("Save as new prompt {}", file.as_deref().unwrap_or(""));
+            let file = steps[choice]
+                .prompt_files()
+                .first()
+                .map(|f| f.to_string())
+                .unwrap_or_default();
+            let dir = crate::actions::prompts_dir_for(path).map_err(stage("file I/O"))?;
+            // A prompt of the step's name exists: an edit can go back to it, or into it. A step
+            // written only in the sequence (or whose name was taken since) can only be saved
+            // as a new prompt, under a name you choose.
+            let saved = dir.join(&file).exists();
             let mut items = vec!["Move up", "Remove", "Edit for this sequence only"];
-            if unsaved {
-                items.push(&save_new);
-            } else if own {
-                items.extend(["Discard sequence edit", "Update prompt to match"]);
+            if own_text.is_some() {
+                items.push("Save as new prompt");
+                if saved {
+                    items.extend(["Discard sequence edit", "Update prompt to match"]);
+                }
             }
             items.push("Back");
-            match choose(
+            let picked = choose(
                 ui,
                 &format!("Step {}: {}", choice + 1, steps[choice].description()),
                 &options(&items),
-            )? {
-                Some(0) if choice > 0 => steps.swap(choice, choice - 1),
-                Some(1) => {
+            )?
+            .map(|i| items[i]);
+            match picked {
+                Some("Move up") if choice > 0 => steps.swap(choice, choice - 1),
+                Some("Remove") => {
                     steps.remove(choice);
                 }
-                Some(2) => steps[choice] = edit_step(ui, path, &steps[choice])?,
-                Some(3) if unsaved => match save_new_prompt(&dir, &steps[choice]) {
-                    Ok(saved) => steps[choice] = saved,
-                    Err(error) => not_saved(ui, &error)?,
-                },
-                Some(3) if own => steps[choice] = saved_step(&steps[choice]),
-                Some(4) if let Some(text) = &own_text => {
-                    let file = steps[choice].prompt_files()[0].to_owned();
+                Some("Edit for this sequence only") => {
+                    steps[choice] = edit_step(ui, path, &steps[choice])?
+                }
+                Some("Save as new prompt") => {
+                    let initial = if saved { "" } else { file.as_str() };
+                    if let Some(name) = text_entry(
+                        ui,
+                        "New prompt name (an existing prompt is never overwritten)",
+                        initial,
+                    )? {
+                        match save_new_prompt(&dir, &steps[choice], &name) {
+                            Ok(step) => steps[choice] = step,
+                            Err(error) => not_saved(ui, &error)?,
+                        }
+                    }
+                }
+                Some("Discard sequence edit") => {
+                    let confirm = choose(
+                        ui,
+                        &format!(
+                            "Drop this step's own text? The step then sends the saved prompt {file}."
+                        ),
+                        &options(&["Cancel", "Discard"]),
+                    )?;
+                    if confirm == Some(1) {
+                        steps[choice] = saved_step(&steps[choice]);
+                    }
+                }
+                Some("Update prompt to match") if let Some(text) = &own_text => {
                     let confirm = choose(
                         ui,
                         &format!(
@@ -6062,7 +6092,6 @@ fn prompt_sequence_action(
                     )?;
                     if confirm == Some(1) {
                         // Atomic: a failed write keeps the old prompt and the edited step.
-                        let dir = crate::actions::prompts_dir_for(path)?;
                         (|| -> Result<()> {
                             std::fs::create_dir_all(&dir)?;
                             crate::actions::write_atomic(&dir.join(&file), text)
@@ -6089,12 +6118,10 @@ fn new_step(ui: &mut impl Ui, path: &Path) -> Result<Option<crate::actions::Acti
         return Ok(None);
     };
     if !mappings::simple_name(&name) {
-        return Err(
-            "validation: prompt names are letters, digits, '-', '_' and '.', not starting with '.'"
-                .into(),
-        );
+        return Err(format!("validation: {PROMPT_NAME_RULE}").into());
     }
-    if crate::actions::prompts_dir_for(path)?.join(&name).exists() {
+    let dir = crate::actions::prompts_dir_for(path).map_err(stage("file I/O"))?;
+    if dir.join(&name).exists() {
         return Err(format!(
             "validation: a prompt named {name} already exists; add it with Add step"
         )
@@ -6108,34 +6135,51 @@ fn new_step(ui: &mut impl Ui, path: &Path) -> Result<Option<crate::actions::Acti
         target,
         enter,
     };
-    // An empty or untouched editor adds nothing.
-    Ok(Some(edit_step(ui, path, &step)?)
-        .filter(|s| matches!(s, crate::actions::Action::PromptOwn { .. })))
+    match edit_step(ui, path, &step)? {
+        own @ crate::actions::Action::PromptOwn { .. } => Ok(Some(own)),
+        _ => Err("validation: the step's text was left empty; no step added".into()),
+    }
 }
 
-/// "Save as new prompt" (v7 ticket 81): the step's text becomes a new prompt file, written
-/// atomically and never over an existing one; the step then points at it.
-fn save_new_prompt(dir: &Path, step: &crate::actions::Action) -> Result<crate::actions::Action> {
-    let crate::actions::Action::PromptOwn { file, text, .. } = step else {
-        return Err("this step has no text of its own".into());
+/// "Save as new prompt" (v7 ticket 81): the step's text becomes prompt `name`, written
+/// whole and never over an existing prompt; the step then points at it.
+fn save_new_prompt(
+    dir: &Path,
+    step: &crate::actions::Action,
+    name: &str,
+) -> Result<crate::actions::Action> {
+    let crate::actions::Action::PromptOwn {
+        target,
+        enter,
+        text,
+        ..
+    } = step
+    else {
+        return Err("validation: this step has no text of its own".into());
     };
-    let target = dir.join(file);
-    let scratch = dir.join(format!(".{file}.new"));
-    (|| -> Result<()> {
+    if !mappings::simple_name(name) {
+        return Err(format!("validation: {PROMPT_NAME_RULE}").into());
+    }
+    let scratch = dir.join(format!(".{name}.new"));
+    // A hard link fails if the name exists, so the prompt appears whole or not at all.
+    // ponytail: needs a filesystem with hard links (not vfat); elsewhere the save is refused.
+    let written = (|| -> Result<()> {
         std::fs::create_dir_all(dir)?;
         std::fs::write(&scratch, text)?;
-        // A hard link fails if the name exists: the prompt appears whole, or not at all.
-        let linked = std::fs::hard_link(&scratch, &target);
-        let _ = std::fs::remove_file(&scratch);
-        match linked {
+        match std::fs::hard_link(&scratch, dir.join(name)) {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                Err(format!("prompt {file} already exists; nothing overwritten").into())
+                Err(format!("prompt {name} already exists; nothing overwritten").into())
             }
             other => Ok(other?),
         }
-    })()
-    .map_err(stage("file I/O"))?;
-    Ok(saved_step(step))
+    })();
+    let _ = std::fs::remove_file(&scratch);
+    written.map_err(stage("file I/O"))?;
+    Ok(crate::actions::Action::Prompt {
+        file: name.into(),
+        target: target.clone(),
+        enter: *enter,
+    })
 }
 
 /// A sequence step back on its saved prompt (v7 ticket 81).
@@ -9890,7 +9934,13 @@ mod tests {
         );
         // The edited step shows as this sequence's version; Discard returns to the prompt.
         let own = Action::PromptSequence(vec![edited.clone()]);
-        let keys = [vec![Enter], vec![Down; 3], vec![Enter], done(1)].concat();
+        let keys = [
+            vec![Enter],
+            vec![Down; 4],
+            vec![Enter, Down, Enter],
+            done(1),
+        ]
+        .concat();
         let (result, screens) = run(keys, &own, false);
         assert_eq!(
             result.unwrap(),
@@ -9903,7 +9953,7 @@ mod tests {
         );
         // Update prompt to match: Cancel changes nothing; Update writes the prompt and the
         // step points at it again.
-        let keys = [vec![Enter], vec![Down; 4], vec![Enter, Enter], done(1)].concat();
+        let keys = [vec![Enter], vec![Down; 5], vec![Enter, Enter], done(1)].concat();
         let (result, _) = run(keys, &own, false);
         assert_eq!(result.unwrap(), Some(own.clone()));
         assert_eq!(
@@ -9912,7 +9962,7 @@ mod tests {
         );
         let keys = [
             vec![Enter],
-            vec![Down; 4],
+            vec![Down; 5],
             vec![Enter, Down, Enter],
             done(1),
         ]
@@ -9943,7 +9993,7 @@ mod tests {
         assert!(!prompts.join(".plan.sequence-edit").exists());
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&prompts, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let keys = [vec![Enter], vec![Down; 4], vec![Enter, Down, Enter]].concat();
+        let keys = [vec![Enter], vec![Down; 5], vec![Enter, Down, Enter]].concat();
         let (result, _) = run(keys, &own, false);
         std::fs::set_permissions(&prompts, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(result.unwrap_err().to_string().contains("file I/O"));
@@ -9956,7 +10006,7 @@ mod tests {
 
     /// v7 ticket 81: a step written only in the sequence gets a new prompt name (validated,
     /// not already taken) and sends its own text; "Save as new prompt" then creates that
-    /// prompt, never overwriting one that appeared meanwhile.
+    /// prompt, never overwriting one that appeared meanwhile, and can take another name.
     #[test]
     fn a_new_sequence_step_is_saved_as_a_new_prompt_without_overwriting() {
         use crate::actions::{Action, Target};
@@ -10023,41 +10073,55 @@ mod tests {
             );
             assert!(screens.iter().any(|s| s.starts_with("Not saved")), "{name}");
         }
-        // Step 2 → Save as new prompt: the prompt is created and the step points at it.
+        // Back on that step changes nothing and writes nothing.
         let seq = Action::PromptSequence(vec![plan.clone(), new.clone()]);
         let keys = [
             vec![Down, Enter],
-            vec![Down; 3],
+            vec![Down; 4],
             vec![Enter],
             vec![Down; 3],
             vec![Enter],
         ]
         .concat();
         let (result, screens) = run(keys, &seq);
-        let saved = Action::Prompt {
-            file: "follow-up".into(),
+        assert_eq!(result, Some(seq.clone()));
+        assert!(!screens.iter().any(|s| s.contains("Write this step's text")));
+        assert!(!prompts.join("follow-up").exists());
+        // Step 2 → Save as new prompt (its name offered): the prompt is created and the step
+        // points at it.
+        let keys = [
+            vec![Down, Enter],
+            vec![Down; 3],
+            vec![Enter, Enter],
+            vec![Down; 3],
+            vec![Enter],
+        ]
+        .concat();
+        let (result, _) = run(keys, &seq);
+        let saved_as = |file: &str| Action::Prompt {
+            file: file.into(),
             target: Target::Agent("claude".into()),
             enter: true,
         };
-        assert!(
-            screens
-                .iter()
-                .any(|s| s.contains("Save as new prompt follow-up"))
-        );
         assert_eq!(
             result,
-            Some(Action::PromptSequence(vec![plan.clone(), saved]))
+            Some(Action::PromptSequence(vec![
+                plan.clone(),
+                saved_as("follow-up")
+            ]))
         );
         assert_eq!(
             std::fs::read(prompts.join("follow-up")).unwrap(),
             b"Review this change.\n"
         );
-        // Once a prompt of that name exists, "Save as new prompt" is no longer offered: only
-        // Update, which asks first (Cancel here) and leaves the other prompt as it is.
+        // The name was taken meanwhile: Save never overwrites it ("already exists"), and the
+        // step can be saved under another name instead; the other prompt stays as it is.
         std::fs::write(prompts.join("follow-up"), "Someone else's.\n").unwrap();
         let keys = [
             vec![Down, Enter],
-            vec![Down; 4],
+            vec![Down; 3],
+            vec![Enter],
+            typed("follow-up"),
             vec![Enter, Enter],
             vec![Down; 3],
             vec![Enter],
@@ -10065,15 +10129,44 @@ mod tests {
         .concat();
         let (result, screens) = run(keys, &seq);
         assert_eq!(result, Some(seq.clone()), "the step keeps its own text");
-        assert!(!screens.iter().any(|s| s.contains("Save as new prompt")));
         assert!(
             screens
                 .iter()
-                .any(|s| s.contains("Write this step's text to the saved prompt follow-up?"))
+                .any(|s| s.starts_with("Not saved") && s.contains("already exists"))
+        );
+        let keys = [
+            vec![Down, Enter],
+            vec![Down; 3],
+            vec![Enter],
+            typed("follow-up-2"),
+            vec![Enter],
+            vec![Down; 3],
+            vec![Enter],
+        ]
+        .concat();
+        let (result, _) = run(keys, &seq);
+        assert_eq!(
+            result,
+            Some(Action::PromptSequence(vec![
+                plan.clone(),
+                saved_as("follow-up-2")
+            ]))
+        );
+        assert_eq!(
+            std::fs::read(prompts.join("follow-up-2")).unwrap(),
+            b"Review this change.\n"
         );
         assert_eq!(
             std::fs::read(prompts.join("follow-up")).unwrap(),
             b"Someone else's.\n"
+        );
+        assert!(
+            std::fs::read_dir(&prompts).unwrap().all(|e| !e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".new")),
+            "no scratch left"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
