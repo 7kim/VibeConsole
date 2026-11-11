@@ -1501,9 +1501,11 @@ fn parse_config(contents: &str) -> Result<Config> {
         Some("16") => 16,
         Some("17") => 17,
         Some("18") => 18,
+        // v19 (v7 ticket 81): a prompt-sequence step may carry its own text (`prompt-own:`).
+        Some("19") => 19,
         _ => {
             return Err(
-                "invalid configuration header; expected vibeconsole-mappings-v1..v18".into(),
+                "invalid configuration header; expected vibeconsole-mappings-v1..v19".into(),
             );
         }
     };
@@ -2038,7 +2040,7 @@ pub fn serialize_config(config: &Config) -> Result<String> {
     validate_variables(&config.vars, "user")?;
     config.validate_references()?;
     let mut contents = format!(
-        "vibeconsole-mappings-v18\nidle\t{}\t{}\t{}\n",
+        "vibeconsole-mappings-v19\nidle\t{}\t{}\t{}\n",
         opt_text(config.idle.octave),
         opt_text(config.idle.tempo),
         arp_text(config.idle.arp)
@@ -2521,7 +2523,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v18\n")
+                .starts_with("vibeconsole-mappings-v19\n")
         );
         assert!(
             load_config(&path)
@@ -2705,7 +2707,7 @@ mod tests {
         };
         save_config(&path, &tuned).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v18\n"));
+        assert!(text.starts_with("vibeconsole-mappings-v19\n"));
         assert!(text.contains("\ntuning\t20\t60\t25\ton\toff\n"));
         assert_eq!(load_config(&path).unwrap(), tuned);
         for bad in [
@@ -2742,6 +2744,61 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7 ticket 81: a sequence step's own text is saved with the sequence (config v19) and
+    /// round-trips; a v18 file loads with no step text; a refused save keeps the last file.
+    #[test]
+    fn sequence_step_text_round_trips_in_v19() {
+        use crate::actions::{Action, Target};
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-step-text-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let saved = |file: &str| Action::Prompt {
+            file: file.into(),
+            target: Target::Agent("claude".into()),
+            enter: true,
+        };
+        let pad = Control::from_note(10, 36).unwrap();
+        let plain = Action::PromptSequence(vec![saved("plan"), saved("build")]);
+        let mut config = Config::default();
+        config.mappings = vec![Mapping::new_action(pad, Input::Pad, plain).unwrap()];
+        save_config(&path, &config).unwrap();
+        let v18 = fs::read_to_string(&path)
+            .unwrap()
+            .replace("vibeconsole-mappings-v19", "vibeconsole-mappings-v18");
+        assert_eq!(
+            parse_config(&v18).unwrap(),
+            config,
+            "a v18 file loads as is"
+        );
+        let own = Action::PromptOwn {
+            file: "plan".into(),
+            target: Target::Agent("claude".into()),
+            enter: true,
+            text: "Plan it:\n\t1. read\n".into(),
+        };
+        config.mappings[0].action = Action::PromptSequence(vec![own, saved("build")]);
+        save_config(&path, &config).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("vibeconsole-mappings-v19\n"), "{text}");
+        assert_eq!(load_config(&path).unwrap(), config);
+        let mut bad = config.clone();
+        bad.mappings[0].action = Action::PromptSequence(vec![Action::PromptOwn {
+            file: "plan".into(),
+            target: Target::Agent("claude".into()),
+            enter: true,
+            text: "  ".into(),
+        }]);
+        assert!(save_config(&path, &bad).is_err());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            text,
+            "the last valid file stays"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// v7 ticket 75: each stick's mode and ranges round-trip in v18; overlapping or bad
     /// ranges and an angle-mode mouse stick are refused, and a refused save keeps the file;
     /// a v17 file loads both sticks as Linear.
@@ -2763,7 +2820,7 @@ mod tests {
         ));
         assert_eq!(load_config(&path).unwrap(), config);
         let v17 = text
-            .replace("vibeconsole-mappings-v18", "vibeconsole-mappings-v17")
+            .replace("vibeconsole-mappings-v19", "vibeconsole-mappings-v17")
             .lines()
             .filter(|l| !l.starts_with("sticks\t"))
             .map(|l| format!("{l}\n"))
@@ -2835,7 +2892,7 @@ mod tests {
     }
 
     /// v7 ticket 49: an agent has a host (tmux, Orca or herdr). A v16 file's agents load as
-    /// tmux and save as v18 with the host; each host round-trips; a host's own name rules
+    /// tmux and save as v19 with the host; each host round-trips; a host's own name rules
     /// are checked; an unknown host is refused.
     #[test]
     fn agents_keep_their_host_and_v16_agents_are_tmux() {
@@ -2843,7 +2900,7 @@ mod tests {
         config.agents = vec![Agent::new("claude", "claude", "claude").unwrap()];
         let v16 = serialize_config(&config)
             .unwrap()
-            .replace("vibeconsole-mappings-v18", "vibeconsole-mappings-v16")
+            .replace("vibeconsole-mappings-v19", "vibeconsole-mappings-v16")
             .replace("sticks\tlinear\tlinear\n", "")
             .replace("\t1\ttmux\n", "\t1\n");
         let old = parse_config(&v16).unwrap();
@@ -2855,7 +2912,7 @@ mod tests {
         herdr.host = Host::Herdr;
         config.agents.extend([orca, herdr]);
         let text = serialize_config(&config).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v18\n"), "{text}");
+        assert!(text.starts_with("vibeconsole-mappings-v19\n"), "{text}");
         assert!(
             text.contains("\nagent\tclaude\tclaude\tclaude\t-\t1\ttmux\n"),
             "{text}"
@@ -3302,7 +3359,7 @@ mod tests {
         let path = dir.join("mappings.tsv");
         save_config(&path, &config).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
-        assert!(saved.starts_with("vibeconsole-mappings-v18\n"));
+        assert!(saved.starts_with("vibeconsole-mappings-v19\n"));
         assert!(saved.contains("\tflow\t") && !saved.contains("flow-start"));
         assert_eq!(load_config(&path).unwrap(), config);
         fs::remove_dir_all(dir).unwrap();
@@ -3328,7 +3385,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v18\n")
+                .starts_with("vibeconsole-mappings-v19\n")
         );
         assert_eq!(load_config(&path).unwrap(), config);
         fs::remove_dir_all(dir).unwrap();
@@ -3349,7 +3406,7 @@ mod tests {
         let path = dir.join("mappings.tsv");
         save_config(&path, &config).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v18\n") && text.contains("\tstatus\n"));
+        assert!(text.starts_with("vibeconsole-mappings-v19\n") && text.contains("\tstatus\n"));
         assert_eq!(load_config(&path).unwrap(), config);
         let pad = Control::from_note(10, 37).unwrap();
         for (action, observable) in [
@@ -3426,7 +3483,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v18\n")
+                .starts_with("vibeconsole-mappings-v19\n")
         );
         assert_eq!(load_config(&path).unwrap(), config);
         // ${NAME}: user variable, then startup variable; other text stays; no environment.

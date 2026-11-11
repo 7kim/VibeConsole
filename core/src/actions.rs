@@ -115,6 +115,8 @@ impl Step {
 
 // Unit separator between steps: every step encoding rejects control characters.
 const STEP_SEPARATOR: char = '\x1f';
+/// The most text a sequence step can carry of its own (v7 ticket 81).
+const MAX_STEP_TEXT: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Action {
@@ -167,9 +169,17 @@ pub enum Action {
     /// The hold of `AppToggleQuit`, sent by the session after one second.
     AppQuit(String),
     /// v7 ticket 20: one pad walks through prompts: tap 1 sends step 1, tap 2 step 2, …,
-    /// wrapping after the last. Each step is a `Prompt`. Unlike `Sequence`, one tap sends
-    /// one step.
+    /// until the last (ticket 88). Each step is a `Prompt` or a `PromptOwn`. Unlike
+    /// `Sequence`, one tap sends one step.
     PromptSequence(Vec<Action>),
+    /// v7 ticket 81: a sequence step edited for this sequence only. It sends `text` instead
+    /// of the saved prompt `file`, which stays unchanged.
+    PromptOwn {
+        file: String,
+        target: Target,
+        enter: bool,
+        text: String,
+    },
     /// v7 ticket 18: bring herdr's agent `name` to the front (`herdr agent focus`).
     HerdrFocus(String),
     /// v7 ticket 17: a T3 Code command (`chat.new`), pressed with whatever key the user's
@@ -184,6 +194,10 @@ impl Action {
     pub fn agents(&self) -> Vec<&str> {
         match self {
             Self::Prompt {
+                target: Target::Agent(name),
+                ..
+            }
+            | Self::PromptOwn {
                 target: Target::Agent(name),
                 ..
             } => vec![name],
@@ -220,8 +234,10 @@ impl Action {
     /// Saved prompt files this action sends, including choice zones and sequence steps.
     pub fn prompt_files(&self) -> Vec<&str> {
         match self {
-            Self::Prompt { file, .. } => vec![file],
-            Self::Choice(choices) => choices.iter().flat_map(Self::prompt_files).collect(),
+            Self::Prompt { file, .. } | Self::PromptOwn { file, .. } => vec![file],
+            Self::Choice(choices) | Self::PromptSequence(choices) => {
+                choices.iter().flat_map(Self::prompt_files).collect()
+            }
             Self::Sequence(steps) => steps
                 .iter()
                 .flat_map(|step| match step {
@@ -285,7 +301,12 @@ impl Action {
             {
                 Err("value knob needs an absolute file path, min < max, and 0–6 decimals".into())
             }
-            Self::Prompt { file, target, .. }
+            Self::PromptOwn { text, .. }
+                if text.trim().is_empty() || text.len() > MAX_STEP_TEXT =>
+            {
+                Err("a sequence's own prompt text must be 1 byte to 64 KiB, not blank".into())
+            }
+            Self::Prompt { file, target, .. } | Self::PromptOwn { file, target, .. }
                 if !crate::mappings::simple_name(file)
                     || matches!(target, Target::Agent(a) if !crate::mappings::simple_name(a)) =>
             {
@@ -308,7 +329,9 @@ impl Action {
             Self::PromptSequence(steps)
                 if steps.is_empty()
                     || steps.len() > 999
-                    || steps.iter().any(|s| !matches!(s, Self::Prompt { .. })) =>
+                    || steps
+                        .iter()
+                        .any(|s| !matches!(s, Self::Prompt { .. } | Self::PromptOwn { .. })) =>
             {
                 Err("a prompt sequence needs 1–999 prompt steps".into())
             }
@@ -391,6 +414,18 @@ impl Action {
                 target.encode(),
                 if *enter { "enter" } else { "paste" }
             ),
+            // The text as hex: its lines, tabs and colons can't break the config line.
+            Self::PromptOwn {
+                file,
+                target,
+                enter,
+                text,
+            } => format!(
+                "prompt-own:{file}:{}:{}:{}",
+                target.encode(),
+                if *enter { "enter" } else { "paste" },
+                text.bytes().map(|b| format!("{b:02x}")).collect::<String>()
+            ),
             Self::Command { window, dir, line } => format!("command:{window}:{dir}:{line}"),
             Self::Application(path) => format!("app:{path}"),
             Self::AppToggle { path, close } => format!(
@@ -435,6 +470,31 @@ impl Action {
                     file: (*file).into(),
                     target: Target::parse(agent),
                     enter,
+                }
+            }
+            _ if value.starts_with("prompt-own:") => {
+                let fields: Vec<_> = value.split(':').collect();
+                let ["prompt-own", file, agent, mode, hex] = fields.as_slice() else {
+                    return Err("invalid sequence prompt step".into());
+                };
+                let bytes = (0..hex.len())
+                    .step_by(2)
+                    .map(|i| {
+                        hex.get(i..i + 2)
+                            .and_then(|h| u8::from_str_radix(h, 16).ok())
+                    })
+                    .collect::<Option<Vec<_>>>()
+                    .filter(|_| hex.len() % 2 == 0)
+                    .ok_or("invalid sequence prompt text")?;
+                Self::PromptOwn {
+                    file: (*file).into(),
+                    target: Target::parse(agent),
+                    enter: match *mode {
+                        "enter" => true,
+                        "paste" => false,
+                        _ => return Err("invalid prompt submit mode".into()),
+                    },
+                    text: String::from_utf8(bytes)?,
                 }
             }
             _ if value.starts_with("choice:") => Self::Choice(
@@ -545,6 +605,16 @@ impl Action {
                 } else {
                     ""
                 }
+            ),
+            Self::PromptOwn {
+                file,
+                target,
+                enter,
+                ..
+            } => format!(
+                "Prompt {file} (this sequence’s version) → {}{}",
+                target.description(),
+                if *enter { " + Enter" } else { " (paste only)" }
             ),
             Self::Command { window, dir, line } => {
                 format!("Run `{line}` in {dir} (tmux window {window})")
@@ -1027,6 +1097,10 @@ pub fn running(action: &Action, agents: &[(String, String)]) -> Option<bool> {
     match action {
         Action::Command { window: name, .. } => window(name),
         Action::Prompt {
+            target: Target::Agent(agent),
+            ..
+        }
+        | Action::PromptOwn {
             target: Target::Agent(agent),
             ..
         } => window(&agents.iter().find(|(name, _)| name == agent)?.1),
@@ -1946,7 +2020,38 @@ fn send_prompt(
     if !crate::mappings::simple_name(file) || !crate::mappings::simple_name(agent_name) {
         return Err("invalid prompt file or agent".into());
     }
-    let path = prompts_dir()?.join(file);
+    send_prompt_at(
+        &prompts_dir()?.join(file),
+        file,
+        agent_name,
+        enter,
+        cancelled,
+    )
+}
+
+/// A sequence step's own text (v7 ticket 81), written where only this user can read it and
+/// sent like a saved prompt; the saved prompt file is never touched.
+fn own_text_file(text: &str) -> Result<PathBuf> {
+    let dir = PathBuf::from(
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .filter(|v| !v.is_empty())
+            .ok_or("XDG_RUNTIME_DIR is not set")?,
+    )
+    .join("vibeconsole");
+    fs::create_dir_all(&dir)?;
+    let path = dir.join("sequence-step-prompt");
+    write_atomic(&path, text)?;
+    Ok(path)
+}
+
+fn send_prompt_at(
+    path: &Path,
+    file: &str,
+    agent_name: &str,
+    enter: bool,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<String> {
+    let path = path.to_path_buf();
     read_prompt(&path)?;
     if cancelled() {
         return Err("prompt cancelled".into());
@@ -2196,6 +2301,29 @@ fn perform(
             target: Target::Agent(agent),
             enter,
         } => send_prompt(file, agent, *enter, cancelled),
+        Action::PromptOwn {
+            file,
+            target: Target::Agent(agent),
+            enter,
+            text,
+        } => send_prompt_at(&own_text_file(text)?, file, agent, *enter, cancelled)
+            .map(|done| format!("{done} (this sequence’s version)")),
+        Action::PromptOwn {
+            file,
+            target: Target::Focused { shift },
+            enter,
+            text,
+        } => {
+            copy_prompt(&own_text_file(text)?, wl_copy(in_unit()))?;
+            tap(crate::keyboard::paste_keys(*shift))?;
+            if *enter {
+                wait(PASTE_SETTLE, cancelled)?;
+                tap(vec![evdev::KeyCode::KEY_ENTER])?;
+            }
+            Ok(format!(
+                "Prompt {file} (this sequence’s version) pasted into the focused window"
+            ))
+        }
         Action::Prompt {
             file,
             target: Target::Focused { shift },
@@ -2569,6 +2697,51 @@ mod tests {
         assert_eq!(positions.current(pad, &reordered), Some(0));
         assert_eq!(positions.current(pad, &steps[..1]), Some(0));
         assert_eq!(Positions::default().label(pad, &steps), "1/3");
+    }
+
+    /// v7 ticket 81: a sequence step edited "for this sequence only" carries its own text,
+    /// kept through the action encoding whatever it holds (lines, tabs, colons, any script);
+    /// an empty, oversized or badly encoded text is refused.
+    #[test]
+    fn a_step_keeps_its_own_text_through_the_encoding() {
+        let text = "Plan: read the spec\n\t- then the tickets:\n«ünïcode» 👍\n";
+        let own = Action::PromptOwn {
+            file: "plan".into(),
+            target: Target::Agent("claude".into()),
+            enter: true,
+            text: text.into(),
+        };
+        let saved = Action::Prompt {
+            file: "build".into(),
+            target: Target::Agent("claude".into()),
+            enter: false,
+        };
+        let sequence = Action::PromptSequence(vec![own.clone(), saved]);
+        let encoded = sequence.encode();
+        assert!(
+            !encoded.contains(['\n', '\t']),
+            "one TSV field: {encoded:?}"
+        );
+        assert_eq!(Action::parse(&encoded).unwrap(), sequence);
+        assert_eq!(own.prompt_files(), ["plan"], "still names its prompt");
+        // Deleting a prompt warns about every sequence step that uses it.
+        assert_eq!(sequence.prompt_files(), ["plan", "build"]);
+        assert!(
+            own.description().contains("this sequence’s version"),
+            "{}",
+            own.description()
+        );
+        for bad in [String::new(), " \n".into(), "x".repeat(64 * 1024 + 1)] {
+            let step = Action::PromptOwn {
+                file: "plan".into(),
+                target: Target::Agent("claude".into()),
+                enter: true,
+                text: bad,
+            };
+            assert!(step.validate().is_err());
+        }
+        assert!(Action::parse("prompt-own:plan:claude:enter:zz").is_err());
+        assert!(Action::parse("prompt-own:plan:claude:enter:").is_err());
     }
 
     /// v7 ticket 19: the free-key helper picks an unused Ctrl+Alt key, keeps every user

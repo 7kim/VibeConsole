@@ -5983,7 +5983,7 @@ fn prompt_sequence_action(
         items.push("Done".into());
         let Some(choice) = choose(
             ui,
-            "Prompt sequence: tap 1 sends step 1, tap 2 step 2, …; after the last it starts again",
+            "Prompt sequence: tap 1 sends step 1, tap 2 step 2, …; after the last it stops until the pad is held 1 s",
             &items,
         )?
         else {
@@ -5998,19 +5998,115 @@ fn prompt_sequence_action(
                 return Ok(Some(crate::actions::Action::PromptSequence(steps)));
             }
         } else {
+            let own_text = match &steps[choice] {
+                crate::actions::Action::PromptOwn { text, .. } => Some(text.clone()),
+                _ => None,
+            };
+            let own = own_text.is_some();
+            let mut items = vec!["Move up", "Remove", "Edit for this sequence only"];
+            if own {
+                items.extend(["Discard sequence edit", "Update prompt to match"]);
+            }
+            items.push("Back");
             match choose(
                 ui,
                 &format!("Step {}: {}", choice + 1, steps[choice].description()),
-                &options(&["Move up", "Remove", "Back"]),
+                &options(&items),
             )? {
                 Some(0) if choice > 0 => steps.swap(choice, choice - 1),
                 Some(1) => {
                     steps.remove(choice);
                 }
+                Some(2) => steps[choice] = edit_step(ui, path, &steps[choice])?,
+                Some(3) if own => steps[choice] = saved_step(&steps[choice]),
+                Some(4) if let Some(text) = &own_text => {
+                    let file = steps[choice].prompt_files()[0].to_owned();
+                    let confirm = choose(
+                        ui,
+                        &format!(
+                            "Write this step's text to the saved prompt {file}? Every pad using {file} then sends it."
+                        ),
+                        &options(&["Cancel", &format!("Update {file}")]),
+                    )?;
+                    if confirm == Some(1) {
+                        // Atomic: a failed write keeps the old prompt and the edited step.
+                        let dir = crate::actions::prompts_dir_for(path)?;
+                        (|| -> Result<()> {
+                            std::fs::create_dir_all(&dir)?;
+                            crate::actions::write_atomic(&dir.join(&file), text)
+                        })()
+                        .map_err(stage("file I/O"))?;
+                        steps[choice] = saved_step(&steps[choice]);
+                    }
+                }
                 _ => {}
             }
         }
     }
+}
+
+/// A sequence step back on its saved prompt (v7 ticket 81).
+fn saved_step(step: &crate::actions::Action) -> crate::actions::Action {
+    match step {
+        crate::actions::Action::PromptOwn {
+            file,
+            target,
+            enter,
+            ..
+        } => crate::actions::Action::Prompt {
+            file: file.clone(),
+            target: target.clone(),
+            enter: *enter,
+        },
+        step => step.clone(),
+    }
+}
+
+/// Edit a step's text for this sequence only (v7 ticket 81): the editor gets the step's own
+/// text, or the saved prompt's, on a hidden scratch copy. The saved prompt never changes; a
+/// failed or empty edit keeps the step as it was.
+fn edit_step(
+    ui: &mut impl Ui,
+    path: &Path,
+    step: &crate::actions::Action,
+) -> Result<crate::actions::Action> {
+    use crate::actions::Action;
+    let (file, target, enter) = match step {
+        Action::Prompt {
+            file,
+            target,
+            enter,
+        }
+        | Action::PromptOwn {
+            file,
+            target,
+            enter,
+            ..
+        } => (file, target, *enter),
+        _ => return Err("only a prompt step can be edited".into()),
+    };
+    let dir = crate::actions::prompts_dir_for(path)?;
+    let scratch = dir.join(format!(".{file}.sequence-edit"));
+    let result = (|| -> Result<Action> {
+        let start = match step {
+            Action::PromptOwn { text, .. } => text.clone(),
+            _ => std::fs::read_to_string(dir.join(file)).unwrap_or_default(),
+        };
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(&scratch, start)?;
+        ui.edit_file(&scratch)?;
+        let text = std::fs::read_to_string(&scratch)?;
+        let edited = Action::PromptOwn {
+            file: file.clone(),
+            target: target.clone(),
+            enter,
+            text,
+        };
+        edited.validate()?;
+        Ok(edited)
+    })();
+    let _ = std::fs::remove_file(&scratch);
+    result.map_err(stage("file I/O"))
 }
 
 /// The T3 Code family (v7 ticket 17): each command shows the key T3's own file binds it
@@ -9639,6 +9735,124 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7 ticket 81: a step can be edited for this sequence only (the prompt file stays
+    /// byte-for-byte the same), discarded back to the saved prompt, or written to the saved
+    /// prompt with "Update prompt to match" after a confirmation. A failed edit or a failed
+    /// update changes nothing.
+    #[test]
+    fn sequence_step_edits_stay_in_the_sequence_until_update_prompt() {
+        use crate::actions::{Action, Target};
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-seq-own-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let prompts = dir.join("prompts");
+        std::fs::create_dir_all(&prompts).unwrap();
+        std::fs::write(prompts.join("plan"), "Saved plan.\n").unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let plan = Action::Prompt {
+            file: "plan".into(),
+            target: Target::Agent("claude".into()),
+            enter: true,
+        };
+        let edited = Action::PromptOwn {
+            file: "plan".into(),
+            target: Target::Agent("claude".into()),
+            enter: true,
+            text: "Review this change.\n".into(), // what the scripted editor writes
+        };
+        let run = |keys: Vec<Key>, saved: &Action, edit_fails: bool| {
+            let mut ui = Script {
+                keys: keys.into(),
+                edit_fails,
+                ..Default::default()
+            };
+            let result = prompt_sequence_action(&mut ui, &path, Some(saved));
+            assert!(ui.keys.is_empty(), "keys left: {:?}", ui.keys);
+            (result, ui.screens)
+        };
+        let done = |n: usize| [vec![Down; n + 1], vec![Enter]].concat(); // past n steps and Add
+        // Step 1 → Edit for this sequence only → Done.
+        let keys = [vec![Enter, Down, Down, Enter], done(1)].concat();
+        let (result, _) = run(keys, &Action::PromptSequence(vec![plan.clone()]), false);
+        assert_eq!(
+            result.unwrap(),
+            Some(Action::PromptSequence(vec![edited.clone()]))
+        );
+        assert_eq!(
+            std::fs::read(prompts.join("plan")).unwrap(),
+            b"Saved plan.\n"
+        );
+        assert!(
+            !prompts.join(".plan.sequence-edit").exists(),
+            "no scratch left behind"
+        );
+        // The edited step shows as this sequence's version; Discard returns to the prompt.
+        let own = Action::PromptSequence(vec![edited.clone()]);
+        let keys = [vec![Enter], vec![Down; 3], vec![Enter], done(1)].concat();
+        let (result, screens) = run(keys, &own, false);
+        assert_eq!(
+            result.unwrap(),
+            Some(Action::PromptSequence(vec![plan.clone()]))
+        );
+        assert!(
+            screens
+                .iter()
+                .any(|s| s.contains("this sequence’s version"))
+        );
+        // Update prompt to match: Cancel changes nothing; Update writes the prompt and the
+        // step points at it again.
+        let keys = [vec![Enter], vec![Down; 4], vec![Enter, Enter], done(1)].concat();
+        let (result, _) = run(keys, &own, false);
+        assert_eq!(result.unwrap(), Some(own.clone()));
+        assert_eq!(
+            std::fs::read(prompts.join("plan")).unwrap(),
+            b"Saved plan.\n"
+        );
+        let keys = [
+            vec![Enter],
+            vec![Down; 4],
+            vec![Enter, Down, Enter],
+            done(1),
+        ]
+        .concat();
+        let (result, _) = run(keys, &own, false);
+        assert_eq!(
+            result.unwrap(),
+            Some(Action::PromptSequence(vec![plan.clone()]))
+        );
+        assert_eq!(
+            std::fs::read(prompts.join("plan")).unwrap(),
+            b"Review this change.\n"
+        );
+        // A failed edit keeps the step and the file; so does an update that can't be written.
+        std::fs::write(prompts.join("plan"), "Saved plan.\n").unwrap();
+        let keys = vec![Enter, Down, Down, Enter];
+        let (result, _) = run(keys, &Action::PromptSequence(vec![plan.clone()]), true);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("editor exited unsuccessfully")
+        );
+        assert_eq!(
+            std::fs::read(prompts.join("plan")).unwrap(),
+            b"Saved plan.\n"
+        );
+        assert!(!prompts.join(".plan.sequence-edit").exists());
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&prompts, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let keys = [vec![Enter], vec![Down; 4], vec![Enter, Down, Enter]].concat();
+        let (result, _) = run(keys, &own, false);
+        std::fs::set_permissions(&prompts, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.unwrap_err().to_string().contains("file I/O"));
+        assert_eq!(
+            std::fs::read(prompts.join("plan")).unwrap(),
+            b"Saved plan.\n"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// v7 ticket 21: a launcher pad can minimize on a tap and quit on a one-second hold.
     #[test]
     fn launcher_pad_can_hold_to_quit() {
@@ -10409,7 +10623,14 @@ mod tests {
             target: Target::Agent("claude".into()),
             enter: true,
         };
-        let steps = vec![prompt("plan"), prompt("build"), prompt("review")];
+        // Ticket 81: step 2 was edited for this sequence; its own text is what gets sent.
+        let own = Action::PromptOwn {
+            file: "build".into(),
+            target: Target::Agent("claude".into()),
+            enter: true,
+            text: "Build only the parser.\n".into(),
+        };
+        let steps = vec![prompt("plan"), own, prompt("review")];
         let button = Control::button(1);
         let seq = Mapping::new_action(
             button,
@@ -11207,7 +11428,7 @@ mod tests {
         )));
         // Ticket 17: a v14 file's per-agent tempos become the shared slow/fast tempos.
         let v14 = saved
-            .replace("vibeconsole-mappings-v18", "vibeconsole-mappings-v14")
+            .replace("vibeconsole-mappings-v19", "vibeconsole-mappings-v14")
             .replace(
                 "tuning\t15\t30\t10\toff\toff\nsticks\tlinear\tlinear\nmidi-devices\t0\nmidi-active\t-\nprofiles\t0\nprofile-lock\t-\nfavourites\t0\n",
                 "",
