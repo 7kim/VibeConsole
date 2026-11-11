@@ -5756,11 +5756,13 @@ fn families(input: mappings::Input) -> Vec<usize> {
     offered
 }
 
-/// The family (index into `FAMILIES`) a saved assignment's action belongs to. Orca's
-/// "needs me" is saved as a key sequence, so it reads as a sequence of steps.
+/// The family (index into `FAMILIES`) a saved assignment's action belongs to: the one
+/// /configure opens on when it's edited (v7 ticket 55). Orca's "needs me" is a key
+/// sequence, recognised as Orca's.
 fn action_family(mapping: &Mapping) -> usize {
     use crate::actions::Action;
     match &mapping.action {
+        action if orca_needs_me().is_ok_and(|needs_me| *action == needs_me) => 8,
         Action::Shortcut => 0,
         Action::Command { .. } if mapping.risky => 12,
         Action::Command { .. } => 4,
@@ -5958,6 +5960,16 @@ fn t3_action(ui: &mut impl Ui) -> Result<Option<crate::actions::Action>> {
     Ok(Some(crate::actions::Action::T3(command.clone())))
 }
 
+/// Orca's "needs me": the jump palette, then its first row (the agent waiting on you). Built
+/// here only, so a saved one is recognised when it's edited (v7 ticket 55).
+fn orca_needs_me() -> Result<crate::actions::Action> {
+    Ok(crate::actions::Action::Sequence(vec![
+        crate::actions::Step::Keys(mappings::parse_shortcut("Ctrl+J")?),
+        crate::actions::Step::Wait(150),
+        crate::actions::Step::Keys(mappings::parse_shortcut("Ctrl+1")?),
+    ]))
+}
+
 /// The Orca family (v7 ticket 15): Orca's Linux default keys, "needs me" (the jump
 /// palette's first row: the agent waiting on you) and a jump to one agent's tab.
 fn orca_mapping(ui: &mut impl Ui, pad: Control, input: mappings::Input) -> Result<Option<Mapping>> {
@@ -5981,11 +5993,7 @@ fn orca_mapping(ui: &mut impl Ui, pad: Control, input: mappings::Input) -> Resul
         return Ok(None);
     };
     let action = match choice {
-        0 => crate::actions::Action::Sequence(vec![
-            crate::actions::Step::Keys(mappings::parse_shortcut("Ctrl+J")?),
-            crate::actions::Step::Wait(150),
-            crate::actions::Step::Keys(mappings::parse_shortcut("Ctrl+1")?),
-        ]),
+        0 => orca_needs_me()?,
         1 => {
             let agents = ui.orca_agents()?;
             if agents.is_empty() {
@@ -6284,16 +6292,7 @@ fn configure_steps(
         {
             continue;
         }
-        let saved_family = saved.as_ref().map(|m| match &m.action {
-            crate::actions::Action::Shortcut => 0,
-            crate::actions::Action::Prompt { .. } => 3,
-            crate::actions::Action::Command { .. } => 4,
-            crate::actions::Action::Sequence(_) => 5,
-            crate::actions::Action::Choice(_) => 6,
-            crate::actions::Action::Value { .. } => 7,
-            action if action.audio() => 2,
-            _ => 1,
-        });
+        let saved_family = saved.as_ref().map(action_family);
         let offered = families(input);
         let Some(family) = choose_saved(
             ui,
@@ -8841,18 +8840,30 @@ mod tests {
                 });
                 let saved = mappings::load_config(&path).unwrap().mappings;
                 let copy = saved.iter().find(|m| m.control == control);
-                let want = if family == 13 {
-                    2
-                } else if family == 8 {
-                    5
-                } else {
-                    family
+                let want = if family == 13 { 2 } else { family };
+                // v7 ticket 55: editing the saved copy opens the family menu on its family
+                // (pads and Xbox buttons; the starred favourite is listed first).
+                let edit_ok = !matches!(kind, "pad" | "Xbox button") || copy.is_none() || {
+                    let mut edit = Script {
+                        keys: [vec![Down; 5], vec![Enter, Down, Enter, Escape, Escape]]
+                            .concat()
+                            .into(),
+                        ..Default::default()
+                    };
+                    let mut again = saved.clone();
+                    configure(&mut edit, &path, &mut again).unwrap();
+                    let cursor = format!("> {}", FAMILIES[want]);
+                    edit.screens
+                        .iter()
+                        .find(|s| s.starts_with("Action family"))
+                        .is_some_and(|m| m.lines().any(|l| l.starts_with(&cursor)))
                 };
                 // A joystick can't take the starred Output mute: refused by name, nothing saved.
                 let refused = kind == "joystick" && family == 13;
                 let ok = matches!(result, Ok(Ok(())))
                     && ui.keys.is_empty()
                     && listed == offered
+                    && edit_ok
                     && if refused {
                         copy.is_none() && screens.contains("which Joystick X increase can't take")
                     } else {
@@ -8865,7 +8876,7 @@ mod tests {
                         .map(|s| s.lines().next().unwrap_or(""))
                         .collect::<Vec<_>>();
                     failures.push(format!(
-                        "{kind} / {}: {:?} keys left {}, listed {listed:?}, saved {:?}\n{}",
+                        "{kind} / {}: {:?} keys left {}, listed {listed:?}, edit opens on it {edit_ok}, saved {:?}\n{}",
                         FAMILIES[family],
                         result
                             .as_ref()
@@ -8879,6 +8890,53 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
         assert!(failures.is_empty(), "{}", failures.join("\n=========\n"));
+    }
+
+    /// v7 ticket 55: editing a saved terminal command and pressing Enter all the way through
+    /// keeps it a terminal command with its one-second hold (it used to open on "Run command
+    /// in tmux", which dropped the hold).
+    #[test]
+    fn editing_a_terminal_command_keeps_its_hold() {
+        use Key::*;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-edit-hold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let pad = Control::from_note(10, 36).unwrap();
+        let action = crate::actions::Action::Command {
+            window: "update".into(),
+            dir: "/tmp".into(),
+            line: "sudo dnf update".into(),
+        };
+        let mut held = Mapping::new_action(pad, mappings::Input::Pad, action).unwrap();
+        held.risky = true;
+        mappings::save(&path, &[held]).unwrap();
+        // Edit saved assignment, the command, then Enter through every step and save.
+        let mut keys = vec![Down; 5];
+        keys.extend(vec![Enter; 12]);
+        keys.push(Escape);
+        let mut ui = Script {
+            keys: keys.into(),
+            ..Default::default()
+        };
+        let mut current = mappings::load(&path).unwrap();
+        configure(&mut ui, &path, &mut current).unwrap();
+        let titles = ui
+            .screens
+            .iter()
+            .map(|s| s.lines().next().unwrap_or("").to_owned())
+            .collect::<Vec<_>>();
+        let saved = mappings::load(&path).unwrap();
+        assert_eq!(saved.len(), 1, "{titles:?}");
+        // The tmux window name is made from the pad's name on save; the command stays.
+        assert!(
+            matches!(&saved[0].action, crate::actions::Action::Command { line, dir, .. }
+                if line == "sudo dnf update" && dir == "/tmp"),
+            "{titles:?}"
+        );
+        assert!(saved[0].risky, "the hold was dropped: {titles:?}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// v7 ticket 42: a refused assignment is a "Not saved" note that stays in /configure: the
