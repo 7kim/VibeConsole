@@ -5310,26 +5310,45 @@ fn action_menu(
         return Err("launch actions require a pad/piano press; joystick actions remain keyboard holds; knobs support audio steps".into());
     }
     if family == 1 {
-        let apps = ui.applications()?;
+        // v7 ticket 48: Orca, T3 Code and herdr first, each shown once (the entry that
+        // launches); one that isn't installed says so.
+        use crate::actions::{AGENT_APPS, agent_app};
+        let installed = ui.applications()?;
+        let mut apps = Vec::new();
+        let mut missing = Vec::new();
+        for agent in AGENT_APPS {
+            match installed.iter().find(|(_, p)| agent_app(p) == Some(agent)) {
+                Some(app) => apps.push(app.clone()),
+                None => missing.push(agent),
+            }
+        }
+        let agents = apps.len();
+        apps.extend(
+            installed
+                .into_iter()
+                .filter(|(_, p)| agent_app(p).is_none()),
+        );
         let mut names = apps
             .iter()
-            .map(|(n, p)| {
-                format!(
-                    "{n} | {}",
-                    Path::new(p)
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                )
+            .enumerate()
+            .map(|(i, (n, p))| {
+                let file = Path::new(p).file_name().unwrap_or_default();
+                let agent = if i < agents { "Agent app: " } else { "" };
+                format!("{agent}{n} | {}", file.to_string_lossy())
             })
             .collect::<Vec<_>>();
+        names.extend(
+            missing
+                .iter()
+                .map(|a| format!("Agent app: {a} (not installed)")),
+        );
         names.push("Start or repair Wispr Flow".into());
         let saved_action = saved;
         let saved = match saved {
             Some(Action::Application(path) | Action::AppToggle { path, .. }) => {
                 apps.iter().position(|(_, p)| p == path)
             }
-            Some(Action::Flow) => Some(apps.len()),
+            Some(Action::Flow) => Some(apps.len() + missing.len()),
             _ => None,
         };
         let Some(i) = choose_saved(
@@ -5341,7 +5360,10 @@ fn action_menu(
         else {
             return Ok(None);
         };
-        if i == apps.len() {
+        if let Some(agent) = i.checked_sub(apps.len()).and_then(|m| missing.get(m)) {
+            return Err(format!("validation: {agent} not installed").into());
+        }
+        if i == apps.len() + missing.len() {
             return Ok(Some(Action::Flow));
         }
         let path = apps[i].1.clone();
@@ -9086,6 +9108,85 @@ mod tests {
             crate::actions::Action::AppToggleQuit("/nonexistent/recorded.desktop".into())
         );
         assert_eq!(mappings::load(&path).unwrap(), current);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 48: Orca and T3 Code are listed first, once each, matched by desktop ID
+    /// (GNOME's screen reader "Orca" isn't); they save as launchers like any app; a missing
+    /// herdr says not installed and saves nothing.
+    #[test]
+    fn agent_apps_are_listed_first_as_launchers() {
+        use Key::*;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-agentapps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let usr = |id: &str| format!("/usr/share/applications/{id}");
+        let local = |id: &str| format!("/home/u/.local/share/applications/{id}");
+        let apps = vec![
+            ("Firefox".into(), usr("firefox.desktop")),
+            ("Orca".into(), usr("orca-ide.desktop")),
+            ("Orca".into(), usr("orca.desktop")), // the screen reader
+            ("T3 Code".into(), local("com.t3tools.T3Code.desktop")),
+            (
+                "T3 Code (Nightly)".into(),
+                local("appimagekit_99c9-T3_Code__Nightly_.desktop"),
+            ),
+        ];
+        // learn, Launch application, the app (Downs), then: hold to quit, fire when, save and finish
+        let quit = [Down, Down, Enter, Enter, Down, Enter];
+        let pick = |downs: usize, then: &[Key]| {
+            let mut keys = vec![Enter, Down, Enter];
+            keys.extend(vec![Down; downs]);
+            keys.push(Enter);
+            keys.extend(then);
+            let mut ui = Script {
+                keys: keys.into(),
+                pads: [Control::from_note(10, 42).unwrap()].into(),
+                apps: apps.clone(),
+                ..Default::default()
+            };
+            let mut current = Vec::new();
+            let result = configure(&mut ui, &path, &mut current).map(|_| current);
+            (result, ui.screens.join("\n----\n"))
+        };
+        let (saved, screens) = pick(0, &quit);
+        let list = screens
+            .split("\n----\n")
+            .find(|s| s.contains("Installed visible applications"))
+            .unwrap();
+        let rows = |text: &str| list.lines().filter(|l| l.contains(text)).count();
+        assert!(
+            list.find("Agent app: Orca | orca-ide.desktop").unwrap()
+                < list
+                    .find("Agent app: T3 Code | com.t3tools.T3Code.desktop")
+                    .unwrap()
+                && list.find("T3Code.desktop").unwrap() < list.find("Firefox").unwrap(),
+            "{list}"
+        );
+        assert_eq!(rows("T3_Code"), 0, "duplicate shown once:\n{list}");
+        assert_eq!(
+            rows("Agent app: Orca"),
+            1,
+            "screen reader isn't the agent app"
+        );
+        assert_eq!(rows("Agent app: herdr (not installed)"), 1, "{list}");
+        assert_eq!(
+            saved.unwrap()[0].action,
+            crate::actions::Action::AppToggleQuit(usr("orca-ide.desktop"))
+        );
+        let (saved, _) = pick(1, &quit);
+        assert_eq!(
+            saved.unwrap()[0].action,
+            crate::actions::Action::AppToggleQuit(local("com.t3tools.T3Code.desktop"))
+        );
+
+        let before = std::fs::read(&path).unwrap();
+        let (_, screens) = pick(4, &[Escape, Escape]); // herdr (not installed): error, leave
+        assert!(screens.contains("herdr not installed"), "{screens}");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "nothing saved");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

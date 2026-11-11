@@ -908,6 +908,22 @@ pub fn desktop_id(path: &str) -> Option<String> {
     let (_, below) = path.rsplit_once("/applications/")?;
     Some(below.replace('/', "-"))
 }
+/// The agent apps offered first among launchers (v7 ticket 48).
+pub const AGENT_APPS: [&str; 3] = ["Orca", "T3 Code", "herdr"];
+/// Which agent app an installed entry path launches, matched by desktop ID, never by Name:
+/// GNOME's screen reader is also called "Orca" (`orca.desktop`).
+pub fn agent_app(path: &str) -> Option<&'static str> {
+    let id = desktop_id(path)?.to_lowercase();
+    if id.starts_with("orca-ide") {
+        Some("Orca")
+    } else if id.starts_with("com.t3tools.t3code") || id.contains("t3_code") {
+        Some("T3 Code") // the AppImageLauncher entry is `appimagekit_<hash>-T3_Code_….desktop`
+    } else if id.contains("herdr") {
+        Some("herdr")
+    } else {
+        None
+    }
+}
 
 /// `gdbus call` argv for the window extension's `method` (2 s timeout: never hang a caller).
 fn windows_call(method: &str, args: &[&str]) -> Vec<String> {
