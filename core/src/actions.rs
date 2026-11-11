@@ -908,6 +908,61 @@ pub fn desktop_id(path: &str) -> Option<String> {
     let (_, below) = path.rsplit_once("/applications/")?;
     Some(below.replace('/', "-"))
 }
+/// An installed entry's icon file (v7 ticket 72): the `Icon=` of its `[Desktop Entry]`,
+/// looked up in `theme`, then `hicolor`, under each icon root (or directly in a root such as
+/// `/usr/share/pixmaps`). The file is parsed, never run; an absolute `Icon=` counts only
+/// inside a root. None (no icon, missing or bad file) means: draw the stand-in tile.
+pub fn app_icon(desktop: &Path, roots: &[PathBuf], theme: &str) -> Option<PathBuf> {
+    let text = fs::read_to_string(desktop).ok()?;
+    let icon = *entry_fields(&text).get("Icon")?;
+    if icon.is_empty() || icon.chars().any(char::is_control) || icon.contains("..") {
+        return None;
+    }
+    if icon.starts_with('/') {
+        let path = PathBuf::from(icon);
+        return (roots.iter().any(|r| path.starts_with(r)) && path.is_file()).then_some(path);
+    }
+    if icon.contains('/') {
+        return None;
+    }
+    let sizes = [
+        "scalable", "512x512", "256x256", "128x128", "96x96", "64x64", "48x48",
+    ];
+    roots.iter().find_map(|root| {
+        let dirs = [theme, "hicolor"]
+            .into_iter()
+            .flat_map(|t| sizes.map(|s| root.join(t).join(s).join("apps")))
+            .chain([root.clone()]);
+        dirs.flat_map(|d| ["svg", "png"].map(|ext| d.join(format!("{icon}.{ext}"))))
+            .find(|p| p.is_file())
+    })
+}
+
+/// [`app_icon`] cached per desktop ID: the app asks once per launcher, not once per draw.
+pub struct AppIcons {
+    pub roots: Vec<PathBuf>,
+    pub theme: String,
+    cache: std::collections::HashMap<String, Option<PathBuf>>,
+}
+
+impl AppIcons {
+    pub fn new(roots: Vec<PathBuf>, theme: &str) -> Self {
+        Self {
+            roots,
+            theme: theme.into(),
+            cache: Default::default(),
+        }
+    }
+    pub fn get(&mut self, path: &str) -> Option<PathBuf> {
+        let id = desktop_id(path)?;
+        let (roots, theme) = (&self.roots, &self.theme);
+        self.cache
+            .entry(id)
+            .or_insert_with(|| app_icon(Path::new(path), roots, theme))
+            .clone()
+    }
+}
+
 /// The agent apps offered first among launchers (v7 ticket 48).
 pub const AGENT_APPS: [&str; 3] = ["Orca", "T3 Code", "herdr"];
 /// Which agent app an installed entry path launches, matched by desktop ID, never by Name:
@@ -3182,6 +3237,82 @@ mod tests {
                 .load(Ordering::Acquire))
             .is_err()
         );
+    }
+
+    /// v7 ticket 72: a launcher's icon comes from its `.desktop` file's `Icon=`, looked up in
+    /// the theme; anything missing or bad gives None (the stand-in tile), never an error.
+    #[test]
+    fn app_icons_come_from_desktop_files_and_fall_back_to_the_tile() {
+        let dir = std::env::temp_dir().join(format!("vibeconsole-icons-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let apps = dir.join("applications");
+        let icons = dir.join("icons");
+        let pixmaps = dir.join("pixmaps");
+        let themed = icons.join("Adwaita/scalable/apps");
+        let hicolor = icons.join("hicolor/48x48/apps");
+        for d in [&apps, &themed, &hicolor, &pixmaps] {
+            fs::create_dir_all(d).unwrap();
+        }
+        fs::write(themed.join("firefox.svg"), "<svg/>").unwrap();
+        fs::write(hicolor.join("orca.png"), "png").unwrap();
+        fs::write(pixmaps.join("code.png"), "png").unwrap();
+        let entry = |name: &str, body: &str| {
+            let path = apps.join(format!("{name}.desktop"));
+            fs::write(&path, body).unwrap();
+            path.to_string_lossy().into_owned()
+        };
+        let roots = vec![icons.clone(), pixmaps.clone()];
+        let mut found = AppIcons::new(roots, "Adwaita");
+        let firefox = entry("firefox", "[Desktop Entry]\nName=Firefox\nIcon=firefox\n");
+        let orca = entry("orca-ide", "[Desktop Entry]\nIcon = orca\n");
+        let code = entry("code", "[Desktop Entry]\nIcon=code\n");
+        let inside = entry(
+            "inside",
+            &format!(
+                "[Desktop Entry]\nIcon={}\n",
+                hicolor.join("orca.png").display()
+            ),
+        );
+        assert_eq!(
+            found.get(&firefox),
+            Some(themed.join("firefox.svg")),
+            "theme first"
+        );
+        assert_eq!(
+            found.get(&orca),
+            Some(hicolor.join("orca.png")),
+            "hicolor after the theme"
+        );
+        assert_eq!(
+            found.get(&code),
+            Some(pixmaps.join("code.png")),
+            "a root itself"
+        );
+        assert_eq!(
+            found.get(&inside),
+            Some(hicolor.join("orca.png")),
+            "absolute inside a root"
+        );
+        let tile = [
+            entry("none", "[Desktop Entry]\nName=No icon\n"),
+            entry("gone", "[Desktop Entry]\nIcon=not-installed\n"),
+            entry("action", "[Desktop Action new]\nIcon=firefox\n"),
+            entry("escape", "[Desktop Entry]\nIcon=../../etc/passwd\n"),
+            entry("outside", "[Desktop Entry]\nIcon=/etc/hostname\n"),
+            entry("subdir", "[Desktop Entry]\nIcon=apps/firefox\n"),
+            apps.join("missing.desktop").to_string_lossy().into_owned(),
+        ];
+        fs::write(apps.join("bad.desktop"), [0xff, 0xfe, 0x00]).unwrap();
+        for path in tile
+            .iter()
+            .chain([&apps.join("bad.desktop").to_string_lossy().into_owned()])
+        {
+            assert_eq!(found.get(path), None, "{path} gives the stand-in tile");
+        }
+        // Cached per desktop ID: a later change isn't re-read until the app restarts.
+        fs::remove_file(themed.join("firefox.svg")).unwrap();
+        assert_eq!(found.get(&firefox), Some(themed.join("firefox.svg")));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Ticket 06: a desktop ID is passed to gio as an identifier; missing, rejected and
