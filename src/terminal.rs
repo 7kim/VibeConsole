@@ -3388,13 +3388,16 @@ fn agents_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
             .agents
             .iter()
             .map(|a| {
-                format!(
-                    "{} | {} | tmux {} | {}",
-                    a.name,
-                    a.launch,
-                    a.window,
-                    crate::status::read(&a.name)
-                )
+                let host = match a.host {
+                    mappings::Host::Tmux => format!("{} | tmux {}", a.launch, a.window),
+                    mappings::Host::Orca => format!(
+                        "Orca {} in {}",
+                        a.launch,
+                        a.dir.as_deref().unwrap_or("the default folder")
+                    ),
+                    mappings::Host::Herdr => "herdr".into(),
+                };
+                format!("{} | {host} | {}", a.name, crate::status::read(&a.name))
             })
             .collect::<Vec<_>>();
         choices.extend(options(&[
@@ -3475,32 +3478,81 @@ fn agents_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
         else {
             continue;
         };
-        let Some(launch) = text_entry(
+        // v7 ticket 49: where the agent lives. T3 Code has no supported way to send a prompt.
+        let hosts = [
+            mappings::Host::Tmux,
+            mappings::Host::Orca,
+            mappings::Host::Herdr,
+        ];
+        let Some(host) = choose_saved(
             ui,
-            "Launch command",
-            existing.as_ref().map_or("", |a| &a.launch),
-        )?
-        else {
-            continue;
-        };
-        let Some(window) = text_entry(
-            ui,
-            "tmux window name",
-            existing.as_ref().map_or("", |a| &a.window),
-        )?
-        else {
-            continue;
-        };
-        let Some(dir) = text_entry(
-            ui,
-            "Working directory (absolute path or ${NAME}; empty uses the Settings default)",
+            "Where does this agent live?",
+            options(&[
+                "tmux (VibeConsole starts it in its own tmux window)",
+                "Orca (a terminal in an Orca workspace; started with orca agent launch)",
+                "herdr (an agent herdr runs, by its herdr name; start it in herdr)",
+                "T3 Code",
+            ]),
             existing
                 .as_ref()
-                .and_then(|a| a.dir.as_deref())
-                .unwrap_or(""),
+                .and_then(|a| hosts.iter().position(|h| *h == a.host)),
         )?
         else {
             continue;
+        };
+        let Some(&host) = hosts.get(host) else {
+            not_saved(
+                ui,
+                &"validation: T3 Code can't host an agent: it has no supported way to send a prompt (no CLI); use tmux, Orca or herdr",
+            )?;
+            continue;
+        };
+        let (launch, window, dir) = match host {
+            mappings::Host::Herdr => (name.clone(), name.clone(), String::new()),
+            _ => {
+                let orca = host == mappings::Host::Orca;
+                let Some(launch) = text_entry(
+                    ui,
+                    if orca {
+                        "Orca agent kind (e.g. claude, codex)"
+                    } else {
+                        "Launch command"
+                    },
+                    existing.as_ref().map_or("", |a| &a.launch),
+                )?
+                else {
+                    continue;
+                };
+                let window = if orca {
+                    name.clone()
+                } else {
+                    let Some(window) = text_entry(
+                        ui,
+                        "tmux window name",
+                        existing.as_ref().map_or("", |a| &a.window),
+                    )?
+                    else {
+                        continue;
+                    };
+                    window
+                };
+                let Some(dir) = text_entry(
+                    ui,
+                    if orca {
+                        "Orca workspace folder (absolute path or ${NAME}; empty uses the Settings default)"
+                    } else {
+                        "Working directory (absolute path or ${NAME}; empty uses the Settings default)"
+                    },
+                    existing
+                        .as_ref()
+                        .and_then(|a| a.dir.as_deref())
+                        .unwrap_or(""),
+                )?
+                else {
+                    continue;
+                };
+                (launch, window, dir)
+            }
         };
         let defaults = mappings::Agent::new(&name, &launch, &window).ok();
         let light = existing.as_ref().or(defaults.as_ref());
@@ -3517,9 +3569,16 @@ fn agents_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
         let saved = (|| -> Result<()> {
             let mut agent = mappings::Agent::new(&name, &launch, &window)?;
             agent.octave = crate::status::valid_octave(octave.try_into()?)?;
+            agent.host = host;
             if !dir.trim().is_empty() {
                 existing_directory(&dir, &config)?;
                 agent.dir = Some(dir.clone());
+            }
+            if host == mappings::Host::Orca && config.agent_directory(&agent)?.is_none() {
+                return Err(format!(
+                    "validation: Orca agent {name} needs a folder (its Orca workspace)"
+                )
+                .into());
             }
             if existing.is_some() {
                 config.agents[index] = agent;
@@ -10268,6 +10327,78 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7 ticket 49: Settings → Agents asks where an agent lives. tmux keeps today's fields;
+    /// Orca asks its kind and workspace folder; herdr uses the agent's herdr name; T3 Code is
+    /// refused by name; an Orca agent without a folder is refused. Nothing partial is saved.
+    #[test]
+    fn agents_live_in_tmux_orca_or_herdr_and_t3_is_refused_by_name() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-hosts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("app")).unwrap();
+        let path = dir.join("mappings.tsv");
+        let mut config = mappings::Config::default();
+        config.agents.clear();
+        mappings::save_config(&path, &config).unwrap();
+        let app = dir.join("app").to_str().unwrap().to_owned();
+        let add = |agents: usize, name: &str, host: usize| {
+            let mut keys = vec![Down; agents]; // "Add agent" follows the agents
+            keys.push(Enter);
+            keys.extend(typed(name));
+            keys.push(Enter);
+            keys.extend(vec![Down; host]);
+            keys.push(Enter);
+            keys
+        };
+        let mut keys = add(0, "orca-claude", 1);
+        keys.extend(typed("claude")); // Orca agent kind
+        keys.push(Enter);
+        keys.extend(typed(&app)); // its workspace folder
+        keys.extend([Enter, Enter]); // octave
+        keys.extend(add(1, "api", 2)); // herdr: no more fields but the octave
+        keys.push(Enter);
+        keys.extend(add(2, "t3", 3)); // T3 Code: refused by name
+        keys.push(Enter); // Back
+        keys.extend(add(2, "o2", 1)); // Orca without a folder
+        keys.extend(typed("claude"));
+        keys.extend([Enter, Enter, Enter, Enter]); // kind, empty folder, octave, refused -> Back
+        keys.push(Escape);
+        let mut ui = Script {
+            keys: keys.into(),
+            ..Default::default()
+        };
+        agents_menu(&mut ui, &path).unwrap();
+        let screens = ui.screens.join("\n----\n");
+        assert!(ui.keys.is_empty(), "{screens}");
+        assert!(
+            screens.contains("Not saved: validation: T3 Code can't host an agent"),
+            "{screens}"
+        );
+        assert!(
+            screens.contains("Orca agent o2 needs a folder"),
+            "{screens}"
+        );
+        let agents = mappings::load_config(&path).unwrap().agents;
+        assert_eq!(agents.len(), 2, "{agents:?}");
+        assert_eq!(
+            (
+                agents[0].host,
+                agents[0].launch.as_str(),
+                agents[0].dir.as_deref()
+            ),
+            (mappings::Host::Orca, "claude", Some(app.as_str()))
+        );
+        assert_eq!(
+            (agents[1].host, agents[1].name.as_str()),
+            (mappings::Host::Herdr, "api")
+        );
+        assert!(
+            screens.contains("orca-claude | Orca claude in "),
+            "{screens}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn typed(text: &str) -> Vec<Key> {
         text.bytes().map(Key::Character).collect()
     }
@@ -10398,10 +10529,10 @@ mod tests {
         let path = dir.join("mappings.tsv");
         mappings::save(&path, &[]).unwrap();
         let repo = dir.join("repo").to_str().unwrap().to_owned();
-        let mut keys = vec![Enter, Enter, Enter, Enter, Enter]; // claude -> Edit -> name, launch, window
+        let mut keys = vec![Enter, Enter, Enter, Enter, Enter, Enter]; // claude -> Edit -> name, host (tmux), launch, window
         keys.extend(typed("/definitely/not/here"));
         keys.extend([Enter, Enter, Enter]); // octave default -> refused -> Back
-        keys.extend([Enter, Enter, Enter, Enter, Enter]);
+        keys.extend([Enter, Enter, Enter, Enter, Enter, Enter]);
         keys.extend(typed(&repo));
         keys.extend([Enter, Up, Up, Up, Enter, Escape]); // octave +4
         let mut ui = Script {
@@ -10510,11 +10641,11 @@ mod tests {
             "light-pattern\tneeds-input\tfast\tsteady\n",
             "light-pattern\tthinking\tslow\toff\n",
             "light-pattern\tfinished\toff\tblink\n",
-            "light-other\toff\t2\nlight-folders\t0\nagents\t1\nagent\tcodex\tcodex\tcodex\t-\t-1\n"
+            "light-other\toff\t2\nlight-folders\t0\nagents\t1\nagent\tcodex\tcodex\tcodex\t-\t-1\ttmux\n"
         )));
         // Ticket 17: a v14 file's per-agent tempos become the shared slow/fast tempos.
         let v14 = saved
-            .replace("vibeconsole-mappings-v16", "vibeconsole-mappings-v14")
+            .replace("vibeconsole-mappings-v17", "vibeconsole-mappings-v14")
             .replace(
                 "tuning\t15\t30\t10\toff\toff\nmidi-devices\t0\nmidi-active\t-\nprofiles\t0\nprofile-lock\t-\nfavourites\t0\n",
                 "",
@@ -10524,7 +10655,7 @@ mod tests {
                 "",
             )
             .replace("light-other\toff\t2\n", "light-other\toff\t2\t50\t240\n")
-            .replace("agent\tcodex\tcodex\tcodex\t-\t-1\n", "agent\tcodex\tcodex\tcodex\t-\t-1\t120\t300\n");
+            .replace("agent\tcodex\tcodex\tcodex\t-\t-1\ttmux\n", "agent\tcodex\tcodex\tcodex\t-\t-1\t120\t300\n");
         std::fs::write(&path, v14).unwrap();
         let migrated = mappings::load_config(&path).unwrap();
         assert_eq!(

@@ -1204,6 +1204,124 @@ fn orca_jump(
     Ok(format!("Orca: switched to {agent} in {folder}"))
 }
 
+/// Orca's `--json` reply, or its own refusal (`ok: false`) as the error.
+fn orca_reply(reply: String) -> Result<String> {
+    let value: serde_json::Value = serde_json::from_str(&reply).unwrap_or_default();
+    if value["ok"] == serde_json::Value::Bool(false) {
+        let message = value["error"]["message"]
+            .as_str()
+            .unwrap_or("request refused");
+        return Err(format!("Orca: {message}").into());
+    }
+    Ok(reply)
+}
+/// v7 ticket 49: the terminal of the Orca agent `kind` (e.g. `claude`) in `folder`; when
+/// there is none, start it as a terminal (`orca agent launch`), let it `settle`, and look
+/// again. Every value is one argument.
+fn orca_reach(
+    kind: &str,
+    folder: &str,
+    mut orca: impl FnMut(&[String]) -> Result<String>,
+    settle: impl FnOnce() -> Result<()>,
+) -> Result<String> {
+    let find = |orca: &mut dyn FnMut(&[String]) -> Result<String>| -> Result<Option<String>> {
+        let list = orca_reply(orca(&strings(&["terminal", "list", "--json"]))?)?;
+        Ok(orca_terminals(&list)?
+            .into_iter()
+            .find(|(a, f, _)| a == kind && f == folder)
+            .map(|(_, _, handle)| handle))
+    };
+    if let Some(handle) = find(&mut orca)? {
+        return Ok(handle);
+    }
+    let worktree = format!("path:{folder}");
+    orca_reply(orca(&strings(&[
+        "agent",
+        "launch",
+        "--agent",
+        kind,
+        "--worktree",
+        &worktree,
+        "--surface",
+        "terminal",
+        "--json",
+    ]))?)?;
+    settle()?;
+    find(&mut orca)?.ok_or_else(|| {
+        format!("Orca: started {kind} in {folder}, but its terminal isn't listed yet; press again")
+            .into()
+    })
+}
+/// v7 ticket 49: type `text` into an Orca terminal; with `enter`, Orca bracket-pastes it to
+/// a recognized agent and submits.
+fn orca_send(
+    handle: &str,
+    text: &str,
+    enter: bool,
+    mut orca: impl FnMut(&[String]) -> Result<String>,
+) -> Result<()> {
+    let mut args = strings(&["terminal", "send", "--terminal", handle, "--text", text]);
+    if enter {
+        args.push("--enter".into());
+    }
+    args.push("--json".into());
+    orca_reply(orca(&args)?).map(drop)
+}
+/// v7 ticket 49: a prompt file's text for a hosted agent, passed as one argument. Orca writes
+/// text without Enter to the terminal verbatim, so control characters, and line breaks or
+/// tabs without Enter (typed as keys), are refused rather than guessed.
+fn hosted_text(text: &str, enter: bool) -> Result<String> {
+    let text = text.trim_end_matches(['\n', '\r']);
+    if text.len() > 100_000 {
+        return Err("prompt is over 100 KB; too long to pass to the agent's app".into());
+    }
+    if text
+        .chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\t')
+    {
+        return Err("prompt has control characters; the agent's app would type them".into());
+    }
+    if !enter && text.contains(['\n', '\t']) {
+        return Err(
+            "a prompt with line breaks or tabs needs Enter on for an agent in Orca or herdr (without it, they are typed as keys)"
+                .into(),
+        );
+    }
+    Ok(text.to_owned())
+}
+/// v7 ticket 49: prompt the herdr agent `name` (`herdr agent prompt`, which submits). It must
+/// be running: VibeConsole can't start one (`herdr agent start` needs a pane to run in).
+fn herdr_prompt(
+    name: &str,
+    text: &str,
+    mut herdr: impl FnMut(&[String]) -> Result<String>,
+) -> Result<()> {
+    herdr_running(name, &mut herdr)?;
+    herdr_run(&mut herdr, &["agent", "prompt", name, text]).map(drop)
+}
+/// The herdr agent `name` is running (`herdr agent list`), or say how to fix it.
+fn herdr_running(name: &str, herdr: &mut impl FnMut(&[String]) -> Result<String>) -> Result<()> {
+    let running = crate::status::herdr_agents(&herdr_run(herdr, &["agent", "list"])?)
+        .iter()
+        .any(|(agent, _, _)| agent == name);
+    if !running {
+        return Err(format!("herdr: no agent named {name} is running; start it in herdr").into());
+    }
+    Ok(())
+}
+/// Run herdr; a missing herdr says "herdr not installed".
+fn herdr_run(herdr: &mut impl FnMut(&[String]) -> Result<String>, args: &[&str]) -> Result<String> {
+    herdr(&strings(args)).map_err(|e| {
+        if e.downcast_ref::<io::Error>()
+            .is_some_and(|e| e.kind() == io::ErrorKind::NotFound)
+        {
+            "herdr not installed".into()
+        } else {
+            e
+        }
+    })
+}
+
 /// One launcher-pad press, decided by the Shell extension's view of the app's windows.
 fn app_toggle(
     path: &str,
@@ -1626,17 +1744,53 @@ fn wait(duration: Duration, cancelled: &dyn Fn() -> bool) -> Result<()> {
     Ok(())
 }
 
-/// Start the agent's tmux window when missing; returns its window name.
-fn ensure_agent(agent_name: &str, cancelled: &dyn Fn() -> bool) -> Result<String> {
+/// Where a prompt for an agent goes, once the agent is running (v7 ticket 49).
+enum Reached {
+    /// Its tmux window in the `vibe` session.
+    Tmux(String),
+    /// Its Orca terminal handle.
+    Orca(String),
+    /// Its herdr name; herdr checks it is running when prompted.
+    Herdr(String),
+}
+/// Make sure the agent runs in its host and say where to send to.
+fn reach_agent(agent_name: &str, cancelled: &dyn Fn() -> bool) -> Result<Reached> {
     let config = crate::mappings::load_config(&crate::mappings::config_path()?)?;
     let agent = config
         .agents
         .iter()
         .find(|a| a.name == agent_name)
         .ok_or("target agent was removed; edit this mapping")?;
+    match agent.host {
+        crate::mappings::Host::Tmux => ensure_agent(&config, agent, cancelled).map(Reached::Tmux),
+        crate::mappings::Host::Orca => {
+            let folder = config.agent_directory(agent)?.ok_or_else(|| {
+                format!("Orca agent {agent_name} needs a folder; set one in Settings or Agents")
+            })?;
+            orca_reach(
+                &agent.launch,
+                &folder,
+                |args| command(&orca_program(), args, &cancelled),
+                || wait(AGENT_START, cancelled),
+            )
+            .map(Reached::Orca)
+        }
+        crate::mappings::Host::Herdr => {
+            herdr_running(&agent.name, &mut |args| command("herdr", args, &cancelled))?;
+            Ok(Reached::Herdr(agent.name.clone()))
+        }
+    }
+}
+
+/// Start the agent's tmux window when missing; returns its window name.
+fn ensure_agent(
+    config: &crate::mappings::Config,
+    agent: &crate::mappings::Agent,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<String> {
     // Lets `agent-status -` hooks know which agent they run in.
     let tag = format!("{}={}", crate::status::AGENT_ENV, agent.name);
-    let env = startup_env(&config);
+    let env = startup_env(config);
     // The directory matters only when a window starts; a running agent ignores it.
     let start = |session: bool| -> Result<()> {
         let dir = config.agent_directory(agent)?;
@@ -1720,7 +1874,28 @@ fn send_prompt(
     if cancelled() {
         return Err("prompt cancelled".into());
     }
-    let target = format!("=vibe:={}", ensure_agent(agent_name, cancelled)?);
+    let window = match reach_agent(agent_name, cancelled)? {
+        Reached::Tmux(window) => window,
+        Reached::Orca(handle) => {
+            let text = hosted_text(&fs::read_to_string(&path)?, enter)?;
+            if cancelled() {
+                return Err("prompt cancelled".into());
+            }
+            orca_send(&handle, &text, enter, |args| {
+                command(&orca_program(), args, &cancelled)
+            })?;
+            return Ok(format!("Prompt {file} sent to {agent_name} in Orca"));
+        }
+        Reached::Herdr(name) => {
+            if !enter {
+                return Err("herdr always submits a prompt; turn Enter on for this prompt".into());
+            }
+            let text = hosted_text(&fs::read_to_string(&path)?, true)?;
+            herdr_prompt(&name, &text, |args| command("herdr", args, &cancelled))?;
+            return Ok(format!("Prompt {file} sent to {agent_name} in herdr"));
+        }
+    };
+    let target = format!("=vibe:={window}");
     if cancelled() {
         return Err("prompt cancelled".into());
     }
@@ -1929,7 +2104,7 @@ fn perform(
     match action {
         Action::Sequence(steps) => {
             run_sequence(steps, cancelled, |step| match step {
-                Step::Agent(name) => ensure_agent(name, cancelled).map(drop),
+                Step::Agent(name) => reach_agent(name, cancelled).map(drop),
                 Step::Wait(ms) => wait(Duration::from_millis(u64::from(*ms)), cancelled),
                 Step::Keys(keys) => tap(keys
                     .iter()
@@ -2410,6 +2585,134 @@ mod tests {
         assert_eq!(Action::parse(&jump.encode()).unwrap(), jump);
         assert!(Action::parse("orca-jump:../x:/work").is_err());
         assert!(Action::parse("orca-jump:claude:relative").is_err());
+    }
+
+    /// v7 ticket 49: a prompt reaches an Orca-hosted agent through Orca's CLI, every value
+    /// one argument: found by kind and folder, started with `orca agent launch` when missing
+    /// (then found again), and sent with `orca terminal send`. Orca's own refusals surface.
+    #[test]
+    fn orca_hosted_agents_are_found_started_and_sent_prompts() {
+        let none = r#"{"ok":true,"result":{"terminals":[]}}"#;
+        let one = r#"{"ok":true,"result":{"terminals":[
+            {"handle":"term_9","worktreePath":"/work/app","agentIdentity":"claude","preview":"secret"}]}}"#;
+        let mut calls: Vec<Vec<String>> = Vec::new();
+        let mut settled = 0;
+        let handle = orca_reach(
+            "claude",
+            "/work/app",
+            |args| {
+                calls.push(args.to_vec());
+                Ok(match args[1].as_str() {
+                    "list" if calls.len() == 1 => none.into(),
+                    "list" => one.into(),
+                    _ => r#"{"ok":true,"result":{}}"#.into(),
+                })
+            },
+            || {
+                settled += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(handle, "term_9");
+        assert_eq!(settled, 1);
+        assert_eq!(
+            calls[1],
+            [
+                "agent",
+                "launch",
+                "--agent",
+                "claude",
+                "--worktree",
+                "path:/work/app",
+                "--surface",
+                "terminal",
+                "--json"
+            ]
+        );
+        // Running already: no launch.
+        let mut launched = false;
+        orca_reach(
+            "claude",
+            "/work/app",
+            |args| {
+                launched |= args[0] == "agent";
+                Ok(one.into())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(!launched);
+        // Started but not listed yet: say so, never guess a terminal.
+        let late = orca_reach("claude", "/work/app", |_| Ok(none.into()), || Ok(())).unwrap_err();
+        assert!(late.to_string().contains("press again"), "{late}");
+
+        let mut sent = Vec::new();
+        orca_send("term_9", "Review this; rm -rf /", true, |args| {
+            sent.push(args.to_vec());
+            Ok(r#"{"ok":true}"#.into())
+        })
+        .unwrap();
+        assert_eq!(
+            sent[0],
+            [
+                "terminal",
+                "send",
+                "--terminal",
+                "term_9",
+                "--text",
+                "Review this; rm -rf /",
+                "--enter",
+                "--json"
+            ]
+        );
+        let refused = orca_send("term_9", "x", false, |_| {
+            Ok(r#"{"ok":false,"error":{"code":"runtime_unavailable","message":"Start the Orca app first."}}"#.into())
+        })
+        .unwrap_err();
+        assert_eq!(refused.to_string(), "Orca: Start the Orca app first.");
+    }
+
+    /// v7 ticket 49: what a hosted agent is sent. Orca types text without Enter verbatim, so a
+    /// multi-line prompt without Enter and control characters are refused, not guessed.
+    #[test]
+    fn hosted_prompt_text_is_one_safe_argument() {
+        assert_eq!(hosted_text("Review.\n", false).unwrap(), "Review.");
+        assert_eq!(hosted_text("a\nb\n", true).unwrap(), "a\nb");
+        assert!(hosted_text("a\nb\n", false).is_err());
+        assert!(hosted_text("a\tb", false).is_err());
+        assert_eq!(hosted_text("a\tb", true).unwrap(), "a\tb");
+        assert!(hosted_text("a\x1b[2Jb", true).is_err());
+        assert!(hosted_text(&"x".repeat(100_001), true).is_err());
+    }
+
+    /// v7 ticket 49: a herdr-hosted agent is found in `herdr agent list` and prompted with
+    /// `herdr agent prompt`; one that isn't running is reported (VibeConsole can't start a
+    /// herdr agent: `herdr agent start` needs a pane), and herdr missing says so.
+    #[test]
+    fn herdr_hosted_agents_are_prompted_by_name_and_never_started() {
+        let list = r#"[{"name":"api","agent_status":"idle","pane_id":"w1:p1"}]"#;
+        let mut calls = Vec::new();
+        herdr_prompt("api", "Review this", |args| {
+            calls.push(args.to_vec());
+            Ok(if args[1] == "list" {
+                list.into()
+            } else {
+                String::new()
+            })
+        })
+        .unwrap();
+        assert_eq!(calls[1], ["agent", "prompt", "api", "Review this"]);
+        let missing = herdr_prompt("docs", "x", |_| Ok(list.into())).unwrap_err();
+        assert!(
+            missing.to_string().contains("start it in herdr"),
+            "{missing}"
+        );
+        let absent = herdr_prompt("api", "x", |_| {
+            Err(io::Error::from(io::ErrorKind::NotFound).into())
+        })
+        .unwrap_err();
+        assert_eq!(absent.to_string(), "herdr not installed");
     }
 
     /// v7 ticket 12: the focused app comes from the extension; without it the answer is

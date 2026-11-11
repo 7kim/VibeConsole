@@ -1009,6 +1009,43 @@ pub struct Agent {
     pub dir: Option<String>,
     /// Status lights: this agent's octave light (±1..±4), which says which agent it is.
     pub octave: i8,
+    /// Where the agent lives (v7 ticket 49). Orca: `launch` is the Orca agent kind (e.g.
+    /// `claude`) and the folder is its workspace. herdr: `name` is herdr's agent name.
+    pub host: Host,
+}
+/// Where an agent lives (v7 ticket 49). T3 Code has no supported way to send a prompt, so
+/// it can't host one.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Host {
+    #[default]
+    Tmux,
+    Orca,
+    Herdr,
+}
+impl Host {
+    pub fn text(self) -> &'static str {
+        match self {
+            Self::Tmux => "tmux",
+            Self::Orca => "orca",
+            Self::Herdr => "herdr",
+        }
+    }
+    fn parse(text: &str) -> Result<Self> {
+        [Self::Tmux, Self::Orca, Self::Herdr]
+            .into_iter()
+            .find(|h| h.text() == text)
+            .ok_or_else(|| {
+                format!("unknown agent host {text:?}; expected tmux, orca or herdr").into()
+            })
+    }
+}
+/// herdr's own rule for agent names: `[a-z][a-z0-9_-]{0,31}`.
+pub fn herdr_name(name: &str) -> bool {
+    name.starts_with(|c: char| c.is_ascii_lowercase())
+        && name.len() <= 32
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
 }
 impl Agent {
     pub fn new(name: &str, launch: &str, window: &str) -> Result<Self> {
@@ -1029,6 +1066,7 @@ impl Agent {
             dir: None,
             // Spec defaults: Claude +1, Codex −1.
             octave: if name == "codex" { -1 } else { 1 },
+            host: Host::Tmux,
         })
     }
 }
@@ -1126,6 +1164,23 @@ fn validate_agents(agents: &[Agent]) -> Result<()> {
         Agent::new(&agent.name, &agent.launch, &agent.window)?;
         agent.dir.as_deref().map(directory_syntax).transpose()?;
         crate::status::valid_octave(agent.octave)?;
+        match agent.host {
+            Host::Orca if !simple_name(&agent.launch) => {
+                return Err(format!(
+                    "Orca agent {}: its kind must be one simple name (e.g. claude), not a command",
+                    agent.name
+                )
+                .into());
+            }
+            Host::Herdr if !herdr_name(&agent.name) => {
+                return Err(format!(
+                    "herdr agent {}: herdr names are lowercase letters, digits, _ and -",
+                    agent.name
+                )
+                .into());
+            }
+            _ => {}
+        }
         if !names.insert(&agent.name) || !windows.insert(&agent.window) {
             return Err("agent names and tmux windows must be unique".into());
         }
@@ -1342,9 +1397,10 @@ fn parse_config(contents: &str) -> Result<Config> {
         Some("14") => 14,
         Some("15") => 15,
         Some("16") => 16,
+        Some("17") => 17,
         _ => {
             return Err(
-                "invalid configuration header; expected vibeconsole-mappings-v1..v16".into(),
+                "invalid configuration header; expected vibeconsole-mappings-v1..v17".into(),
             );
         }
     };
@@ -1541,12 +1597,17 @@ fn parse_config(contents: &str) -> Result<Config> {
         let mut agents = Vec::new();
         for _ in 0..count {
             let fields: Vec<_> = lines.next().ok_or("missing agent")?.split('\t').collect();
+            let mut host = Host::Tmux;
             let (name, launch, window, dir, lights) = match fields.as_slice() {
                 ["agent", name, launch, window] if version < 12 => {
                     (name, launch, window, None, None)
                 }
                 ["agent", name, launch, window, dir] if version == 12 => {
                     (name, launch, window, Some(dir), None)
+                }
+                ["agent", name, launch, window, dir, octave, hosted] if version >= 17 => {
+                    host = Host::parse(hosted)?;
+                    (name, launch, window, Some(dir), Some(octave))
                 }
                 ["agent", name, launch, window, dir, octave, thinking, input]
                     if (13..15).contains(&version) =>
@@ -1558,12 +1619,13 @@ fn parse_config(contents: &str) -> Result<Config> {
                     }
                     (name, launch, window, Some(dir), Some(octave))
                 }
-                ["agent", name, launch, window, dir, octave] if version >= 15 => {
+                ["agent", name, launch, window, dir, octave] if (15..17).contains(&version) => {
                     (name, launch, window, Some(dir), Some(octave))
                 }
                 _ => return Err("invalid agent record".into()),
             };
             let mut agent = Agent::new(name, launch, window)?;
+            agent.host = host;
             agent.dir = dir.filter(|dir| **dir != "-").map(|dir| dir.to_string());
             if let Some(octave) = lights {
                 agent.octave = octave.parse()?;
@@ -1856,14 +1918,15 @@ fn mapping_line(mapping: &Mapping) -> Result<String> {
     ))
 }
 
-pub fn save_config(path: &Path, config: &Config) -> Result<()> {
+/// The configuration file's text, checked by parsing it back.
+pub fn serialize_config(config: &Config) -> Result<String> {
     config.idle.validate()?;
     validate_agents(&config.agents)?;
     validate_variables(&config.env, "startup")?;
     validate_variables(&config.vars, "user")?;
     config.validate_references()?;
     let mut contents = format!(
-        "vibeconsole-mappings-v16\nidle\t{}\t{}\t{}\n",
+        "vibeconsole-mappings-v17\nidle\t{}\t{}\t{}\n",
         opt_text(config.idle.octave),
         opt_text(config.idle.tempo),
         arp_text(config.idle.arp)
@@ -1929,12 +1992,13 @@ pub fn save_config(path: &Path, config: &Config) -> Result<()> {
     contents.push_str(&format!("agents\t{}\n", config.agents.len()));
     for agent in &config.agents {
         contents.push_str(&format!(
-            "agent\t{}\t{}\t{}\t{}\t{}\n",
+            "agent\t{}\t{}\t{}\t{}\t{}\t{}\n",
             agent.name,
             agent.launch,
             agent.window,
             agent.dir.as_deref().unwrap_or("-"),
-            agent.octave
+            agent.octave,
+            agent.host.text()
         ));
     }
     let tuning = config.tuning.validate()?;
@@ -1989,6 +2053,11 @@ pub fn save_config(path: &Path, config: &Config) -> Result<()> {
         contents.push_str(&mapping_line(mapping)?);
     }
     parse_config(&contents)?;
+    Ok(contents)
+}
+
+pub fn save_config(path: &Path, config: &Config) -> Result<()> {
+    let contents = serialize_config(config)?;
     fs::create_dir_all(path.parent().ok_or("configuration path has no parent")?)?;
     // ponytail: one staging file; concurrent saves fail safely. Remove a stale file after an interrupted save.
     let temporary = path.with_extension("tmp");
@@ -2338,7 +2407,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v16\n")
+                .starts_with("vibeconsole-mappings-v17\n")
         );
         assert!(
             load_config(&path)
@@ -2520,7 +2589,7 @@ mod tests {
         };
         save_config(&path, &tuned).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v16\n"));
+        assert!(text.starts_with("vibeconsole-mappings-v17\n"));
         assert!(text.contains("\ntuning\t20\t60\t25\ton\toff\n"));
         assert_eq!(load_config(&path).unwrap(), tuned);
         for bad in [
@@ -2555,6 +2624,49 @@ mod tests {
                 .is_err()
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 49: an agent has a host (tmux, Orca or herdr). A v16 file's agents load as
+    /// tmux and save as v17 with the host; each host round-trips; a host's own name rules
+    /// are checked; an unknown host is refused.
+    #[test]
+    fn agents_keep_their_host_and_v16_agents_are_tmux() {
+        let mut config = Config::default();
+        config.agents = vec![Agent::new("claude", "claude", "claude").unwrap()];
+        let v16 = serialize_config(&config)
+            .unwrap()
+            .replace("vibeconsole-mappings-v17", "vibeconsole-mappings-v16")
+            .replace("\t1\ttmux\n", "\t1\n");
+        let old = parse_config(&v16).unwrap();
+        assert_eq!(old.agents[0].host, Host::Tmux);
+        let mut orca = Agent::new("orca-claude", "claude", "orca-claude").unwrap();
+        orca.host = Host::Orca;
+        orca.dir = Some("/work/app".into());
+        let mut herdr = Agent::new("api", "api", "api").unwrap();
+        herdr.host = Host::Herdr;
+        config.agents.extend([orca, herdr]);
+        let text = serialize_config(&config).unwrap();
+        assert!(text.starts_with("vibeconsole-mappings-v17\n"), "{text}");
+        assert!(
+            text.contains("\nagent\tclaude\tclaude\tclaude\t-\t1\ttmux\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\tclaude\torca-claude\t/work/app\t1\torca\n"),
+            "{text}"
+        );
+        assert_eq!(parse_config(&text).unwrap(), config);
+        assert!(parse_config(&text.replace("\t1\torca\n", "\t1\tt3\n")).is_err());
+        assert!(parse_config(&text.replace("\t1\torca\n", "\t1\n")).is_err());
+        // An Orca agent's kind is one simple name (it is passed to `orca agent launch`).
+        let mut bad = config.clone();
+        bad.agents[1].launch = "claude --yolo".into();
+        assert!(serialize_config(&bad).is_err());
+        // A herdr agent's name follows herdr's rule.
+        let mut bad = config.clone();
+        bad.agents[2].name = "API".into();
+        bad.agents[2].window = "API".into();
+        assert!(serialize_config(&bad).is_err());
     }
 
     /// v7 ticket 06: other MIDI devices are listed by name; each gets its own context, so
@@ -2981,7 +3093,7 @@ mod tests {
         let path = dir.join("mappings.tsv");
         save_config(&path, &config).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
-        assert!(saved.starts_with("vibeconsole-mappings-v16\n"));
+        assert!(saved.starts_with("vibeconsole-mappings-v17\n"));
         assert!(saved.contains("\tflow\t") && !saved.contains("flow-start"));
         assert_eq!(load_config(&path).unwrap(), config);
         fs::remove_dir_all(dir).unwrap();
@@ -3007,7 +3119,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v16\n")
+                .starts_with("vibeconsole-mappings-v17\n")
         );
         assert_eq!(load_config(&path).unwrap(), config);
         fs::remove_dir_all(dir).unwrap();
@@ -3028,7 +3140,7 @@ mod tests {
         let path = dir.join("mappings.tsv");
         save_config(&path, &config).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v16\n") && text.contains("\tstatus\n"));
+        assert!(text.starts_with("vibeconsole-mappings-v17\n") && text.contains("\tstatus\n"));
         assert_eq!(load_config(&path).unwrap(), config);
         let pad = Control::from_note(10, 37).unwrap();
         for (action, observable) in [
@@ -3105,7 +3217,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v16\n")
+                .starts_with("vibeconsole-mappings-v17\n")
         );
         assert_eq!(load_config(&path).unwrap(), config);
         // ${NAME}: user variable, then startup variable; other text stays; no environment.
