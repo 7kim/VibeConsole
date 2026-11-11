@@ -854,7 +854,7 @@ pub fn overlay(all: &[Mapping], profile: Option<&Profile>, context: u8) -> Vec<M
 }
 /// Gamepad tuning (v7 config v16): stick dead zone and trigger fire point in percent of
 /// travel, mouse speed 1–50, rumble on/off. Defaults are safe: rumble off.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Tuning {
     pub dead_zone: u8,
     pub trigger: u8,
@@ -862,6 +862,95 @@ pub struct Tuning {
     pub rumble: bool,
     /// v7 ticket 22: the stick that moves the pointer, if any.
     pub mouse: MouseStick,
+    /// v7 ticket 75 (config v18): left then right stick, each Linear or Angle.
+    pub sticks: [StickMode; 2],
+}
+/// How a stick fires (v7 ticket 75). Linear: up/down/left/right, each on its own axis.
+/// Angle: the stick's angle (0° = up, clockwise) picks one of its ranges, each a control.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum StickMode {
+    #[default]
+    Linear,
+    /// `[start, end)` in whole degrees; `start > end` wraps through 0°. At most
+    /// [`MAX_RANGES`], never overlapping.
+    Angle(Vec<(u16, u16)>),
+}
+/// Ranges one stick can have in angle mode; each is its own control id.
+pub const MAX_RANGES: usize = 16;
+impl StickMode {
+    /// The default angle mode: 8 sectors of 45°, from straight up clockwise.
+    pub fn sectors() -> Self {
+        Self::Angle((0..8).map(|k| (k * 45, k * 45 + 45)).collect())
+    }
+    /// `linear`, or `angle:0-45,45-90,…`.
+    pub fn text(&self) -> String {
+        match self {
+            Self::Linear => "linear".into(),
+            Self::Angle(ranges) => {
+                let ranges = ranges.iter().map(|(a, b)| format!("{a}-{}", b % 360));
+                format!("angle:{}", ranges.collect::<Vec<_>>().join(","))
+            }
+        }
+    }
+    pub fn parse(text: &str) -> Result<Self> {
+        if text == "linear" {
+            return Ok(Self::Linear);
+        }
+        let ranges = text
+            .strip_prefix("angle:")
+            .ok_or("stick mode must be linear or angle")?;
+        let range = |r: &str| -> Result<(u16, u16)> {
+            let (a, b) = r
+                .split_once('-')
+                .ok_or("a stick range is start-end in degrees")?;
+            let end: u16 = b.trim().parse()?;
+            Ok((a.trim().parse()?, if end == 0 { 360 } else { end }))
+        };
+        Ok(Self::Angle(
+            ranges.split(',').map(range).collect::<Result<_>>()?,
+        ))
+    }
+    /// The range holding `degrees` (0 ≤ degrees < 360), if any. Core's one lookup: firing,
+    /// the hints and Detect all use it.
+    pub fn range_at(&self, degrees: f32) -> Option<usize> {
+        let Self::Angle(ranges) = self else {
+            return None;
+        };
+        ranges.iter().position(|&(a, b)| {
+            let (a, b) = (f32::from(a), f32::from(b));
+            if a < b {
+                (a..b).contains(&degrees)
+            } else {
+                degrees >= a || degrees < b
+            }
+        })
+    }
+    fn validate(&self, side: &str) -> Result<()> {
+        let Self::Angle(ranges) = self else {
+            return Ok(());
+        };
+        if ranges.is_empty() || ranges.len() > MAX_RANGES {
+            return Err(format!("tuning: {side} stick needs 1–{MAX_RANGES} angle ranges").into());
+        }
+        for &(a, b) in ranges {
+            if a >= 360 || !(1..=360).contains(&b) || a == b % 360 {
+                return Err(format!("tuning: {side} stick range {a}°–{b}° is not 0–360°").into());
+            }
+        }
+        for degree in 0..360u16 {
+            let holding = ranges.iter().filter(|&&(a, b)| {
+                if a < b {
+                    (a..b).contains(&degree)
+                } else {
+                    degree >= a || degree < b
+                }
+            });
+            if holding.count() > 1 {
+                return Err(format!("tuning: {side} stick ranges overlap at {degree}°").into());
+            }
+        }
+        Ok(())
+    }
 }
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum MouseStick {
@@ -887,11 +976,24 @@ impl Default for Tuning {
             mouse_speed: 10,
             rumble: false,
             mouse: MouseStick::Off,
+            sticks: Default::default(),
         }
     }
 }
 impl Tuning {
     pub fn validate(self) -> Result<Self> {
+        for (stick, side, mouse) in [
+            (0, "left", MouseStick::Left),
+            (1, "right", MouseStick::Right),
+        ] {
+            self.sticks[stick].validate(side)?;
+            if self.mouse == mouse && self.sticks[stick] != StickMode::Linear {
+                return Err(format!(
+                    "tuning: the {side} stick moves the pointer, so it can't be in angle mode"
+                )
+                .into());
+            }
+        }
         if self.dead_zone > 90 {
             return Err("tuning: dead zone must be 0–90%".into());
         }
@@ -1398,9 +1500,10 @@ fn parse_config(contents: &str) -> Result<Config> {
         Some("15") => 15,
         Some("16") => 16,
         Some("17") => 17,
+        Some("18") => 18,
         _ => {
             return Err(
-                "invalid configuration header; expected vibeconsole-mappings-v1..v17".into(),
+                "invalid configuration header; expected vibeconsole-mappings-v1..v18".into(),
             );
         }
     };
@@ -1658,6 +1761,15 @@ fn parse_config(contents: &str) -> Result<Config> {
                 "left" => MouseStick::Left,
                 "right" => MouseStick::Right,
                 _ => return Err("tuning mouse must be off, left or right".into()),
+            },
+            sticks: if version >= 18 {
+                let line = lines.next().ok_or("missing sticks")?;
+                let ["sticks", left, right] = line.split('\t').collect::<Vec<_>>()[..] else {
+                    return Err("expected sticks left/right fields".into());
+                };
+                [StickMode::parse(left)?, StickMode::parse(right)?]
+            } else {
+                Default::default()
             },
         }
         .validate()?
@@ -1926,7 +2038,7 @@ pub fn serialize_config(config: &Config) -> Result<String> {
     validate_variables(&config.vars, "user")?;
     config.validate_references()?;
     let mut contents = format!(
-        "vibeconsole-mappings-v17\nidle\t{}\t{}\t{}\n",
+        "vibeconsole-mappings-v18\nidle\t{}\t{}\t{}\n",
         opt_text(config.idle.octave),
         opt_text(config.idle.tempo),
         arp_text(config.idle.arp)
@@ -2001,14 +2113,16 @@ pub fn serialize_config(config: &Config) -> Result<String> {
             agent.host.text()
         ));
     }
-    let tuning = config.tuning.validate()?;
+    let tuning = config.tuning.clone().validate()?;
     contents.push_str(&format!(
-        "tuning\t{}\t{}\t{}\t{}\t{}\n",
+        "tuning\t{}\t{}\t{}\t{}\t{}\nsticks\t{}\t{}\n",
         tuning.dead_zone,
         tuning.trigger,
         tuning.mouse_speed,
         if tuning.rumble { "on" } else { "off" },
-        tuning.mouse.text()
+        tuning.mouse.text(),
+        tuning.sticks[0].text(),
+        tuning.sticks[1].text()
     ));
     contents.push_str(&format!("midi-devices\t{}\n", config.midi_devices.len()));
     for name in &config.midi_devices {
@@ -2407,7 +2521,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v17\n")
+                .starts_with("vibeconsole-mappings-v18\n")
         );
         assert!(
             load_config(&path)
@@ -2570,7 +2684,8 @@ mod tests {
                 trigger: 30,
                 mouse_speed: 10,
                 rumble: false,
-                mouse: MouseStick::Off
+                mouse: MouseStick::Off,
+                sticks: Default::default(),
             }
         );
         // A failed save leaves the v15 file byte-identical.
@@ -2586,35 +2701,36 @@ mod tests {
             mouse_speed: 25,
             rumble: true,
             mouse: MouseStick::Off,
+            sticks: Default::default(),
         };
         save_config(&path, &tuned).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v17\n"));
+        assert!(text.starts_with("vibeconsole-mappings-v18\n"));
         assert!(text.contains("\ntuning\t20\t60\t25\ton\toff\n"));
         assert_eq!(load_config(&path).unwrap(), tuned);
         for bad in [
             Tuning {
                 dead_zone: 91,
-                ..tuned.tuning
+                ..tuned.tuning.clone()
             },
             Tuning {
                 trigger: 0,
-                ..tuned.tuning
+                ..tuned.tuning.clone()
             },
             Tuning {
                 trigger: 101,
-                ..tuned.tuning
+                ..tuned.tuning.clone()
             },
             Tuning {
                 mouse_speed: 0,
-                ..tuned.tuning
+                ..tuned.tuning.clone()
             },
             Tuning {
                 mouse_speed: 51,
-                ..tuned.tuning
+                ..tuned.tuning.clone()
             },
         ] {
-            assert!(bad.validate().is_err(), "{bad:?}");
+            assert!(bad.clone().validate().is_err(), "{bad:?}");
         }
         // A v16 file without its tuning line, or with a bad one, is refused.
         let v16 = text.clone();
@@ -2626,8 +2742,100 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7 ticket 75: each stick's mode and ranges round-trip in v18; overlapping or bad
+    /// ranges and an angle-mode mouse stick are refused, and a refused save keeps the file;
+    /// a v17 file loads both sticks as Linear.
+    #[test]
+    fn stick_modes_round_trip_and_bad_ranges_are_refused() {
+        let dir = std::env::temp_dir().join(format!("vibeconsole-sticks-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let mut config = Config::default();
+        config.tuning.sticks = [
+            StickMode::sectors(),
+            StickMode::Angle(vec![(50, 80), (330, 30)]),
+        ];
+        save_config(&path, &config).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains(
+            "\nsticks\tangle:0-45,45-90,90-135,135-180,180-225,225-270,270-315,315-0\tangle:50-80,330-30\n"
+        ));
+        assert_eq!(load_config(&path).unwrap(), config);
+        let v17 = text
+            .replace("vibeconsole-mappings-v18", "vibeconsole-mappings-v17")
+            .lines()
+            .filter(|l| !l.starts_with("sticks\t"))
+            .map(|l| format!("{l}\n"))
+            .collect::<String>();
+        assert_eq!(
+            parse_config(&v17).unwrap().tuning.sticks,
+            [StickMode::Linear, StickMode::Linear]
+        );
+        let refused = |sticks: [StickMode; 2], mouse: MouseStick| {
+            let mut bad = config.clone();
+            bad.tuning.sticks = sticks;
+            bad.tuning.mouse = mouse;
+            let error = save_config(&path, &bad).unwrap_err().to_string();
+            assert_eq!(fs::read_to_string(&path).unwrap(), text, "{error}");
+            error
+        };
+        let angle = |r: Vec<(u16, u16)>| StickMode::Angle(r);
+        let linear = StickMode::Linear;
+        assert!(
+            refused(
+                [angle(vec![(0, 90), (45, 100)]), linear.clone()],
+                MouseStick::Off
+            )
+            .contains("overlap at 45°")
+        );
+        assert!(
+            refused(
+                [linear.clone(), angle(vec![(300, 20), (10, 40)])],
+                MouseStick::Off
+            )
+            .contains("overlap at 10°")
+        );
+        assert!(
+            refused([angle(vec![(10, 10)]), linear.clone()], MouseStick::Off)
+                .contains("not 0–360°")
+        );
+        assert!(
+            refused([angle(vec![(400, 10)]), linear.clone()], MouseStick::Off)
+                .contains("not 0–360°")
+        );
+        assert!(refused([angle(vec![]), linear.clone()], MouseStick::Off).contains("1–16"));
+        assert!(
+            refused([angle(vec![(0, 1); 17]), linear.clone()], MouseStick::Off).contains("1–16")
+        );
+        assert!(
+            refused([StickMode::sectors(), linear.clone()], MouseStick::Left)
+                .contains("moves the pointer")
+        );
+        for bad in [
+            "sticks\tdiagonal\tlinear",
+            "sticks\tangle:10\tlinear",
+            "sticks\tangle:a-b\tlinear",
+            "sticks\tlinear",
+        ] {
+            let edited = text
+                .lines()
+                .map(|l| {
+                    if l.starts_with("sticks\t") {
+                        bad.to_string()
+                    } else {
+                        l.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(parse_config(&edited).is_err(), "{bad}");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// v7 ticket 49: an agent has a host (tmux, Orca or herdr). A v16 file's agents load as
-    /// tmux and save as v17 with the host; each host round-trips; a host's own name rules
+    /// tmux and save as v18 with the host; each host round-trips; a host's own name rules
     /// are checked; an unknown host is refused.
     #[test]
     fn agents_keep_their_host_and_v16_agents_are_tmux() {
@@ -2635,7 +2843,8 @@ mod tests {
         config.agents = vec![Agent::new("claude", "claude", "claude").unwrap()];
         let v16 = serialize_config(&config)
             .unwrap()
-            .replace("vibeconsole-mappings-v17", "vibeconsole-mappings-v16")
+            .replace("vibeconsole-mappings-v18", "vibeconsole-mappings-v16")
+            .replace("sticks\tlinear\tlinear\n", "")
             .replace("\t1\ttmux\n", "\t1\n");
         let old = parse_config(&v16).unwrap();
         assert_eq!(old.agents[0].host, Host::Tmux);
@@ -2646,7 +2855,7 @@ mod tests {
         herdr.host = Host::Herdr;
         config.agents.extend([orca, herdr]);
         let text = serialize_config(&config).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v17\n"), "{text}");
+        assert!(text.starts_with("vibeconsole-mappings-v18\n"), "{text}");
         assert!(
             text.contains("\nagent\tclaude\tclaude\tclaude\t-\t1\ttmux\n"),
             "{text}"
@@ -3093,7 +3302,7 @@ mod tests {
         let path = dir.join("mappings.tsv");
         save_config(&path, &config).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
-        assert!(saved.starts_with("vibeconsole-mappings-v17\n"));
+        assert!(saved.starts_with("vibeconsole-mappings-v18\n"));
         assert!(saved.contains("\tflow\t") && !saved.contains("flow-start"));
         assert_eq!(load_config(&path).unwrap(), config);
         fs::remove_dir_all(dir).unwrap();
@@ -3119,7 +3328,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v17\n")
+                .starts_with("vibeconsole-mappings-v18\n")
         );
         assert_eq!(load_config(&path).unwrap(), config);
         fs::remove_dir_all(dir).unwrap();
@@ -3140,7 +3349,7 @@ mod tests {
         let path = dir.join("mappings.tsv");
         save_config(&path, &config).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v17\n") && text.contains("\tstatus\n"));
+        assert!(text.starts_with("vibeconsole-mappings-v18\n") && text.contains("\tstatus\n"));
         assert_eq!(load_config(&path).unwrap(), config);
         let pad = Control::from_note(10, 37).unwrap();
         for (action, observable) in [
@@ -3217,7 +3426,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v17\n")
+                .starts_with("vibeconsole-mappings-v18\n")
         );
         assert_eq!(load_config(&path).unwrap(), config);
         // ${NAME}: user variable, then startup variable; other text stays; no environment.

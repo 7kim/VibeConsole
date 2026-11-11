@@ -41,20 +41,43 @@ const STICKS: [&str; 8] = [
     "Right stick left",
     "Right stick right",
 ];
-/// Every control an Xbox controller has: buttons, then stick directions.
-pub const CONTROLS: usize = BUTTONS.len() + STICKS.len();
+/// v7 ticket 75: a stick in angle mode fires one control per range: the left stick's from
+/// here, the right stick's [`MAX_RANGES`] later.
+pub const ANGLE_BASE: u8 = STICK_BASE + 8;
+const MAX_RANGES: u8 = crate::mappings::MAX_RANGES as u8;
+/// Every control an Xbox controller has: buttons, stick directions, then angle ranges.
+pub const CONTROLS: usize = ANGLE_BASE as usize + 2 * MAX_RANGES as usize;
 
 pub fn control(button: gilrs::Button) -> Option<Control> {
     let id = BUTTONS.iter().position(|(b, _)| *b == button)?;
     Some(Control::button(u8::try_from(id).ok()?))
 }
-pub fn button_name(id: u8) -> &'static str {
+pub fn button_name(id: u8) -> String {
+    if let Some(range) = id.checked_sub(ANGLE_BASE).filter(|r| *r < 2 * MAX_RANGES) {
+        let side = if range < MAX_RANGES { "Left" } else { "Right" };
+        return format!("{side} stick angle range {}", range % MAX_RANGES + 1);
+    }
     let id = usize::from(id);
     BUTTONS
         .get(id)
         .map(|(_, name)| *name)
         .or_else(|| STICKS.get(id.wrapping_sub(BUTTONS.len())).copied())
         .unwrap_or("unknown")
+        .into()
+}
+/// Which stick (0 left, 1 right) a direction or angle range belongs to.
+fn stick_of(control: Control) -> Option<usize> {
+    match control.id {
+        id if (STICK_BASE..ANGLE_BASE).contains(&id) => Some(usize::from((id - STICK_BASE) / 4)),
+        id if usize::from(id) < CONTROLS && id >= ANGLE_BASE => {
+            Some(usize::from((id - ANGLE_BASE) / MAX_RANGES))
+        }
+        _ => None,
+    }
+}
+/// A stick's angle in degrees: 0 = up, clockwise (gilrs: up is positive y).
+pub fn angle_of(x: f32, y: f32) -> f32 {
+    (x.atan2(y).to_degrees() + 360.0) % 360.0
 }
 
 /// The default layout, so a new controller is useful before anything is configured.
@@ -237,6 +260,8 @@ pub struct Analog {
     pub rt: f32,
     pub left: (f32, f32),
     pub right: (f32, f32),
+    /// v7 ticket 75: after a stick's mode changes it fires nothing until it's let go.
+    pub wait: [bool; 2],
 }
 /// Analog movement reduced to what VibeConsole uses.
 #[derive(Clone, Copy, Debug)]
@@ -285,33 +310,66 @@ pub fn analog(
             set(down, control, on, &mut changes);
         }
         Motion::Axis(axis, value) => {
-            let (stick, offset, y) = match axis {
-                gilrs::Axis::LeftStickX => (&mut analog.left, 0, false),
-                gilrs::Axis::LeftStickY => (&mut analog.left, 0, true),
-                gilrs::Axis::RightStickX => (&mut analog.right, 4, false),
-                gilrs::Axis::RightStickY => (&mut analog.right, 4, true),
+            let (side, y) = match axis {
+                gilrs::Axis::LeftStickX => (0, false),
+                gilrs::Axis::LeftStickY => (0, true),
+                gilrs::Axis::RightStickX => (1, false),
+                gilrs::Axis::RightStickY => (1, true),
                 _ => return changes,
+            };
+            let stick = if side == 0 {
+                &mut analog.left
+            } else {
+                &mut analog.right
             };
             if y {
                 stick.1 = value;
             } else {
                 stick.0 = value;
             }
+            let (sx, sy) = *stick;
             // The mouse stick moves the pointer; its directions don't fire.
             let mouse = match tuning.mouse {
-                crate::mappings::MouseStick::Left => 0,
-                crate::mappings::MouseStick::Right => 4,
-                crate::mappings::MouseStick::Off => u8::MAX,
+                crate::mappings::MouseStick::Left => Some(0),
+                crate::mappings::MouseStick::Right => Some(1),
+                crate::mappings::MouseStick::Off => None,
             };
-            if offset == mouse {
+            if mouse == Some(side) {
                 return changes;
             }
+            let dead = f32::from(tuning.dead_zone);
+            let press = dead.max(50.0);
+            let push = sx.hypot(sy).min(1.0) * 100.0;
+            if analog.wait[side] {
+                analog.wait[side] = push > dead;
+                return changes;
+            }
+            // Angle mode: the range the stick points into is held; moving to the next range
+            // releases the first before pressing the next. Inside the dead zone, none.
+            if let mode @ crate::mappings::StickMode::Angle(_) = &tuning.sticks[side] {
+                let base = ANGLE_BASE + side as u8 * MAX_RANGES;
+                let held = (base..base + MAX_RANGES)
+                    .map(Control::button)
+                    .find(|c| down.contains(c));
+                let target = (push > dead)
+                    .then(|| mode.range_at(angle_of(sx, sy)))
+                    .flatten()
+                    .map(|range| Control::button(base + range as u8));
+                if held != target {
+                    if let Some(held) = held {
+                        set(down, held, false, &mut changes);
+                    }
+                    if let Some(target) = target.filter(|_| push >= press || held.is_some()) {
+                        set(down, target, true, &mut changes);
+                    }
+                }
+                return changes;
+            }
+            let offset = side as u8 * 4;
             // Up/down for y (gilrs: up is positive), right/left for x.
             let (positive, negative) = if y { (0, 1) } else { (3, 2) };
             let at = |n: u8| Control::button(STICK_BASE + offset + n);
             let percent = value.abs() * 100.0;
-            let dead = f32::from(tuning.dead_zone);
-            let press = dead.max(50.0);
             // Releases first, so flipping sides never holds both directions.
             for (n, sign) in [(positive, 1.0), (negative, -1.0)] {
                 let control = at(n);
@@ -328,6 +386,25 @@ pub fn analog(
         }
     }
     changes
+}
+
+/// v7 ticket 75: a stick whose mode changes forgets its held directions and ranges and, if
+/// pushed now, fires nothing until it's let go. True when any stick's mode changed.
+pub fn retune(
+    down: &mut HashSet<Control>,
+    analog: &mut Analog,
+    old: &crate::mappings::Tuning,
+    new: &crate::mappings::Tuning,
+) -> bool {
+    let changed = [0, 1].map(|s| old.sticks[s] != new.sticks[s]);
+    let dead = f32::from(new.dead_zone);
+    for (side, (x, y)) in [(0, analog.left), (1, analog.right)] {
+        if changed[side] {
+            down.retain(|c| stick_of(*c) != Some(side));
+            analog.wait[side] = x.hypot(y) * 100.0 > dead;
+        }
+    }
+    changed.contains(&true)
 }
 
 /// v7 ticket 11: rumble when a source (agent or folder) newly finishes or needs the user;
@@ -474,8 +551,12 @@ impl Pad {
                 _ => None,
             };
             if let Some(motion) = motion {
-                let tuning = self.tuning;
-                changes.extend(analog(&mut self.down, &mut self.analog, motion, &tuning));
+                changes.extend(analog(
+                    &mut self.down,
+                    &mut self.analog,
+                    motion,
+                    &self.tuning,
+                ));
                 continue;
             }
             let kind = match event.event {
@@ -496,6 +577,13 @@ impl Pad {
             changes.extend(change(&mut self.down, kind, &name));
         }
         changes
+    }
+    /// New settings; true when a stick's mode changed ([`retune`]): the caller then runs a
+    /// transition.
+    pub fn set_tuning(&mut self, tuning: crate::mappings::Tuning) -> bool {
+        let changed = retune(&mut self.down, &mut self.analog, &self.tuning, &tuning);
+        self.tuning = tuning;
+        changed
     }
     /// A transition: queued events are dropped and held buttons forgotten, so the next
     /// fresh press fires and nothing replays.
@@ -843,6 +931,116 @@ mod tests {
     /// v7 ticket 09: holding LB switches to layer 2. The switch is a transition: a button
     /// held across it is released, doesn't fire on release, and fires its layer-2 action on
     /// its next press. LB itself is the layer key, never a mapping.
+    /// v7 ticket 75: in angle mode a stick fires the range it points into (0° = up,
+    /// clockwise), never its linear directions; moving on releases before pressing; the
+    /// dead zone fires nothing; a mode change waits for the stick to be let go.
+    #[test]
+    fn angle_mode_fires_the_range_the_stick_points_into() {
+        use crate::mappings::{StickMode, Tuning};
+        let mut tuning = Tuning::default(); // dead zone 15%
+        tuning.sticks[0] = StickMode::sectors();
+        let (mut down, mut pad) = (HashSet::new(), Analog::default());
+        // Moves the left stick to `deg` at `push` (0–1) in one step.
+        let mut push = |deg: f32,
+                        push: f32,
+                        tuning: &Tuning,
+                        down: &mut HashSet<Control>,
+                        pad: &mut Analog| {
+            let (x, y) = (deg.to_radians().sin() * push, deg.to_radians().cos() * push);
+            pad.left = (x, y);
+            analog(down, pad, Motion::Axis(gilrs::Axis::LeftStickY, y), tuning)
+        };
+        let range = |i: u8| Control::button(ANGLE_BASE + i);
+        let press = |c| Change::Event(Event::Press(c));
+        let release = |c| Change::Event(Event::Release(c, ReleaseType::ButtonUp));
+        assert_eq!(angle_of(0.0, 1.0), 0.0);
+        assert_eq!(angle_of(1.0, 0.0), 90.0);
+        assert_eq!(angle_of(-1.0, 0.0), 270.0);
+        // 65° fires the 45°–90° sector, not "left" or "up".
+        assert_eq!(
+            push(65.0, 0.8, &tuning, &mut down, &mut pad),
+            [press(range(1))]
+        );
+        assert_eq!(down, HashSet::from([range(1)]));
+        assert_eq!(
+            push(70.0, 0.9, &tuning, &mut down, &mut pad),
+            [],
+            "same range: held once"
+        );
+        assert_eq!(
+            push(100.0, 0.8, &tuning, &mut down, &mut pad),
+            [release(range(1)), press(range(2))]
+        );
+        // Back inside the dead zone: released; a drift-sized push fires nothing.
+        assert_eq!(
+            push(100.0, 0.1, &tuning, &mut down, &mut pad),
+            [release(range(2))]
+        );
+        assert_eq!(
+            push(300.0, 0.3, &tuning, &mut down, &mut pad),
+            [],
+            "under half travel"
+        );
+        assert_eq!(
+            push(300.0, 0.6, &tuning, &mut down, &mut pad),
+            [press(range(6))]
+        );
+        push(0.0, 0.0, &tuning, &mut down, &mut pad);
+        // The right stick stays linear.
+        pad.right = (0.8, 0.0);
+        let right = analog(
+            &mut down,
+            &mut pad,
+            Motion::Axis(gilrs::Axis::RightStickX, 0.8),
+            &tuning,
+        );
+        assert_eq!(right, [press(Control::button(STICK_BASE + 7))]);
+        // The user's own ranges, one wrapping through 0°; a gap fires nothing.
+        tuning.sticks[0] = StickMode::Angle(vec![(50, 80), (330, 30)]);
+        assert_eq!(
+            push(65.0, 0.8, &tuning, &mut down, &mut pad),
+            [press(range(0))]
+        );
+        assert_eq!(
+            push(40.0, 0.8, &tuning, &mut down, &mut pad),
+            [release(range(0))]
+        );
+        assert_eq!(
+            push(10.0, 0.8, &tuning, &mut down, &mut pad),
+            [press(range(1))]
+        );
+        assert_eq!(push(345.0, 0.8, &tuning, &mut down, &mut pad), []);
+        // Changing the mode while pushed: its held range is forgotten, and nothing fires until
+        // the stick is let go and pushed again.
+        let mut linear = tuning.clone();
+        linear.sticks[0] = StickMode::Linear;
+        assert!(retune(&mut down, &mut pad, &tuning, &linear));
+        assert!(!down.contains(&range(1)) && down.contains(&Control::button(STICK_BASE + 7)));
+        assert_eq!(
+            push(270.0, 0.9, &linear, &mut down, &mut pad),
+            [],
+            "still pushed"
+        );
+        assert_eq!(push(0.0, 0.0, &linear, &mut down, &mut pad), []);
+        pad.left = (-0.9, 0.0);
+        let left = analog(
+            &mut down,
+            &mut pad,
+            Motion::Axis(gilrs::Axis::LeftStickX, -0.9),
+            &linear,
+        );
+        assert_eq!(
+            left,
+            [press(Control::button(STICK_BASE + 2))],
+            "fresh push: linear left"
+        );
+        assert!(
+            !retune(&mut down, &mut pad, &linear, &linear.clone()),
+            "no mode change"
+        );
+        assert_eq!(button_name(ANGLE_BASE + 17), "Right stick angle range 2");
+    }
+
     #[test]
     fn holding_lb_switches_layers_as_a_transition() {
         use evdev::KeyCode;

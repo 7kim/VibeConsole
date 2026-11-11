@@ -891,9 +891,16 @@ impl Terminal {
         };
         let before = self.alert_states();
         self.light_agents = config.status_lights.then(|| config.agents.clone());
-        // Settings -> Xbox tuning applies within a status refresh.
-        if let Some(pad) = &mut self.gamepad {
-            pad.tuning = config.tuning;
+        // Settings -> Xbox tuning applies within a status refresh; a stick mode change is a
+        // transition (v7 ticket 75).
+        let modes =
+            (self.gamepad.as_mut()).is_some_and(|pad| pad.set_tuning(config.tuning.clone()));
+        if modes {
+            if let Err(error) =
+                self.gamepad_transition("Stick mode changed: held keys released".into())
+            {
+                self.notice = format!("stick mode change: {error}");
+            }
         }
         self.light_patterns = config.light_patterns;
         self.light_sessions = if config.status_lights {
@@ -1397,7 +1404,7 @@ impl Terminal {
         match crate::gamepad::Pad::open() {
             Ok(mut pad) => {
                 if let Ok(config) = mappings::load_config(&self.path) {
-                    pad.tuning = config.tuning;
+                    pad.tuning = config.tuning.clone();
                 }
                 if let Some(name) = pad.connected().first() {
                     self.notice = format!("Xbox controller ready: {name}");
@@ -4179,7 +4186,7 @@ fn profile_menu(ui: &mut impl Ui, path: &Path, name: &str) -> Result<()> {
 /// fires) and how far a trigger is pulled before it fires.
 fn tuning_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
     let mut config = mappings::load_config(path)?;
-    let tuning = config.tuning;
+    let tuning = config.tuning.clone();
     let items = vec![
         format!("Stick dead zone: {}%", tuning.dead_zone),
         format!("Triggers fire at: {}% of travel", tuning.trigger),
@@ -4196,6 +4203,8 @@ fn tuning_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
             }
         ),
         format!("Mouse speed: {}", tuning.mouse_speed),
+        format!("Left stick: {}", stick_text(&tuning.sticks[0])),
+        format!("Right stick: {}", stick_text(&tuning.sticks[1])),
         "Back".to_string(),
     ];
     let title = format!(
@@ -4259,9 +4268,56 @@ fn tuning_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
             };
             config.tuning.mouse_speed = u8::try_from(value)?;
         }
+        Some(side @ (5 | 6)) => {
+            let side = side - 5;
+            let Some(mode) = choose(
+                ui,
+                "Stick mode: Linear fires up, down, left and right; Angle fires the range the stick points into (0° = up, clockwise)",
+                &options(&["Linear", "Angle: 8 sectors of 45°", "Angle: my own ranges"]),
+            )?
+            else {
+                return Ok(());
+            };
+            config.tuning.sticks[side] = match mode {
+                0 => mappings::StickMode::Linear,
+                1 => mappings::StickMode::sectors(),
+                _ => {
+                    let now = match &tuning.sticks[side] {
+                        mode @ mappings::StickMode::Angle(_) => {
+                            mode.text()["angle:".len()..].to_owned()
+                        }
+                        mappings::StickMode::Linear => String::new(),
+                    };
+                    let Some(text) = text_entry(
+                        ui,
+                        "Ranges in degrees, start-end, comma separated (e.g. 50-80,280-310); 0° = up, clockwise",
+                        &now,
+                    )?
+                    else {
+                        return Ok(());
+                    };
+                    mappings::StickMode::parse(&format!("angle:{}", text.replace(' ', "")))?
+                }
+            };
+        }
         _ => return Ok(()),
     }
     mappings::save_config(path, &config)
+}
+
+/// A stick's mode for Settings -> Xbox tuning (v7 ticket 75).
+fn stick_text(mode: &mappings::StickMode) -> String {
+    match mode {
+        mappings::StickMode::Linear => "Linear (up, down, left, right)".into(),
+        mappings::StickMode::Angle(ranges) => format!(
+            "Angle: {}",
+            ranges
+                .iter()
+                .map(|(a, b)| format!("{a}°–{b}°"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 /// Settings -> MIDI device (v7 ticket 06): the Akai, or another MIDI device, connected now
@@ -7484,6 +7540,7 @@ mod tests {
             rt: 0.0,
             left: (0.0, -1.0),
             right: (0.25, 0.0),
+            ..Analog::default()
         };
         let held = std::collections::HashSet::from([y]);
         let now = Instant::now();
@@ -9078,6 +9135,58 @@ mod tests {
         settings_menu(&mut ui, &path).unwrap();
         assert!(ui.screens.iter().any(|s| s.contains("Not saved")));
         assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 75: Settings -> Xbox tuning sets each stick Linear or Angle; overlapping
+    /// ranges are refused with the reason and keep the saved file.
+    #[test]
+    fn xbox_tuning_sets_stick_modes_and_refuses_overlapping_ranges() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-stick-ui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut keys = vec![Down; 8];
+        keys.push(Enter); // Xbox tuning
+        keys.extend(vec![Down; 5]);
+        keys.extend([Enter, Down, Enter, Escape]); // Left stick: 8 sectors
+        let mut ui = Script {
+            keys: keys.into(),
+            ..Default::default()
+        };
+        settings_menu(&mut ui, &path).unwrap();
+        assert!(ui.keys.is_empty());
+        let sticks = mappings::load_config(&path).unwrap().tuning.sticks;
+        assert_eq!(
+            sticks,
+            [mappings::StickMode::sectors(), mappings::StickMode::Linear]
+        );
+        let before = std::fs::read(&path).unwrap();
+        let mut keys = vec![Down; 8];
+        keys.push(Enter);
+        keys.extend(vec![Down; 6]);
+        keys.extend([Enter, Down, Down, Enter]); // Right stick: my own ranges
+        keys.extend("0-90,45-100".bytes().map(Character));
+        keys.extend([Enter, Enter, Escape]); // Not saved -> Back
+        let mut ui = Script {
+            keys: keys.into(),
+            ..Default::default()
+        };
+        settings_menu(&mut ui, &path).unwrap();
+        assert!(ui.keys.is_empty());
+        assert!(
+            ui.screens.iter().any(|s| s.contains("Not saved") && s.contains("right stick ranges overlap at 45°")),
+            "{:?}",
+            ui.screens.last()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains("Left stick: Angle: 0°–45°, 45°–90°"))
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -10997,9 +11106,9 @@ mod tests {
         )));
         // Ticket 17: a v14 file's per-agent tempos become the shared slow/fast tempos.
         let v14 = saved
-            .replace("vibeconsole-mappings-v17", "vibeconsole-mappings-v14")
+            .replace("vibeconsole-mappings-v18", "vibeconsole-mappings-v14")
             .replace(
-                "tuning\t15\t30\t10\toff\toff\nmidi-devices\t0\nmidi-active\t-\nprofiles\t0\nprofile-lock\t-\nfavourites\t0\n",
+                "tuning\t15\t30\t10\toff\toff\nsticks\tlinear\tlinear\nmidi-devices\t0\nmidi-active\t-\nprofiles\t0\nprofile-lock\t-\nfavourites\t0\n",
                 "",
             )
             .replace(
