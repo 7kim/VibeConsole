@@ -409,8 +409,26 @@ fn create_output() -> Result<VirtualDevice> {
 
 pub struct Output {
     pub keyboard: Keyboard,
-    device: VirtualDevice,
+    /// None: a recording output (v7 ticket 51), for session tests; nothing reaches the desktop.
+    device: Option<VirtualDevice>,
     pub node: std::path::PathBuf,
+    /// Keys a recording output was asked to press (true) and release (false), in order.
+    pub recorded: Vec<(KeyCode, bool)>,
+}
+
+fn send(
+    device: &mut Option<VirtualDevice>,
+    recorded: &mut Vec<(KeyCode, bool)>,
+    key: KeyCode,
+    down: bool,
+) -> io::Result<()> {
+    match device {
+        Some(device) => device.emit(&[InputEvent::new(EventType::KEY.0, key.0, i32::from(down))]),
+        None => {
+            recorded.push((key, down));
+            Ok(())
+        }
+    }
 }
 
 impl Output {
@@ -438,40 +456,51 @@ impl Output {
         };
         Ok(Self {
             keyboard,
-            device,
+            device: Some(device),
             node,
+            recorded: Vec::new(),
+        })
+    }
+    /// An output with no uinput device that records its keys instead (v7 ticket 51): lets a
+    /// session test drive real events without keyboard output on the desktop.
+    pub fn recording(mappings: &[Mapping]) -> Result<Self> {
+        let mut keyboard = Keyboard::new(mappings)?;
+        keyboard.running = false;
+        Ok(Self {
+            keyboard,
+            device: None,
+            node: std::path::PathBuf::new(),
+            recorded: Vec::new(),
         })
     }
     pub fn fire_due(&mut self) -> Result<Vec<(Control, bool)>> {
-        let device = &mut self.device;
+        let (device, recorded) = (&mut self.device, &mut self.recorded);
         Ok(self.keyboard.fire_due(Instant::now(), &mut |key, down| {
-            device.emit(&[InputEvent::new(EventType::KEY.0, key.0, i32::from(down))])
+            send(device, recorded, key, down)
         })?)
     }
     pub fn observe(&mut self, event: Event) -> Result<Option<(Control, bool)>> {
-        let device = &mut self.device;
-        Ok(self.keyboard.observe(event, &mut |key, down| {
-            device.emit(&[InputEvent::new(EventType::KEY.0, key.0, i32::from(down))])
-        })?)
+        let (device, recorded) = (&mut self.device, &mut self.recorded);
+        Ok(self
+            .keyboard
+            .observe(event, &mut |key, down| send(device, recorded, key, down))?)
     }
     pub fn tap(&mut self, keys: &[KeyCode]) -> Result<()> {
-        let device = &mut self.device;
-        Ok(self.keyboard.tap(keys, &mut |key, down| {
-            device.emit(&[InputEvent::new(EventType::KEY.0, key.0, i32::from(down))])
-        })?)
+        let (device, recorded) = (&mut self.device, &mut self.recorded);
+        Ok(self
+            .keyboard
+            .tap(keys, &mut |key, down| send(device, recorded, key, down))?)
     }
     pub fn pause(&mut self) -> Result<()> {
-        let device = &mut self.device;
-        self.keyboard.pause(&mut |key, down| {
-            device.emit(&[InputEvent::new(EventType::KEY.0, key.0, i32::from(down))])
-        })?;
+        let (device, recorded) = (&mut self.device, &mut self.recorded);
+        self.keyboard
+            .pause(&mut |key, down| send(device, recorded, key, down))?;
         Ok(())
     }
     pub fn clear(&mut self) -> Result<()> {
-        let device = &mut self.device;
-        self.keyboard.clear(&mut |key, down| {
-            device.emit(&[InputEvent::new(EventType::KEY.0, key.0, i32::from(down))])
-        })?;
+        let (device, recorded) = (&mut self.device, &mut self.recorded);
+        self.keyboard
+            .clear(&mut |key, down| send(device, recorded, key, down))?;
         Ok(())
     }
 }

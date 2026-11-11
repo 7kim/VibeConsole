@@ -10043,6 +10043,74 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7 ticket 51: with a verified Akai program, pressing Xbox shortcuts (a saved Y = Left
+    /// and the default A = Enter) through the session's event path types the keys, keeps the
+    /// session running with no error, and leaves every key released. The keyboard records its
+    /// keys instead of reaching the desktop.
+    #[test]
+    fn xbox_shortcuts_keep_a_verified_akai_session_running() {
+        use crate::feedback::{Octave, Resolver, Settings, State};
+        use evdev::KeyCode;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-xbox-akai-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let pad = Control::from_note(10, 36).unwrap();
+        let mut lit = Mapping::new(pad, "F1", "hold").unwrap();
+        lit.feedback.octave = Some(Octave::Offset(1));
+        let y = Mapping::new(Control::button(3), "Left", "hold").unwrap();
+        mappings::save(&path, &[lit, y.clone()]).unwrap();
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        let saved = mappings::load_config(&path).unwrap().mappings;
+        ui.run_mappings = ui.context_mappings(&saved); // the Akai program's set, as at Run
+        let baseline = State {
+            octave: 0,
+            tempo: 120,
+            arp: false,
+        };
+        ui.resolver = Some(Resolver::new(&ui.run_mappings, baseline, Settings::default()).unwrap());
+        ui.context_verified = true;
+        // The keyboard as Run builds it with an Xbox controller connected.
+        let all = [ui.run_mappings.clone(), ui.xbox_layout().unwrap()].concat();
+        let mut output = crate::keyboard::Output::recording(&all).unwrap();
+        output.keyboard.resume();
+        ui.output = Some(output);
+        ui.wanted_run = true;
+        ui.suspended = false;
+        for button in [y.control, Control::button(0), y.control] {
+            ui.handle_events(vec![
+                Event::Press(button),
+                Event::Release(button, crate::ReleaseType::ButtonUp),
+            ])
+            .unwrap();
+            ui.handle_events(vec![
+                Event::Press(pad),
+                Event::Release(pad, crate::ReleaseType::NoteOff),
+            ])
+            .unwrap(); // the Akai pad between Xbox presses
+        }
+        assert!(ui.wanted_run && !ui.suspended, "paused: {}", ui.error);
+        assert!(ui.error.is_empty(), "{}", ui.error);
+        let recorded = &ui.output.as_ref().unwrap().recorded;
+        for key in [KeyCode::KEY_LEFT, KeyCode::KEY_ENTER, KeyCode::KEY_F1] {
+            assert!(
+                recorded.contains(&(key, true)),
+                "{key:?} typed: {recorded:?}"
+            );
+        }
+        let mut held = std::collections::HashSet::new();
+        for &(key, down) in recorded {
+            if down {
+                held.insert(key);
+            } else {
+                held.remove(&key);
+            }
+        }
+        assert!(held.is_empty(), "still held: {held:?}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// A fast knob turn overflows the action queue: extra steps are skipped without pausing,
     /// while a pad press that cannot be queued is still an error (the caller pauses).
     #[test]
