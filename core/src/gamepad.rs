@@ -558,6 +558,135 @@ impl Drop for Pad {
     }
 }
 
+/// What the Xbox button light shows while VibeConsole owns the controller (v7 ticket 64).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Light {
+    /// Output running: steady.
+    Running,
+    /// Paused, or not running yet: slow blink.
+    Paused,
+}
+
+/// Where the kernel lists LEDs; xone's controller lights are the `gip*` folders.
+pub const LEDS: &str = "/sys/class/leds";
+
+/// The controller's own Xbox button light (v7 ticket 64), through xone's sysfs files:
+/// `mode` (GIP: 0 off, 1 on, 2 fast blink, 3 blink, 4 slow blink, 8/9 fade) and
+/// `brightness`. xpad registers a light only for Xbox 360 pads (`xpad_led_probe`), so a
+/// Series controller on xpad has none and it's reported unavailable. Whatever the lights
+/// showed before comes back on drop: quit, error or a dropped session.
+pub struct ButtonLight {
+    /// Each light's folder with the mode and brightness it had at open.
+    saved: Vec<(std::path::PathBuf, String, String)>,
+    shown: Option<Light>,
+}
+impl ButtonLight {
+    /// Finds the lights and checks they can be written, without writing. Err is the reason
+    /// the light is unavailable, ready to show.
+    pub fn open(leds: &std::path::Path) -> std::result::Result<Self, String> {
+        let mut dirs = std::fs::read_dir(leds)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| e.file_name().to_string_lossy().starts_with("gip"))
+                    .map(|e| e.path())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if dirs.is_empty() {
+            return Err("Xbox button light: unavailable: no xone controller light \
+                        (xpad has none for Xbox One/Series controllers)"
+                .into());
+        }
+        dirs.sort();
+        let mut saved = Vec::new();
+        for dir in dirs {
+            let read =
+                |file: &str| std::fs::read_to_string(dir.join(file)).map(|s| s.trim().to_owned());
+            // Opening for write sends nothing to the controller; only a write does.
+            let writable = |file: &str| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(dir.join(file))
+                    .is_ok()
+            };
+            match (read("mode"), read("brightness")) {
+                (Ok(mode), Ok(brightness)) if writable("mode") && writable("brightness") => {
+                    saved.push((dir, mode, brightness));
+                }
+                _ => {
+                    return Err(format!(
+                        "Xbox button light: unavailable: {} is not writable \
+                         (a udev rule must give your user its mode and brightness)",
+                        dir.display()
+                    ));
+                }
+            }
+        }
+        Ok(Self { saved, shown: None })
+    }
+    /// After a controller comes or goes: the lights there now, keeping the values found
+    /// first for lights already known (they may show VibeConsole's mode by now). None when
+    /// no light is left or usable.
+    pub fn reopen(old: Option<Self>, leds: &std::path::Path) -> Option<Self> {
+        let mut new = Self::open(leds).ok();
+        if let Some(mut old) = old {
+            if let Some(new) = &mut new {
+                for (dir, mode, brightness) in &mut new.saved {
+                    if let Some((_, m, b)) = old.saved.iter().find(|(d, ..)| d == dir) {
+                        (*mode, *brightness) = (m.clone(), b.clone());
+                    }
+                }
+            }
+            // Lights that stay are restored by `new`; unplugged ones can't be.
+            old.shown = None;
+        }
+        new
+    }
+    /// The line `doctor` and Xbox tuning show: available, or why not.
+    pub fn status() -> String {
+        Self::open(std::path::Path::new(LEDS)).map_or_else(|why| why, |light| light.describe())
+    }
+    pub fn describe(&self) -> String {
+        let names = self
+            .saved
+            .iter()
+            .filter_map(|(dir, ..)| dir.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        format!("Xbox button light: available ({})", names.join(", "))
+    }
+    /// Sets every light's mode; writes nothing when it already shows `light`.
+    pub fn show(&mut self, light: Light) -> crate::Result<()> {
+        if self.shown == Some(light) {
+            return Ok(());
+        }
+        let mode = match light {
+            Light::Running => "1",
+            Light::Paused => "4",
+        };
+        for (dir, ..) in &self.saved {
+            std::fs::write(dir.join("mode"), mode)
+                .map_err(|e| format!("Xbox button light: cannot set {}: {e}", dir.display()))?;
+        }
+        self.shown = Some(light);
+        Ok(())
+    }
+}
+impl Drop for ButtonLight {
+    /// Puts back the mode and brightness found at open. A light never shown is left alone;
+    /// an unplugged one can't be restored and is skipped.
+    fn drop(&mut self) {
+        if self.shown.is_none() {
+            return;
+        }
+        for (dir, mode, brightness) in &self.saved {
+            let _ = std::fs::write(dir.join("mode"), mode);
+            let _ = std::fs::write(dir.join("brightness"), brightness);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -965,5 +1094,125 @@ mod tests {
         let mixed = layout(&[mine.clone()]);
         assert_eq!(mixed.len(), defaults.len());
         assert_eq!(mixed.iter().find(|m| m.control == a).unwrap().keys, ["F5"]);
+    }
+
+    /// A stand-in for /sys/class/leds: one xone light (`gip0`) with the given mode, plus a
+    /// keyboard light VibeConsole must never touch.
+    fn leds(name: &str, mode: &str) -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("vibeconsole-leds-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (dir, mode) in [("gip0", mode), ("input2::capslock", "x")] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            std::fs::write(root.join(dir).join("mode"), format!("{mode}\n")).unwrap();
+            std::fs::write(root.join(dir).join("brightness"), "20\n").unwrap();
+        }
+        root
+    }
+    fn mode(root: &std::path::Path, dir: &str) -> String {
+        std::fs::read_to_string(root.join(dir).join("mode")).unwrap()
+    }
+
+    #[test]
+    fn button_light_follows_running_and_paused_and_is_restored_on_quit() {
+        let root = leds("follow", "3");
+        let mut light = ButtonLight::open(&root).unwrap();
+        assert_eq!(light.describe(), "Xbox button light: available (gip0)");
+        assert_eq!(mode(&root, "gip0"), "3\n", "opening writes nothing");
+        light.show(Light::Running).unwrap();
+        assert_eq!(mode(&root, "gip0"), "1");
+        light.show(Light::Paused).unwrap();
+        assert_eq!(mode(&root, "gip0"), "4");
+        // The same state again writes nothing: the file isn't rewritten.
+        std::fs::write(root.join("gip0/mode"), "marker").unwrap();
+        light.show(Light::Paused).unwrap();
+        assert_eq!(mode(&root, "gip0"), "marker");
+        std::fs::write(root.join("gip0/brightness"), "5").unwrap();
+        drop(light);
+        assert_eq!(mode(&root, "gip0"), "3", "quit puts the old mode back");
+        assert_eq!(
+            std::fs::read_to_string(root.join("gip0/brightness")).unwrap(),
+            "20"
+        );
+        assert_eq!(
+            mode(&root, "input2::capslock"),
+            "x\n",
+            "other lights untouched"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_reopen_after_plugging_in_keeps_each_lights_original_mode() {
+        let root = leds("reopen", "3");
+        let mut light = ButtonLight::open(&root).unwrap();
+        light.show(Light::Paused).unwrap();
+        // A second controller arrives; the first already shows VibeConsole's slow blink.
+        std::fs::create_dir_all(root.join("gip1")).unwrap();
+        std::fs::write(root.join("gip1/mode"), "1").unwrap();
+        std::fs::write(root.join("gip1/brightness"), "20").unwrap();
+        let mut light = ButtonLight::reopen(Some(light), &root).unwrap();
+        assert_eq!(mode(&root, "gip0"), "4", "reopening writes nothing");
+        light.show(Light::Running).unwrap();
+        assert_eq!(
+            (mode(&root, "gip0"), mode(&root, "gip1")),
+            ("1".into(), "1".into())
+        );
+        drop(light);
+        assert_eq!(
+            (mode(&root, "gip0"), mode(&root, "gip1")),
+            ("3".into(), "1".into())
+        );
+        // The last controller unplugged: nothing left to drive.
+        std::fs::remove_dir_all(root.join("gip0")).unwrap();
+        std::fs::remove_dir_all(root.join("gip1")).unwrap();
+        assert!(ButtonLight::reopen(None, &root).is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_light_never_shown_is_not_rewritten_on_quit() {
+        let root = leds("unshown", "1");
+        drop(ButtonLight::open(&root).unwrap());
+        assert_eq!(mode(&root, "gip0"), "1\n");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn no_xone_light_or_no_write_permission_is_reported_unavailable() {
+        let root = leds("none", "1");
+        std::fs::remove_dir_all(root.join("gip0")).unwrap();
+        let error = ButtonLight::open(&root).err().unwrap();
+        assert!(
+            error.starts_with("Xbox button light: unavailable: "),
+            "{error}"
+        );
+        assert!(error.contains("xpad"), "{error}");
+        std::fs::remove_dir_all(&root).unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        let root = leds("readonly", "1");
+        let file = root.join("gip0/mode");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
+        if std::fs::OpenOptions::new().write(true).open(&file).is_err() {
+            // (Skipped when the tests run as root, which can write anything.)
+            let error = ButtonLight::open(&root).err().unwrap();
+            assert!(
+                error.contains("not writable") && error.contains("gip0"),
+                "{error}"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_failed_write_names_its_stage() {
+        let root = leds("gone", "1");
+        let mut light = ButtonLight::open(&root).unwrap();
+        std::fs::remove_dir_all(root.join("gip0")).unwrap(); // unplugged
+        let error = light.show(Light::Running).unwrap_err().to_string();
+        assert!(error.starts_with("Xbox button light: "), "{error}");
+        drop(light); // restoring an unplugged light doesn't panic
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -321,6 +321,7 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                 Err(e) => println!("Xbox controllers: {e}"),
             }
             println!("{}", crate::gamepad::headset());
+            println!("{}", crate::gamepad::ButtonLight::status());
             match crate::recording::permissions() {
                 Ok(n) => {
                     println!("Physical-key recording: {n} readable keyboard(s); no events captured")

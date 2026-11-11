@@ -207,6 +207,9 @@ struct Terminal {
     device: Option<String>,
     /// Xbox controllers (v7 ticket 07), opened by real sessions only.
     gamepad: Option<crate::gamepad::Pad>,
+    /// The controller's Xbox button light (v7 ticket 64): steady while running, slow blink
+    /// otherwise; dropping it (unplug, quit) puts back what it showed before.
+    button_light: Option<crate::gamepad::ButtonLight>,
     /// LB held: Xbox buttons use layer 2 (v7 ticket 09).
     layer2: bool,
     /// The focused app's profile (v7 ticket 12); None is Default.
@@ -720,6 +723,7 @@ impl Terminal {
             context: 0,
             device: None,
             gamepad: None,
+            button_light: None,
             layer2: false,
             profile: None,
             follow_apps: false,
@@ -1399,8 +1403,31 @@ impl Terminal {
                     self.notice = format!("Xbox controller ready: {name}");
                 }
                 self.gamepad = Some(pad);
+                self.open_button_light();
             }
             Err(error) => self.notice = error.to_string(),
+        }
+    }
+    /// The light exists only while a controller on xone is plugged in; unavailable is
+    /// shown by `doctor` and Xbox tuning, not as a session error.
+    fn open_button_light(&mut self) {
+        self.button_light = crate::gamepad::ButtonLight::reopen(
+            self.button_light.take(),
+            std::path::Path::new(crate::gamepad::LEDS),
+        );
+    }
+    /// Shows running or paused on the Xbox button light; a failed write gives the light up
+    /// (restoring what it can) and says why.
+    fn show_button_light(&mut self) {
+        let light = if self.output.is_some() && !self.suspended {
+            crate::gamepad::Light::Running
+        } else {
+            crate::gamepad::Light::Paused
+        };
+        let result = self.button_light.as_mut().map(|l| l.show(light));
+        if let Some(Err(error)) = result {
+            self.button_light = None;
+            self.notice = error.to_string();
         }
     }
     /// v7 ticket 40: Run with no verified MIDI program (none connected, or not detected yet)
@@ -2280,12 +2307,18 @@ impl Terminal {
                     Event::DuplicatePress(control) | Event::UnmatchedRelease(control),
                 ) if crate::gamepad::is_layer_key(control) => {}
                 crate::gamepad::Change::Event(event) => self.handle_events(vec![event])?,
-                crate::gamepad::Change::Connected(name) => self.gamepad_transition(format!(
-                    "Xbox controller connected: {name}; buttons fire on their next press"
-                ))?,
-                crate::gamepad::Change::Disconnected(name) => self.gamepad_transition(format!(
-                    "Xbox controller disconnected: {name}; held keys released"
-                ))?,
+                crate::gamepad::Change::Connected(name) => {
+                    self.gamepad_transition(format!(
+                        "Xbox controller connected: {name}; buttons fire on their next press"
+                    ))?;
+                    self.open_button_light();
+                }
+                crate::gamepad::Change::Disconnected(name) => {
+                    self.gamepad_transition(format!(
+                        "Xbox controller disconnected: {name}; held keys released"
+                    ))?;
+                    self.open_button_light();
+                }
             }
         }
         let connected = self
@@ -2298,6 +2331,7 @@ impl Terminal {
         }
         self.quit_holds();
         self.move_pointer();
+        self.show_button_light();
         if let Some(action) = self.guide.tick(Instant::now()) {
             if let Err(error) = self.guide_action(action) {
                 self.error = format!("Profile lock failed: {error}");
@@ -4164,7 +4198,11 @@ fn tuning_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
         format!("Mouse speed: {}", tuning.mouse_speed),
         "Back".to_string(),
     ];
-    let title = format!("Xbox tuning\n{}", crate::gamepad::headset());
+    let title = format!(
+        "Xbox tuning\n{}\n{}",
+        crate::gamepad::headset(),
+        crate::gamepad::ButtonLight::status()
+    );
     match choose(ui, &title, &items)? {
         Some(0) => {
             let Some(value) = number(
