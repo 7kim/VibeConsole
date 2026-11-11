@@ -246,6 +246,8 @@ struct Terminal {
     /// Status-feedback pads: what the last press did, and the derived running state.
     phases: BTreeMap<Control, Phase>,
     probed: BTreeMap<Control, Option<bool>>,
+    /// v7 ticket 54: the Xbox layout's status buttons on the current layer and profile.
+    xbox_status: Vec<Mapping>,
     /// A background status probe in flight: tmux/gdbus/proc never block the session loop.
     probe: Option<std::sync::mpsc::Receiver<BTreeMap<Control, Option<bool>>>>,
     /// Return to running once the Flow capture is confirmed and the command list is shown.
@@ -749,6 +751,7 @@ impl Terminal {
             flow_resume: false,
             phases: BTreeMap::new(),
             probed: BTreeMap::new(),
+            xbox_status: Vec::new(),
             probe: None,
             agent_states: Vec::new(),
             light_agents: None,
@@ -823,10 +826,9 @@ impl Terminal {
             }
             self.probe = None;
         }
+        self.refresh_xbox_status();
         let pads = self
-            .run_mappings
-            .iter()
-            .filter(|m| m.status)
+            .status_mappings()
             .map(|m| (m.control, m.action.clone()))
             .collect::<Vec<_>>();
         if pads.is_empty() {
@@ -855,11 +857,23 @@ impl Terminal {
         });
         self.probe = Some(receiver);
     }
-    /// `Status <pad>: <word>` per status pad, for the live pane.
-    fn status_lines(&self) -> Vec<String> {
+    /// Status pads: the open program's, then the Xbox buttons' on the current layer (v7
+    /// ticket 54). A command an Xbox button started keeps its line if the controller goes.
+    fn status_mappings(&self) -> impl Iterator<Item = &Mapping> {
         self.run_mappings
             .iter()
+            .chain(&self.xbox_status)
             .filter(|m| m.status)
+    }
+    fn refresh_xbox_status(&mut self) {
+        self.xbox_status = self
+            .xbox_layout()
+            .map(|layout| layout.into_iter().filter(|m| m.status).collect())
+            .unwrap_or_default();
+    }
+    /// `Status <pad>: <word>` per status pad, for the live pane.
+    fn status_lines(&self) -> Vec<String> {
+        self.status_mappings()
             .map(|m| {
                 let probed = self.probed.get(&m.control).copied().flatten();
                 let word = status_word(self.phases.get(&m.control).copied(), probed);
@@ -1287,6 +1301,7 @@ impl Terminal {
     /// The keyboard takes a new mapping set (layer or profile change): a transition. Held
     /// keys are released, held pads and buttons wait for a fresh press.
     fn reload_keyboard(&mut self) -> Result<()> {
+        self.refresh_xbox_status();
         let all = self.with_gamepad(&self.run_mappings)?;
         // Unverified, `all` holds the Xbox layout only (ticket 40), so it may run.
         let resume = self.wanted_run && !self.suspended;
@@ -2064,13 +2079,14 @@ impl Terminal {
             let _ = reply.send(self.tap(&keys).map_err(|e| e.to_string()));
         }
         while let Some((action, ok, notice)) = self.actions.notice() {
-            for mapping in self
-                .run_mappings
-                .iter()
-                .filter(|m| m.status && m.action == action)
-            {
+            let done = self
+                .status_mappings()
+                .filter(|m| m.action == action)
+                .map(|m| m.control)
+                .collect::<Vec<_>>();
+            for control in done {
                 let phase = if ok { Phase::Done } else { Phase::Failed };
-                self.phases.insert(mapping.control, phase);
+                self.phases.insert(control, phase);
             }
             let notice = notice
                 .chars()
@@ -10276,6 +10292,58 @@ mod tests {
             Some(1),
             "Default's octave light is back"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 54: an Xbox button saved with status feedback shows its line in the live
+    /// pane like an Akai pad ("Status Xbox X: sent", then its result), and the lines follow
+    /// the Xbox layer in use: layer 2 lines only while LB is held.
+    #[test]
+    fn xbox_status_lines_show_and_follow_the_layer() {
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-xbox-status-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let command = |line: &str| crate::actions::Action::Command {
+            window: "w".into(),
+            dir: "/tmp".into(),
+            line: line.into(),
+        };
+        let status = |control: Control, context: u8, line: &str| {
+            let mut m = Mapping::new_action(control, mappings::Input::Pad, command(line)).unwrap();
+            m.status = true;
+            m.context = context;
+            m
+        };
+        let (x, b) = (Control::button(2), Control::button(1));
+        let layer1 = status(x, mappings::GAMEPAD_CONTEXT, "build");
+        let layer2 = status(b, mappings::GAMEPAD_LAYER_2, "deploy");
+        mappings::save(&path, &[layer1, layer2]).unwrap();
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        ui.actions = crate::actions::Dispatcher::with(|_, _, _| Ok("started".into()));
+        ui.refresh_xbox_status();
+        let lines = ui.status_lines();
+        assert_eq!(lines.len(), 1, "layer 1 only: {lines:?}");
+        assert!(lines[0].starts_with("Status Xbox X: "), "{lines:?}");
+        ui.transition(x, true).unwrap();
+        assert_eq!(ui.status_lines(), ["Status Xbox X: sent"]);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while ui.phases.get(&x) == Some(&Phase::Sent) {
+            ui.tick().unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "no result for the Xbox status line"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(ui.phases[&x], Phase::Done);
+        ui.set_layer(true).unwrap(); // LB held
+        let lines = ui.status_lines();
+        assert_eq!(lines.len(), 1, "layer 2 only: {lines:?}");
+        assert!(lines[0].starts_with("Status Xbox B: "), "{lines:?}");
+        ui.set_layer(false).unwrap();
+        assert!(ui.status_lines()[0].starts_with("Status Xbox X: "));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
