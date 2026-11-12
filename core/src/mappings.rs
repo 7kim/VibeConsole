@@ -406,11 +406,27 @@ impl Mapping {
     }
 }
 
+impl Mapping {
+    /// What kind of control this is, as listed: an Xbox control by its kind (v7 ticket 110),
+    /// else the MIDI input.
+    pub fn input_description(&self) -> String {
+        if self.control.message == crate::Message::Button {
+            crate::gamepad::kind(self.control.id).into()
+        } else {
+            self.input.description()
+        }
+    }
+}
 impl fmt::Display for Mapping {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let device = if self.control.message == crate::Message::Button {
+            "Xbox controller".to_string()
+        } else {
+            format!("USB {DEVICE}")
+        };
         write!(
             f,
-            "{} | {} | USB {DEVICE} | {} channel {} id {} direction {} | {} | {} | {} | Feedback: {}",
+            "{} | {} | {device} | {} channel {} id {} direction {} | {} | {} | {} | Feedback: {}",
             program_label(self.context),
             self.label,
             self.control.message.text(),
@@ -419,7 +435,7 @@ impl fmt::Display for Mapping {
             self.control.direction,
             self.action_label(),
             self.behavior,
-            self.input.description(),
+            self.input_description(),
             self.feedback
         )
     }
@@ -2975,6 +2991,36 @@ mod tests {
 
     /// v7 ticket 81: a sequence step's own text is saved with the sequence (config v19) and
     /// round-trips; a v18 file loads with no step text; a refused save keeps the last file.
+    /// v7 ticket 110: Xbox controls are listed by kind (button, trigger, D-pad, stick), on the
+    /// Xbox controller, never as a pad, a note or the Akai's USB device.
+    #[test]
+    fn xbox_rows_name_their_kind_and_device() {
+        use crate::gamepad::{STICK_BASE, kind};
+        for (id, want) in [
+            (2, "Xbox button"),  // X
+            (9, "Xbox button"),  // Menu
+            (6, "Xbox trigger"), // LT
+            (16, "Xbox D-pad"),  // D-pad right
+            (11, "Xbox stick"),  // left stick press
+            (STICK_BASE, "Xbox stick"),
+        ] {
+            assert_eq!(kind(id), want, "{id}");
+            let row = Mapping::new(Control::button(id), "F1", "hold")
+                .unwrap()
+                .to_string();
+            assert!(
+                row.contains(want) && row.contains("| Xbox controller |"),
+                "{row}"
+            );
+            assert!(!row.contains("Pad Note") && !row.contains(DEVICE), "{row}");
+        }
+        let pad = Mapping::new(Control::from_note(10, 36).unwrap(), "F1", "hold").unwrap();
+        assert!(
+            pad.to_string().contains("Pad Note press/release"),
+            "MIDI rows unchanged"
+        );
+    }
+
     /// v7 ticket 98: Orca keys round-trip in v22; an older file can't carry them, and its
     /// Orca "needs me" sequence loads as Orca keys while other sequences stay as they are.
     #[test]

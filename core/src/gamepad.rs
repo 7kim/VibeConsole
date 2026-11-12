@@ -129,6 +129,18 @@ pub fn button_name(id: u8) -> String {
         .unwrap_or("unknown")
         .into()
 }
+/// v7 ticket 110: the kind of Xbox control an id is, shown wherever Xbox controls are
+/// listed instead of "pad": button, trigger, D-pad or stick (its press, directions, angle
+/// ranges and gestures). Share isn't read (gilrs reports it only as an unknown button).
+pub fn kind(id: u8) -> &'static str {
+    match id {
+        6 | 7 => "Xbox trigger",
+        13..=16 => "Xbox D-pad",
+        11 | 12 => "Xbox stick",
+        id if id >= STICK_BASE => "Xbox stick",
+        _ => "Xbox button",
+    }
+}
 /// Which stick (0 left, 1 right) a direction or angle range belongs to.
 fn stick_of(control: Control) -> Option<usize> {
     match control.id {

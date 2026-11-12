@@ -5813,7 +5813,7 @@ fn mapping_label(mapping: &Mapping, program: Option<&(u8, crate::feedback::Paylo
         "{} | {} | {} | {}{}{}{} | {} | Feedback: {}",
         mappings::program_label(mapping.context),
         mapping.name(program),
-        mapping.input.description(),
+        mapping.input_description(),
         mapping.action_label(),
         if invalid {
             " [INVALID: agent removed]"
