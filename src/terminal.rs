@@ -5916,12 +5916,14 @@ fn configure_choice(ui: &mut impl Ui) -> Result<Option<usize>> {
             let border = |size| "─".repeat(size - 2);
             rows.push(String::new());
             rows.push(format!("╭{}╮   ╭{}╮", border(left), border(right)));
+            // v7 ticket 109: the MIDI keyboard and the Xbox controller each have their own pane.
             for (a, b) in [
-                ("Learn controls".into(), "Saved assignments".into()),
+                ("MIDI keyboard".into(), "Saved assignments".into()),
                 (item(0), item(5)),
                 (item(1), item(6)),
                 (item(2), String::new()),
                 (item(3), String::new()),
+                ("── Xbox controller ──".into(), String::new()),
                 (item(4), String::new()),
             ] {
                 rows.push(format!(
@@ -5933,9 +5935,11 @@ fn configure_choice(ui: &mut impl Ui) -> Result<Option<usize>> {
             rows.push(format!("╰{}╯   ╰{}╯", border(left), border(right)));
         } else {
             if ui.height() >= 22 {
-                rows.push("Learn controls".into());
+                rows.push("MIDI keyboard".into());
             }
-            rows.extend((0..5).map(item));
+            rows.extend((0..4).map(item));
+            rows.push("─ Xbox controller ─".into());
+            rows.push(item(4));
             rows.push("─ Saved assignments ─".into());
             rows.extend((5..7).map(item));
         }
@@ -6764,15 +6768,44 @@ fn configure_steps(
             let favourites = mappings::load_config(path)
                 .map(|c| c.favourites)
                 .unwrap_or_default();
+            // v7 ticket 109: Xbox and MIDI assignments are listed apart; with both saved,
+            // the device comes first.
+            let all = saved_list(current, ui.context(), &favourites);
+            let xbox = |m: &Mapping| m.control.message == crate::Message::Button;
+            let (midi_n, xbox_n) = (
+                all.iter().filter(|(m, _)| !xbox(m)).count(),
+                all.iter().filter(|(m, _)| xbox(m)).count(),
+            );
+            let want_xbox = if midi_n > 0 && xbox_n > 0 {
+                let devices = vec![
+                    format!("MIDI keyboard ({midi_n})"),
+                    format!("Xbox controller ({xbox_n})"),
+                ];
+                let Some(device) = choose(ui, "Saved assignments: which device?", &devices)? else {
+                    continue;
+                };
+                Some(device == 1)
+            } else {
+                None
+            };
+            let list = all
+                .into_iter()
+                .filter(|(m, _)| want_xbox.is_none_or(|x| xbox(m) == x))
+                .collect::<Vec<_>>();
+            let title = match want_xbox {
+                Some(true) => "Saved assignments · Xbox controller",
+                Some(false) => "Saved assignments · MIDI keyboard",
+                None => "Saved assignments",
+            };
             let Some(index) = choose(
                 ui,
-                "Saved assignments",
-                &saved_list(current, ui.context(), &favourites)
-                    .into_iter()
+                title,
+                &list
+                    .iter()
                     .map(|(m, star)| {
                         format!(
                             "{}{}",
-                            if star { "★ " } else { "" },
+                            if *star { "★ " } else { "" },
                             mapping_label(m, ui.program().as_ref())
                         )
                     })
@@ -6781,7 +6814,7 @@ fn configure_steps(
             else {
                 continue;
             };
-            let chosen = saved_list(current, ui.context(), &favourites)[index].0;
+            let chosen = list[index].0;
             (chosen.control, chosen.context)
         };
         let existing = current
@@ -8452,6 +8485,56 @@ mod tests {
         assert!(ui.input.is_none() && ui.output.is_none());
     }
 
+    /// v7 ticket 109: with Akai and Xbox assignments saved, Edit asks the device first and
+    /// lists only that device's; with one device's only, it lists them straight away.
+    #[test]
+    fn edit_lists_xbox_and_midi_assignments_apart() {
+        use Key::*;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-device-panes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let pad = Mapping::new(Control::from_note(10, 36).unwrap(), "F1", "hold").unwrap();
+        let x = Mapping::new(Control::button(2), "F8", "hold").unwrap();
+        let mut current = vec![pad, x];
+        mappings::save(&path, &current).unwrap();
+        let mut ui = Script {
+            // Edit -> Xbox -> back; Edit -> MIDI -> back; leave
+            keys: [
+                Tab, Enter, Down, Enter, Escape, Tab, Enter, Enter, Escape, Escape, Escape,
+            ]
+            .into(),
+            ..Default::default()
+        };
+        configure(&mut ui, &path, &mut current).unwrap();
+        let screens = ui.screens.join("\n----\n");
+        assert!(
+            screens.contains("Saved assignments: which device?"),
+            "{screens}"
+        );
+        assert!(screens.contains("MIDI keyboard (1)") && screens.contains("Xbox controller (1)"));
+        let xbox = ui
+            .screens
+            .iter()
+            .find(|s| s.starts_with("Saved assignments · Xbox controller"))
+            .unwrap();
+        assert!(
+            xbox.contains("Xbox X") && !xbox.contains("ch10 #36"),
+            "{xbox}"
+        );
+        let midi = ui
+            .screens
+            .iter()
+            .find(|s| s.starts_with("Saved assignments · MIDI keyboard"))
+            .unwrap();
+        assert!(
+            midi.contains("ch10 #36") && !midi.contains("Xbox X"),
+            "{midi}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn configure_panes_keep_learning_order_and_keyboard_focus() {
         use Key::*;
@@ -8473,7 +8556,12 @@ mod tests {
         assert!(
             first
                 .lines()
-                .any(|line| line.contains("Learn controls") && line.contains("Saved assignments"))
+                .any(|line| line.contains("MIDI keyboard") && line.contains("Saved assignments"))
+        );
+        // v7 ticket 109: the Xbox controller has its own pane, below the MIDI keyboard's.
+        assert!(first.find("Xbox controller").unwrap() > first.find("Learn joystick").unwrap());
+        assert!(
+            first.find("Xbox controller").unwrap() < first.find("Learn an Xbox button").unwrap()
         );
         assert!(ui.screens[1].contains("> Learn a piano key"));
         assert!(ui.screens[2].contains("> Remove saved assignment"));
@@ -9606,10 +9694,15 @@ mod tests {
                 // v7 ticket 55: editing the saved copy opens the family menu on its family
                 // (pads and Xbox buttons; the starred favourite is listed first).
                 let edit_ok = !matches!(kind, "pad" | "Xbox button") || copy.is_none() || {
+                    // v7 ticket 109: an Xbox button and the starred Akai pad are listed apart;
+                    // the device comes first, then the Xbox list holds only the copy.
+                    let pick = if kind == "Xbox button" {
+                        vec![Enter, Down, Enter, Enter]
+                    } else {
+                        vec![Enter, Down, Enter]
+                    };
                     let mut edit = Script {
-                        keys: [vec![Down; 5], vec![Enter, Down, Enter, Escape, Escape]]
-                            .concat()
-                            .into(),
+                        keys: [vec![Down; 5], pick, vec![Escape, Escape]].concat().into(),
                         ..Default::default()
                     };
                     let mut again = saved.clone();
