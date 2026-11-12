@@ -1228,6 +1228,19 @@ impl Terminal {
                     // v7 ticket 20: a prompt sequence sends its current step, and moves on
                     // only once that step was sent. Ticket 88: once finished, a tap sends
                     // nothing, and a one-second hold starts it over.
+                    // v7 ticket 116: a saved sequence's steps come from the library, so an edit
+                    // reaches every pad using it.
+                    let action = match action {
+                        crate::actions::Action::SavedSequence(name) => {
+                            let config = mappings::load_config(&self.path)?;
+                            let steps =
+                                mappings::saved_sequence(&config, &name).ok_or_else(|| {
+                                    format!("validation: saved sequence {name} is gone")
+                                })?;
+                            crate::actions::Action::PromptSequence(steps.to_vec())
+                        }
+                        action => action,
+                    };
                     let sequence = match &action {
                         crate::actions::Action::PromptSequence(steps) => Some(steps.clone()),
                         _ => None,
@@ -1287,7 +1300,11 @@ impl Terminal {
                     return submitted;
                 }
                 // Letting go before one second cancels a finished sequence's start-over hold.
-                if matches!(action, crate::actions::Action::PromptSequence(_)) {
+                if matches!(
+                    action,
+                    crate::actions::Action::PromptSequence(_)
+                        | crate::actions::Action::SavedSequence(_)
+                ) {
                     self.holds.release(pad, Instant::now());
                 }
                 return Ok(());
@@ -1564,9 +1581,13 @@ impl Terminal {
             // v7 ticket 101: a prompt sequence is a trigger, so its release never reaches
             // `transition`; letting go here cancels a finished sequence's start-over hold.
             if let Event::Release(pad, _) | Event::UnmatchedRelease(pad) = &event {
-                let sequence = self
-                    .fired(*pad)?
-                    .is_some_and(|m| matches!(m.action, crate::actions::Action::PromptSequence(_)));
+                let sequence = self.fired(*pad)?.is_some_and(|m| {
+                    matches!(
+                        m.action,
+                        crate::actions::Action::PromptSequence(_)
+                            | crate::actions::Action::SavedSequence(_)
+                    )
+                });
                 if sequence {
                     self.holds.release(*pad, Instant::now());
                 }
@@ -1686,7 +1707,10 @@ impl Terminal {
                 Some(crate::actions::Action::AppToggleQuit(path)) => {
                     self.submit_quiet(crate::actions::Action::AppQuit(path))
                 }
-                Some(crate::actions::Action::PromptSequence(_)) => {
+                Some(
+                    crate::actions::Action::PromptSequence(_)
+                    | crate::actions::Action::SavedSequence(_),
+                ) => {
                     self.positions.restart(pad);
                     self.notice = format!("{}: sequence starts over at step 1", self.name(pad));
                 }
@@ -4967,9 +4991,14 @@ fn prompts_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
         let files = prompt_files(&dir)?;
         let mut rows = files.clone();
         rows.push("New prompt".into());
+        rows.push("Saved prompt sequences…".into()); // v7 ticket 116
         let Some(index) = choose(ui, &format!("Prompts in {}", dir.display()), &rows)? else {
             return Ok(());
         };
+        if index == files.len() + 1 {
+            saved_sequences_menu(ui, path)?;
+            continue;
+        }
         let result = if index == files.len() {
             match text_entry(ui, "New prompt name", "")? {
                 Some(name) if files.contains(&name) => {
@@ -6098,7 +6127,7 @@ fn action_family(mapping: &Mapping) -> usize {
         Action::OrcaJump { .. } => 8,
         Action::T3(_) => 9,
         Action::HerdrFocus(_) => 10,
-        Action::PromptSequence(_) => 11,
+        Action::PromptSequence(_) | Action::SavedSequence(_) => 11,
         action if action.audio() => 2,
         _ => 1, // launchers, hold to quit, Wispr Flow
     }
@@ -6172,6 +6201,159 @@ const FAMILIES: [&str; 14] = [
 
 fn configure(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) -> Result<()> {
     configure_for(ui, path, current, None)
+}
+
+/// v7 ticket 116: a pad's prompt sequence: one of the saved ones (each pad keeps its own
+/// position), or one built for this pad only.
+fn sequence_for_pad(
+    ui: &mut impl Ui,
+    path: &Path,
+    saved: Option<&crate::actions::Action>,
+) -> Result<Option<crate::actions::Action>> {
+    let config = mappings::load_config(path).map_err(stage("file I/O"))?;
+    if config.sequences.is_empty() {
+        return prompt_sequence_action(ui, path, saved);
+    }
+    let mut items = vec!["A sequence for this pad only".to_string()];
+    items.extend(
+        config
+            .sequences
+            .iter()
+            .map(|(name, steps)| format!("Saved: {name} ({} steps)", steps.len())),
+    );
+    let current = match saved {
+        Some(crate::actions::Action::SavedSequence(name)) => config
+            .sequences
+            .iter()
+            .position(|(n, _)| n == name)
+            .map(|i| i + 1),
+        Some(crate::actions::Action::PromptSequence(_)) => Some(0),
+        _ => None,
+    };
+    let Some(choice) = choose_saved(ui, "Prompt sequence", items, current)? else {
+        return Ok(None);
+    };
+    if choice == 0 {
+        let own = saved.filter(|a| matches!(a, crate::actions::Action::PromptSequence(_)));
+        return prompt_sequence_action(ui, path, own);
+    }
+    Ok(Some(crate::actions::Action::SavedSequence(
+        config.sequences[choice - 1].0.clone(),
+    )))
+}
+
+/// v7 ticket 116: Agents → Prompts → Prompt sequences: the saved sequences, by name. New and
+/// Edit use the sequence editor; a rename follows every pad using it; a sequence a pad uses
+/// can't be deleted (the pads are named).
+fn saved_sequences_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
+    use crate::actions::Action;
+    loop {
+        let mut config = mappings::load_config(path).map_err(stage("file I/O"))?;
+        let mut rows = config
+            .sequences
+            .iter()
+            .map(|(name, steps)| format!("{name} ({} steps)", steps.len()))
+            .collect::<Vec<_>>();
+        rows.push("New sequence".into());
+        let Some(index) = choose(ui, "Saved prompt sequences", &rows)? else {
+            return Ok(());
+        };
+        let users = |config: &mappings::Config, name: &str| {
+            config
+                .mappings
+                .iter()
+                .chain(config.profiles.iter().flat_map(|p| p.mappings.iter()))
+                .filter(|m| m.action == Action::SavedSequence(name.into()))
+                .map(|m| format!("{} {}", mappings::program_label(m.context), m.name(None)))
+                .collect::<Vec<_>>()
+        };
+        let result: Result<()> = (|| {
+            if index == config.sequences.len() {
+                let Some(name) =
+                    text_entry(ui, "New sequence name (letters, digits, - and _)", "")?
+                else {
+                    return Ok(());
+                };
+                if !mappings::simple_name(&name)
+                    || mappings::saved_sequence(&config, &name).is_some()
+                {
+                    return Err(format!(
+                        "validation: {name:?} is taken or not letters, digits, - and _"
+                    )
+                    .into());
+                }
+                let Some(Action::PromptSequence(steps)) = prompt_sequence_action(ui, path, None)?
+                else {
+                    return Ok(());
+                };
+                config.sequences.push((name, steps));
+                return mappings::save_config(path, &config).map_err(stage("file I/O"));
+            }
+            let name = config.sequences[index].0.clone();
+            match choose(
+                ui,
+                &format!("Saved sequence {name}"),
+                &options(&["Edit", "Rename", "Delete", "Back"]),
+            )? {
+                Some(0) => {
+                    let steps = Action::PromptSequence(config.sequences[index].1.clone());
+                    if let Some(Action::PromptSequence(steps)) =
+                        prompt_sequence_action(ui, path, Some(&steps))?
+                    {
+                        config.sequences[index].1 = steps;
+                        mappings::save_config(path, &config).map_err(stage("file I/O"))?;
+                    }
+                    Ok(())
+                }
+                Some(1) => {
+                    let Some(new) = text_entry(ui, "New name", &name)? else {
+                        return Ok(());
+                    };
+                    if !mappings::simple_name(&new)
+                        || mappings::saved_sequence(&config, &new).is_some()
+                    {
+                        return Err(format!(
+                            "validation: {new:?} is taken or not letters, digits, - and _"
+                        )
+                        .into());
+                    }
+                    config.sequences[index].0 = new.clone();
+                    let rename = |m: &mut Mapping| {
+                        if m.action == Action::SavedSequence(name.clone()) {
+                            m.action = Action::SavedSequence(new.clone());
+                        }
+                    };
+                    config.mappings.iter_mut().for_each(rename);
+                    config
+                        .profiles
+                        .iter_mut()
+                        .flat_map(|p| p.mappings.iter_mut())
+                        .for_each(rename);
+                    mappings::save_config(path, &config).map_err(stage("file I/O"))
+                }
+                Some(2) => {
+                    let used = users(&config, &name);
+                    if !used.is_empty() {
+                        return Err(format!("validation: sequence {name} is used by {}; map those to something else first", used.join(", ")).into());
+                    }
+                    if choose(
+                        ui,
+                        &format!("Delete sequence {name}? No pad uses it."),
+                        &options(&["Cancel", "Delete"]),
+                    )? == Some(1)
+                    {
+                        config.sequences.remove(index);
+                        mappings::save_config(path, &config).map_err(stage("file I/O"))?;
+                    }
+                    Ok(())
+                }
+                _ => Ok(()),
+            }
+        })();
+        if let Err(error) = result {
+            not_saved(ui, &error)?;
+        }
+    }
 }
 
 /// The prompt-sequence editor (v7 ticket 20): add step n+1 (a saved prompt or a new one),
@@ -7129,7 +7311,8 @@ fn configure_steps(
             if !matches!(input, mappings::Input::Pad | mappings::Input::Piano) {
                 return Err("validation: prompt sequences require a pad or piano press".into());
             }
-            let Some(action) = prompt_sequence_action(ui, path, saved.as_ref().map(|m| &m.action))?
+            // v7 ticket 116: a saved sequence, or one built for this pad.
+            let Some(action) = sequence_for_pad(ui, path, saved.as_ref().map(|m| &m.action))?
             else {
                 continue;
             };
@@ -11930,6 +12113,124 @@ mod tests {
     /// and the default A = Enter) through the session's event path types the keys, keeps the
     /// session running with no error, and leaves every key released. The keyboard records its
     /// keys instead of reaching the desktop.
+    /// v7 ticket 116: two pads on one saved sequence each keep their own position; an edit
+    /// of the saved sequence reaches both and starts them at step 1.
+    #[test]
+    fn two_pads_share_a_saved_sequence_and_an_edit_reaches_both() {
+        use crate::actions::{Action, Target};
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-saved-seq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let step = |file: &str| Action::Prompt {
+            file: file.into(),
+            target: Target::Agent("claude".into()),
+            enter: true,
+        };
+        let (six, seven) = (
+            Control::from_note(10, 41).unwrap(),
+            Control::from_note(10, 42).unwrap(),
+        );
+        let saved = |pad| {
+            Mapping::new_action(
+                pad,
+                mappings::Input::Pad,
+                Action::SavedSequence("notes".into()),
+            )
+            .unwrap()
+        };
+        let mut config = mappings::Config::default();
+        config.sequences = vec![("notes".into(), vec![step("one"), step("two")])];
+        config.mappings = vec![saved(six), saved(seven)];
+        mappings::save_config(&path, &config).unwrap();
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        let (sent, ran) = std::sync::mpsc::channel();
+        ui.actions = crate::actions::Dispatcher::with(move |action, _, _| {
+            sent.send(action.clone()).unwrap();
+            Ok("done".into())
+        });
+        ui.run_mappings = ui.context_mappings(&config.mappings);
+        let mut output = crate::keyboard::Output::recording(&ui.run_mappings).unwrap();
+        output.keyboard.resume();
+        ui.output = Some(output);
+        ui.wanted_run = true;
+        ui.suspended = false;
+        let mut tap = |ui: &mut Terminal, pad| {
+            ui.handle_events(vec![
+                Event::Press(pad),
+                Event::Release(pad, crate::ReleaseType::NoteOff),
+            ])
+            .unwrap();
+            ran.recv_timeout(Duration::from_secs(2)).unwrap()
+        };
+        assert_eq!(tap(&mut ui, six), step("one"));
+        assert_eq!(tap(&mut ui, seven), step("one"), "its own position");
+        assert_eq!(tap(&mut ui, six), step("two"));
+        config.sequences[0].1 = vec![step("edited"), step("two")];
+        mappings::save_config(&path, &config).unwrap();
+        assert_eq!(
+            tap(&mut ui, seven),
+            step("edited"),
+            "the edit reaches every pad, from step 1"
+        );
+        assert_eq!(tap(&mut ui, six), step("edited"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 116: a saved sequence a pad uses can't be deleted (the pads are named); a
+    /// rename follows every pad using it.
+    #[test]
+    fn a_used_saved_sequence_cannot_be_deleted_and_a_rename_follows_its_pads() {
+        use crate::actions::{Action, Target};
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-seq-menu-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let step = Action::Prompt {
+            file: "plan".into(),
+            target: Target::Agent("claude".into()),
+            enter: true,
+        };
+        let pad = Control::from_note(10, 36).unwrap();
+        let mut config = mappings::Config::default();
+        config.sequences = vec![("notes".into(), vec![step])];
+        config.mappings = vec![
+            Mapping::new_action(
+                pad,
+                mappings::Input::Pad,
+                Action::SavedSequence("notes".into()),
+            )
+            .unwrap(),
+        ];
+        mappings::save_config(&path, &config).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut keys = vec![Enter, Down, Down, Enter, Enter]; // notes -> Delete -> (refused) Back
+        keys.extend([Enter, Down, Enter]); // notes -> Rename
+        keys.extend(vec![Backspace; 5]);
+        keys.extend("daily".bytes().map(Character));
+        keys.extend([Enter, Escape]);
+        let mut ui = Script {
+            keys: keys.into(),
+            ..Default::default()
+        };
+        saved_sequences_menu(&mut ui, &path).unwrap();
+        let screens = ui.screens.join("\n----\n");
+        assert!(
+            screens.contains("Not saved: validation: sequence notes is used by"),
+            "{screens}"
+        );
+        assert_ne!(std::fs::read(&path).unwrap(), before, "the rename saved");
+        let saved = mappings::load_config(&path).unwrap();
+        assert_eq!(saved.sequences[0].0, "daily");
+        assert_eq!(
+            saved.mappings[0].action,
+            Action::SavedSequence("daily".into())
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// v7 ticket 103: an action's result ("Restored …") is a notice, never "Error:"; only a
     /// failure is the error, and the next success or a profile switch replaces it.
     #[test]
@@ -12949,9 +13250,9 @@ mod tests {
             })
             .map(|l| format!("{l}\n"))
             .collect::<String>()
-            .replace("vibeconsole-mappings-v24", "vibeconsole-mappings-v14")
+            .replace("vibeconsole-mappings-v25", "vibeconsole-mappings-v14")
             .replace(
-                "tuning\t15\t30\t10\toff\toff\nsticks\tlinear\tlinear\nmidi-devices\t0\nmidi-active\t-\nxbox-programs\t-\t-\t-\t-\t-\t-\t-\t-\nprofiles\t0\nprofile-lock\t-\nfavourites\t0\n",
+                "tuning\t15\t30\t10\toff\toff\nsticks\tlinear\tlinear\nmidi-devices\t0\nmidi-active\t-\nxbox-programs\t-\t-\t-\t-\t-\t-\t-\t-\nprofiles\t0\nprofile-lock\t-\nfavourites\t0\nsequences\t0\n",
                 "",
             )
             .replace(

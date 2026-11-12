@@ -606,6 +606,8 @@ pub struct Config {
     pub lock: Option<Lock>,
     /// v7 ticket 24: favourite mappings and profiles (`favourite_key`), listed first.
     pub favourites: Vec<String>,
+    /// v7 ticket 116 (config v25): prompt sequences saved by name, each its steps.
+    pub sequences: Vec<(String, Vec<crate::actions::Action>)>,
 }
 /// A mapping's favourite key: its context and control, which stay the same when its
 /// action is edited.
@@ -637,6 +639,29 @@ pub struct Profile {
     pub apps: Vec<String>,
     /// Overrides only: pads and Xbox buttons, no feedback.
     pub mappings: Vec<Mapping>,
+}
+/// v7 ticket 116: saved sequence names are simple names (they can't leave anything), unique,
+/// and each holds valid prompt steps.
+fn validate_sequences(sequences: &[(String, Vec<crate::actions::Action>)]) -> Result<()> {
+    let mut seen = HashSet::new();
+    for (name, steps) in sequences {
+        if !simple_name(name) || !seen.insert(name.as_str()) {
+            return Err(format!(
+                "saved sequence {name:?}: a unique name of letters, digits, - and _"
+            )
+            .into());
+        }
+        crate::actions::Action::PromptSequence(steps.clone()).validate()?;
+    }
+    Ok(())
+}
+/// v7 ticket 116: a saved sequence's steps by name.
+pub fn saved_sequence<'a>(config: &'a Config, name: &str) -> Option<&'a [crate::actions::Action]> {
+    config
+        .sequences
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, steps)| steps.as_slice())
 }
 /// v7 ticket 115: an Xbox program name is one printable line of at most 32 characters, with
 /// no tab, and not a lone `-` (which means "no name").
@@ -1115,6 +1140,7 @@ impl Default for Config {
             profiles: Vec::new(),
             lock: None,
             favourites: Vec::new(),
+            sequences: Vec::new(),
         }
     }
 }
@@ -1525,6 +1551,9 @@ fn parse_mapping_line(line: &str, version: u32, midi_devices: &[String]) -> Resu
         if version < 23 && fields[10] == "nothing" {
             return Err("a silenced default needs a v23 configuration".into());
         }
+        if version < 25 && fields[10].starts_with("saved-sequence:") {
+            return Err("a saved sequence needs a v25 configuration".into());
+        }
         crate::actions::Action::parse(fields[10])?
     } else {
         crate::actions::Action::Shortcut
@@ -1722,9 +1751,11 @@ fn parse_config(contents: &str) -> Result<Config> {
         Some("23") => 23,
         // v24 (v7 ticket 115): Xbox programs 2–8 and their names (`xbox-programs`).
         Some("24") => 24,
+        // v25 (v7 ticket 116): saved prompt sequences (`sequences`, `saved-sequence:`).
+        Some("25") => 25,
         _ => {
             return Err(
-                "invalid configuration header; expected vibeconsole-mappings-v1..v24".into(),
+                "invalid configuration header; expected vibeconsole-mappings-v1..v25".into(),
             );
         }
     };
@@ -2121,6 +2152,31 @@ fn parse_config(contents: &str) -> Result<Config> {
         }
         validate_favourites(&favourites)?;
     }
+    // v25 (v7 ticket 116): the saved prompt sequences.
+    let mut sequences = Vec::new();
+    if has(&mut lines, "sequences\t") {
+        let count: usize = lines
+            .next()
+            .and_then(|l| l.strip_prefix("sequences\t"))
+            .ok_or("expected sequences count")?
+            .parse()?;
+        if count > 256 {
+            return Err("too many saved sequences (256 at most)".into());
+        }
+        for _ in 0..count {
+            let line = lines.next().ok_or("missing saved sequence")?;
+            let ["saved-sequence", name, steps] = line.split('\t').collect::<Vec<_>>()[..] else {
+                return Err("invalid saved-sequence record".into());
+            };
+            let crate::actions::Action::PromptSequence(steps) =
+                crate::actions::Action::parse(steps)?
+            else {
+                return Err("a saved sequence holds prompt steps".into());
+            };
+            sequences.push((name.to_owned(), steps));
+        }
+        validate_sequences(&sequences)?;
+    }
     let mut mappings = Vec::new();
     let mut seen = HashSet::new();
     let mut labels = HashSet::new();
@@ -2165,6 +2221,21 @@ fn parse_config(contents: &str) -> Result<Config> {
         }
     }
     mappings.sort_by_key(|mapping| (mapping.context, mapping.control));
+    // v7 ticket 116: every pad's saved sequence exists in the library.
+    for mapping in mappings
+        .iter()
+        .chain(profiles.iter().flat_map(|p| p.mappings.iter()))
+    {
+        if let crate::actions::Action::SavedSequence(name) = &mapping.action {
+            if !sequences.iter().any(|(n, _)| n == name) {
+                return Err(format!(
+                    "{} uses saved sequence {name}, which doesn't exist",
+                    mapping.control.label()
+                )
+                .into());
+            }
+        }
+    }
     Ok(Config {
         mappings,
         agents,
@@ -2187,6 +2258,7 @@ fn parse_config(contents: &str) -> Result<Config> {
         profiles,
         lock,
         favourites,
+        sequences,
     })
 }
 
@@ -2283,7 +2355,7 @@ pub fn serialize_config(config: &Config) -> Result<String> {
     validate_variables(&config.vars, "user")?;
     config.validate_references()?;
     let mut contents = format!(
-        "vibeconsole-mappings-v24\nidle\t{}\t{}\t{}\n",
+        "vibeconsole-mappings-v25\nidle\t{}\t{}\t{}\n",
         opt_text(config.idle.octave),
         opt_text(config.idle.tempo),
         arp_text(config.idle.arp)
@@ -2419,6 +2491,14 @@ pub fn serialize_config(config: &Config) -> Result<String> {
     contents.push_str(&format!("favourites\t{}\n", config.favourites.len()));
     for key in &config.favourites {
         contents.push_str(&format!("favourite\t{key}\n"));
+    }
+    validate_sequences(&config.sequences)?;
+    contents.push_str(&format!("sequences\t{}\n", config.sequences.len()));
+    for (name, steps) in &config.sequences {
+        contents.push_str(&format!(
+            "saved-sequence\t{name}\t{}\n",
+            crate::actions::Action::PromptSequence(steps.clone()).encode()
+        ));
     }
     for mapping in &config.mappings {
         contents.push_str(&mapping_line(mapping)?);
@@ -2778,7 +2858,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v24\n")
+                .starts_with("vibeconsole-mappings-v25\n")
         );
         assert!(
             load_config(&path)
@@ -2962,7 +3042,7 @@ mod tests {
         };
         save_config(&path, &tuned).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v24\n"));
+        assert!(text.starts_with("vibeconsole-mappings-v25\n"));
         assert!(text.contains("\ntuning\t20\t60\t25\ton\toff\n"));
         assert_eq!(load_config(&path).unwrap(), tuned);
         for bad in [
@@ -3021,7 +3101,7 @@ mod tests {
         assert_eq!(config.device_lights, DevicePatterns::default());
         save_config(&path, &config).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v24\n"), "{text}");
+        assert!(text.starts_with("vibeconsole-mappings-v25\n"), "{text}");
         assert!(
             text.contains(concat!(
                 "device-lights\ton\ton\ton\n",
@@ -3034,7 +3114,7 @@ mod tests {
             "{text}"
         );
         let v19 = text
-            .replace("vibeconsole-mappings-v24", "vibeconsole-mappings-v19")
+            .replace("vibeconsole-mappings-v25", "vibeconsole-mappings-v19")
             .lines()
             .filter(|l| !v20_record(l))
             .map(|l| format!("{l}\n"))
@@ -3075,6 +3155,52 @@ mod tests {
 
     /// v7 ticket 81: a sequence step's own text is saved with the sequence (config v19) and
     /// round-trips; a v18 file loads with no step text; a refused save keeps the last file.
+    /// v7 ticket 116: saved prompt sequences round-trip in v25; a v24 file can't hold them; a
+    /// pad can't use one that doesn't exist, and names are simple and unique.
+    #[test]
+    fn saved_sequences_round_trip_in_v25_and_are_checked() {
+        use crate::actions::{Action, Target};
+        let step = |file: &str| Action::Prompt {
+            file: file.into(),
+            target: Target::Agent("claude".into()),
+            enter: true,
+        };
+        let pad = Control::from_note(10, 36).unwrap();
+        let mut config = Config::default();
+        config.sequences = vec![("release-notes".into(), vec![step("plan"), step("notes")])];
+        config.mappings = vec![
+            Mapping::new_action(
+                pad,
+                Input::Pad,
+                Action::SavedSequence("release-notes".into()),
+            )
+            .unwrap(),
+        ];
+        let text = serialize_config(&config).unwrap();
+        assert!(
+            text.contains("\nsequences\t1\nsaved-sequence\trelease-notes\tprompts:"),
+            "{text}"
+        );
+        assert!(text.contains("\tsaved-sequence:release-notes\t"), "{text}");
+        assert_eq!(parse_config(&text).unwrap(), config);
+        assert_eq!(saved_sequence(&config, "release-notes").unwrap().len(), 2);
+        let v24 = text.replace("vibeconsole-mappings-v25", "vibeconsole-mappings-v24");
+        assert!(parse_config(&v24).unwrap_err().to_string().contains("v25"));
+        let mut missing = config.clone();
+        missing.sequences.clear();
+        assert!(
+            serialize_config(&missing)
+                .unwrap_err()
+                .to_string()
+                .contains("doesn't exist")
+        );
+        for bad in ["../x", "two words", "release-notes"] {
+            let mut twice = config.clone();
+            twice.sequences.push((bad.into(), vec![step("plan")]));
+            assert!(serialize_config(&twice).is_err(), "{bad}");
+        }
+    }
+
     /// v7 ticket 115: Xbox programs 2–8 and their names round-trip in v24; an older file
     /// can't hold them, and its Xbox mappings are all program 1.
     #[test]
@@ -3096,13 +3222,13 @@ mod tests {
         assert_eq!(parse_config(&text).unwrap(), config);
         assert_eq!(xbox_program_name(&config, 2), "Browser");
         assert_eq!(xbox_program_name(&config, 3), "Program 3");
-        let v23 = text.replace("vibeconsole-mappings-v24", "vibeconsole-mappings-v23");
+        let v23 = text.replace("vibeconsole-mappings-v25", "vibeconsole-mappings-v23");
         assert!(parse_config(&v23).unwrap_err().to_string().contains("v24"));
         config.mappings.retain(|m| m.context == GAMEPAD_CONTEXT);
         config.xbox_names = Default::default();
         let old = serialize_config(&config)
             .unwrap()
-            .replace("vibeconsole-mappings-v24", "vibeconsole-mappings-v23")
+            .replace("vibeconsole-mappings-v25", "vibeconsole-mappings-v23")
             .replace("xbox-programs\t-\t-\t-\t-\t-\t-\t-\t-\n", "");
         let loaded = parse_config(&old).unwrap();
         assert_eq!(loaded, config, "a v23 file loads as is");
@@ -3127,11 +3253,11 @@ mod tests {
         ];
         let text = serialize_config(&config).unwrap();
         assert!(
-            text.starts_with("vibeconsole-mappings-v24\n") && text.contains("\tnothing\t"),
+            text.starts_with("vibeconsole-mappings-v25\n") && text.contains("\tnothing\t"),
             "{text}"
         );
         assert_eq!(parse_config(&text).unwrap(), config);
-        let v22 = text.replace("vibeconsole-mappings-v24", "vibeconsole-mappings-v22");
+        let v22 = text.replace("vibeconsole-mappings-v25", "vibeconsole-mappings-v22");
         assert!(parse_config(&v22).unwrap_err().to_string().contains("v23"));
     }
 
@@ -3183,9 +3309,9 @@ mod tests {
             .unwrap(),
         ];
         let text = serialize_config(&config).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v24\n"), "{text}");
+        assert!(text.starts_with("vibeconsole-mappings-v25\n"), "{text}");
         assert_eq!(parse_config(&text).unwrap(), config);
-        let v21 = text.replace("vibeconsole-mappings-v24", "vibeconsole-mappings-v21");
+        let v21 = text.replace("vibeconsole-mappings-v25", "vibeconsole-mappings-v21");
         assert!(parse_config(&v21).unwrap_err().to_string().contains("v22"));
         // An old needs-me pad (a plain sequence) becomes Orca keys; another sequence doesn't.
         let old = v21.replace("orca-keys:", "sequence:");
@@ -3205,15 +3331,15 @@ mod tests {
         let mut config = Config::default();
         config.mappings = vec![Mapping::new(pad, "Ctrl+T", "tap").unwrap()];
         let text = serialize_config(&config).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v24\n"), "{text}");
+        assert!(text.starts_with("vibeconsole-mappings-v25\n"), "{text}");
         assert!(text.contains("\ttap\tCtrl+T\t"), "{text}");
         assert_eq!(parse_config(&text).unwrap(), config);
-        let v20 = text.replace("vibeconsole-mappings-v24", "vibeconsole-mappings-v20");
+        let v20 = text.replace("vibeconsole-mappings-v25", "vibeconsole-mappings-v20");
         assert!(parse_config(&v20).unwrap_err().to_string().contains("v21"));
         config.mappings = vec![Mapping::new(pad, "Ctrl+T", "hold").unwrap()];
         let old = serialize_config(&config)
             .unwrap()
-            .replace("vibeconsole-mappings-v24", "vibeconsole-mappings-v20");
+            .replace("vibeconsole-mappings-v25", "vibeconsole-mappings-v20");
         assert_eq!(
             parse_config(&old).unwrap(),
             config,
@@ -3241,7 +3367,7 @@ mod tests {
         save_config(&path, &config).unwrap();
         let v18 = fs::read_to_string(&path)
             .unwrap()
-            .replace("vibeconsole-mappings-v24", "vibeconsole-mappings-v18")
+            .replace("vibeconsole-mappings-v25", "vibeconsole-mappings-v18")
             .lines()
             .filter(|l| !v20_record(l))
             .map(|l| format!("{l}\n"))
@@ -3260,7 +3386,7 @@ mod tests {
         config.mappings[0].action = Action::PromptSequence(vec![own, saved("build")]);
         save_config(&path, &config).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v24\n"), "{text}");
+        assert!(text.starts_with("vibeconsole-mappings-v25\n"), "{text}");
         assert_eq!(load_config(&path).unwrap(), config);
         let mut bad = config.clone();
         bad.mappings[0].action = Action::PromptSequence(vec![Action::PromptOwn {
@@ -3299,7 +3425,7 @@ mod tests {
         ));
         assert_eq!(load_config(&path).unwrap(), config);
         let v17 = text
-            .replace("vibeconsole-mappings-v24", "vibeconsole-mappings-v17")
+            .replace("vibeconsole-mappings-v25", "vibeconsole-mappings-v17")
             .lines()
             .filter(|l| !v20_record(l))
             .map(|l| format!("{l}\n"))
@@ -3383,7 +3509,7 @@ mod tests {
         config.agents = vec![Agent::new("claude", "claude", "claude").unwrap()];
         let v16 = serialize_config(&config)
             .unwrap()
-            .replace("vibeconsole-mappings-v24", "vibeconsole-mappings-v16")
+            .replace("vibeconsole-mappings-v25", "vibeconsole-mappings-v16")
             .lines()
             .filter(|l| !v20_record(l))
             .map(|l| format!("{l}\n"))
@@ -3399,7 +3525,7 @@ mod tests {
         herdr.host = Host::Herdr;
         config.agents.extend([orca, herdr]);
         let text = serialize_config(&config).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v24\n"), "{text}");
+        assert!(text.starts_with("vibeconsole-mappings-v25\n"), "{text}");
         assert!(
             text.contains("\nagent\tclaude\tclaude\tclaude\t-\t1\ttmux\n"),
             "{text}"
@@ -3786,7 +3912,7 @@ mod tests {
         save_config(&path, &config).unwrap();
         let full = fs::read_to_string(&path).unwrap();
         let early = full.replace(
-            "midi-devices\t0\nmidi-active\t-\nxbox-programs\t-\t-\t-\t-\t-\t-\t-\t-\nprofiles\t0\nprofile-lock\t-\nfavourites\t0\n",
+            "midi-devices\t0\nmidi-active\t-\nxbox-programs\t-\t-\t-\t-\t-\t-\t-\t-\nprofiles\t0\nprofile-lock\t-\nfavourites\t0\nsequences\t0\n",
             "",
         );
         assert_ne!(early, full);
@@ -3876,7 +4002,7 @@ mod tests {
         let path = dir.join("mappings.tsv");
         save_config(&path, &config).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
-        assert!(saved.starts_with("vibeconsole-mappings-v24\n"));
+        assert!(saved.starts_with("vibeconsole-mappings-v25\n"));
         assert!(saved.contains("\tflow\t") && !saved.contains("flow-start"));
         assert_eq!(load_config(&path).unwrap(), config);
         fs::remove_dir_all(dir).unwrap();
@@ -3902,7 +4028,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v24\n")
+                .starts_with("vibeconsole-mappings-v25\n")
         );
         assert_eq!(load_config(&path).unwrap(), config);
         fs::remove_dir_all(dir).unwrap();
@@ -3923,7 +4049,7 @@ mod tests {
         let path = dir.join("mappings.tsv");
         save_config(&path, &config).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v24\n") && text.contains("\tstatus\n"));
+        assert!(text.starts_with("vibeconsole-mappings-v25\n") && text.contains("\tstatus\n"));
         assert_eq!(load_config(&path).unwrap(), config);
         let pad = Control::from_note(10, 37).unwrap();
         for (action, observable) in [
@@ -4000,7 +4126,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v24\n")
+                .starts_with("vibeconsole-mappings-v25\n")
         );
         assert_eq!(load_config(&path).unwrap(), config);
         // ${NAME}: user variable, then startup variable; other text stays; no environment.

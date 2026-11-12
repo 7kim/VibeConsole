@@ -122,6 +122,9 @@ const MAX_STEP_TEXT: usize = 64 * 1024;
 pub enum Action {
     Shortcut,
     Sequence(Vec<Step>),
+    /// v7 ticket 116 (config v25): a prompt sequence saved by name in the library; the
+    /// steps are read from there at each press, so an edit reaches every pad using it.
+    SavedSequence(String),
     /// v7 ticket 111 (config v23): does nothing; saved over a built-in Xbox default so the
     /// button stays silent instead of the default coming back.
     Nothing,
@@ -459,6 +462,7 @@ impl Action {
             }
             Self::OutputMute => "output-mute".into(),
             Self::Nothing => "nothing".into(),
+            Self::SavedSequence(name) => format!("saved-sequence:{name}"),
             Self::MicrophoneMute => "microphone-mute".into(),
             Self::OrcaJump { agent, folder } => format!("orca-jump:{agent}:{folder}"),
             Self::T3(command) => format!("t3:{command}"),
@@ -567,6 +571,13 @@ impl Action {
             }
             "output-mute" => Self::OutputMute,
             "nothing" => Self::Nothing,
+            _ if value.starts_with("saved-sequence:") => {
+                let name = &value["saved-sequence:".len()..];
+                if !crate::mappings::simple_name(name) {
+                    return Err("a saved sequence's name is letters, digits, - and _".into());
+                }
+                Self::SavedSequence(name.into())
+            }
             "microphone-mute" => Self::MicrophoneMute,
             // Mappings saved before the merge used separate start and repair actions.
             "flow" | "flow-start" | "flow-repair" => Self::Flow,
@@ -705,6 +716,7 @@ impl Action {
             ),
             Self::OutputMute => "Toggle default output mute".into(),
             Self::Nothing => "No action (built-in default silenced)".into(),
+            Self::SavedSequence(name) => format!("Saved prompt sequence {name} (one step per tap)"),
             Self::MicrophoneMute => "Toggle default microphone mute".into(),
             Self::OrcaJump { agent, folder } => format!("Orca: jump to {agent} in {folder}"),
             Self::T3(command) => format!("T3 Code: {command}"),
