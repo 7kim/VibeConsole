@@ -2029,9 +2029,16 @@ fn send_prompt(
 /// Sends a sequence step's own text (v7 ticket 81) like a saved prompt, from a file of its
 /// own in the user's runtime directory, deleted once sent; the saved prompt is never touched.
 fn with_own_text(text: &str, send: impl FnOnce(&Path) -> Result<String>) -> Result<String> {
+    with_own_text_in(&crate::status::dir()?, text, send)
+}
+/// v7 ticket 94: `dir` holds the step's text while it's sent; tests pass a temporary one.
+fn with_own_text_in(
+    dir: &Path,
+    text: &str,
+    send: impl FnOnce(&Path) -> Result<String>,
+) -> Result<String> {
     static SENT: AtomicU64 = AtomicU64::new(0);
-    let dir = crate::status::dir()?;
-    fs::create_dir_all(&dir)?;
+    fs::create_dir_all(dir)?;
     let n = SENT.fetch_add(1, Ordering::Relaxed);
     let path = dir.join(format!("step-prompt-{}-{n}", std::process::id()));
     write_atomic(&path, text)?;
@@ -2080,20 +2087,32 @@ fn send_prompt_at(
         return Err("prompt cancelled".into());
     }
     let path = path.to_str().ok_or("prompt path is not UTF-8")?;
-    let commands = prompt_tmux_args(path, &target, enter);
-    tmux_ok(&commands[0])?;
-    if cancelled() {
-        return Err("prompt cancelled".into());
-    }
-    tmux_ok(&commands[1])?;
-    if enter {
-        // Enter after the paste has landed is a separate key, never part of the paste.
-        wait(PASTE_SETTLE, cancelled)?;
-        tmux_ok(&commands[2])?;
-    }
+    paste_into_tmux(path, &target, enter, cancelled, &mut |args| tmux_ok(args))?;
     Ok(format!(
         "Prompt {file} sent to {agent_name}; tmux attach -t vibe"
     ))
+}
+/// The tmux half of a prompt send: load the file into a buffer, paste it into `target`, then
+/// Enter as its own key once the paste has landed. v7 ticket 94: `run` stands in for tmux.
+fn paste_into_tmux(
+    path: &str,
+    target: &str,
+    enter: bool,
+    cancelled: &dyn Fn() -> bool,
+    run: &mut dyn FnMut(&[&str]) -> Result<()>,
+) -> Result<()> {
+    let commands = prompt_tmux_args(path, target, enter);
+    run(&commands[0])?;
+    if cancelled() {
+        return Err("prompt cancelled".into());
+    }
+    run(&commands[1])?;
+    if enter {
+        // Enter after the paste has landed is a separate key, never part of the paste.
+        wait(PASTE_SETTLE, cancelled)?;
+        run(&commands[2])?;
+    }
+    Ok(())
 }
 
 // The worker then asks the session to press the paste shortcut (and Enter) on its keyboard.
@@ -2699,6 +2718,66 @@ mod tests {
         assert_eq!(positions.current(pad, &reordered), Some(0));
         assert_eq!(positions.current(pad, &steps[..1]), Some(0));
         assert_eq!(Positions::default().label(pad, &steps), "1/3");
+    }
+
+    /// v7 ticket 94: a step's own text is what reaches the agent: the buffer tmux loads holds
+    /// the step's text, not the saved prompt's, and the file is gone after the send and after
+    /// a failed paste. tmux is stood in; nothing real starts.
+    #[test]
+    fn a_steps_own_text_is_what_tmux_loads_and_its_file_is_removed() {
+        let dir = std::env::temp_dir().join(format!("vibeconsole-own-text-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("plan"), "Saved plan.\n").unwrap();
+        let only_plan = |dir: &Path| {
+            let names = fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect::<Vec<_>>();
+            assert_eq!(names, ["plan"], "the step's file is removed");
+        };
+        let mut calls = Vec::new();
+        let mut loaded = String::new();
+        let sent = with_own_text_in(&dir, "Step text.\n", |path| {
+            let path = path.to_str().unwrap();
+            paste_into_tmux(path, "=vibe:=claude", true, &|| false, &mut |args| {
+                calls.push(args.join(" "));
+                if args[0] == "load-buffer" {
+                    loaded = fs::read_to_string(args[3])?;
+                }
+                Ok(())
+            })?;
+            Ok("sent".into())
+        });
+        assert_eq!(sent.unwrap(), "sent");
+        assert_eq!(
+            loaded, "Step text.\n",
+            "the step's text, not the saved prompt's"
+        );
+        assert!(
+            calls[1].starts_with("paste-buffer") && calls[1].ends_with("-t =vibe:=claude"),
+            "{calls:?}"
+        );
+        assert_eq!(calls.len(), 3, "load, paste, then Enter: {calls:?}");
+        only_plan(&dir);
+        let failed = with_own_text_in(&dir, "Other text.\n", |path| {
+            let path = path.to_str().unwrap();
+            paste_into_tmux(path, "=vibe:=claude", false, &|| false, &mut |args| {
+                if args[0] == "paste-buffer" {
+                    return Err("tmux paste-buffer: can't find session vibe".into());
+                }
+                Ok(())
+            })
+            .map(|()| String::new())
+        });
+        assert!(
+            failed
+                .unwrap_err()
+                .to_string()
+                .contains("can't find session")
+        );
+        only_plan(&dir);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     /// v7 ticket 81: a sequence step edited "for this sequence only" carries its own text,
