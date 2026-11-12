@@ -223,6 +223,24 @@ fn main() -> Result<()> {
             println!("{mapping}");
         }
     }
+    // v7 ticket 111: the built-in Xbox defaults still in force are VibeConsole's own; listed
+    // so you can see them (change or silence one in /configure to save it).
+    let defaults = crate::gamepad::default_layout()
+        .into_iter()
+        .filter(|d| {
+            !mappings
+                .iter()
+                .any(|m| m.context == d.context && m.control == d.control)
+        })
+        .collect::<Vec<_>>();
+    if !defaults.is_empty() {
+        println!(
+            "Built-in Xbox defaults (VibeConsole's own; change or silence one in /configure):"
+        );
+        for default in &defaults {
+            println!("{default} | default");
+        }
+    }
     match args.first().map(String::as_str).unwrap_or("detect") {
         "list" => Ok(()),
         "feedback-read" => feedback::read_only(),

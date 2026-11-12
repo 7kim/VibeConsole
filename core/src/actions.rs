@@ -122,6 +122,9 @@ const MAX_STEP_TEXT: usize = 64 * 1024;
 pub enum Action {
     Shortcut,
     Sequence(Vec<Step>),
+    /// v7 ticket 111 (config v23): does nothing; saved over a built-in Xbox default so the
+    /// button stays silent instead of the default coming back.
+    Nothing,
     /// v7 ticket 98 (config v22): Orca's own keys (a shortcut, or "needs me": Ctrl+J, a wait,
     /// Ctrl+1), sent only while Orca IDE is the focused app; elsewhere nothing is sent.
     OrcaKeys(Vec<Step>),
@@ -455,6 +458,7 @@ impl Action {
                 format!("volume-{}:{step}", if *up { "up" } else { "down" })
             }
             Self::OutputMute => "output-mute".into(),
+            Self::Nothing => "nothing".into(),
             Self::MicrophoneMute => "microphone-mute".into(),
             Self::OrcaJump { agent, folder } => format!("orca-jump:{agent}:{folder}"),
             Self::T3(command) => format!("t3:{command}"),
@@ -562,6 +566,7 @@ impl Action {
                 }
             }
             "output-mute" => Self::OutputMute,
+            "nothing" => Self::Nothing,
             "microphone-mute" => Self::MicrophoneMute,
             // Mappings saved before the merge used separate start and repair actions.
             "flow" | "flow-start" | "flow-repair" => Self::Flow,
@@ -699,6 +704,7 @@ impl Action {
                 if *up { "up" } else { "down" }
             ),
             Self::OutputMute => "Toggle default output mute".into(),
+            Self::Nothing => "No action (built-in default silenced)".into(),
             Self::MicrophoneMute => "Toggle default microphone mute".into(),
             Self::OrcaJump { agent, folder } => format!("Orca: jump to {agent} in {folder}"),
             Self::T3(command) => format!("T3 Code: {command}"),
@@ -2484,6 +2490,7 @@ fn perform(
             command(&orca_program()?, args, &cancelled)
         }),
         Action::Shortcut => Err("shortcut belongs to keyboard output".into()),
+        Action::Nothing => Ok(String::new()), // v7 ticket 111: a silenced default
         Action::Choice(_) | Action::Value { .. } => Err("knob actions run in the session".into()),
         _ => audio(action, |args| command("wpctl", args, &cancelled)),
     }

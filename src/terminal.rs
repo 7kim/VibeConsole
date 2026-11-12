@@ -124,6 +124,11 @@ trait Ui {
     fn learn_button(&mut self) -> Result<Option<Control>> {
         self.learn()
     }
+    /// Whether an Xbox controller is connected now (v7 ticket 111: its built-in defaults are
+    /// listed for editing only then).
+    fn xbox_connected(&self) -> bool {
+        false
+    }
     fn learn_knob(&mut self) -> Result<Option<Learned>> {
         Err("knob learning unavailable".into())
     }
@@ -1228,6 +1233,9 @@ impl Terminal {
                         }
                         action => action,
                     };
+                    if action == crate::actions::Action::Nothing {
+                        return Ok(()); // v7 ticket 111: a silenced built-in default
+                    }
                     let submitted = if action.flow() {
                         self.start_flow()
                     } else {
@@ -2991,6 +2999,11 @@ impl Drop for Terminal {
 }
 
 impl Ui for Terminal {
+    fn xbox_connected(&self) -> bool {
+        self.gamepad
+            .as_ref()
+            .is_some_and(|pad| !pad.connected().is_empty())
+    }
     fn login(&mut self, request: crate::runtime::Login) -> Result<bool> {
         crate::runtime::login(request)
     }
@@ -6738,15 +6751,26 @@ fn configure_steps(
         } else {
             None
         };
+        let mut chose_default = false;
         let (pad, pad_context) = if let Some(pad) = learned {
             // v7 ticket 97: an Xbox button's layer comes first, showing what each layer does
             // now, so only the chosen layer's assignment is looked up (and replaced).
             let context = if pad.message == crate::Message::Button {
                 let now = |context| {
+                    let default = (profile.is_none() && context == mappings::GAMEPAD_CONTEXT)
+                        .then(|| {
+                            crate::gamepad::default_layout()
+                                .into_iter()
+                                .find(|d| d.control == pad)
+                        })
+                        .flatten()
+                        .map(|d| format!("{} (default)", d.action_label()));
                     current
                         .iter()
                         .find(|m| m.context == context && m.control == pad)
-                        .map_or("free".into(), Mapping::action_label)
+                        .map(Mapping::action_label)
+                        .or(default)
+                        .unwrap_or_else(|| "free".into())
                 };
                 let layers = vec![
                     format!("Layer 1 (normal): {}", now(mappings::GAMEPAD_CONTEXT)),
@@ -6768,13 +6792,31 @@ fn configure_steps(
             let favourites = mappings::load_config(path)
                 .map(|c| c.favourites)
                 .unwrap_or_default();
+            // v7 ticket 111: the built-in Xbox defaults not changed yet are listed too, marked
+            // default (they apply to Default only, on layer 1).
+            let defaults = if profile.is_none() && ui.xbox_connected() {
+                crate::gamepad::default_layout()
+                    .into_iter()
+                    .filter(|d| {
+                        !current
+                            .iter()
+                            .any(|m| m.context == d.context && m.control == d.control)
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
             // v7 ticket 109: Xbox and MIDI assignments are listed apart; with both saved,
             // the device comes first.
-            let all = saved_list(current, ui.context(), &favourites);
+            let all = saved_list(current, ui.context(), &favourites)
+                .into_iter()
+                .map(|(m, star)| (m, star, false))
+                .chain(defaults.iter().map(|m| (m, false, true)))
+                .collect::<Vec<_>>();
             let xbox = |m: &Mapping| m.control.message == crate::Message::Button;
             let (midi_n, xbox_n) = (
-                all.iter().filter(|(m, _)| !xbox(m)).count(),
-                all.iter().filter(|(m, _)| xbox(m)).count(),
+                all.iter().filter(|(m, _, _)| !xbox(m)).count(),
+                all.iter().filter(|(m, _, _)| xbox(m)).count(),
             );
             let want_xbox = if midi_n > 0 && xbox_n > 0 {
                 let devices = vec![
@@ -6790,7 +6832,7 @@ fn configure_steps(
             };
             let list = all
                 .into_iter()
-                .filter(|(m, _)| want_xbox.is_none_or(|x| xbox(m) == x))
+                .filter(|(m, _, _)| want_xbox.is_none_or(|x| xbox(m) == x))
                 .collect::<Vec<_>>();
             let title = match want_xbox {
                 Some(true) => "Saved assignments · Xbox controller",
@@ -6802,10 +6844,11 @@ fn configure_steps(
                 title,
                 &list
                     .iter()
-                    .map(|(m, star)| {
+                    .map(|(m, star, default)| {
                         format!(
-                            "{}{}",
+                            "{}{}{}",
                             if *star { "★ " } else { "" },
+                            if *default { "(default) " } else { "" },
                             mapping_label(m, ui.program().as_ref())
                         )
                     })
@@ -6814,7 +6857,8 @@ fn configure_steps(
             else {
                 continue;
             };
-            let chosen = list[index].0;
+            let (chosen, _, default) = list[index];
+            chose_default = default;
             (chosen.control, chosen.context)
         };
         let existing = current
@@ -6826,10 +6870,48 @@ fn configure_steps(
                 format!("{name}: unassigned")
             });
         if action == 6 {
+            // v7 ticket 111: removing a built-in default silences it (saved as no action);
+            // removing a changed button that has a default brings the default back.
+            let default = (profile.is_none() && pad_context == mappings::GAMEPAD_CONTEXT)
+                .then(|| {
+                    crate::gamepad::default_layout()
+                        .into_iter()
+                        .find(|d| d.control == pad)
+                })
+                .flatten();
+            if chose_default {
+                let keys = default
+                    .as_ref()
+                    .map(Mapping::action_label)
+                    .unwrap_or_default();
+                if choose(
+                    ui,
+                    &format!(
+                        "Silence {} (built-in default: {keys})? It then does nothing until you change it or reset it to default.",
+                        pad.label()
+                    ),
+                    &options(&["Cancel", "Silence it"]),
+                )? == Some(1)
+                {
+                    let silent = Mapping::new_action(
+                        pad,
+                        mappings::Input::Pad,
+                        crate::actions::Action::Nothing,
+                    )
+                    .map_err(stage("validation"))?;
+                    commit(path, current, pad, pad_context, Some(silent), profile)
+                        .map_err(stage("file I/O"))?;
+                }
+                continue;
+            }
+            let remove = match &default {
+                Some(d) => format!("Reset to default ({})", d.action_label()),
+                None => "Remove assignment".into(),
+            };
             if choose(
                 ui,
                 &format!("Remove {existing}?"),
-                &options(&["Cancel", "Remove assignment"]),
+                &options(&["Cancel", remove.as_str()]),
             )? == Some(1)
             {
                 commit(path, current, pad, pad_context, None, profile)
@@ -7794,8 +7876,13 @@ mod tests {
         claude: String,
         /// The verified program, when a test needs its pad and knob table (v7 ticket 45).
         program: Option<(u8, crate::feedback::Payload)>,
+        /// An Xbox controller is connected (v7 ticket 111).
+        xbox: bool,
     }
     impl Ui for Script {
+        fn xbox_connected(&self) -> bool {
+            self.xbox
+        }
         fn midi_devices(&mut self) -> Result<Vec<String>> {
             Ok(self.midi_devices.clone())
         }
@@ -8483,6 +8570,67 @@ mod tests {
         ui.reset_input_lights();
         assert!(!ui.input_light(now) && !ui.note_light(pad, now) && !ui.note_light(piano, now));
         assert!(ui.input.is_none() && ui.output.is_none());
+    }
+
+    /// v7 ticket 111: with a controller connected, the built-in Xbox defaults are listed;
+    /// removing one silences it (saved as no action), and removing that brings it back.
+    #[test]
+    fn xbox_defaults_are_listed_silenced_and_reset() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-defaults-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let a = Control::button(0);
+        let mut current =
+            vec![Mapping::new(Control::from_note(10, 36).unwrap(), "F1", "hold").unwrap()];
+        mappings::save(&path, &current).unwrap();
+        // Remove -> Xbox -> A (default) -> Silence it; leave.
+        let mut ui = Script {
+            keys: [Tab, Down, Enter, Down, Enter, Enter, Down, Enter, Escape].into(),
+            xbox: true,
+            ..Default::default()
+        };
+        configure(&mut ui, &path, &mut current).unwrap();
+        let screens = ui.screens.join("\n----\n");
+        assert!(screens.contains("Xbox controller (9)"), "{screens}");
+        assert!(
+            screens.contains("(default) Xbox controller | Xbox A | Xbox button | Enter"),
+            "{screens}"
+        );
+        assert!(
+            screens.contains("Silence Xbox A (built-in default: Enter)?"),
+            "{screens}"
+        );
+        let saved = mappings::load(&path).unwrap();
+        let silent = saved.iter().find(|m| m.control == a).expect("A saved");
+        assert_eq!(silent.action, crate::actions::Action::Nothing);
+        assert_eq!(
+            crate::gamepad::layout(&saved)
+                .iter()
+                .find(|m| m.control == a)
+                .unwrap()
+                .action,
+            crate::actions::Action::Nothing,
+            "the default doesn't come back"
+        );
+        // Remove -> Xbox -> A (silenced) -> Reset to default; leave.
+        ui.screens.clear();
+        ui.keys = [Tab, Down, Enter, Down, Enter, Enter, Down, Enter, Escape].into();
+        configure(&mut ui, &path, &mut current).unwrap();
+        let screens = ui.screens.join("\n----\n");
+        assert!(screens.contains("Reset to default (Enter)"), "{screens}");
+        let saved = mappings::load(&path).unwrap();
+        assert!(!saved.iter().any(|m| m.control == a));
+        assert_eq!(
+            crate::gamepad::layout(&saved)
+                .iter()
+                .find(|m| m.control == a)
+                .unwrap()
+                .keys,
+            ["Enter"]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// v7 ticket 109: with Akai and Xbox assignments saved, Edit asks the device first and
@@ -12669,7 +12817,7 @@ mod tests {
             })
             .map(|l| format!("{l}\n"))
             .collect::<String>()
-            .replace("vibeconsole-mappings-v22", "vibeconsole-mappings-v14")
+            .replace("vibeconsole-mappings-v23", "vibeconsole-mappings-v14")
             .replace(
                 "tuning\t15\t30\t10\toff\toff\nsticks\tlinear\tlinear\nmidi-devices\t0\nmidi-active\t-\nprofiles\t0\nprofile-lock\t-\nfavourites\t0\n",
                 "",
