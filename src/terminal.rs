@@ -227,6 +227,10 @@ struct Terminal {
     xbox_program: u8,
     program_keys: crate::gamepad::ProgramKeys,
     last_xbox: bool,
+    /// v7 ticket 113: the keyboard's lock-key LEDs, opened when first needed; a failure to
+    /// open is said once, not retried every tick.
+    lock_lights: Option<crate::keyboard::LockLights>,
+    lock_failed: bool,
     /// The focused app's profile (v7 ticket 12); None is Default.
     profile: Option<String>,
     /// Real sessions follow the focused app; tests never call the desktop.
@@ -750,6 +754,8 @@ impl Terminal {
             xbox_program: 1,
             program_keys: crate::gamepad::ProgramKeys::default(),
             last_xbox: false,
+            lock_lights: None,
+            lock_failed: false,
             profile: None,
             follow_apps: false,
             focus_unavailable: false,
@@ -1117,6 +1123,9 @@ impl Terminal {
         self.suspended = true;
         self.guide.cancel();
         self.program_keys.cancel();
+        if let Some(lights) = &mut self.lock_lights {
+            lights.restore(); // v7 ticket 113: paused, the keyboard LED shows its own state
+        }
         self.holds.clear();
         if let Some(pad) = &mut self.gamepad {
             pad.stop_rumble();
@@ -1513,6 +1522,45 @@ impl Terminal {
         if let Some(Err(error)) = result {
             self.button_light = None;
             self.notice = error.to_string();
+        }
+    }
+    /// v7 ticket 113: the keyboard LED shows the most urgent busy agent state's pattern while
+    /// output runs and the keyboard switch is on; otherwise (paused, nothing busy, switched
+    /// off) it shows what it showed before. A failure gives the LED up and says why.
+    fn show_lock_light(&mut self) {
+        let states = self.alert_states();
+        let states = states.iter().map(|(_, s)| *s).collect::<Vec<_>>();
+        let pattern = self
+            .device_lights
+            .as_ref()
+            .filter(|p| p.keyboard_on)
+            .and_then(|p| crate::status::keyboard_light(&states, p));
+        let running = self.output.is_some() && !self.suspended;
+        let Some(light) = pattern.filter(|_| running) else {
+            if let Some(lights) = &mut self.lock_lights {
+                lights.restore();
+            }
+            return;
+        };
+        if self.lock_lights.is_none() && !self.lock_failed {
+            match crate::keyboard::LockLights::open() {
+                Ok(lights) => self.lock_lights = Some(lights),
+                Err(error) => {
+                    self.lock_failed = true;
+                    self.notice = error.to_string();
+                }
+            }
+        }
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        let shown = self
+            .lock_lights
+            .as_mut()
+            .map(|l| l.show(crate::status::light_on(light, ms)));
+        if let Some(Err(error)) = shown {
+            self.lock_lights = None; // dropping it restores what it can
+            self.notice = format!("Keyboard light: {error}; given up");
         }
     }
     /// v7 ticket 40: Run with no verified MIDI program (none connected, or not detected yet)
@@ -2521,6 +2569,7 @@ impl Terminal {
         self.quit_holds();
         self.move_pointer();
         self.show_button_light();
+        self.show_lock_light();
         if let Some(action) = self.guide.tick(Instant::now()) {
             if let Err(error) = self.guide_action(action) {
                 self.error = format!("Profile lock failed: {error}");
@@ -4657,6 +4706,18 @@ fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 crate::status::word(&crate::status::RUMBLES, rumble)
             ));
         }
+        // v7 ticket 113: the computer keyboard's lock-key LED, then its pattern per state.
+        rows.push(format!(
+            "Keyboard light (Scroll Lock LED, else Caps Lock; LED only): {}",
+            on(devices.keyboard_on)
+        ));
+        for (name, light) in NAMES.iter().zip(devices.keyboard) {
+            rows.push(format!(
+                "Keyboard · {}: {}",
+                name.split(" (").next().unwrap_or(name),
+                crate::status::word(&crate::status::LIGHTS, light)
+            ));
+        }
         let blind = NAMES
             .iter()
             .zip(patterns.states)
@@ -4712,6 +4773,24 @@ fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                     (crate::status::TEMPOS[t].1, crate::status::OCTAVES[o].1);
             } else if index == 6 || index == 7 {
                 config.device_lights.on[index - 6] = !devices.on[index - 6];
+            } else if index == 12 {
+                config.device_lights.keyboard_on = !devices.keyboard_on;
+            } else if index > 12 {
+                let state = index - 13;
+                let lights = crate::status::LIGHTS.map(|(w, _)| w);
+                let Some(l) = choose_at(
+                    ui,
+                    &format!("Keyboard · {}: LED", NAMES[state]),
+                    &options(&lights),
+                    crate::status::LIGHTS
+                        .iter()
+                        .position(|(_, v)| *v == devices.keyboard[state])
+                        .unwrap_or(0),
+                )?
+                else {
+                    return Ok(());
+                };
+                config.device_lights.keyboard[state] = crate::status::LIGHTS[l].1;
             } else if index >= 8 {
                 let state = index - 8;
                 let (light, rumble) = devices.xbox[state];
@@ -12113,6 +12192,48 @@ mod tests {
     /// and the default A = Enter) through the session's event path types the keys, keeps the
     /// session running with no error, and leaves every key released. The keyboard records its
     /// keys instead of reaching the desktop.
+    /// v7 ticket 113: while output runs, the keyboard LED shows an agent needing input (by its
+    /// pattern); paused, it goes back to what it showed. A stand-in LED records the writes.
+    #[test]
+    fn the_keyboard_led_follows_agents_and_goes_back_on_pause() {
+        let dir = std::env::temp_dir().join(format!("vibeconsole-lock-led-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = writes.clone();
+        ui.lock_lights = Some(crate::keyboard::LockLights::with(vec![
+            crate::keyboard::Led::new(
+                "test keyboard",
+                false,
+                Box::new(move |on| {
+                    seen.lock().unwrap().push(on);
+                    Ok(())
+                }),
+            ),
+        ]));
+        let mut patterns = crate::status::DevicePatterns::default();
+        patterns.keyboard_on = true;
+        patterns.keyboard[1] = crate::status::Light::Steady; // needs input
+        ui.device_lights = Some(patterns);
+        ui.agent_states = vec![("claude".into(), "claude".into(), "needs-input")];
+        ui.output = Some(crate::keyboard::Output::recording(&[]).unwrap());
+        ui.suspended = false;
+        ui.show_lock_light();
+        assert_eq!(*writes.lock().unwrap(), [true], "lit for needs input");
+        ui.suspend().unwrap();
+        assert_eq!(
+            *writes.lock().unwrap(),
+            [true, false],
+            "paused: back to what it showed"
+        );
+        ui.show_lock_light();
+        assert_eq!(writes.lock().unwrap().len(), 2, "nothing more while paused");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// v7 ticket 116: two pads on one saved sequence each keep their own position; an edit
     /// of the saved sequence reaches both and starts them at step 1.
     #[test]
@@ -13244,13 +13365,13 @@ mod tests {
         let v14 = saved
             .lines()
             .filter(|l| {
-                !["device-lights\t", "xbox-pattern\t", "ps5-pattern\t"]
+                !["device-lights\t", "xbox-pattern\t", "ps5-pattern\t", "keyboard-lights\t", "keyboard-pattern\t"]
                     .iter()
                     .any(|p| l.starts_with(p))
             })
             .map(|l| format!("{l}\n"))
             .collect::<String>()
-            .replace("vibeconsole-mappings-v25", "vibeconsole-mappings-v14")
+            .replace("vibeconsole-mappings-v26", "vibeconsole-mappings-v14")
             .replace(
                 "tuning\t15\t30\t10\toff\toff\nsticks\tlinear\tlinear\nmidi-devices\t0\nmidi-active\t-\nxbox-programs\t-\t-\t-\t-\t-\t-\t-\t-\nprofiles\t0\nprofile-lock\t-\nfavourites\t0\nsequences\t0\n",
                 "",

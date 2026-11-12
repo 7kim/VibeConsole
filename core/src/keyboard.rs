@@ -464,6 +464,107 @@ fn send(
     }
 }
 
+/// v7 ticket 113: the computer keyboard as an agent status light. One LED per keyboard
+/// VibeConsole may write to: Scroll Lock where the keyboard has it, else Caps Lock. Only the
+/// LED is lit; the lock state itself is never toggled, so typing is unaffected. Each LED goes
+/// back to what it showed before on `restore` and on drop (pause, error, quit).
+pub struct LockLights {
+    leds: Vec<Led>,
+    lit: Option<bool>,
+}
+/// One keyboard's LED: its name, what it showed before, and how to set it.
+pub struct Led {
+    pub name: String,
+    was: bool,
+    write: Box<dyn FnMut(bool) -> io::Result<()> + Send>,
+}
+impl Led {
+    pub fn new(
+        name: &str,
+        was: bool,
+        write: Box<dyn FnMut(bool) -> io::Result<()> + Send>,
+    ) -> Self {
+        Self {
+            name: name.to_owned(),
+            was,
+            write,
+        }
+    }
+}
+impl LockLights {
+    /// Every keyboard with a Scroll Lock or Caps Lock LED that can be opened for writing.
+    /// Nothing is sent until `show`.
+    pub fn open() -> Result<Self> {
+        use evdev::{EventType, InputEvent, LedCode};
+        let mut leds = Vec::new();
+        for (path, device) in evdev::enumerate() {
+            let Some(supported) = device.supported_leds() else {
+                continue;
+            };
+            let led = if supported.contains(LedCode::LED_SCROLLL) {
+                LedCode::LED_SCROLLL
+            } else if supported.contains(LedCode::LED_CAPSL) {
+                LedCode::LED_CAPSL
+            } else {
+                continue;
+            };
+            let typing = device
+                .supported_keys()
+                .is_some_and(|k| k.contains(KeyCode::KEY_A));
+            let writable = std::fs::OpenOptions::new().write(true).open(&path).is_ok();
+            if !typing || !writable {
+                continue;
+            }
+            let Ok(mut device) = evdev::Device::open(&path) else {
+                continue;
+            };
+            let was = device.get_led_state().is_ok_and(|s| s.contains(led));
+            let name = device.name().unwrap_or("keyboard").to_owned();
+            leds.push(Led::new(
+                &name,
+                was,
+                Box::new(move |on| {
+                    device.send_events(&[InputEvent::new(EventType::LED.0, led.0, i32::from(on))])
+                }),
+            ));
+        }
+        if leds.is_empty() {
+            return Err("keyboard light unavailable: no keyboard with a Scroll Lock or Caps Lock LED can be written (check /dev/input permissions)".into());
+        }
+        Ok(Self::with(leds))
+    }
+    pub fn with(leds: Vec<Led>) -> Self {
+        Self { leds, lit: None }
+    }
+    pub fn names(&self) -> Vec<&str> {
+        self.leds.iter().map(|l| l.name.as_str()).collect()
+    }
+    /// Light every LED or put it out; nothing is sent when it already shows that.
+    pub fn show(&mut self, on: bool) -> io::Result<()> {
+        if self.lit == Some(on) {
+            return Ok(());
+        }
+        for led in &mut self.leds {
+            (led.write)(on)?;
+        }
+        self.lit = Some(on);
+        Ok(())
+    }
+    /// Each LED back to what it showed before VibeConsole lit it.
+    pub fn restore(&mut self) {
+        if self.lit.take().is_some() {
+            for led in &mut self.leds {
+                let _ = (led.write)(led.was);
+            }
+        }
+    }
+}
+impl Drop for LockLights {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
 impl Output {
     pub fn new(mappings: &[Mapping]) -> Result<Self> {
         let mut keyboard = Keyboard::new(mappings)?;
@@ -1479,5 +1580,55 @@ mod tests {
         keyboard.resume();
         keyboard.observe_at(release(), ms(4200), &mut emit).unwrap();
         assert_eq!(keyboard.take_early(), None);
+    }
+
+    /// v7 ticket 113: the keyboard LED is written only when it changes, and put back to what
+    /// it showed before on restore and on drop; a stand-in records every write.
+    #[test]
+    fn lock_lights_write_changes_only_and_put_the_leds_back() {
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let led = |name: &str, was| {
+            let writes = writes.clone();
+            let name_owned = name.to_owned();
+            Led::new(
+                name,
+                was,
+                Box::new(move |on| {
+                    writes.lock().unwrap().push((name_owned.clone(), on));
+                    Ok(())
+                }),
+            )
+        };
+        let mut lights = LockLights::with(vec![led("a", false), led("b", true)]);
+        assert_eq!(lights.names(), ["a", "b"]);
+        lights.restore();
+        assert!(
+            writes.lock().unwrap().is_empty(),
+            "nothing lit, nothing to put back"
+        );
+        lights.show(true).unwrap();
+        lights.show(true).unwrap();
+        assert_eq!(
+            *writes.lock().unwrap(),
+            [("a".to_string(), true), ("b".to_string(), true)]
+        );
+        lights.restore();
+        assert_eq!(
+            writes.lock().unwrap()[2..],
+            [("a".to_string(), false), ("b".to_string(), true)]
+        );
+        writes.lock().unwrap().clear();
+        lights.show(false).unwrap();
+        drop(lights);
+        assert_eq!(
+            *writes.lock().unwrap(),
+            [
+                ("a".to_string(), false),
+                ("b".to_string(), false),
+                ("a".to_string(), false),
+                ("b".to_string(), true)
+            ],
+            "drop puts each LED back"
+        );
     }
 }

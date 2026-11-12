@@ -525,6 +525,9 @@ pub struct DevicePatterns {
     pub on: [bool; 3],
     pub xbox: [(Light, Rumble); 4],
     pub ps5: [(&'static str, Light, Rumble); 4],
+    /// v7 ticket 113 (config v26): the computer keyboard's lock-key LED, off until turned on.
+    pub keyboard_on: bool,
+    pub keyboard: [Light; 4],
 }
 impl Default for DevicePatterns {
     /// The design board's (version 34).
@@ -546,6 +549,8 @@ impl Default for DevicePatterns {
                 ("blue", SlowPulse, quiet),
                 ("green", Blink, Short),
             ],
+            keyboard_on: false,
+            keyboard: [FastBlink, FastBlink, SlowPulse, Blink],
         }
     }
 }
@@ -559,6 +564,24 @@ impl DevicePatterns {
             .into()),
             None => Ok(()),
         }
+    }
+}
+/// v7 ticket 113: the keyboard LED's pattern for these source states: the most urgent busy
+/// state's, as on the MPK and the Xbox button. None when nothing is busy (the LED then
+/// shows the real lock state).
+pub fn keyboard_light(states: &[&str], patterns: &DevicePatterns) -> Option<Light> {
+    let busy = BUSY.iter().position(|s| states.contains(s))?;
+    Some(patterns.keyboard[busy])
+}
+/// Whether a one-LED pattern is lit `ms` milliseconds in: blink once a second, fast blink
+/// four times a second, slow pulse once every two seconds.
+pub fn light_on(light: Light, ms: u64) -> bool {
+    match light {
+        Light::Off => false,
+        Light::Steady => true,
+        Light::Blink => ms % 1000 < 500,
+        Light::FastBlink => ms % 250 < 125,
+        Light::SlowPulse => ms % 2000 < 1000,
     }
 }
 /// The Xbox button light for these source states (v7 ticket 86): the pattern of the most
@@ -1375,5 +1398,24 @@ mod tests {
         for (word, octave) in OCTAVES {
             assert_eq!(octave_word(octave), word);
         }
+    }
+
+    /// v7 ticket 113: the keyboard LED follows the most urgent busy state's pattern, and a
+    /// pattern is lit or dark by time.
+    #[test]
+    fn the_keyboard_light_follows_the_most_urgent_state() {
+        let mut patterns = DevicePatterns::default();
+        assert!(!patterns.keyboard_on, "off until turned on");
+        patterns.keyboard = [Light::Steady, Light::FastBlink, Light::Off, Light::Blink];
+        assert_eq!(
+            keyboard_light(&["thinking", "needs-decision"], &patterns),
+            Some(Light::Steady)
+        );
+        assert_eq!(keyboard_light(&["finished"], &patterns), Some(Light::Blink));
+        assert_eq!(keyboard_light(&["idle"], &patterns), None);
+        assert!(light_on(Light::Steady, 123) && !light_on(Light::Off, 0));
+        assert!(light_on(Light::Blink, 100) && !light_on(Light::Blink, 600));
+        assert!(light_on(Light::FastBlink, 10) && !light_on(Light::FastBlink, 200));
+        assert!(light_on(Light::SlowPulse, 900) && !light_on(Light::SlowPulse, 1500));
     }
 }

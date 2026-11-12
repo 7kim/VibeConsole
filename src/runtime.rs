@@ -334,6 +334,19 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
             }
             println!("{}", crate::gamepad::headset());
             println!("{}", crate::gamepad::ButtonLight::status());
+            // v7 ticket 113: the keyboard's lock-key LED (opened only, nothing sent) and RGB.
+            match crate::keyboard::LockLights::open() {
+                Ok(lights) => println!("Keyboard light: available ({})", lights.names().join(", ")),
+                Err(e) => println!("Keyboard light: {e}"),
+            }
+            println!(
+                "RGB keyboard: unavailable: {}",
+                if Command::new("openrgb").arg("--version").output().is_ok() {
+                    "VibeConsole can't yet put OpenRGB's colours back afterwards, so it doesn't change them"
+                } else {
+                    "OpenRGB is not installed (VibeConsole never installs it)"
+                }
+            );
             match crate::recording::permissions() {
                 Ok(n) => {
                     println!("Physical-key recording: {n} readable keyboard(s); no events captured")
