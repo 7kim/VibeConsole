@@ -6087,7 +6087,7 @@ fn prompt_sequence_action(
                 steps.push(step);
             }
         } else if choice == steps.len() + 2 {
-            match new_step(ui, path) {
+            match new_step(ui, path, &steps) {
                 Ok(Some(step)) => steps.push(step),
                 Ok(None) => {}
                 Err(error) => not_saved(ui, &error)?,
@@ -6183,8 +6183,13 @@ fn prompt_sequence_action(
 }
 
 /// A step written only in this sequence (v7 ticket 81): a new prompt name (never one that
-/// exists), its target, then its text in the editor. Nothing is written to the prompts.
-fn new_step(ui: &mut impl Ui, path: &Path) -> Result<Option<crate::actions::Action>> {
+/// exists, nor one another unsaved step holds: ticket 92), its target, then its text in the
+/// editor. Nothing is written to the prompts.
+fn new_step(
+    ui: &mut impl Ui,
+    path: &Path,
+    steps: &[crate::actions::Action],
+) -> Result<Option<crate::actions::Action>> {
     let Some(name) = text_entry(
         ui,
         "Name for this step's prompt (saved only if you later choose Save as new prompt)",
@@ -6203,6 +6208,12 @@ fn new_step(ui: &mut impl Ui, path: &Path) -> Result<Option<crate::actions::Acti
         )
         .into());
     }
+    if let Some(owner) = unsaved_step_owner(path, &dir, steps, &name) {
+        return Err(format!(
+            "validation: {owner} already uses the name {name} for a prompt not saved yet; pick another name"
+        )
+        .into());
+    }
     let Some((target, enter)) = prompt_target(ui, path, None)? else {
         return Ok(None);
     };
@@ -6215,6 +6226,40 @@ fn new_step(ui: &mut impl Ui, path: &Path) -> Result<Option<crate::actions::Acti
         own @ crate::actions::Action::PromptOwn { .. } => Ok(Some(own)),
         _ => Err("validation: the step's text was left empty; no step added".into()),
     }
+}
+
+/// v7 ticket 92: which step already holds `name` for a prompt not saved yet: one in the
+/// sequence being edited, else one in any saved mapping (every program, device, layer and
+/// profile). A step whose prompt file exists doesn't reserve its name.
+fn unsaved_step_owner(
+    path: &Path,
+    dir: &Path,
+    steps: &[crate::actions::Action],
+    name: &str,
+) -> Option<String> {
+    use crate::actions::Action;
+    let unsaved = |step: &Action| matches!(step, Action::PromptOwn { file, .. } if file == name && !dir.join(file).exists());
+    if let Some(i) = steps.iter().position(unsaved) {
+        return Some(format!("step {} of this sequence", i + 1));
+    }
+    let config = mappings::load_config(path).ok()?;
+    let profiles = config.profiles.iter().flat_map(|p| {
+        p.mappings
+            .iter()
+            .map(move |m| (m, format!(" in profile {}", p.name)))
+    });
+    config
+        .mappings
+        .iter()
+        .map(|m| (m, String::new()))
+        .chain(profiles)
+        .find_map(|(m, place)| match &m.action {
+            Action::PromptSequence(seq) => seq
+                .iter()
+                .position(unsaved)
+                .map(|i| format!("step {} of {}{place}", i + 1, m.control.label())),
+            _ => None,
+        })
 }
 
 /// "Save as new prompt" (v7 ticket 81): the step's text becomes prompt `name`, written
@@ -10200,6 +10245,102 @@ mod tests {
             std::fs::read(prompts.join("plan")).unwrap(),
             b"Saved plan.\n"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 92: a step written only in a sequence reserves its name until it's saved
+    /// as a prompt: another sequence, or an earlier step of this one, can't take it.
+    #[test]
+    fn an_unsaved_step_name_is_reserved_across_sequences() {
+        use crate::actions::{Action, Target};
+        use Key::*;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-seq-reserve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let prompts = dir.join("prompts");
+        std::fs::create_dir_all(&prompts).unwrap();
+        std::fs::write(prompts.join("plan"), "Saved plan.\n").unwrap();
+        let path = dir.join("mappings.tsv");
+        let own = |file: &str| Action::PromptOwn {
+            file: file.into(),
+            target: Target::Agent("claude".into()),
+            enter: true,
+            text: "Draft.\n".into(),
+        };
+        let pad = Control::from_note(10, 36).unwrap();
+        let elsewhere = Mapping::new_action(
+            pad,
+            mappings::Input::Pad,
+            Action::PromptSequence(vec![own("draft")]),
+        )
+        .unwrap();
+        mappings::save(&path, &[elsewhere]).unwrap();
+        let plan = Action::Prompt {
+            file: "plan".into(),
+            target: Target::Agent("claude".into()),
+            enter: true,
+        };
+        let typed = |text: &str| text.bytes().map(Character).collect::<Vec<_>>();
+        let run = |keys: Vec<Key>, saved: &Action| {
+            let mut ui = Script {
+                keys: keys.into(),
+                ..Default::default()
+            };
+            let result = prompt_sequence_action(&mut ui, &path, Some(saved)).unwrap();
+            assert!(ui.keys.is_empty(), "keys left: {:?}", ui.keys);
+            (result, ui.screens)
+        };
+        // Another sequence's unsaved step holds "draft": refused, naming it; no step added.
+        let one = Action::PromptSequence(vec![plan.clone()]);
+        let keys = [
+            vec![Down, Down, Down, Enter],
+            typed("draft"),
+            vec![Enter, Enter],
+            vec![Down; 2],
+            vec![Enter],
+        ]
+        .concat();
+        let (result, screens) = run(keys, &one);
+        assert_eq!(result, Some(one.clone()));
+        assert!(
+            screens
+                .iter()
+                .any(|s| s.contains("step 1 of Bank A Pad 1 already uses the name draft")),
+            "{}",
+            screens.join("\n----\n")
+        );
+        // An earlier step of this sequence holds "local": refused, naming that step.
+        let two = Action::PromptSequence(vec![plan.clone(), own("local")]);
+        let keys = [
+            vec![Down; 4],
+            vec![Enter],
+            typed("local"),
+            vec![Enter, Enter],
+            vec![Down; 3],
+            vec![Enter],
+        ]
+        .concat();
+        let (result, screens) = run(keys, &two);
+        assert_eq!(result, Some(two.clone()));
+        assert!(
+            screens
+                .iter()
+                .any(|s| s.contains("step 2 of this sequence already uses the name local"))
+        );
+        // A free name is accepted as before.
+        let keys = [
+            vec![Down, Down, Down, Enter],
+            typed("fresh"),
+            vec![Enter, Enter, Down, Enter],
+            vec![Down; 3],
+            vec![Enter],
+        ]
+        .concat();
+        let (result, _) = run(keys, &one);
+        let Some(Action::PromptSequence(steps)) = result else {
+            panic!("no sequence");
+        };
+        assert!(matches!(&steps[1], Action::PromptOwn { file, .. } if file == "fresh"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
