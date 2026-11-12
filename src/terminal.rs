@@ -1427,6 +1427,7 @@ impl Terminal {
             }
         }
         self.reload_keyboard()?;
+        self.error.clear(); // v7 ticket 103: a switch replaces an old error
         self.notice = format!("Profile: {}", self.profile.as_deref().unwrap_or("Default"));
         Ok(())
     }
@@ -1969,7 +1970,9 @@ impl Terminal {
                 if self.stop.load(Ordering::Relaxed) {
                     eprintln!("{message}");
                 }
-                self.error = message;
+                // v7 ticket 103: a restore result is a notice; a failed one is the Err below.
+                self.error.clear();
+                self.notice = message;
             }
             Err(error) => {
                 self.error = error.to_string();
@@ -2141,6 +2144,39 @@ impl Terminal {
         Ok(())
     }
 
+    /// Finished actions: their status phase, Flow's state, and their text (v7 ticket 103: a
+    /// result is a notice and clears an old error; a failure is the error).
+    fn take_results(&mut self) {
+        while let Some((action, ok, notice)) = self.actions.notice() {
+            let done = self
+                .status_mappings()
+                .filter(|m| m.action == action)
+                .map(|m| m.control)
+                .collect::<Vec<_>>();
+            for control in done {
+                let phase = if ok { Phase::Done } else { Phase::Failed };
+                self.phases.insert(control, phase);
+            }
+            let notice = notice
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(2000)
+                .collect();
+            if action.flow() {
+                self.flow_pending = false;
+                self.flow_failed = !ok;
+                self.flow_resume &= ok;
+            }
+            // v7 ticket 103: a result ("Restored …", "Launched …") is a notice and clears an
+            // old error; only a failure is an error.
+            if ok {
+                self.error.clear();
+                self.notice = notice;
+            } else {
+                self.error = notice;
+            }
+        }
+    }
     fn tick(&mut self) -> Result<()> {
         if self.stop.load(Ordering::Relaxed) {
             self.pause()?;
@@ -2182,33 +2218,7 @@ impl Terminal {
         for (keys, reply) in self.actions.tap_requests() {
             let _ = reply.send(self.tap(&keys).map_err(|e| e.to_string()));
         }
-        while let Some((action, ok, notice)) = self.actions.notice() {
-            let done = self
-                .status_mappings()
-                .filter(|m| m.action == action)
-                .map(|m| m.control)
-                .collect::<Vec<_>>();
-            for control in done {
-                let phase = if ok { Phase::Done } else { Phase::Failed };
-                self.phases.insert(control, phase);
-            }
-            let notice = notice
-                .chars()
-                .filter(|c| !c.is_control())
-                .take(2000)
-                .collect();
-            if action.flow() {
-                self.flow_pending = false;
-                self.flow_failed = !ok;
-                self.flow_resume &= ok;
-                if ok {
-                    self.error.clear();
-                    self.notice = notice;
-                    continue;
-                }
-            }
-            self.error = notice;
-        }
+        self.take_results();
         // Resume only on the command list: a menu that suspended output must find it paused.
         if self.flow_resume && !self.flow_pending && self.at_menu {
             self.flow_resume = false;
@@ -2527,7 +2537,7 @@ Changing musical settings while running is unsupported.",
             if !self.follow_programs
                 && let Some(mut controller) = self.controller.take()
             {
-                self.error = controller.finish()?;
+                self.notice = controller.finish()?; // v7 ticket 103: a result, not an error
                 self.input = None;
                 self.reset_input_lights();
                 self.reconnected = true;
@@ -11531,6 +11541,59 @@ mod tests {
     /// and the default A = Enter) through the session's event path types the keys, keeps the
     /// session running with no error, and leaves every key released. The keyboard records its
     /// keys instead of reaching the desktop.
+    /// v7 ticket 103: an action's result ("Restored …") is a notice, never "Error:"; only a
+    /// failure is the error, and the next success or a profile switch replaces it.
+    #[test]
+    fn action_results_are_notices_and_only_failures_are_errors() {
+        use crate::actions::Action;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-results-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        let replies = std::sync::Mutex::new(std::collections::VecDeque::from([
+            Ok("Restored org.gnome.Ptyxis.desktop".to_string()),
+            Err("wpctl: no default sink".to_string()),
+            Ok("Launched org.mozilla.firefox.desktop".to_string()),
+        ]));
+        ui.actions = crate::actions::Dispatcher::with(move |_, _, _| {
+            replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap()
+                .map_err(Into::into)
+        });
+        let settle = |ui: &mut Terminal, done: &dyn Fn(&Terminal) -> bool| {
+            for _ in 0..200 {
+                ui.take_results();
+                if done(ui) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("no result: notice {:?} error {:?}", ui.notice, ui.error);
+        };
+        ui.actions.submit(Action::OutputMute, None).unwrap();
+        settle(&mut ui, &|ui| !ui.notice.is_empty());
+        assert_eq!(ui.notice, "Restored org.gnome.Ptyxis.desktop");
+        assert!(ui.error.is_empty(), "a result is no error: {}", ui.error);
+        ui.actions.submit(Action::OutputMute, None).unwrap();
+        settle(&mut ui, &|ui| !ui.error.is_empty());
+        assert!(ui.error.contains("no default sink"), "{}", ui.error);
+        ui.actions.submit(Action::OutputMute, None).unwrap();
+        settle(&mut ui, &|ui| ui.error.is_empty());
+        assert_eq!(ui.notice, "Launched org.mozilla.firefox.desktop");
+        // A profile switch replaces an old error too.
+        ui.profile = Some("Firefox".into()); // as if Firefox's profile were active
+        ui.error = "Action rejected: earlier".into();
+        ui.set_profile(None).unwrap();
+        assert!(ui.error.is_empty(), "{}", ui.error);
+        assert_eq!(ui.notice, "Profile: Default");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// v7 ticket 101: through the real event path (keyboard, then the session), a finished
     /// sequence sends nothing on any number of taps, even a second apart; a ½ s hold re-arms
     /// nothing; only a full one-second hold starts it over, and the next tap sends step 1.
