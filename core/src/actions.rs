@@ -122,6 +122,9 @@ const MAX_STEP_TEXT: usize = 64 * 1024;
 pub enum Action {
     Shortcut,
     Sequence(Vec<Step>),
+    /// v7 ticket 98 (config v22): Orca's own keys (a shortcut, or "needs me": Ctrl+J, a wait,
+    /// Ctrl+1), sent only while Orca IDE is the focused app; elsewhere nothing is sent.
+    OrcaKeys(Vec<Step>),
     /// Knob zones, one prompt each, sent once the knob settles in a new zone.
     Choice(Vec<Action>),
     /// Knob position written to `path` as min..max with `decimals`, stored scaled by 10^decimals.
@@ -278,6 +281,14 @@ impl Action {
                 Err("a sequence needs 1–32 steps".into())
             }
             Self::Sequence(steps) => steps.iter().try_for_each(Step::validate),
+            Self::OrcaKeys(steps)
+                if steps.is_empty()
+                    || steps.len() > 32
+                    || steps.iter().any(|s| !matches!(s, Step::Keys(_) | Step::Wait(_))) =>
+            {
+                Err("Orca keys need 1–32 key and wait steps".into())
+            }
+            Self::OrcaKeys(steps) => steps.iter().try_for_each(Step::validate),
             Self::Choice(choices)
                 if !(2..=16).contains(&choices.len())
                     || choices.iter().any(|c| !matches!(c, Self::Prompt { .. })) =>
@@ -397,6 +408,14 @@ impl Action {
                 max,
                 decimals,
             } => format!("value:{decimals}:{min}:{max}:{path}"),
+            Self::OrcaKeys(steps) => format!(
+                "orca-keys:{}",
+                steps
+                    .iter()
+                    .map(Step::encode)
+                    .collect::<Vec<_>>()
+                    .join(&STEP_SEPARATOR.to_string())
+            ),
             Self::Sequence(steps) => format!(
                 "sequence:{}",
                 steps
@@ -517,6 +536,12 @@ impl Action {
                     decimals: decimals.parse()?,
                 }
             }
+            _ if value.starts_with("orca-keys:") => Self::OrcaKeys(
+                value["orca-keys:".len()..]
+                    .split(STEP_SEPARATOR)
+                    .map(Step::parse)
+                    .collect::<Result<_>>()?,
+            ),
             _ if value.starts_with("sequence:") => Self::Sequence(
                 value["sequence:".len()..]
                     .split(STEP_SEPARATOR)
@@ -636,6 +661,15 @@ impl Action {
                 "Value knob {}–{} → {path}",
                 fixed(*min, *decimals),
                 fixed(*max, *decimals)
+            ),
+            Self::OrcaKeys(steps) => format!(
+                "Orca: {} (only while Orca is focused)",
+                steps
+                    .iter()
+                    .filter(|s| !matches!(s, Step::Wait(_)))
+                    .map(Step::description)
+                    .collect::<Vec<_>>()
+                    .join(" → ")
             ),
             Self::Sequence(steps) => format!(
                 "Sequence: {}",
@@ -1033,6 +1067,32 @@ impl AppIcons {
     }
 }
 
+/// v7 ticket 98: whether Orca IDE is the focused app. No app focused is "not Orca"; a desktop
+/// that can't tell is an error ("focused app unavailable"), never a guess.
+pub fn orca_in_front(focused: Result<Option<String>>) -> Result<bool> {
+    Ok(focused?.is_some_and(|id| id.to_lowercase().starts_with("orca-ide")))
+}
+/// v7 ticket 98: Orca's keys, tapped only while Orca is focused (`focused` is the window
+/// extension's answer). `Ok(None)` when they were sent; `Ok(Some(why))` when nothing was.
+fn orca_keys(
+    steps: &[Step],
+    focused: Result<Option<String>>,
+    cancelled: &dyn Fn() -> bool,
+    tap: &dyn Fn(Vec<evdev::KeyCode>) -> Result<()>,
+) -> Result<Option<String>> {
+    if !orca_in_front(focused)? {
+        return Ok(Some("Orca isn't focused; nothing sent".into()));
+    }
+    run_sequence(steps, cancelled, |step| match step {
+        Step::Wait(ms) => wait(Duration::from_millis(u64::from(*ms)), cancelled),
+        Step::Keys(keys) => tap(keys
+            .iter()
+            .map(|k| crate::keyboard::key_code(k))
+            .collect::<Result<_>>()?),
+        _ => Err("Orca keys hold only keys and waits".into()),
+    })?;
+    Ok(None)
+}
 /// The agent apps offered first among launchers (v7 ticket 48).
 pub const AGENT_APPS: [&str; 3] = ["Orca", "T3 Code", "herdr"];
 /// Which agent app an installed entry path launches, matched by desktop ID, never by Name:
@@ -2301,6 +2361,8 @@ fn perform(
     tap: &dyn Fn(Vec<evdev::KeyCode>) -> Result<()>,
 ) -> Result<String> {
     match action {
+        Action::OrcaKeys(steps) => orca_keys(steps, focused_app(gdbus_output), cancelled, tap)
+            .map(|sent| sent.unwrap_or_else(|| action.description())),
         Action::Sequence(steps) => {
             run_sequence(steps, cancelled, |step| match step {
                 Step::Agent(name) => reach_agent(name, cancelled).map(drop),
@@ -2718,6 +2780,52 @@ mod tests {
         assert_eq!(positions.current(pad, &reordered), Some(0));
         assert_eq!(positions.current(pad, &steps[..1]), Some(0));
         assert_eq!(Positions::default().label(pad, &steps), "1/3");
+    }
+
+    /// v7 ticket 98: Orca's keys go out only while Orca is focused; in another app nothing is
+    /// sent and the result says why; a desktop that can't tell is an error, never a guess.
+    #[test]
+    fn orca_keys_are_sent_only_while_orca_is_focused() {
+        let needs_me = crate::mappings::orca_needs_me_steps();
+        let sent = std::cell::RefCell::new(Vec::new());
+        let tap = |keys: Vec<evdev::KeyCode>| {
+            sent.borrow_mut().push(keys);
+            Ok(())
+        };
+        let focused = |id: &str| Ok(Some(id.to_owned()));
+        assert_eq!(
+            orca_keys(&needs_me, focused("orca-ide.desktop"), &|| false, &tap).unwrap(),
+            None
+        );
+        assert_eq!(
+            *sent.borrow(),
+            [
+                vec![evdev::KeyCode::KEY_LEFTCTRL, evdev::KeyCode::KEY_J],
+                vec![evdev::KeyCode::KEY_LEFTCTRL, evdev::KeyCode::KEY_1]
+            ]
+        );
+        sent.borrow_mut().clear();
+        for other in [
+            focused("org.gnome.Ptyxis.desktop"),
+            focused("orca.desktop"),
+            Ok(None),
+        ] {
+            assert_eq!(
+                orca_keys(&needs_me, other, &|| false, &tap)
+                    .unwrap()
+                    .as_deref(),
+                Some("Orca isn't focused; nothing sent")
+            );
+        }
+        let unknown = orca_keys(&needs_me, Err("no extension".into()), &|| false, &tap);
+        assert!(unknown.is_err());
+        assert!(
+            sent.borrow().is_empty(),
+            "nothing sent outside Orca: {:?}",
+            sent.borrow()
+        );
+        // The screen reader's desktop ID is never taken for Orca IDE.
+        assert!(!orca_in_front(Ok(Some("orca.desktop".into()))).unwrap());
     }
 
     /// v7 ticket 94: a step's own text is what reaches the agent: the buffer tmux loads holds

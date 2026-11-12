@@ -5964,7 +5964,7 @@ fn families(input: mappings::Input) -> Vec<usize> {
 fn action_family(mapping: &Mapping) -> usize {
     use crate::actions::Action;
     match &mapping.action {
-        action if orca_needs_me().is_ok_and(|needs_me| *action == needs_me) => 8,
+        Action::OrcaKeys(_) => 8,
         Action::Shortcut => 0,
         Action::Command { .. } if mapping.risky => 12,
         Action::Command { .. } => 4,
@@ -6435,11 +6435,10 @@ fn t3_action(ui: &mut impl Ui) -> Result<Option<crate::actions::Action>> {
 /// Orca's "needs me": the jump palette, then its first row (the agent waiting on you). Built
 /// here only, so a saved one is recognised when it's edited (v7 ticket 55).
 fn orca_needs_me() -> Result<crate::actions::Action> {
-    Ok(crate::actions::Action::Sequence(vec![
-        crate::actions::Step::Keys(mappings::parse_shortcut("Ctrl+J")?),
-        crate::actions::Step::Wait(150),
-        crate::actions::Step::Keys(mappings::parse_shortcut("Ctrl+1")?),
-    ]))
+    // v7 ticket 98: Orca keys, sent only while Orca is focused.
+    Ok(crate::actions::Action::OrcaKeys(
+        mappings::orca_needs_me_steps(),
+    ))
 }
 
 /// The Orca family (v7 ticket 15): Orca's Linux default keys, "needs me" (the jump
@@ -6481,11 +6480,10 @@ fn orca_mapping(ui: &mut impl Ui, pad: Control, input: mappings::Input) -> Resul
             let (agent, folder) = agents[index].clone();
             crate::actions::Action::OrcaJump { agent, folder }
         }
-        n => {
-            return Ok(Some(
-                Mapping::new(pad, SHORTCUTS[n - 2].1, "hold").map_err(stage("validation"))?,
-            ));
-        }
+        // v7 ticket 98: Orca's shortcuts are Orca keys too, sent only while Orca is focused.
+        n => crate::actions::Action::OrcaKeys(vec![crate::actions::Step::Keys(
+            mappings::parse_shortcut(SHORTCUTS[n - 2].1)?,
+        )]),
     };
     Ok(Some(
         Mapping::new_action(pad, input, action).map_err(stage("validation"))?,
@@ -9342,7 +9340,7 @@ mod tests {
             (
                 "orca needs me",
                 [family(6), vec![Enter]].concat(),
-                vec![Enter, Enter, Enter, Down, Enter],
+                vec![Enter, Enter, Down, Enter], // layer, fire when, finish (Orca keys: no status)
                 |a| a.encode().contains("Ctrl+J"),
             ),
             (
@@ -10058,7 +10056,7 @@ mod tests {
         mappings::save(&path, &[]).unwrap();
         let pads = [36, 37, 38].map(|n| Control::from_note(10, n).unwrap());
         let family = vec![Down; 6]; // Orca is the 7th family offered for a pad
-        let save = [Enter, Enter, Enter]; // fire when pressed, no status, save and another
+        let save = [Enter, Enter]; // fire when pressed, save and another (Orca keys: no status)
         let mut keys = vec![Enter];
         keys.extend(family.clone());
         keys.extend([Enter, Enter]); // Orca, needs me
@@ -10070,7 +10068,7 @@ mod tests {
         keys.push(Enter);
         keys.extend(family);
         keys.extend([Enter, Down, Down, Down, Enter]); // next tab
-        keys.extend([Enter, Enter, Enter]); // fire when, no feedback, save
+        keys.extend([Enter, Enter]); // fire when, save
         keys.extend([Tab, Tab, Enter]);
         let mut ui = Script {
             keys: keys.into(),
@@ -10085,9 +10083,10 @@ mod tests {
         configure(&mut ui, &path, &mut current).unwrap();
         assert!(ui.keys.is_empty());
         let saved = mappings::load(&path).unwrap();
+        // v7 ticket 98: Orca keys, sent only while Orca is focused.
         assert_eq!(
             saved[0].action.encode(),
-            "sequence:keys:Ctrl+J\u{1f}wait:150\u{1f}keys:Ctrl+1".replace("\\u{1f}", "\u{1f}")
+            "orca-keys:keys:Ctrl+J\u{1f}wait:150\u{1f}keys:Ctrl+1"
         );
         assert_eq!(
             saved[1].action,
@@ -10096,7 +10095,14 @@ mod tests {
                 folder: "/work/b".into()
             }
         );
-        assert_eq!(saved[2].keys, ["Ctrl", "Shift", "RightBracket"]);
+        assert_eq!(
+            saved[2].action,
+            crate::actions::Action::OrcaKeys(vec![crate::actions::Step::Keys(vec![
+                "Ctrl".into(),
+                "Shift".into(),
+                "RightBracket".into()
+            ])])
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -12322,7 +12328,7 @@ mod tests {
             })
             .map(|l| format!("{l}\n"))
             .collect::<String>()
-            .replace("vibeconsole-mappings-v21", "vibeconsole-mappings-v14")
+            .replace("vibeconsole-mappings-v22", "vibeconsole-mappings-v14")
             .replace(
                 "tuning\t15\t30\t10\toff\toff\nsticks\tlinear\tlinear\nmidi-devices\t0\nmidi-active\t-\nprofiles\t0\nprofile-lock\t-\nfavourites\t0\n",
                 "",
