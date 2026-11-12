@@ -160,20 +160,26 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from xbox_series_white import DOTS, box_uv
 
 
+GRIP = {}  # one dotted copy per source material, shared by every part (ticket 121)
+
+
 def grip(ob, faces=None):
     me = box_uv(ob, "grip").data
-    m = ob.material_slots[0].material.copy()
-    m.name = "grip_dotted"
-    nt = m.node_tree
-    uvn = nt.nodes.new("ShaderNodeUVMap")
-    uvn.uv_map = "grip"
-    tex = nt.nodes.new("ShaderNodeTexImage")
-    tex.image = DOTS
-    nm = nt.nodes.new("ShaderNodeNormalMap")
-    nm.uv_map = "grip"
-    nt.links.new(uvn.outputs["UV"], tex.inputs["Vector"])
-    nt.links.new(tex.outputs["Color"], nm.inputs["Color"])
-    nt.links.new(nm.outputs["Normal"], [n for n in nt.nodes if n.type == "BSDF_PRINCIPLED"][0].inputs["Normal"])
+    source = ob.material_slots[0].material
+    m = GRIP.get(source.name)
+    if m is None:
+        m = GRIP[source.name] = source.copy()
+        m.name = "grip_dotted"
+        nt = m.node_tree
+        uvn = nt.nodes.new("ShaderNodeUVMap")
+        uvn.uv_map = "grip"
+        tex = nt.nodes.new("ShaderNodeTexImage")
+        tex.image = DOTS
+        nm = nt.nodes.new("ShaderNodeNormalMap")
+        nm.uv_map = "grip"
+        nt.links.new(uvn.outputs["UV"], tex.inputs["Vector"])
+        nt.links.new(tex.outputs["Color"], nm.inputs["Color"])
+        nt.links.new(nm.outputs["Normal"], [n for n in nt.nodes if n.type == "BSDF_PRINCIPLED"][0].inputs["Normal"])
     if faces is None:
         ob.material_slots[0].material = m
         return
@@ -183,11 +189,41 @@ def grip(ob, faces=None):
             poly.material_index = len(me.materials) - 1
 
 
+def grip_panels(ob):
+    """Faces of the two grip panels (ticket 122): in the source each is its own mesh island on
+    the back of a handle, left and right of the battery door. Islands are found by vertex
+    position, since the glTF import splits vertices along UV seams."""
+    me, mw = ob.data, ob.matrix_world
+    parent = {}
+
+    def find(k):
+        while parent.setdefault(k, k) != k:
+            parent[k] = parent[parent[k]]
+            k = parent[k]
+        return k
+
+    key = lambda vi: tuple(round(c * 1e6) for c in me.vertices[vi].co)
+    for p in me.polygons:
+        root = find(key(p.vertices[0]))
+        for vi in p.vertices[1:]:
+            parent[find(key(vi))] = root
+    islands = {}
+    for p in me.polygons:
+        islands.setdefault(find(key(p.vertices[0])), []).append(p)
+    panels = [faces for faces in islands.values()
+              if len(faces) > 300 and min(abs((mw @ p.center).x) for p in faces) > 0.035
+              and sum(p.normal.z < -0.3 for p in faces) > 100]
+    sides = sorted((mw @ faces[0].center).x > 0 for faces in panels)
+    if sides != [False, True]:
+        raise SystemExit(f"grip panels: expected one per handle, found {len(panels)}")
+    return {p.index for faces in panels for p in faces}
+
+
 for name in ("trigger_left", "trigger_right", "bumper_left", "bumper_right"):
     grip(named[name])
-# The back of the grips: faces turned away from the face plane, below the centre line.
-# ponytail: normal/centre test, not a painted mask; paint one if the dots spill where they shouldn't.
-grip(named["body"], lambda p: p.normal.z < -0.3 and p.center.y < 0)
+# The back of the grips only: the battery door and the centre of the back stay smooth.
+GRIP_FACES = grip_panels(named["body"])
+grip(named["body"], lambda p: p.index in GRIP_FACES)
 
 # 5. The View and Menu icons printed on their caps (two overlapping rectangles; three lines),
 # joined to their buttons so they move with them.
