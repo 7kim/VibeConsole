@@ -612,7 +612,7 @@ impl Action {
                 enter,
                 ..
             } => format!(
-                "Prompt {file} (this sequence’s version) → {}{}",
+                "Prompt {file} (Edited in this sequence) → {}{}",
                 target.description(),
                 if *enter { " + Enter" } else { " (paste only)" }
             ),
@@ -2307,7 +2307,7 @@ fn perform(
         } => with_own_text(text, |path| {
             send_prompt_at(path, file, agent, *enter, cancelled)
         })
-        .map(|done| format!("{done} (this sequence’s version)")),
+        .map(|done| format!("{done} (Edited in this sequence)")),
         Action::PromptOwn {
             file,
             target: Target::Focused { shift },
@@ -2323,7 +2323,7 @@ fn perform(
                 tap(vec![evdev::KeyCode::KEY_ENTER])?;
             }
             Ok(format!(
-                "Prompt {file} (this sequence’s version) pasted into the focused window"
+                "Prompt {file} (Edited in this sequence) pasted into the focused window"
             ))
         }
         Action::Prompt {
@@ -2729,7 +2729,7 @@ mod tests {
         // Deleting a prompt warns about every sequence step that uses it.
         assert_eq!(sequence.prompt_files(), ["plan", "build"]);
         assert!(
-            own.description().contains("this sequence’s version"),
+            own.description().contains("Edited in this sequence"),
             "{}",
             own.description()
         );

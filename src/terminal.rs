@@ -6070,10 +6070,7 @@ fn prompt_sequence_action(
             .collect::<Vec<_>>();
         items.push(format!("Add step {}", steps.len() + 1));
         items.push("Done".into());
-        items.push(format!(
-            "Write step {} for this sequence only",
-            steps.len() + 1
-        ));
+        items.push("New prompt (this sequence only)".into());
         let Some(choice) = choose(
             ui,
             "Prompt sequence: tap 1 sends step 1, tap 2 step 2, …; after the last it stops until the pad is held 1 s",
@@ -10176,7 +10173,7 @@ mod tests {
             !prompts.join(".plan.sequence-edit").exists(),
             "no scratch left behind"
         );
-        // The edited step shows as this sequence's version; Discard returns to the prompt.
+        // The edited step is marked Edited in this sequence; Discard returns to the prompt.
         let own = Action::PromptSequence(vec![edited.clone()]);
         let keys = [
             vec![Enter],
@@ -10193,7 +10190,7 @@ mod tests {
         assert!(
             screens
                 .iter()
-                .any(|s| s.contains("this sequence’s version"))
+                .any(|s| s.contains("Edited in this sequence"))
         );
         // Update prompt to match: Cancel changes nothing; Update writes the prompt and the
         // step points at it again.
@@ -10327,6 +10324,17 @@ mod tests {
                 .iter()
                 .any(|s| s.contains("step 2 of this sequence already uses the name local"))
         );
+        // v7 ticket 93: the item and the step list use the ticket's words.
+        assert!(
+            screens
+                .iter()
+                .any(|s| s.contains("New prompt (this sequence only)"))
+        );
+        assert!(
+            screens
+                .iter()
+                .any(|s| s.contains("2. Prompt local (Edited in this sequence)"))
+        );
         // A free name is accepted as before.
         let keys = [
             vec![Down, Down, Down, Enter],
@@ -10373,7 +10381,7 @@ mod tests {
             (result, ui.screens)
         };
         let typed = |text: &str| text.bytes().map(Character).collect::<Vec<_>>();
-        // "Write step 2 for this sequence only": name, target (claude), Paste and Enter,
+        // "New prompt (this sequence only)": name, target (claude), Paste and Enter,
         // then the editor; Done.
         let keys = [
             vec![Down, Down, Down, Enter],
