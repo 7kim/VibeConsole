@@ -1540,6 +1540,16 @@ impl Terminal {
                     continue;
                 }
             }
+            // v7 ticket 101: a prompt sequence is a trigger, so its release never reaches
+            // `transition`; letting go here cancels a finished sequence's start-over hold.
+            if let Event::Release(pad, _) | Event::UnmatchedRelease(pad) = &event {
+                let sequence = self
+                    .fired(*pad)?
+                    .is_some_and(|m| matches!(m.action, crate::actions::Action::PromptSequence(_)));
+                if sequence {
+                    self.holds.release(*pad, Instant::now());
+                }
+            }
             if let Some(output) = &mut self.output {
                 match output.observe(event) {
                     Ok(Some((pad, active))) => {
@@ -11520,6 +11530,98 @@ mod tests {
     /// and the default A = Enter) through the session's event path types the keys, keeps the
     /// session running with no error, and leaves every key released. The keyboard records its
     /// keys instead of reaching the desktop.
+    /// v7 ticket 101: through the real event path (keyboard, then the session), a finished
+    /// sequence sends nothing on any number of taps, even a second apart; a ½ s hold re-arms
+    /// nothing; only a full one-second hold starts it over, and the next tap sends step 1.
+    #[test]
+    fn a_finished_sequence_restarts_only_after_a_full_hold() {
+        use crate::actions::{Action, Target};
+        let dir = std::env::temp_dir().join(format!("vibeconsole-seq-hold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let prompt = |file: &str| Action::Prompt {
+            file: file.into(),
+            target: Target::Agent("claude".into()),
+            enter: true,
+        };
+        let steps = vec![prompt("one"), prompt("two"), prompt("three")];
+        let pad = Control::from_note(10, 41).unwrap();
+        let seq = Mapping::new_action(
+            pad,
+            mappings::Input::Pad,
+            Action::PromptSequence(steps.clone()),
+        )
+        .unwrap();
+        mappings::save(&path, &[seq]).unwrap();
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        let (sent, ran) = std::sync::mpsc::channel();
+        ui.actions = crate::actions::Dispatcher::with(move |action, _, _| {
+            sent.send(action.clone()).unwrap();
+            Ok("done".into())
+        });
+        ui.run_mappings = ui.context_mappings(&mappings::load_config(&path).unwrap().mappings);
+        let mut output = crate::keyboard::Output::recording(&ui.run_mappings).unwrap();
+        output.keyboard.resume();
+        ui.output = Some(output);
+        ui.wanted_run = true;
+        ui.suspended = false;
+        let press = |ui: &mut Terminal| ui.handle_events(vec![Event::Press(pad)]).unwrap();
+        let release = |ui: &mut Terminal| {
+            ui.handle_events(vec![Event::Release(pad, crate::ReleaseType::NoteOff)])
+                .unwrap()
+        };
+        let wait = |ui: &mut Terminal, ms| {
+            std::thread::sleep(Duration::from_millis(ms));
+            ui.quit_holds();
+        };
+        let nothing = |ran: &std::sync::mpsc::Receiver<Action>| {
+            assert!(
+                ran.recv_timeout(Duration::from_millis(100)).is_err(),
+                "nothing sent"
+            );
+        };
+        for step in &steps {
+            press(&mut ui);
+            release(&mut ui);
+            assert_eq!(&ran.recv_timeout(Duration::from_secs(2)).unwrap(), step);
+        }
+        for _ in 0..3 {
+            press(&mut ui);
+            release(&mut ui);
+            wait(&mut ui, 1100); // a tap's hold must not come due later
+            nothing(&ran);
+            assert!(
+                ui.notice
+                    .ends_with("sequence finished · hold 1 s to start over"),
+                "{}",
+                ui.notice
+            );
+        }
+        press(&mut ui);
+        wait(&mut ui, 500);
+        release(&mut ui);
+        wait(&mut ui, 700);
+        press(&mut ui);
+        release(&mut ui);
+        nothing(&ran);
+        press(&mut ui);
+        wait(&mut ui, 1100);
+        release(&mut ui);
+        assert!(
+            ui.notice.ends_with("sequence starts over at step 1"),
+            "{}",
+            ui.notice
+        );
+        press(&mut ui);
+        release(&mut ui);
+        assert_eq!(
+            &ran.recv_timeout(Duration::from_secs(2)).unwrap(),
+            &steps[0]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// v7 ticket 99: a terminal-command pad tapped shorter than a second runs nothing and the
     /// notice says to hold it.
     #[test]
