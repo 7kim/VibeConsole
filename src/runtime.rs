@@ -107,7 +107,7 @@ fn extension_dir() -> Result<PathBuf> {
     Ok(base.join("gnome-shell/extensions").join(EXTENSION_UUID))
 }
 fn service() -> &'static str {
-    "# Managed by VibeConsole\n[Unit]\nDescription=VibeConsole controller shortcuts\nAfter=graphical-session-pre.target pipewire.service wireplumber.service\nPartOf=graphical-session.target\n\n[Service]\nType=simple\nExecStart=\"%h/.local/bin/vibeconsole\" daemon\nRestart=no\n# SIGTERM goes to the main process only, so its handled shutdown restores controller feedback\nKillMode=mixed\nTimeoutStopSec=15\n\n[Install]\nWantedBy=graphical-session.target\n"
+    "# Managed by VibeConsole\n[Unit]\nDescription=VibeConsole controller shortcuts\nAfter=graphical-session.target pipewire.service wireplumber.service\nPartOf=graphical-session.target\n\n[Service]\nType=simple\nExecStart=\"%h/.local/bin/vibeconsole\" daemon\nRestart=no\n# SIGTERM goes to the main process only, so its handled shutdown restores controller feedback\nKillMode=mixed\nTimeoutStopSec=15\n\n[Install]\nWantedBy=graphical-session.target\n"
 }
 fn managed(path: &Path) -> Result<()> {
     if path.exists() && !fs::read_to_string(path)?.starts_with("# Managed by VibeConsole\n") {
@@ -140,11 +140,26 @@ fn write_unit() -> Result<()> {
     if !binary()?.is_file() {
         return Err("run vibeconsole install first".into());
     }
-    let path = unit()?;
-    managed(&path)?;
+    write_unit_at(&unit()?, systemctl)
+}
+fn write_unit_at(path: &Path, mut systemctl: impl FnMut(&[&str]) -> Result<()>) -> Result<()> {
+    managed(path)?;
     fs::create_dir_all(path.parent().unwrap())?;
-    fs::write(&path, service())?;
+    fs::write(path, service())?;
     systemctl(&["daemon-reload"])
+}
+/// v8 ticket 117: `install` brings an installed managed unit up to date. It never enables or
+/// disables it, and leaves a missing or hand-written unit alone. True when it rewrote one.
+fn refresh_installed_unit(
+    path: &Path,
+    systemctl: impl FnMut(&[&str]) -> Result<()>,
+) -> Result<bool> {
+    if !path.is_file() || managed(path).is_err() {
+        return Ok(false);
+    }
+    write_unit_at(path, systemctl)
+        .map_err(|e| format!("install: updating the login service unit failed: {e}"))?;
+    Ok(true)
 }
 /// Settings -> Login service (ticket 21).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -247,6 +262,9 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                 "Installed {}. Installation does not enable/start login startup. Add ~/.local/bin to PATH if needed.",
                 binary.display()
             );
+            if refresh_installed_unit(&unit()?, systemctl)? {
+                println!("Login service unit updated; enabled/disabled is unchanged.");
+            }
             println!("{}", login_doctor(unit()?.is_file(), systemctl));
             let extension = extension_dir()?;
             fs::create_dir_all(&extension)?;
@@ -510,6 +528,43 @@ mod tests {
                 .contains(&format!("\"uuid\": \"{EXTENSION_UUID}\""))
         );
         assert!(EXTENSION_FILES[1].1.contains("org.vibeconsole.Windows"));
+    }
+
+    /// v8 ticket 117: the unit starts after the desktop session is up, and reinstalling
+    /// rewrites an old managed unit without enabling or disabling it.
+    #[test]
+    fn reinstall_updates_the_unit_to_wait_for_the_desktop_and_keeps_enabled_state() {
+        use std::cell::RefCell;
+        assert!(service().contains("\nAfter=graphical-session.target "));
+        assert!(!service().contains("graphical-session-pre"));
+        assert!(service().contains("\nPartOf=graphical-session.target\n"));
+        assert!(service().contains("\nWantedBy=graphical-session.target\n"));
+        let dir = std::env::temp_dir().join(format!("vibeconsole-unit-{}", std::process::id()));
+        let path = dir.join("systemd/user/vibeconsole.service");
+        let calls = RefCell::new(Vec::<String>::new());
+        let runner = |args: &[&str]| -> Result<()> {
+            calls.borrow_mut().push(args.join(" "));
+            Ok(())
+        };
+        // Not installed: nothing is written.
+        assert!(!refresh_installed_unit(&path, runner).unwrap());
+        assert!(!path.exists());
+        // An old managed unit is rewritten; only daemon-reload runs.
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let old = service().replace(
+            "After=graphical-session.target",
+            "After=graphical-session-pre.target",
+        );
+        fs::write(&path, &old).unwrap();
+        assert!(refresh_installed_unit(&path, runner).unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), service());
+        assert_eq!(*calls.borrow(), ["daemon-reload"]);
+        // A hand-written unit is left alone.
+        fs::write(&path, "[Unit]\n").unwrap();
+        assert!(!refresh_installed_unit(&path, runner).unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "[Unit]\n");
+        assert_eq!(calls.borrow().len(), 1);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     /// v7 ticket 95: a stopped service is an answer, not an error; a missing unit or a
