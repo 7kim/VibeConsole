@@ -383,9 +383,12 @@ impl Terminal {
                 crate::screen::bulb(input_on)
             )
         };
+        // Stored names are only shown while the MPK is connected (ticket 85).
         let program = match (
             &self.device,
-            self.program_names.get(usize::from(self.context)),
+            self.program_names
+                .get(usize::from(self.context))
+                .filter(|_| self.input.is_some()),
         ) {
             (Some(device), _) => format!("MIDI device {device}"),
             (None, Some(name)) => name.clone(),
@@ -740,9 +743,7 @@ impl Terminal {
             context_verified: true,
             follow_programs: false,
             follow_retry: Instant::now(),
-            program_names: (1..=8)
-                .map(|n| format!("Program {n} — name unavailable"))
-                .collect(),
+            program_names: (1..=8).map(|n| format!("Program {n}")).collect(),
             program_snapshot: None,
             original,
             stop: Arc::new(AtomicBool::new(false)),
@@ -2090,8 +2091,11 @@ impl Terminal {
                 self.connecting = true;
                 self.prepare_connection()?;
                 self.notice = format!(
-                    "Detected Program {} from current hardware.{}",
-                    context + 1,
+                    "Detected {} from current hardware.{}",
+                    self.program_names
+                        .get(usize::from(context))
+                        .cloned()
+                        .unwrap_or_else(|| mappings::program_label(context)),
                     if self
                         .run_mappings
                         .iter()
@@ -7530,7 +7534,12 @@ mod tests {
         let observation = |context| crate::feedback::ProgramObservation::Detected {
             context,
             payload: [0; 245],
-            names: (1..=8).map(|i| format!("Program {i}")).collect(),
+            names: (1..=8)
+                .map(|i| match i {
+                    3 => "Program 3 — Prompts".into(),
+                    _ => format!("Program {i}"),
+                })
+                .collect(),
         };
         assert!(!ui.feedback_allowed);
         ui.observe_program(observation(Some(0))).unwrap();
@@ -7538,6 +7547,10 @@ mod tests {
         assert!(ui.context_verified && ui.feedback_allowed && ui.wanted_run);
         ui.observe_program(observation(Some(2))).unwrap();
         assert_eq!(ui.context, 2);
+        assert!(
+            ui.notice
+                .contains("Detected Program 3 — Prompts from current hardware")
+        );
         assert!(ui.context_verified && ui.feedback_allowed && ui.wanted_run);
         ui.observe_program(observation(None)).unwrap();
         assert!(!ui.context_verified && !ui.feedback_allowed);
@@ -8250,6 +8263,20 @@ mod tests {
         let view = ui.detection_view((120, 40), true);
         assert!(view.contains(" Unidentified ") && !view.contains("Bank A"));
         assert!(view.contains("💡 ON  Note ch1 #29") && view.contains("CC ch1 #70: 64"));
+    }
+
+    /// Ticket 85: the header shows the MPK's stored name while it is connected,
+    /// and the default "Program N" when it is not.
+    #[test]
+    fn header_shows_default_program_names_without_the_mpk() {
+        let mut ui =
+            Terminal::open_mode(Path::new("/unused-vibeconsole-program-names"), true).unwrap();
+        ui.context = 2;
+        let frame = ui.screen("").render(120, 40, false);
+        assert!(frame.contains("Program 3 (") && !frame.contains("unavailable"));
+        ui.program_names = (1..=8).map(|n| format!("Program {n} — Stale")).collect();
+        let frame = ui.screen("").render(120, 40, false);
+        assert!(frame.contains("Program 3 (") && !frame.contains("Stale"));
     }
 
     #[test]

@@ -477,12 +477,17 @@ fn rename_program(transport: &mut impl Programs, slot: u8, name: &str) -> Result
     }
     Ok(())
 }
+/// Ticket 85: "Program N — <stored name>", exactly as saved; the default "Program N"
+/// when the name is blank or can't be read.
+fn program_title(slot: usize, payload: Option<&Payload>) -> String {
+    match payload.map(program_name) {
+        Some(name) if !name.trim().is_empty() => format!("Program {slot} — {name}"),
+        _ => format!("Program {slot}"),
+    }
+}
 fn program_names(transport: &mut impl Programs) -> Vec<String> {
     (1..=8)
-        .map(|slot| match transport.read_slot(slot) {
-            Ok(payload) => format!("Program {slot} — {}", program_name(&payload)),
-            Err(_) => format!("Program {slot} — name unavailable"),
-        })
+        .map(|slot| program_title(slot.into(), transport.read_slot(slot).ok().as_ref()))
         .collect()
 }
 pub fn names(input: &mut midi::Input) -> Result<Vec<String>> {
@@ -740,7 +745,7 @@ impl Controller {
                 let names = programs
                     .iter()
                     .enumerate()
-                    .map(|(i, p)| format!("Program {} — {}", i + 1, program_name(p)))
+                    .map(|(i, p)| program_title(i + 1, Some(p)))
                     .collect();
                 let _ = sender.send(Notice::Program(ProgramObservation::Detected {
                     context,
@@ -1158,10 +1163,13 @@ mod tests {
                 self.0.write_slot(slot, payload)
             }
         }
+        // Ticket 85: the stored name exactly as saved; unreadable or blank shows the default.
+        fake.slots[2][..16].fill(0);
         let listed = program_names(&mut Partial(fake));
         assert_eq!(listed.len(), 8);
-        assert!(listed[3].contains("name unavailable"));
-        assert!(listed[0].starts_with("Program 1 —"));
+        assert_eq!(listed[1], "Program 2 — Test");
+        assert_eq!(listed[2], "Program 3");
+        assert_eq!(listed[3], "Program 4");
     }
 
     /// Ticket 14: status lights replace program feedback, hold back feedback changes while
