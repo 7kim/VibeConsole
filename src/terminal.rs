@@ -1207,6 +1207,10 @@ impl Terminal {
             return Ok(());
         }
         self.start_flow()?;
+        self.await_flow()
+    }
+    /// Waits for the Flow request `begin_flow` submitted.
+    fn await_flow(&mut self) -> Result<()> {
         while self.flow_pending && !self.stop.load(Ordering::Relaxed) {
             self.tick()?;
             std::thread::sleep(Duration::from_millis(20));
@@ -1221,6 +1225,41 @@ impl Terminal {
         self.notice =
             "Flow helper opened the current keyboard; dictation remains unverified.".into();
         Ok(())
+    }
+    /// v8 ticket 118: the login service tries Flow again every `every` until `window` has
+    /// passed, instead of staying paused after one failure (e.g. a desktop not up yet). Each
+    /// try goes through `begin_flow`, which pauses: held keys are released and MIDI drained.
+    /// Lights keep updating between tries; a stop ends the wait at once. True once Flow is up.
+    fn retry_flow_startup(
+        &mut self,
+        every: Duration,
+        window: Duration,
+        mut attempt: impl FnMut(&mut Self) -> Result<()>,
+    ) -> Result<bool> {
+        let deadline = Instant::now() + window;
+        for tries in 1.. {
+            let error = match attempt(self) {
+                Ok(()) => return Ok(true),
+                Err(error) => error,
+            };
+            self.pause()?;
+            let last = self.stop.load(Ordering::Relaxed) || Instant::now() + every > deadline;
+            self.error = if last {
+                format!("Automatic Flow startup failed after {tries} tries: {error}")
+            } else {
+                format!("Automatic Flow startup failed (try {tries}), retrying: {error}")
+            };
+            eprintln!("{}", self.error);
+            if last {
+                return Ok(false);
+            }
+            let next = Instant::now() + every;
+            while Instant::now() < next && !self.stop.load(Ordering::Relaxed) {
+                self.tick()?;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        unreachable!()
     }
     fn transition(&mut self, pad: Control, active: bool) -> Result<()> {
         let fired = self.fired(pad)?;
@@ -7620,15 +7659,11 @@ pub fn daemon(path: &Path, current: Vec<Mapping>) -> Result<()> {
     ui.use_device(&config, &current)?;
     ui.open_gamepad();
     ui.follow_apps = true;
-    let flow_ready = match ui.startup_flow() {
-        Ok(()) => true,
-        Err(error) => {
-            ui.pause()?;
-            ui.error = format!("Automatic Flow startup failed: {error}");
-            eprintln!("{}", ui.error);
-            false
-        }
-    };
+    let flow_ready = ui.retry_flow_startup(
+        Duration::from_secs(5),
+        Duration::from_secs(60),
+        Terminal::startup_flow,
+    )?;
     if ui.flow_missing {
         eprintln!("Wispr Flow not installed; automatic startup skipped.");
     }
@@ -12893,6 +12928,75 @@ mod tests {
                 );
             }
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v8 ticket 118: the login service retries a failed Flow startup. A failure then a
+    /// success ends ready; failing every try ends paused with one stage-named error; a stop
+    /// during the wait ends it at once. The injected runner never touches Flow.
+    #[test]
+    fn login_service_retries_flow_startup_until_it_works_or_time_runs_out() {
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-flow-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let attempt = |ui: &mut Terminal| -> Result<()> {
+            ui.begin_flow(None)?;
+            ui.await_flow()
+        };
+        let flow = |fail: usize, stop: Option<Arc<AtomicBool>>| {
+            let tries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = Arc::clone(&tries);
+            let dispatcher = crate::actions::Dispatcher::with(move |_, _, _| {
+                if counted.fetch_add(1, Ordering::SeqCst) < fail {
+                    if let Some(stop) = &stop {
+                        stop.store(true, Ordering::SeqCst); // SIGTERM while Flow fails
+                    }
+                    Err("Flow launch: desktop session unavailable".into())
+                } else {
+                    Ok("Flow helper opened the current keyboard".into())
+                }
+            });
+            (dispatcher, tries)
+        };
+        let (every, window) = (Duration::from_millis(30), Duration::from_millis(200));
+
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        let (dispatcher, tries) = flow(1, None);
+        ui.actions = dispatcher;
+        assert!(ui.retry_flow_startup(every, window, attempt).unwrap());
+        assert_eq!(tries.load(Ordering::SeqCst), 2);
+
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        let (dispatcher, tries) = flow(usize::MAX, None);
+        ui.actions = dispatcher;
+        assert!(!ui.retry_flow_startup(every, window, attempt).unwrap());
+        assert!(!ui.wanted_run);
+        let tried = tries.load(Ordering::SeqCst);
+        assert!((2..=8).contains(&tried), "{tried} tries");
+        assert_eq!(ui.error.matches("Automatic Flow startup failed").count(), 1);
+        assert!(
+            ui.error.contains(&format!("after {tried} tries"))
+                && ui
+                    .error
+                    .contains("Flow launch: desktop session unavailable"),
+            "{}",
+            ui.error
+        );
+
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        let (dispatcher, tries) = flow(usize::MAX, Some(Arc::clone(&ui.stop)));
+        ui.actions = dispatcher;
+        let started = Instant::now();
+        assert!(
+            !ui.retry_flow_startup(every, Duration::from_secs(60), attempt)
+                .unwrap()
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(!ui.wanted_run && ui.suspended);
+        assert_eq!(tries.load(Ordering::SeqCst), 1);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
