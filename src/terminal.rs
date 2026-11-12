@@ -11036,7 +11036,23 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mappings.tsv");
         let pad = Control::from_note(10, 36).unwrap();
-        mappings::save(&path, &[Mapping::new(pad, "F1", "hold").unwrap()]).unwrap();
+        // v7 ticket 104: a setup like the user's, whose first mappings are a knob and a lit
+        // pad (neither may be a profile override), used to fail before Claude was asked.
+        let knob = Control {
+            channel: 1,
+            id: 20,
+            message: crate::Message::Cc,
+            direction: 1,
+        };
+        let mut turn = Mapping::new(knob, "Right", "pulse").unwrap();
+        turn.input = mappings::Input::RelativeKnob { step: 1 };
+        let mut lit = Mapping::new(Control::from_note(10, 37).unwrap(), "Shift", "hold").unwrap();
+        lit.feedback.octave = Some(crate::feedback::Octave::Offset(-1));
+        mappings::save(
+            &path,
+            &[turn, lit, Mapping::new(pad, "F1", "hold").unwrap()],
+        )
+        .unwrap();
         let profile = mappings::Profile {
             name: "Firefox".into(),
             apps: vec!["firefox.desktop".into()],

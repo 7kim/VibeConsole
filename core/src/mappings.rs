@@ -735,10 +735,24 @@ pub fn profile_text_from_reply(reply: &str) -> Option<String> {
 /// The request sent to Claude for a profile: the format by example and the controls the
 /// user has, so its overrides land on real pads.
 pub fn profile_request(config: &Config, app: &str, wish: &str) -> Result<String> {
+    // v7 ticket 104: the example uses mappings a profile may hold (pads and Xbox buttons
+    // without feedback); a setup whose first mappings are knobs or lit pads would otherwise
+    // fail before Claude is asked. With none, a stand-in pad shows the format.
+    let mut overrides = config
+        .mappings
+        .iter()
+        .filter(|m| m.input == Input::Pad && !m.feedback.enabled())
+        .take(2)
+        .cloned()
+        .collect::<Vec<_>>();
+    if overrides.is_empty() {
+        let pad = Control::from_note(10, 36).ok_or("example pad")?;
+        overrides.push(Mapping::new(pad, "Ctrl+T", "hold")?);
+    }
     let example = Profile {
         name: "Example".into(),
         apps: vec![app.to_owned()],
-        mappings: config.mappings.iter().take(2).cloned().collect(),
+        mappings: overrides,
     };
     let controls = config
         .mappings
@@ -3536,6 +3550,36 @@ mod tests {
         with_pads.mappings = vec![Mapping::new(pad, "F1", "hold").unwrap()];
         let request = profile_request(&with_pads, "firefox.desktop", "Tabs on the pads.").unwrap();
         assert!(request.contains("vibeconsole-profile-v1") && request.contains("Bank A Pad 1"));
+        // v7 ticket 104: a setup whose first mappings are a knob and a lit pad (like the user's)
+        // still makes a request; its example holds only what a profile may.
+        let knob = Control {
+            channel: 1,
+            id: 20,
+            message: crate::Message::Cc,
+            direction: 1,
+        };
+        let mut turn = Mapping::new(knob, "Right", "pulse").unwrap();
+        turn.input = Input::RelativeKnob { step: 1 };
+        let mut lit = Mapping::new(Control::from_note(10, 37).unwrap(), "Shift", "hold").unwrap();
+        lit.feedback.octave = Some(crate::feedback::Octave::Offset(-1));
+        let mut users = Config::default();
+        users.mappings = vec![turn, lit, Mapping::new(pad, "F1", "hold").unwrap()];
+        let request = profile_request(&users, "firefox.desktop", "Tabs.").unwrap();
+        // The example sits between the header and the rules; the controls list follows them.
+        let example = request
+            [request.find(PROFILE_HEADER).unwrap()..request.find("Rules:").unwrap()]
+            .to_owned();
+        assert!(
+            example.contains("\tF1\t") && !example.contains("Shift") && !example.contains("Right"),
+            "{example}"
+        );
+        // No pad at all: a stand-in pad still shows the format.
+        let request = profile_request(&Config::default(), "firefox.desktop", "Tabs.").unwrap();
+        assert!(
+            profile_text_from_reply(&request)
+                .unwrap()
+                .contains("Ctrl+T")
+        );
     }
 
     /// Review fix: a v16 file written before devices, profiles, the lock or favourites
