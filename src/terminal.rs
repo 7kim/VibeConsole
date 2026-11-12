@@ -6844,18 +6844,21 @@ fn configure_steps(
                     let saved_behavior = saved.as_ref().and_then(|m| match m.behavior {
                         mappings::Behavior::Hold => Some(0),
                         mappings::Behavior::Toggle => Some(1),
+                        mappings::Behavior::Tap => Some(2),
                         _ => None,
                     });
+                    // v7 ticket 96: one tap sends the shortcut once per press, however long
+                    // it's held, so the desktop never repeats it.
                     let Some(b) = choose_saved(
                         ui,
                         "Activation behavior",
-                        options(&["hold", "toggle"]),
+                        options(&["hold", "toggle", "one tap (once per press, never repeats)"]),
                         saved_behavior,
                     )?
                     else {
                         continue;
                     };
-                    if b == 0 { "hold" } else { "toggle" }
+                    ["hold", "toggle", "tap"][b]
                 }
             };
             Mapping::new(pad, &keys.join("+"), behavior).map_err(stage("validation"))?
@@ -8654,6 +8657,60 @@ mod tests {
                 .iter()
                 .any(|s| s.contains("Select keys remains available"))
         );
+    }
+
+    /// v7 ticket 96: "one tap" is offered as an activation behavior, saves as tap, and an
+    /// edit starts on it.
+    #[test]
+    fn one_tap_is_offered_saved_and_preselected() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-one-tap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let a = Control::from_note(10, 36).unwrap();
+        let mut current = vec![Mapping::new(a, "Shift", "hold").unwrap()];
+        mappings::save(&path, &current).unwrap();
+        let mut ui = Script {
+            keys: [
+                Tab, Enter, Enter, // Edit -> saved pad
+                Enter, // family: keyboard shortcut (saved)
+                Enter, Enter, Enter, Up,
+                Enter, // keep Shift: Select keys -> Modifiers -> back -> Done
+                Down, Down, Enter, // behavior: one tap
+                Enter, Enter, Enter,  // no hardware feedback, fire when pressed, save
+                Escape, // leave configure
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let result = configure(&mut ui, &path, &mut current);
+        assert!(
+            result.is_ok(),
+            "{result:?}\n{}",
+            ui.screens.join("\n----\n")
+        );
+        let saved = mappings::load(&path).unwrap();
+        assert_eq!(
+            saved[0].behavior,
+            mappings::Behavior::Tap,
+            "{}",
+            ui.screens.join("\n----\n")
+        );
+        ui.screens.clear();
+        ui.keys = [
+            Tab, Enter, Enter, Enter, Enter, Enter, Enter, Up, Enter, Escape, Escape, Escape,
+        ]
+        .into();
+        configure(&mut ui, &path, &mut current).unwrap();
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains("> one tap (once per press, never repeats)  [x] (saved)")),
+            "{}",
+            ui.screens.join("\n----\n")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -12187,7 +12244,7 @@ mod tests {
             })
             .map(|l| format!("{l}\n"))
             .collect::<String>()
-            .replace("vibeconsole-mappings-v20", "vibeconsole-mappings-v14")
+            .replace("vibeconsole-mappings-v21", "vibeconsole-mappings-v14")
             .replace(
                 "tuning\t15\t30\t10\toff\toff\nsticks\tlinear\tlinear\nmidi-devices\t0\nmidi-active\t-\nprofiles\t0\nprofile-lock\t-\nfavourites\t0\n",
                 "",

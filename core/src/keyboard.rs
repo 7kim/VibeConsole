@@ -193,8 +193,33 @@ impl Keyboard {
     ) -> io::Result<Option<(Control, bool)>> {
         let assignment = &self.assignments[index];
         let pad = assignment.control;
+        if assignment.behavior == Behavior::Tap {
+            // v7 ticket 96: one tap per press: keys down, then up in reverse; nothing stays
+            // held, and a key another held assignment shares is left alone.
+            if !pressed {
+                return Ok(None);
+            }
+            let keys = assignment
+                .keys
+                .iter()
+                .copied()
+                .filter(|key| {
+                    !self.assignments.iter().enumerate().any(|(other, item)| {
+                        other != index && item.active && item.keys.contains(key)
+                    })
+                })
+                .collect::<Vec<_>>();
+            for &key in &keys {
+                emit(key, true)?;
+            }
+            for &key in keys.iter().rev() {
+                emit(key, false)?;
+            }
+            return Ok(Some((pad, true)));
+        }
         let active = match assignment.behavior {
             Behavior::Trigger => return Ok(pressed.then_some((pad, true))),
+            Behavior::Tap => unreachable!("handled above"),
             Behavior::Hold | Behavior::Pulse => pressed,
             Behavior::Toggle if pressed => !assignment.active,
             Behavior::Toggle => return Ok(None),
@@ -1289,6 +1314,111 @@ mod tests {
                 (K::KEY_LEFTSHIFT, true),
                 (K::KEY_LEFTSHIFT, false)
             ]
+        );
+    }
+
+    /// v7 ticket 96: a one-tap control sends its shortcut once per press, however long it's
+    /// held; a key a held assignment shares stays held; a transition leaves nothing held.
+    #[test]
+    fn one_tap_sends_once_per_press_and_never_holds_a_key() {
+        use evdev::KeyCode as K;
+        let tap = Control::from_note(10, 36).unwrap();
+        let ctrl = Control::from_note(10, 37).unwrap();
+        let maps = [
+            Mapping::new(tap, "Ctrl+T", "tap").unwrap(),
+            Mapping::new(ctrl, "Ctrl", "hold").unwrap(),
+        ];
+        let sent = std::cell::RefCell::new(Vec::new());
+        let mut emit = |key, down| {
+            sent.borrow_mut().push((key, down));
+            Ok(())
+        };
+        let release = |pad| Event::Release(pad, ReleaseType::NoteOff);
+        let mut keyboard = Keyboard::new(&maps).unwrap();
+        keyboard.resume();
+        // Pressed and held (a held pad sends nothing more), then released: one tap.
+        assert_eq!(
+            keyboard.observe(Event::Press(tap), &mut emit).unwrap(),
+            Some((tap, true))
+        );
+        assert_eq!(
+            keyboard
+                .observe(Event::DuplicatePress(tap), &mut emit)
+                .unwrap(),
+            None
+        );
+        assert_eq!(keyboard.observe(release(tap), &mut emit).unwrap(), None);
+        assert_eq!(
+            *sent.borrow(),
+            [
+                (K::KEY_LEFTCTRL, true),
+                (K::KEY_T, true),
+                (K::KEY_T, false),
+                (K::KEY_LEFTCTRL, false)
+            ]
+        );
+        assert!(!keyboard.active(tap));
+        // Ctrl held by another pad: the tap leaves it down.
+        sent.borrow_mut().clear();
+        keyboard.observe(Event::Press(ctrl), &mut emit).unwrap();
+        keyboard.observe(Event::Press(tap), &mut emit).unwrap();
+        keyboard.observe(release(tap), &mut emit).unwrap();
+        assert_eq!(
+            *sent.borrow(),
+            [(K::KEY_LEFTCTRL, true), (K::KEY_T, true), (K::KEY_T, false)]
+        );
+        keyboard.observe(release(ctrl), &mut emit).unwrap();
+        assert_eq!(sent.borrow().last(), Some(&(K::KEY_LEFTCTRL, false)));
+        // Paused while pressed: nothing to release, and its release after resume sends nothing.
+        sent.borrow_mut().clear();
+        keyboard.observe(Event::Press(tap), &mut emit).unwrap();
+        keyboard.pause(&mut emit).unwrap();
+        keyboard.resume();
+        assert_eq!(keyboard.observe(release(tap), &mut emit).unwrap(), None);
+        assert_eq!(
+            sent.borrow().len(),
+            4,
+            "one tap, nothing on pause or release: {:?}",
+            sent.borrow()
+        );
+    }
+
+    /// v7 ticket 96: LT on one tap: squeezed, held and eased off it taps once; it taps again
+    /// only after dropping below its fire point.
+    #[test]
+    fn a_one_tap_trigger_taps_once_per_squeeze() {
+        use crate::gamepad::{Analog, Change, Motion, analog};
+        let lt = crate::gamepad::control(gilrs::Button::LeftTrigger2).unwrap();
+        let maps = [Mapping::new(lt, "F6", "tap").unwrap()];
+        let tuning = crate::mappings::Tuning::default(); // fires at 30%
+        let mut keyboard = Keyboard::new(&maps).unwrap();
+        keyboard.resume();
+        let (mut down, mut pad) = (HashSet::new(), Analog::default());
+        let mut downs = 0;
+        for value in [0.1, 0.5, 0.8, 1.0, 0.8, 0.27, 0.6, 0.1, 0.5, 0.0] {
+            for change in analog(
+                &mut down,
+                &mut pad,
+                Motion::Trigger(gilrs::Button::LeftTrigger2, value),
+                &tuning,
+            ) {
+                let Change::Event(event) = change else {
+                    continue;
+                };
+                keyboard
+                    .observe(event, &mut |key, pressed| {
+                        if pressed {
+                            assert_eq!(key, evdev::KeyCode::KEY_F6);
+                            downs += 1;
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            downs, 2,
+            "one per squeeze; hovering near the fire point taps nothing more"
         );
     }
 }
