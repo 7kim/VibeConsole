@@ -390,10 +390,6 @@ def build():
     slab("port_usb_c", (9, 3, 3.2), (0, 47, z(0, 40) - 8), (0, 47, z(0, 40) - 8), M["port"], bev=1.2)
     slab("port_headset", (4, 6, 4), (0, -16, z(0, -10) - 9), (0, -16, z(0, -10) - 9), M["port"], bev=1.6)
     bpy.context.view_layer.update()
-    for name in ("dpad", "dpad_cross", "dpad_cross.001", "stick_left_cap"):
-        o = bpy.data.objects.get(name)
-        if o:
-            print("WHERE", name, [round(c / MM, 1) for c in o.matrix_world.translation], "dims", [round(c / MM, 1) for c in o.dimensions])
     return shell
 
 
