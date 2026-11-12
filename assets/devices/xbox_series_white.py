@@ -77,10 +77,10 @@ def dotted(name, color, rough):
     return m
 
 
-def box_uv(ob):
+def box_uv(ob, name="UVMap"):
     """Cube-projected UVs, TILE mm per repeat, so the dots keep one size on every part."""
     me = ob.data
-    uv = me.uv_layers.new(name="UVMap")
+    uv = me.uv_layers.new(name=name)
     for poly in me.polygons:
         a, b = [i for i in range(3) if i != max(range(3), key=lambda i: abs(poly.normal[i]))]
         for li in poly.loop_indices:
@@ -445,4 +445,5 @@ def main():
     bpy.ops.render.render(write_still=True)
 
 
-main()
+if __name__ == "__main__":  # imported by split/xbox_split.py for the grip dots
+    main()
