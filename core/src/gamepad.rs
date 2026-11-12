@@ -45,14 +45,78 @@ const STICKS: [&str; 8] = [
 /// here, the right stick's [`MAX_RANGES`] later.
 pub const ANGLE_BASE: u8 = STICK_BASE + 8;
 const MAX_RANGES: u8 = crate::mappings::MAX_RANGES as u8;
-/// Every control an Xbox controller has: buttons, stick directions, then angle ranges.
-pub const CONTROLS: usize = ANGLE_BASE as usize + 2 * MAX_RANGES as usize;
+/// v7 ticket 76: stick gestures in angle mode follow the ranges. Each stick has the six
+/// turns, then a flick into each range, then a hold in each range.
+pub const GESTURE_BASE: u8 = ANGLE_BASE + 2 * MAX_RANGES;
+/// The turns, in id order: degrees, clockwise, name.
+pub const TURNS: [(u16, bool, &str); 6] = [
+    (90, true, "quarter turn clockwise"),
+    (90, false, "quarter turn counterclockwise"),
+    (180, true, "half circle clockwise"),
+    (180, false, "half circle counterclockwise"),
+    (360, true, "full circle clockwise"),
+    (360, false, "full circle counterclockwise"),
+];
+const PER_STICK: u8 = TURNS.len() as u8 + 2 * MAX_RANGES;
+/// Every control an Xbox controller has: buttons, stick directions, angle ranges, gestures.
+pub const CONTROLS: usize = GESTURE_BASE as usize + 2 * PER_STICK as usize;
+
+/// A stick gesture (v7 ticket 76), each its own control.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Gesture {
+    /// One of [`TURNS`], from any start.
+    Turn(usize),
+    /// A quick push into a range and straight back.
+    Flick(usize),
+    /// Resting in a range for [`HOLD_MS`].
+    Hold(usize),
+}
+impl Gesture {
+    pub fn control(self, side: usize) -> Control {
+        let at = match self {
+            Self::Turn(t) => t as u8,
+            Self::Flick(r) => TURNS.len() as u8 + r as u8,
+            Self::Hold(r) => TURNS.len() as u8 + MAX_RANGES + r as u8,
+        };
+        Control::button(GESTURE_BASE + side as u8 * PER_STICK + at)
+    }
+    /// The stick and gesture a control id stands for.
+    pub fn of(id: u8) -> Option<(usize, Self)> {
+        let at = id.checked_sub(GESTURE_BASE)?;
+        if at >= 2 * PER_STICK {
+            return None;
+        }
+        let (side, at) = (usize::from(at / PER_STICK), at % PER_STICK);
+        let turns = TURNS.len() as u8;
+        Some((
+            side,
+            if at < turns {
+                Self::Turn(usize::from(at))
+            } else if at < turns + MAX_RANGES {
+                Self::Flick(usize::from(at - turns))
+            } else {
+                Self::Hold(usize::from(at - turns - MAX_RANGES))
+            },
+        ))
+    }
+    fn name(self) -> String {
+        match self {
+            Self::Turn(t) => TURNS[t].2.into(),
+            Self::Flick(r) => format!("flick into range {}", r + 1),
+            Self::Hold(r) => format!("hold in range {}", r + 1),
+        }
+    }
+}
 
 pub fn control(button: gilrs::Button) -> Option<Control> {
     let id = BUTTONS.iter().position(|(b, _)| *b == button)?;
     Some(Control::button(u8::try_from(id).ok()?))
 }
 pub fn button_name(id: u8) -> String {
+    if let Some((side, gesture)) = Gesture::of(id) {
+        let side = if side == 0 { "Left" } else { "Right" };
+        return format!("{side} stick {}", gesture.name());
+    }
     if let Some(range) = id.checked_sub(ANGLE_BASE).filter(|r| *r < 2 * MAX_RANGES) {
         let side = if range < MAX_RANGES { "Left" } else { "Right" };
         return format!("{side} stick angle range {}", range % MAX_RANGES + 1);
@@ -69,9 +133,8 @@ pub fn button_name(id: u8) -> String {
 fn stick_of(control: Control) -> Option<usize> {
     match control.id {
         id if (STICK_BASE..ANGLE_BASE).contains(&id) => Some(usize::from((id - STICK_BASE) / 4)),
-        id if usize::from(id) < CONTROLS && id >= ANGLE_BASE => {
-            Some(usize::from((id - ANGLE_BASE) / MAX_RANGES))
-        }
+        id if id >= GESTURE_BASE => Gesture::of(id).map(|(side, _)| side),
+        id if id >= ANGLE_BASE => Some(usize::from((id - ANGLE_BASE) / MAX_RANGES)),
         _ => None,
     }
 }
@@ -262,6 +325,9 @@ pub struct Analog {
     pub right: (f32, f32),
     /// v7 ticket 75: after a stick's mode changes it fires nothing until it's let go.
     pub wait: [bool; 2],
+    /// v7 ticket 76: a stick in angle mode with gestures mapped; [`Gestures`] fires its
+    /// ranges and gestures instead of [`analog`].
+    pub gestures: [bool; 2],
 }
 /// Analog movement reduced to what VibeConsole uses.
 #[derive(Clone, Copy, Debug)]
@@ -347,6 +413,9 @@ pub fn analog(
             // Angle mode: the range the stick points into is held; moving to the next range
             // releases the first before pressing the next. Inside the dead zone, none.
             if let mode @ crate::mappings::StickMode::Angle(_) = &tuning.sticks[side] {
+                if analog.gestures[side] {
+                    return changes;
+                }
                 let base = ANGLE_BASE + side as u8 * MAX_RANGES;
                 let held = (base..base + MAX_RANGES)
                     .map(Control::button)
@@ -386,6 +455,255 @@ pub fn analog(
         }
     }
     changes
+}
+
+/// v7 ticket 76: gesture timings in milliseconds. ponytail: fixed provisional values; tune
+/// them from developer test 76 on the real controller, and move them into Tuning (a config
+/// bump) if they need to differ per user.
+/// Resting this long in one range makes the stroke plain angle mode (the range is held).
+pub const SETTLE_MS: u64 = 250;
+/// A flick goes out and back to rest within this.
+pub const FLICK_MS: u64 = 250;
+/// Resting this long in a range fires its hold gesture.
+pub const HOLD_MS: u64 = 700;
+/// A turn completes within this, from leaving rest to coming back.
+pub const TURN_MS: u64 = 1200;
+/// Degrees a quarter, half and full turn must sweep: room for a sloppy thumb.
+fn reach(degrees: u16) -> f32 {
+    match degrees {
+        90 => 70.0,
+        180 => 155.0,
+        _ => 320.0,
+    }
+}
+
+/// One stick's movement from leaving rest until it's back at rest.
+#[derive(Clone, Copy, Debug, Default)]
+struct Stroke {
+    /// When it left rest; None at rest.
+    start: Option<u64>,
+    angle: f32,
+    /// Degrees swept so far, clockwise positive.
+    travel: f32,
+    range: Option<usize>,
+    /// When it entered the range it's in.
+    since: u64,
+    push: f32,
+    farthest: f32,
+    /// The range it pointed into at its farthest push.
+    flick: Option<usize>,
+    /// Rested in a range: plain angle mode until let go, no gesture.
+    sectors: bool,
+    /// A hold fired or a transition cut it: nothing more until let go.
+    inert: bool,
+}
+
+/// v7 ticket 76: stick gestures, like EA FC's skill moves. Only a stick in angle mode with a
+/// gesture mapped uses this; there a gesture fires once when it completes, and the ranges
+/// it passes don't fire.
+#[derive(Default)]
+pub struct Gestures {
+    strokes: [Stroke; 2],
+    /// The gesture controls mapped on either layer.
+    mapped: HashSet<Control>,
+}
+impl Gestures {
+    /// The gestures `mappings` use, and which sticks therefore detect them.
+    pub fn set(&mut self, mappings: &[Mapping], analog: &mut Analog) {
+        self.mapped = mappings
+            .iter()
+            .map(|m| m.control)
+            .filter(|c| c.message == crate::Message::Button && Gesture::of(c.id).is_some())
+            .collect();
+        analog.gestures = [0, 1].map(|side| self.mapped.iter().any(|c| stick_of(*c) == Some(side)));
+    }
+    /// A transition: a stroke in progress fires nothing, now or when it ends.
+    pub fn cancel(&mut self) {
+        for stroke in &mut self.strokes {
+            stroke.inert |= stroke.start.is_some();
+        }
+    }
+    /// After a stick mode change: the stick starts over.
+    fn forget(&mut self, side: usize) {
+        self.strokes[side] = Stroke::default();
+    }
+    fn mapped(&self, side: usize, gesture: Gesture) -> bool {
+        self.mapped.contains(&gesture.control(side))
+    }
+    /// A stick with gestures moved to `(x, y)` at `now`.
+    pub fn motion(
+        &mut self,
+        side: usize,
+        (x, y): (f32, f32),
+        tuning: &crate::mappings::Tuning,
+        down: &mut HashSet<Control>,
+        now: u64,
+    ) -> Vec<Change> {
+        let mut changes = Vec::new();
+        let mode = &tuning.sticks[side];
+        if !matches!(mode, crate::mappings::StickMode::Angle(_)) {
+            return changes;
+        }
+        let dead = f32::from(tuning.dead_zone);
+        let push = x.hypot(y).min(1.0) * 100.0;
+        let base = ANGLE_BASE + side as u8 * MAX_RANGES;
+        let held = (base..base + MAX_RANGES)
+            .map(Control::button)
+            .find(|c| down.contains(c));
+        if push <= dead {
+            if let Some(held) = held {
+                down.remove(&held);
+                changes.push(Change::Event(Event::Release(held, ReleaseType::ButtonUp)));
+            }
+            let stroke = self.strokes[side];
+            if let Some(start) = stroke.start.filter(|_| !stroke.sectors && !stroke.inert) {
+                let fired = self.finish(side, &stroke, now.saturating_sub(start), tuning);
+                changes.extend(fired.into_iter().flat_map(tap));
+            }
+            self.strokes[side] = Stroke::default();
+            return changes;
+        }
+        let angle = angle_of(x, y);
+        let range = mode.range_at(angle);
+        let stroke = &mut self.strokes[side];
+        if stroke.start.is_none() {
+            *stroke = Stroke {
+                start: Some(now),
+                angle,
+                range,
+                since: now,
+                ..Stroke::default()
+            };
+        } else {
+            let mut turn = angle - stroke.angle;
+            if turn > 180.0 {
+                turn -= 360.0;
+            } else if turn < -180.0 {
+                turn += 360.0;
+            }
+            stroke.travel += turn;
+            stroke.angle = angle;
+            if range != stroke.range {
+                stroke.range = range;
+                stroke.since = now;
+            }
+        }
+        stroke.push = push;
+        if push > stroke.farthest {
+            stroke.farthest = push;
+            stroke.flick = range;
+        }
+        if stroke.inert {
+            return changes;
+        }
+        if stroke.sectors {
+            // Plain angle mode until let go: the range pointed into is held.
+            let target = range.map(|r| Control::button(base + r as u8));
+            if held != target {
+                if let Some(held) = held {
+                    down.remove(&held);
+                    changes.push(Change::Event(Event::Release(held, ReleaseType::ButtonUp)));
+                }
+                if let Some(target) = target {
+                    down.insert(target);
+                    changes.push(Change::Event(Event::Press(target)));
+                }
+            }
+            return changes;
+        }
+        changes.extend(self.dwell(side, tuning, down, now));
+        changes
+    }
+    /// Time passing with the sticks still: a rest in a range holds it or fires its hold.
+    pub fn tick(
+        &mut self,
+        tuning: &crate::mappings::Tuning,
+        down: &mut HashSet<Control>,
+        now: u64,
+    ) -> Vec<Change> {
+        (0..2)
+            .flat_map(|side| self.dwell(side, tuning, down, now))
+            .collect()
+    }
+    fn dwell(
+        &mut self,
+        side: usize,
+        tuning: &crate::mappings::Tuning,
+        down: &mut HashSet<Control>,
+        now: u64,
+    ) -> Vec<Change> {
+        let stroke = self.strokes[side];
+        let (Some(start), Some(range)) = (stroke.start, stroke.range) else {
+            return Vec::new();
+        };
+        let press = f32::from(tuning.dead_zone).max(50.0);
+        if stroke.sectors || stroke.inert || stroke.push < press {
+            return Vec::new();
+        }
+        // A turn under way isn't a rest, until it's too late to be a turn.
+        let turning = stroke.travel.abs() >= reach(90)
+            && now.saturating_sub(start) <= TURN_MS
+            && (0..TURNS.len()).any(|t| self.mapped(side, Gesture::Turn(t)));
+        let rest = now.saturating_sub(stroke.since);
+        if turning {
+            return Vec::new();
+        }
+        if self.mapped(side, Gesture::Hold(range)) {
+            // A hold gesture replaces its range's plain press.
+            if rest >= HOLD_MS {
+                self.strokes[side].inert = true;
+                return tap(Gesture::Hold(range).control(side));
+            }
+            return Vec::new();
+        }
+        if rest >= SETTLE_MS {
+            self.strokes[side].sectors = true;
+            let control = Control::button(ANGLE_BASE + side as u8 * MAX_RANGES + range as u8);
+            down.insert(control);
+            return vec![Change::Event(Event::Press(control))];
+        }
+        Vec::new()
+    }
+    /// What a stroke that came back to rest fired: the biggest mapped turn it completed in
+    /// time, else a mapped flick, else (a short push that wasn't a turn) its range, once.
+    fn finish(
+        &self,
+        side: usize,
+        stroke: &Stroke,
+        took: u64,
+        tuning: &crate::mappings::Tuning,
+    ) -> Option<Control> {
+        let turn = (0..TURNS.len())
+            .filter(|&t| {
+                let (degrees, clockwise, _) = TURNS[t];
+                took <= TURN_MS
+                    && (stroke.travel > 0.0) == clockwise
+                    && stroke.travel.abs() >= reach(degrees)
+                    && self.mapped(side, Gesture::Turn(t))
+            })
+            .max_by_key(|&t| TURNS[t].0);
+        if let Some(turn) = turn {
+            return Some(Gesture::Turn(turn).control(side));
+        }
+        let press = f32::from(tuning.dead_zone).max(50.0);
+        if stroke.travel.abs() >= reach(90) || stroke.farthest < press {
+            return None;
+        }
+        let range = stroke.flick?;
+        if took <= FLICK_MS && self.mapped(side, Gesture::Flick(range)) {
+            return Some(Gesture::Flick(range).control(side));
+        }
+        Some(Control::button(
+            ANGLE_BASE + side as u8 * MAX_RANGES + range as u8,
+        ))
+    }
+}
+/// A gesture or a quick range: pressed and let go at once.
+fn tap(control: Control) -> Vec<Change> {
+    vec![
+        Change::Event(Event::Press(control)),
+        Change::Event(Event::Release(control, ReleaseType::ButtonUp)),
+    ]
 }
 
 /// v7 ticket 75: a stick whose mode changes forgets its held directions and ranges and, if
@@ -513,6 +831,9 @@ pub struct Pad {
     pub down: HashSet<Control>,
     pub analog: Analog,
     pub tuning: crate::mappings::Tuning,
+    /// v7 ticket 76: stick gestures, timed from `clock`.
+    gestures: Gestures,
+    clock: std::time::Instant,
 }
 impl Pad {
     pub fn open() -> crate::Result<Self> {
@@ -524,7 +845,13 @@ impl Pad {
             down: HashSet::new(),
             analog: Analog::default(),
             tuning: crate::mappings::Tuning::default(),
+            gestures: Gestures::default(),
+            clock: std::time::Instant::now(),
         })
+    }
+    /// The gestures the saved mappings use (v7 ticket 76).
+    pub fn set_gestures(&mut self, mappings: &[Mapping]) {
+        self.gestures.set(mappings, &mut self.analog);
     }
     pub fn poll(&mut self) -> Vec<Change> {
         let mut changes = Vec::new();
@@ -543,6 +870,27 @@ impl Pad {
                     &mut self.analog,
                     motion,
                     &self.tuning,
+                ));
+                let side = match motion {
+                    Motion::Axis(gilrs::Axis::LeftStickX | gilrs::Axis::LeftStickY, _) => 0,
+                    Motion::Axis(gilrs::Axis::RightStickX | gilrs::Axis::RightStickY, _) => 1,
+                    _ => continue,
+                };
+                if !self.analog.gestures[side] {
+                    continue;
+                }
+                if self.analog.wait[side] {
+                    self.gestures.forget(side);
+                    continue;
+                }
+                let stick = [self.analog.left, self.analog.right][side];
+                let now = self.clock.elapsed().as_millis() as u64;
+                changes.extend(self.gestures.motion(
+                    side,
+                    stick,
+                    &self.tuning,
+                    &mut self.down,
+                    now,
                 ));
                 continue;
             }
@@ -563,6 +911,8 @@ impl Pad {
             let name = self.gilrs.gamepad(event.id).name().to_owned();
             changes.extend(change(&mut self.down, kind, &name));
         }
+        let now = self.clock.elapsed().as_millis() as u64;
+        changes.extend(self.gestures.tick(&self.tuning, &mut self.down, now));
         changes
     }
     /// New settings; true when a stick's mode changed ([`retune`]): the caller then runs a
@@ -577,6 +927,7 @@ impl Pad {
     pub fn drain(&mut self) {
         while self.gilrs.next_event().is_some() {}
         keep_held_analog(&mut self.down);
+        self.gestures.cancel();
     }
     /// One short rumble on every controller that supports it, when Tuning has it on.
     /// Rumble is hardware feedback: it plays only while VibeConsole owns the controller.
@@ -1415,5 +1766,176 @@ mod tests {
         assert!(error.starts_with("Xbox button light: "), "{error}");
         drop(light); // restoring an unplugged light doesn't panic
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// v7 ticket 76: a stick path as (milliseconds, degrees, push 0–1) points, fed to the
+    /// detector with a tick at each; returns every control pressed, in order.
+    fn stroke(
+        gestures: &mut Gestures,
+        tuning: &crate::mappings::Tuning,
+        points: &[(u64, f32, f32)],
+    ) -> Vec<Control> {
+        let mut down = HashSet::new();
+        let mut pressed = Vec::new();
+        for &(at, degrees, push) in points {
+            let (x, y) = (
+                degrees.to_radians().sin() * push,
+                degrees.to_radians().cos() * push,
+            );
+            let mut changes = gestures.motion(1, (x, y), tuning, &mut down, at);
+            changes.extend(gestures.tick(tuning, &mut down, at));
+            for change in changes {
+                if let Change::Event(Event::Press(control)) = change {
+                    pressed.push(control);
+                }
+            }
+        }
+        assert!(down.is_empty(), "nothing left held after rest: {down:?}");
+        pressed
+    }
+    /// A full-push sweep from `from` through `degrees` (negative: counterclockwise) over
+    /// `ms`, sampled every 20 ms, then back to rest.
+    fn sweep(from: f32, degrees: f32, ms: u64) -> Vec<(u64, f32, f32)> {
+        let steps = ms / 20;
+        let mut points = (0..=steps)
+            .map(|i| {
+                let at = (from + degrees * i as f32 / steps as f32).rem_euclid(360.0);
+                (i * 20, at, 1.0)
+            })
+            .collect::<Vec<_>>();
+        points.push((ms + 20, 0.0, 0.0));
+        points
+    }
+    fn right_stick_gestures(gestures: &[Gesture]) -> (Gestures, crate::mappings::Tuning) {
+        let mut tuning = crate::mappings::Tuning::default();
+        tuning.sticks[1] = crate::mappings::StickMode::sectors();
+        let mappings = gestures
+            .iter()
+            .map(|g| {
+                let mut m = Mapping::new(g.control(1), "F1", "hold").unwrap();
+                m.context = GAMEPAD_CONTEXT;
+                m
+            })
+            .collect::<Vec<_>>();
+        let mut detector = Gestures::default();
+        let mut analog = Analog::default();
+        detector.set(&mappings, &mut analog);
+        assert_eq!(analog.gestures, [false, true]);
+        (detector, tuning)
+    }
+
+    #[test]
+    fn gesture_controls_are_named_and_valid_xbox_controls() {
+        for side in 0..2 {
+            for gesture in [Gesture::Turn(5), Gesture::Flick(0), Gesture::Hold(15)] {
+                let control = gesture.control(side);
+                assert_eq!(Gesture::of(control.id), Some((side, gesture)));
+                assert!(control.validate().is_ok(), "{control:?}");
+                assert_eq!(stick_of(control), Some(side));
+            }
+        }
+        assert_eq!(
+            Gesture::Turn(2).control(1).label(),
+            "Xbox Right stick half circle clockwise"
+        );
+        assert_eq!(
+            Gesture::Flick(2).control(0).label(),
+            "Xbox Left stick flick into range 3"
+        );
+        assert_eq!(
+            Gesture::Hold(0).control(1).label(),
+            "Xbox Right stick hold in range 1"
+        );
+        assert_eq!(Gesture::Hold(15).control(1).id as usize, CONTROLS - 1);
+        assert!(Control::button(CONTROLS as u8).validate().is_err());
+        // Angle ranges keep their ids and names.
+        assert_eq!(button_name(ANGLE_BASE + 17), "Right stick angle range 2");
+    }
+
+    #[test]
+    fn stick_gestures_fire_once_when_completed_and_never_the_ranges_they_pass() {
+        let turns = [0, 1, 2, 3, 4, 5].map(Gesture::Turn);
+        let (mut g, tuning) = right_stick_gestures(&turns);
+        // 180° clockwise: the half circle, once; not the quarter it passed, not a range.
+        assert_eq!(
+            stroke(&mut g, &tuning, &sweep(0.0, 180.0, 400)),
+            [Gesture::Turn(2).control(1)]
+        );
+        // 360° counterclockwise from the right: the full circle.
+        assert_eq!(
+            stroke(&mut g, &tuning, &sweep(90.0, -360.0, 800)),
+            [Gesture::Turn(5).control(1)]
+        );
+        // A 90° turn.
+        assert_eq!(
+            stroke(&mut g, &tuning, &sweep(270.0, 90.0, 250)),
+            [Gesture::Turn(0).control(1)]
+        );
+
+        // A flick into range 3 (90°–135°) and back, and a rest in range 5 for the hold time.
+        let (mut g, tuning) = right_stick_gestures(&[Gesture::Flick(2), Gesture::Hold(4)]);
+        let flick = [
+            (0, 100.0, 1.0),
+            (60, 100.0, 1.0),
+            (150, 100.0, 1.0),
+            (200, 0.0, 0.0),
+        ];
+        assert_eq!(
+            stroke(&mut g, &tuning, &flick),
+            [Gesture::Flick(2).control(1)]
+        );
+        let mut hold = (0..=45).map(|i| (i * 20, 190.0, 1.0)).collect::<Vec<_>>();
+        hold.push((920, 0.0, 0.0));
+        assert_eq!(
+            stroke(&mut g, &tuning, &hold),
+            [Gesture::Hold(4).control(1)],
+            "once, not again on release"
+        );
+    }
+
+    #[test]
+    fn slow_short_or_interrupted_sweeps_fire_no_gesture() {
+        let turns = [0, 1, 2, 3, 4, 5].map(Gesture::Turn);
+        let (mut g, tuning) = right_stick_gestures(&turns);
+        let gesture = |c: &Control| Gesture::of(c.id).is_some();
+        // Too slow: three seconds for a half circle is pointing, not a turn.
+        let slow = stroke(&mut g, &tuning, &sweep(0.0, 180.0, 3000));
+        assert!(!slow.iter().any(gesture), "{slow:?}");
+        // Stops short of the only turn mapped: nothing at all, not even a range.
+        let (mut g, tuning) = right_stick_gestures(&[Gesture::Turn(2)]);
+        assert_eq!(stroke(&mut g, &tuning, &sweep(0.0, 120.0, 300)), []);
+        // Cut by a transition half-way: nothing, now or when it comes back to rest.
+        let path = sweep(0.0, 180.0, 400);
+        let (first, rest) = path.split_at(path.len() / 2);
+        assert_eq!(stroke(&mut g, &tuning, first), []);
+        g.cancel();
+        assert_eq!(stroke(&mut g, &tuning, rest), []);
+        // The next stroke works again.
+        assert_eq!(
+            stroke(&mut g, &tuning, &sweep(0.0, 180.0, 400)),
+            [Gesture::Turn(2).control(1)]
+        );
+    }
+
+    #[test]
+    fn a_stick_with_gestures_still_reaches_its_ranges() {
+        let (mut g, tuning) = right_stick_gestures(&[Gesture::Turn(2)]);
+        let range = |r: u8| Control::button(ANGLE_BASE + MAX_RANGES + r);
+        // A quick push that isn't a gesture taps its range once.
+        let quick = [(0, 100.0, 1.0), (100, 100.0, 1.0), (140, 0.0, 0.0)];
+        assert_eq!(stroke(&mut g, &tuning, &quick), [range(2)]);
+        // Resting holds the range; moving on (no turn) presses the next, like plain angle mode.
+        let mut rest = (0..=20).map(|i| (i * 20, 100.0, 1.0)).collect::<Vec<_>>();
+        rest.extend([(420, 150.0, 1.0), (440, 150.0, 1.0), (460, 0.0, 0.0)]);
+        assert_eq!(stroke(&mut g, &tuning, &rest), [range(2), range(3)]);
+        // Inside the dead zone nothing starts.
+        assert_eq!(
+            stroke(
+                &mut g,
+                &tuning,
+                &[(0, 90.0, 0.1), (300, 90.0, 0.1), (320, 0.0, 0.0)]
+            ),
+            []
+        );
     }
 }

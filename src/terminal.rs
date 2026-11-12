@@ -898,8 +898,10 @@ impl Terminal {
         self.device_lights = config.status_lights.then(|| config.device_lights.clone());
         // Settings -> Xbox tuning applies within a status refresh; a stick mode change is a
         // transition (v7 ticket 75).
-        let modes =
-            (self.gamepad.as_mut()).is_some_and(|pad| pad.set_tuning(config.tuning.clone()));
+        let modes = (self.gamepad.as_mut()).is_some_and(|pad| {
+            pad.set_gestures(&config.mappings); // v7 ticket 76
+            pad.set_tuning(config.tuning.clone())
+        });
         if modes {
             if let Err(error) =
                 self.gamepad_transition("Stick mode changed: held keys released".into())
@@ -1432,6 +1434,7 @@ impl Terminal {
             Ok(mut pad) => {
                 if let Ok(config) = mappings::load_config(&self.path) {
                     pad.tuning = config.tuning.clone();
+                    pad.set_gestures(&config.mappings);
                 }
                 if let Some(name) = pad.connected().first() {
                     self.notice = format!("Xbox controller ready: {name}");
@@ -6571,6 +6574,53 @@ fn settle(
     }
 }
 
+/// v7 ticket 76: a stick in angle mode pushed on a Learn page is that range, or one of the
+/// stick's gestures: a flick into it, a hold in it, or a turn from any start.
+fn range_or_gesture(ui: &mut impl Ui, control: Control) -> Result<Option<Control>> {
+    use crate::gamepad::{ANGLE_BASE, GESTURE_BASE, Gesture, HOLD_MS, TURNS};
+    let at = control.id.wrapping_sub(ANGLE_BASE);
+    if control.message != crate::Message::Button
+        || control.id < ANGLE_BASE
+        || control.id >= GESTURE_BASE
+    {
+        return Ok(Some(control));
+    }
+    let (side, range) = (
+        usize::from(at) / mappings::MAX_RANGES,
+        usize::from(at) % mappings::MAX_RANGES,
+    );
+    let n = range + 1;
+    let mut choices = vec![
+        (
+            control,
+            format!("Pointing into range {n} (held while pointed)"),
+        ),
+        (
+            Gesture::Flick(range).control(side),
+            format!("A flick into range {n} (quick push and back)"),
+        ),
+        (
+            Gesture::Hold(range).control(side),
+            format!("Resting in range {n} for {:.1} s", HOLD_MS as f32 / 1000.0),
+        ),
+    ];
+    choices.extend((0..TURNS.len()).map(|t| {
+        (
+            Gesture::Turn(t).control(side),
+            format!("A {} (from any start)", TURNS[t].2),
+        )
+    }));
+    let labels = choices
+        .iter()
+        .map(|(_, text)| text.clone())
+        .collect::<Vec<_>>();
+    let title = format!(
+        "{} was pushed. What should fire the action? A gesture fires once when it completes, and the ranges it passes don't fire.",
+        control.label()
+    );
+    Ok(choose(ui, &title, &labels)?.map(|i| choices[i].0))
+}
+
 fn configure_steps(
     ui: &mut impl Ui,
     path: &Path,
@@ -6597,7 +6647,12 @@ fn configure_steps(
             };
             page = settled;
             match learned {
-                Learned::Press(control) => Some(control),
+                Learned::Press(control) => {
+                    let Some(control) = range_or_gesture(ui, control)? else {
+                        continue;
+                    };
+                    Some(control)
+                }
                 Learned::Motion(control, input, label) => {
                     motion = Some((control, input, label));
                     Some(control)
@@ -8987,6 +9042,54 @@ mod tests {
             assert_eq!(saved[0].control, a);
             assert_eq!(saved[0].context, context);
             assert_eq!(saved[0].action, crate::actions::Action::OutputMute);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    /// v7 ticket 76: pushing a stick in angle mode on Learn offers its range or a gesture;
+    /// the choice is what gets saved.
+    #[test]
+    fn learning_a_stick_range_can_save_a_gesture_instead() {
+        use crate::gamepad::{ANGLE_BASE, Gesture};
+        use Key::*;
+        let range = Control::button(ANGLE_BASE + mappings::MAX_RANGES as u8 + 2);
+        for (downs, want) in [(5, Gesture::Turn(2).control(1)), (0, range)] {
+            let dir = std::env::temp_dir().join(format!(
+                "vibeconsole-gesture-{}-{downs}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("mappings.tsv");
+            mappings::save(&path, &[]).unwrap();
+            let mut keys = vec![Enter]; // learn a pad: the stick is pushed into range 3
+            keys.extend(std::iter::repeat_n(Down, downs));
+            keys.push(Enter); // range, or "half circle clockwise"
+            keys.extend([Down, Down, Enter, Down, Down, Enter, Enter]); // Output mute, layer 1
+            keys.extend([Enter, Enter, Tab, Tab, Enter]); // fire when, save, finish
+            let mut ui = Script {
+                keys: keys.into(),
+                pads: [range].into(),
+                context: 2,
+                ..Default::default()
+            };
+            let mut current = Vec::new();
+            let result = configure(&mut ui, &path, &mut current);
+            assert!(
+                result.is_ok(),
+                "{result:?}\n{}",
+                ui.screens.join("\n----\n")
+            );
+            assert!(
+                ui.screens
+                    .iter()
+                    .any(|s| s.contains("A half circle clockwise (from any start)")),
+                "the gestures are offered"
+            );
+            let saved = mappings::load_config(&path).unwrap().mappings;
+            assert_eq!(saved.len(), 1, "{}", ui.screens.join("\n----\n"));
+            assert_eq!(saved[0].control, want);
+            assert_eq!(saved[0].context, mappings::GAMEPAD_CONTEXT);
             std::fs::remove_dir_all(dir).unwrap();
         }
     }

@@ -72,8 +72,10 @@ impl Control {
         }
     }
     pub fn validate(self) -> Result<()> {
+        // Xbox controls are bounded by `gamepad::CONTROLS` (gestures go past 127, v7 ticket
+        // 76); MIDI ids are 7-bit.
         if !(1..=16).contains(&self.channel)
-            || self.id > 127
+            || (self.message != Message::Button && self.id > 127)
             || match self.message {
                 Message::Note => self.direction != 0,
                 Message::Button => {
