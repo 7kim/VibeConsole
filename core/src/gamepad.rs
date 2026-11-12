@@ -248,32 +248,114 @@ impl Guide {
 }
 
 /// The mappings for a layer: layer 1 is the layout (defaults plus saved), layer 2 only
-/// what was saved for it.
+/// what was saved for it. Xbox program 1.
 pub fn layer(saved: &[Mapping], second: bool) -> Vec<Mapping> {
+    layer_in(saved, 1, second)
+}
+/// v7 ticket 115: a layer of one Xbox program (1–8).
+pub fn layer_in(saved: &[Mapping], program: u8, second: bool) -> Vec<Mapping> {
     if second {
+        let context = crate::mappings::xbox_context(program, true);
         saved
             .iter()
-            .filter(|m| m.context == crate::mappings::GAMEPAD_LAYER_2)
+            .filter(|m| m.context == context)
             .cloned()
             .collect()
     } else {
-        layout(saved)
+        layout_in(saved, program)
     }
 }
-/// The layout in use: each saved Xbox mapping replaces that button's default.
-/// ponytail: a default can be replaced but not removed; add "unassigned" if asked.
+/// The layout in use for Xbox program 1: each saved Xbox mapping replaces that button's
+/// default.
 pub fn layout(saved: &[Mapping]) -> Vec<Mapping> {
+    layout_in(saved, 1)
+}
+/// v7 ticket 115: an Xbox program's layer-1 layout; the built-in defaults apply in every
+/// program until a button is saved there.
+pub fn layout_in(saved: &[Mapping], program: u8) -> Vec<Mapping> {
+    let context = crate::mappings::xbox_context(program, false);
     let saved = saved
         .iter()
-        .filter(|m| m.context == GAMEPAD_CONTEXT)
+        .filter(|m| m.context == context)
         .cloned()
         .collect::<Vec<_>>();
     let mut layout = default_layout()
         .into_iter()
         .filter(|d| !saved.iter().any(|m| m.control == d.control))
+        .map(|mut d| {
+            d.context = context;
+            d
+        })
         .collect::<Vec<_>>();
     layout.extend(saved);
     layout
+}
+
+/// v7 ticket 115: what View and Menu do. Held, LB, LT, RB or RT picks an Xbox program
+/// (View: 1–4, Menu: 5–8) and nothing else fires; let go without a pick, View or Menu fires
+/// its own mapping then (fire on release: an exception the user agreed to on 12 Nov 2026).
+#[derive(Default)]
+pub struct ProgramKeys {
+    /// View or Menu held, and whether it picked a program.
+    held: Option<(Control, bool)>,
+}
+#[derive(Debug, PartialEq)]
+pub enum ProgramStep {
+    /// Not ours: handle the event as usual.
+    Pass,
+    /// Taken: nothing fires.
+    Swallow,
+    /// Switch to this Xbox program (1–8).
+    Select(u8),
+    /// View or Menu tapped alone: fire its own mapping now.
+    Tap(Control),
+}
+impl ProgramKeys {
+    pub fn event(&mut self, event: &Event) -> ProgramStep {
+        let view = control(gilrs::Button::Select);
+        let menu = control(gilrs::Button::Start);
+        let picks = [
+            gilrs::Button::LeftTrigger,
+            gilrs::Button::LeftTrigger2,
+            gilrs::Button::RightTrigger,
+            gilrs::Button::RightTrigger2,
+        ]
+        .map(control);
+        let key = |c: &Control| Some(*c) == view || Some(*c) == menu;
+        match event {
+            Event::Press(c) if key(c) => {
+                if self.held.is_none() {
+                    self.held = Some((*c, false));
+                }
+                ProgramStep::Swallow
+            }
+            Event::DuplicatePress(c) if key(c) => ProgramStep::Swallow,
+            Event::Release(c, _) | Event::UnmatchedRelease(c) if key(c) => match self.held {
+                Some((held, used)) if held == *c => {
+                    self.held = None;
+                    if used || matches!(event, Event::UnmatchedRelease(_)) {
+                        ProgramStep::Swallow
+                    } else {
+                        ProgramStep::Tap(*c)
+                    }
+                }
+                _ => ProgramStep::Swallow,
+            },
+            Event::Press(c) => match (&mut self.held, picks.iter().position(|p| *p == Some(*c))) {
+                (Some((held, used)), Some(at)) => {
+                    *used = true;
+                    let base = if Some(*held) == view { 0 } else { 4 };
+                    ProgramStep::Select(base + at as u8 + 1)
+                }
+                _ => ProgramStep::Pass,
+            },
+            _ => ProgramStep::Pass,
+        }
+    }
+    /// A transition: a View or Menu hold in progress is forgotten (its release fires nothing).
+    pub fn cancel(&mut self) {
+        self.held = None;
+    }
 }
 
 /// After a transition: buttons are forgotten (their release is then unmatched), but a stick
@@ -1948,6 +2030,86 @@ mod tests {
                 &[(0, 90.0, 0.1), (300, 90.0, 0.1), (320, 0.0, 0.0)]
             ),
             []
+        );
+    }
+
+    /// v7 ticket 115: View or Menu held + LB/LT/RB/RT picks an Xbox program and fires
+    /// nothing; View or Menu tapped alone fires its own mapping on release.
+    #[test]
+    fn view_and_menu_pick_xbox_programs_and_a_tap_fires_on_release() {
+        let b = |button| control(button).unwrap();
+        let (view, menu) = (b(gilrs::Button::Select), b(gilrs::Button::Start));
+        let (lb, rt) = (
+            b(gilrs::Button::LeftTrigger),
+            b(gilrs::Button::RightTrigger2),
+        );
+        let up = |c| Event::Release(c, ReleaseType::ButtonUp);
+        let mut keys = ProgramKeys::default();
+        assert_eq!(keys.event(&Event::Press(view)), ProgramStep::Swallow);
+        assert_eq!(keys.event(&Event::Press(rt)), ProgramStep::Select(4));
+        assert_eq!(
+            keys.event(&up(rt)),
+            ProgramStep::Pass,
+            "the keyboard never saw its press"
+        );
+        assert_eq!(
+            keys.event(&up(view)),
+            ProgramStep::Swallow,
+            "a combo fires nothing"
+        );
+        assert_eq!(keys.event(&Event::Press(menu)), ProgramStep::Swallow);
+        assert_eq!(keys.event(&Event::Press(lb)), ProgramStep::Select(5));
+        assert_eq!(keys.event(&up(menu)), ProgramStep::Swallow);
+        // A tap of View alone fires View, on release.
+        assert_eq!(keys.event(&Event::Press(view)), ProgramStep::Swallow);
+        assert_eq!(keys.event(&up(view)), ProgramStep::Tap(view));
+        // LB alone is LB (the layer key), and a View hold cut by a transition fires nothing.
+        assert_eq!(keys.event(&Event::Press(lb)), ProgramStep::Pass);
+        keys.event(&Event::Press(view));
+        keys.cancel();
+        assert_eq!(
+            keys.event(&Event::UnmatchedRelease(view)),
+            ProgramStep::Swallow
+        );
+        // Program 1 keeps the contexts it always had; programs 2–8 have their own.
+        use crate::mappings::{GAMEPAD_CONTEXT, GAMEPAD_LAYER_2, xbox_context, xbox_program};
+        assert_eq!(
+            (xbox_context(1, false), xbox_context(1, true)),
+            (GAMEPAD_CONTEXT, GAMEPAD_LAYER_2)
+        );
+        for program in 1..=8 {
+            for layer2 in [false, true] {
+                assert_eq!(
+                    xbox_program(xbox_context(program, layer2)),
+                    Some((program, layer2))
+                );
+            }
+        }
+        assert_eq!(xbox_program(5), None);
+    }
+
+    /// v7 ticket 115: the built-in defaults apply in every Xbox program; a saved button
+    /// replaces its default only in its own program.
+    #[test]
+    fn each_xbox_program_has_its_own_layout() {
+        let a = control(gilrs::Button::South).unwrap();
+        let mut f9 = Mapping::new(a, "F9", "hold").unwrap();
+        f9.context = crate::mappings::xbox_context(3, false);
+        let saved = [f9];
+        let keys = |program| {
+            layout_in(&saved, program)
+                .into_iter()
+                .find(|m| m.control == a)
+                .unwrap()
+                .keys
+        };
+        assert_eq!(keys(1), ["Enter"]);
+        assert_eq!(keys(3), ["F9"]);
+        assert_eq!(keys(4), ["Enter"]);
+        assert!(
+            layout_in(&saved, 2)
+                .iter()
+                .all(|m| m.context == crate::mappings::xbox_context(2, false))
         );
     }
 }

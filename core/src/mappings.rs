@@ -168,14 +168,37 @@ pub const DEVICE_CONTEXT: u8 = 240;
 pub const GAMEPAD_CONTEXT: u8 = 239;
 /// Xbox layer 2 (v7 ticket 09): what each button does while LB is held.
 pub const GAMEPAD_LAYER_2: u8 = 238;
+/// v7 ticket 115: the Xbox controller has 8 programs, each with layer 1 and layer 2. Program 1
+/// keeps the contexts it always had (239, 238); program N takes the next two below.
+pub const XBOX_PROGRAMS: u8 = 8;
+const XBOX_LOWEST: u8 = GAMEPAD_CONTEXT + 1 - 2 * XBOX_PROGRAMS;
+pub fn xbox_context(program: u8, layer2: bool) -> u8 {
+    GAMEPAD_CONTEXT - 2 * (program.clamp(1, XBOX_PROGRAMS) - 1) - u8::from(layer2)
+}
+/// The Xbox program (1–8) and layer a context is, if it is one.
+pub fn xbox_program(context: u8) -> Option<(u8, bool)> {
+    (XBOX_LOWEST..=GAMEPAD_CONTEXT).contains(&context).then(|| {
+        (
+            (GAMEPAD_CONTEXT - context) / 2 + 1,
+            (GAMEPAD_CONTEXT - context) % 2 == 1,
+        )
+    })
+}
 pub fn gamepad_context(context: u8) -> bool {
-    matches!(context, GAMEPAD_CONTEXT | GAMEPAD_LAYER_2)
+    xbox_program(context).is_some()
 }
 pub fn program_label(context: u8) -> String {
-    if context == GAMEPAD_CONTEXT {
-        "Xbox controller".into()
-    } else if context == GAMEPAD_LAYER_2 {
-        "Xbox controller, layer 2 (LB held)".into()
+    if let Some((program, layer2)) = xbox_program(context) {
+        let base = if program == 1 {
+            "Xbox controller".to_string()
+        } else {
+            format!("Xbox Program {program}")
+        };
+        if layer2 {
+            format!("{base}, layer 2 (LB held)")
+        } else {
+            base
+        }
     } else if context >= DEVICE_CONTEXT {
         format!("Other MIDI device {}", context - DEVICE_CONTEXT + 1)
     } else if context < 8 {
@@ -328,7 +351,7 @@ impl Mapping {
                 "application/system actions require Trigger, empty keys, and no feedback".into(),
             );
         }
-        if (self.context > 16 && self.context < GAMEPAD_LAYER_2)
+        if (self.context > 16 && self.context < XBOX_LOWEST)
             || gamepad_context(self.context) != (self.control.message == crate::Message::Button)
             || (gamepad_context(self.context) && crate::gamepad::is_reserved(self.control))
             || self.label.is_empty()
@@ -575,6 +598,8 @@ pub struct Config {
     pub midi_devices: Vec<String>,
     /// The MIDI device the session uses: None is the Akai.
     pub midi_active: Option<String>,
+    /// v7 ticket 115 (config v24): the Xbox programs' names; empty means "Program N".
+    pub xbox_names: [String; XBOX_PROGRAMS as usize],
     /// v7 ticket 12: per-app overrides; an app with no profile uses Default.
     pub profiles: Vec<Profile>,
     /// v7 ticket 13: a pinned profile (or Default) that ignores focus changes.
@@ -612,6 +637,26 @@ pub struct Profile {
     pub apps: Vec<String>,
     /// Overrides only: pads and Xbox buttons, no feedback.
     pub mappings: Vec<Mapping>,
+}
+/// v7 ticket 115: an Xbox program name is one printable line of at most 32 characters, with
+/// no tab, and not a lone `-` (which means "no name").
+fn validate_xbox_names(names: &[String]) -> Result<()> {
+    if names
+        .iter()
+        .any(|n| n.chars().count() > 32 || n == "-" || n.chars().any(char::is_control))
+    {
+        return Err("an Xbox program name is up to 32 printable characters".into());
+    }
+    Ok(())
+}
+/// The name an Xbox program shows: its own, else "Program N".
+pub fn xbox_program_name(config: &Config, program: u8) -> String {
+    let name = &config.xbox_names[usize::from(program.clamp(1, XBOX_PROGRAMS) - 1)];
+    if name.is_empty() {
+        format!("Program {program}")
+    } else {
+        name.clone()
+    }
 }
 /// A profile name: one printable line, 1–32 characters.
 pub fn valid_profile_name(name: &str) -> bool {
@@ -1066,6 +1111,7 @@ impl Default for Config {
             device_lights: Default::default(),
             midi_devices: Vec::new(),
             midi_active: None,
+            xbox_names: Default::default(),
             profiles: Vec::new(),
             lock: None,
             favourites: Vec::new(),
@@ -1075,7 +1121,7 @@ impl Default for Config {
 /// The device column of a mapping line: the Akai's USB id, `midi` or `xbox`.
 fn device_field(context: u8) -> &'static str {
     match context {
-        GAMEPAD_CONTEXT | GAMEPAD_LAYER_2 => "xbox",
+        c if gamepad_context(c) => "xbox",
         c if c >= DEVICE_CONTEXT => "midi",
         _ => DEVICE,
     }
@@ -1503,6 +1549,9 @@ fn parse_mapping_line(line: &str, version: u32, midi_devices: &[String]) -> Resu
         Mapping::new_action(pad, line.split('\t').nth(2).unwrap().parse()?, action)?
     };
     mapping.context = context;
+    if version < 24 && xbox_program(context).is_some_and(|(program, _)| program > 1) {
+        return Err("Xbox programs 2–8 need a v24 configuration".into());
+    }
     mapping.risky = match fields.get(11).filter(|_| version >= 9) {
         None | Some(&"-") => false,
         Some(&"risky") => true,
@@ -1671,9 +1720,11 @@ fn parse_config(contents: &str) -> Result<Config> {
         Some("22") => 22,
         // v23 (v7 ticket 111): `nothing`, a silenced built-in Xbox default.
         Some("23") => 23,
+        // v24 (v7 ticket 115): Xbox programs 2–8 and their names (`xbox-programs`).
+        Some("24") => 24,
         _ => {
             return Err(
-                "invalid configuration header; expected vibeconsole-mappings-v1..v23".into(),
+                "invalid configuration header; expected vibeconsole-mappings-v1..v24".into(),
             );
         }
     };
@@ -1980,6 +2031,23 @@ fn parse_config(contents: &str) -> Result<Config> {
         midi_active = (active != "-").then(|| active.to_owned());
         validate_devices(&midi_devices, midi_active.as_ref())?;
     }
+    // v24 (v7 ticket 115): the Xbox programs' names, `-` for "Program N".
+    let mut xbox_names: [String; XBOX_PROGRAMS as usize] = Default::default();
+    if has(&mut lines, "xbox-programs\t") {
+        let line = lines.next().ok_or("expected xbox-programs")?;
+        let names = line.split('\t').skip(1).collect::<Vec<_>>();
+        if names.len() != usize::from(XBOX_PROGRAMS) {
+            return Err("xbox-programs needs 8 names".into());
+        }
+        for (slot, name) in xbox_names.iter_mut().zip(names) {
+            *slot = if name == "-" {
+                String::new()
+            } else {
+                name.to_owned()
+            };
+        }
+        validate_xbox_names(&xbox_names)?;
+    }
     let parse_mapping = |line: &str| parse_mapping_line(line, version, &midi_devices);
     let mut profiles = Vec::new();
     if has(&mut lines, "profiles\t") {
@@ -2115,6 +2183,7 @@ fn parse_config(contents: &str) -> Result<Config> {
         device_lights,
         midi_devices,
         midi_active,
+        xbox_names,
         profiles,
         lock,
         favourites,
@@ -2214,7 +2283,7 @@ pub fn serialize_config(config: &Config) -> Result<String> {
     validate_variables(&config.vars, "user")?;
     config.validate_references()?;
     let mut contents = format!(
-        "vibeconsole-mappings-v23\nidle\t{}\t{}\t{}\n",
+        "vibeconsole-mappings-v24\nidle\t{}\t{}\t{}\n",
         opt_text(config.idle.octave),
         opt_text(config.idle.tempo),
         arp_text(config.idle.arp)
@@ -2311,6 +2380,16 @@ pub fn serialize_config(config: &Config) -> Result<String> {
         config.midi_active.as_deref().unwrap_or("-")
     ));
     validate_devices(&config.midi_devices, config.midi_active.as_ref())?;
+    validate_xbox_names(&config.xbox_names)?;
+    contents.push_str(&format!(
+        "xbox-programs\t{}\n",
+        config
+            .xbox_names
+            .iter()
+            .map(|n| if n.is_empty() { "-" } else { n.as_str() })
+            .collect::<Vec<_>>()
+            .join("\t")
+    ));
     validate_profiles(&config.profiles)?;
     contents.push_str(&format!("profiles\t{}\n", config.profiles.len()));
     for profile in &config.profiles {
@@ -2699,7 +2778,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v23\n")
+                .starts_with("vibeconsole-mappings-v24\n")
         );
         assert!(
             load_config(&path)
@@ -2883,7 +2962,7 @@ mod tests {
         };
         save_config(&path, &tuned).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v23\n"));
+        assert!(text.starts_with("vibeconsole-mappings-v24\n"));
         assert!(text.contains("\ntuning\t20\t60\t25\ton\toff\n"));
         assert_eq!(load_config(&path).unwrap(), tuned);
         for bad in [
@@ -2942,7 +3021,7 @@ mod tests {
         assert_eq!(config.device_lights, DevicePatterns::default());
         save_config(&path, &config).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v23\n"), "{text}");
+        assert!(text.starts_with("vibeconsole-mappings-v24\n"), "{text}");
         assert!(
             text.contains(concat!(
                 "device-lights\ton\ton\ton\n",
@@ -2955,7 +3034,7 @@ mod tests {
             "{text}"
         );
         let v19 = text
-            .replace("vibeconsole-mappings-v23", "vibeconsole-mappings-v19")
+            .replace("vibeconsole-mappings-v24", "vibeconsole-mappings-v19")
             .lines()
             .filter(|l| !v20_record(l))
             .map(|l| format!("{l}\n"))
@@ -2996,6 +3075,43 @@ mod tests {
 
     /// v7 ticket 81: a sequence step's own text is saved with the sequence (config v19) and
     /// round-trips; a v18 file loads with no step text; a refused save keeps the last file.
+    /// v7 ticket 115: Xbox programs 2–8 and their names round-trip in v24; an older file
+    /// can't hold them, and its Xbox mappings are all program 1.
+    #[test]
+    fn xbox_programs_and_names_round_trip_in_v24() {
+        let mut config = Config::default();
+        let mut second = Mapping::new(Control::button(0), "F9", "hold").unwrap();
+        second.context = xbox_context(2, true);
+        // In saved order (by context): program 2's layer 2 before program 1.
+        config.mappings = vec![
+            second,
+            Mapping::new(Control::button(0), "F8", "hold").unwrap(),
+        ];
+        config.xbox_names[1] = "Browser".into();
+        let text = serialize_config(&config).unwrap();
+        assert!(
+            text.contains("\nxbox-programs\t-\tBrowser\t-\t-\t-\t-\t-\t-\n"),
+            "{text}"
+        );
+        assert_eq!(parse_config(&text).unwrap(), config);
+        assert_eq!(xbox_program_name(&config, 2), "Browser");
+        assert_eq!(xbox_program_name(&config, 3), "Program 3");
+        let v23 = text.replace("vibeconsole-mappings-v24", "vibeconsole-mappings-v23");
+        assert!(parse_config(&v23).unwrap_err().to_string().contains("v24"));
+        config.mappings.retain(|m| m.context == GAMEPAD_CONTEXT);
+        config.xbox_names = Default::default();
+        let old = serialize_config(&config)
+            .unwrap()
+            .replace("vibeconsole-mappings-v24", "vibeconsole-mappings-v23")
+            .replace("xbox-programs\t-\t-\t-\t-\t-\t-\t-\t-\n", "");
+        let loaded = parse_config(&old).unwrap();
+        assert_eq!(loaded, config, "a v23 file loads as is");
+        assert_eq!(xbox_program(loaded.mappings[0].context), Some((1, false)));
+        let mut bad = config.clone();
+        bad.xbox_names[0] = "a\tb".into();
+        assert!(serialize_config(&bad).is_err());
+    }
+
     /// v7 ticket 111: a silenced default (`nothing`) round-trips in v23; an older file can't
     /// hold it.
     #[test]
@@ -3011,11 +3127,11 @@ mod tests {
         ];
         let text = serialize_config(&config).unwrap();
         assert!(
-            text.starts_with("vibeconsole-mappings-v23\n") && text.contains("\tnothing\t"),
+            text.starts_with("vibeconsole-mappings-v24\n") && text.contains("\tnothing\t"),
             "{text}"
         );
         assert_eq!(parse_config(&text).unwrap(), config);
-        let v22 = text.replace("vibeconsole-mappings-v23", "vibeconsole-mappings-v22");
+        let v22 = text.replace("vibeconsole-mappings-v24", "vibeconsole-mappings-v22");
         assert!(parse_config(&v22).unwrap_err().to_string().contains("v23"));
     }
 
@@ -3067,9 +3183,9 @@ mod tests {
             .unwrap(),
         ];
         let text = serialize_config(&config).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v23\n"), "{text}");
+        assert!(text.starts_with("vibeconsole-mappings-v24\n"), "{text}");
         assert_eq!(parse_config(&text).unwrap(), config);
-        let v21 = text.replace("vibeconsole-mappings-v23", "vibeconsole-mappings-v21");
+        let v21 = text.replace("vibeconsole-mappings-v24", "vibeconsole-mappings-v21");
         assert!(parse_config(&v21).unwrap_err().to_string().contains("v22"));
         // An old needs-me pad (a plain sequence) becomes Orca keys; another sequence doesn't.
         let old = v21.replace("orca-keys:", "sequence:");
@@ -3089,15 +3205,15 @@ mod tests {
         let mut config = Config::default();
         config.mappings = vec![Mapping::new(pad, "Ctrl+T", "tap").unwrap()];
         let text = serialize_config(&config).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v23\n"), "{text}");
+        assert!(text.starts_with("vibeconsole-mappings-v24\n"), "{text}");
         assert!(text.contains("\ttap\tCtrl+T\t"), "{text}");
         assert_eq!(parse_config(&text).unwrap(), config);
-        let v20 = text.replace("vibeconsole-mappings-v23", "vibeconsole-mappings-v20");
+        let v20 = text.replace("vibeconsole-mappings-v24", "vibeconsole-mappings-v20");
         assert!(parse_config(&v20).unwrap_err().to_string().contains("v21"));
         config.mappings = vec![Mapping::new(pad, "Ctrl+T", "hold").unwrap()];
         let old = serialize_config(&config)
             .unwrap()
-            .replace("vibeconsole-mappings-v23", "vibeconsole-mappings-v20");
+            .replace("vibeconsole-mappings-v24", "vibeconsole-mappings-v20");
         assert_eq!(
             parse_config(&old).unwrap(),
             config,
@@ -3125,7 +3241,7 @@ mod tests {
         save_config(&path, &config).unwrap();
         let v18 = fs::read_to_string(&path)
             .unwrap()
-            .replace("vibeconsole-mappings-v23", "vibeconsole-mappings-v18")
+            .replace("vibeconsole-mappings-v24", "vibeconsole-mappings-v18")
             .lines()
             .filter(|l| !v20_record(l))
             .map(|l| format!("{l}\n"))
@@ -3144,7 +3260,7 @@ mod tests {
         config.mappings[0].action = Action::PromptSequence(vec![own, saved("build")]);
         save_config(&path, &config).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v23\n"), "{text}");
+        assert!(text.starts_with("vibeconsole-mappings-v24\n"), "{text}");
         assert_eq!(load_config(&path).unwrap(), config);
         let mut bad = config.clone();
         bad.mappings[0].action = Action::PromptSequence(vec![Action::PromptOwn {
@@ -3183,7 +3299,7 @@ mod tests {
         ));
         assert_eq!(load_config(&path).unwrap(), config);
         let v17 = text
-            .replace("vibeconsole-mappings-v23", "vibeconsole-mappings-v17")
+            .replace("vibeconsole-mappings-v24", "vibeconsole-mappings-v17")
             .lines()
             .filter(|l| !v20_record(l))
             .map(|l| format!("{l}\n"))
@@ -3267,7 +3383,7 @@ mod tests {
         config.agents = vec![Agent::new("claude", "claude", "claude").unwrap()];
         let v16 = serialize_config(&config)
             .unwrap()
-            .replace("vibeconsole-mappings-v23", "vibeconsole-mappings-v16")
+            .replace("vibeconsole-mappings-v24", "vibeconsole-mappings-v16")
             .lines()
             .filter(|l| !v20_record(l))
             .map(|l| format!("{l}\n"))
@@ -3283,7 +3399,7 @@ mod tests {
         herdr.host = Host::Herdr;
         config.agents.extend([orca, herdr]);
         let text = serialize_config(&config).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v23\n"), "{text}");
+        assert!(text.starts_with("vibeconsole-mappings-v24\n"), "{text}");
         assert!(
             text.contains("\nagent\tclaude\tclaude\tclaude\t-\t1\ttmux\n"),
             "{text}"
@@ -3670,7 +3786,7 @@ mod tests {
         save_config(&path, &config).unwrap();
         let full = fs::read_to_string(&path).unwrap();
         let early = full.replace(
-            "midi-devices\t0\nmidi-active\t-\nprofiles\t0\nprofile-lock\t-\nfavourites\t0\n",
+            "midi-devices\t0\nmidi-active\t-\nxbox-programs\t-\t-\t-\t-\t-\t-\t-\t-\nprofiles\t0\nprofile-lock\t-\nfavourites\t0\n",
             "",
         );
         assert_ne!(early, full);
@@ -3760,7 +3876,7 @@ mod tests {
         let path = dir.join("mappings.tsv");
         save_config(&path, &config).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
-        assert!(saved.starts_with("vibeconsole-mappings-v23\n"));
+        assert!(saved.starts_with("vibeconsole-mappings-v24\n"));
         assert!(saved.contains("\tflow\t") && !saved.contains("flow-start"));
         assert_eq!(load_config(&path).unwrap(), config);
         fs::remove_dir_all(dir).unwrap();
@@ -3786,7 +3902,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v23\n")
+                .starts_with("vibeconsole-mappings-v24\n")
         );
         assert_eq!(load_config(&path).unwrap(), config);
         fs::remove_dir_all(dir).unwrap();
@@ -3807,7 +3923,7 @@ mod tests {
         let path = dir.join("mappings.tsv");
         save_config(&path, &config).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v23\n") && text.contains("\tstatus\n"));
+        assert!(text.starts_with("vibeconsole-mappings-v24\n") && text.contains("\tstatus\n"));
         assert_eq!(load_config(&path).unwrap(), config);
         let pad = Control::from_note(10, 37).unwrap();
         for (action, observable) in [
@@ -3884,7 +4000,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v23\n")
+                .starts_with("vibeconsole-mappings-v24\n")
         );
         assert_eq!(load_config(&path).unwrap(), config);
         // ${NAME}: user variable, then startup variable; other text stays; no environment.

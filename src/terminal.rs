@@ -129,6 +129,10 @@ trait Ui {
     fn xbox_connected(&self) -> bool {
         false
     }
+    /// The Xbox program in use (v7 ticket 115): Learn saves an Xbox button there.
+    fn xbox_program(&self) -> u8 {
+        1
+    }
     fn learn_knob(&mut self) -> Result<Option<Learned>> {
         Err("knob learning unavailable".into())
     }
@@ -218,6 +222,11 @@ struct Terminal {
     button_light: Option<crate::gamepad::ButtonLight>,
     /// LB held: Xbox buttons use layer 2 (v7 ticket 09).
     layer2: bool,
+    /// v7 ticket 115: the Xbox program in use (1–8), its View/Menu picker, and whether the
+    /// last control used was the Xbox controller's (the header names that device's program).
+    xbox_program: u8,
+    program_keys: crate::gamepad::ProgramKeys,
+    last_xbox: bool,
     /// The focused app's profile (v7 ticket 12); None is Default.
     profile: Option<String>,
     /// Real sessions follow the focused app; tests never call the desktop.
@@ -400,7 +409,9 @@ impl Terminal {
             (None, Some(name)) => name.clone(),
             (None, None) => mappings::program_label(self.context),
         };
-        let program = if self.context_verified {
+        let program = if self.last_xbox && self.gamepad.is_some() {
+            format!("Xbox · {}", self.xbox_program_label()) // v7 ticket 115
+        } else if self.context_verified {
             format!("{program} (hardware/RAM verified)")
         } else {
             format!("{program} (select hardware to verify)")
@@ -736,6 +747,9 @@ impl Terminal {
             gamepad: None,
             button_light: None,
             layer2: false,
+            xbox_program: 1,
+            program_keys: crate::gamepad::ProgramKeys::default(),
+            last_xbox: false,
             profile: None,
             follow_apps: false,
             focus_unavailable: false,
@@ -1102,6 +1116,7 @@ impl Terminal {
     fn suspend(&mut self) -> Result<()> {
         self.suspended = true;
         self.guide.cancel();
+        self.program_keys.cancel();
         self.holds.clear();
         if let Some(pad) = &mut self.gamepad {
             pad.stop_rumble();
@@ -1306,16 +1321,12 @@ impl Terminal {
     /// focused app's profile on top.
     fn xbox_layout(&self) -> Result<Vec<Mapping>> {
         let config = mappings::load_config(&self.path)?;
-        let layer = crate::gamepad::layer(&config.mappings, self.layer2);
+        let layer = crate::gamepad::layer_in(&config.mappings, self.xbox_program, self.layer2);
         let profile = self
             .profile
             .as_deref()
             .and_then(|name| config.profile(name));
-        let context = if self.layer2 {
-            mappings::GAMEPAD_LAYER_2
-        } else {
-            mappings::GAMEPAD_CONTEXT
-        };
+        let context = mappings::xbox_context(self.xbox_program, self.layer2);
         Ok(mappings::overlay(&layer, profile, context))
     }
     /// The mapping a press fires, as the keyboard has it: the open context's, or for an Xbox
@@ -1592,6 +1603,30 @@ impl Terminal {
         }
         Ok(())
     }
+    /// v7 ticket 115: switch the Xbox program: a transition (held keys released, the next
+    /// press fires fresh); nothing is written to the controller.
+    fn set_xbox_program(&mut self, program: u8) -> Result<()> {
+        let program = program.clamp(1, mappings::XBOX_PROGRAMS);
+        if self.xbox_program != program {
+            self.release_all()?;
+            self.xbox_program = program;
+            self.reload_keyboard()?;
+        }
+        self.notice = format!("Xbox · {}", self.xbox_program_label());
+        Ok(())
+    }
+    /// "Program N — name" (or "Program N") for the Xbox program in use.
+    fn xbox_program_label(&self) -> String {
+        let name = mappings::load_config(&self.path)
+            .map(|c| mappings::xbox_program_name(&c, self.xbox_program))
+            .unwrap_or_default();
+        let number = format!("Program {}", self.xbox_program);
+        if name.is_empty() || name == number {
+            number
+        } else {
+            format!("{number} — {name}")
+        }
+    }
     /// LB pressed or let go (v7 ticket 09): a transition. Held keys are released, held pads
     /// and buttons wait for a fresh press, and the keyboard gets the other layer.
     fn set_layer(&mut self, second: bool) -> Result<()> {
@@ -1759,6 +1794,22 @@ impl Terminal {
         }
     }
     fn rename_program(&mut self) -> Result<()> {
+        // v7 ticket 115: the Xbox programs' names live in VibeConsole's config only.
+        if self
+            .gamepad
+            .as_ref()
+            .is_some_and(|p| !p.connected().is_empty())
+        {
+            let devices = options(&[
+                "MPK (stored on the controller)",
+                "Xbox controller (saved in VibeConsole)",
+            ]);
+            match choose(self, "Rename a program on which device?", &devices)? {
+                Some(1) => return rename_xbox_program(self, &self.path.clone()),
+                Some(_) => {}
+                None => return Ok(()),
+            }
+        }
         self.program_connection()?;
         let names = crate::feedback::names(self.input.as_mut().ok_or("MIDI disconnected")?)?;
         self.program_names = names.clone();
@@ -2366,6 +2417,7 @@ impl Terminal {
                 }
             };
             if let Some(event) = self.detector.observe(message) {
+                self.last_xbox = false; // v7 ticket 115: the header follows the device used
                 events.push(event);
             }
             self.handle_events(events)?;
@@ -2378,6 +2430,24 @@ impl Terminal {
             .unwrap_or_default();
         for change in changes {
             if let crate::gamepad::Change::Event(event) = &change {
+                self.last_xbox = true;
+                // v7 ticket 115: View/Menu held + LB/LT/RB/RT picks an Xbox program; a tap of
+                // View or Menu alone fires its own mapping on release.
+                match self.program_keys.event(event) {
+                    crate::gamepad::ProgramStep::Pass => {}
+                    crate::gamepad::ProgramStep::Swallow => continue,
+                    crate::gamepad::ProgramStep::Select(program) => {
+                        self.set_xbox_program(program)?;
+                        continue;
+                    }
+                    crate::gamepad::ProgramStep::Tap(control) => {
+                        self.handle_events(vec![
+                            Event::Press(control),
+                            Event::Release(control, crate::ReleaseType::ButtonUp),
+                        ])?;
+                        continue;
+                    }
+                }
                 let (action, gesture) = self.guide.event(event, Instant::now());
                 if let Some(action) = action {
                     if let Err(error) = self.guide_action(action) {
@@ -2999,6 +3069,9 @@ impl Drop for Terminal {
 }
 
 impl Ui for Terminal {
+    fn xbox_program(&self) -> u8 {
+        self.xbox_program
+    }
     fn xbox_connected(&self) -> bool {
         self.gamepad
             .as_ref()
@@ -6595,6 +6668,27 @@ fn saved_list<'a>(
     list
 }
 
+/// v7 ticket 115: name an Xbox program (saved in the config, atomically; blank clears it).
+fn rename_xbox_program(ui: &mut impl Ui, path: &Path) -> Result<()> {
+    let mut config = mappings::load_config(path).map_err(stage("file I/O"))?;
+    let names = (1..=mappings::XBOX_PROGRAMS)
+        .map(|p| mappings::xbox_program_name(&config, p))
+        .collect::<Vec<_>>();
+    let Some(at) = choose(ui, "Rename which Xbox program?", &names)? else {
+        return Ok(());
+    };
+    let Some(name) = text_entry(
+        ui,
+        "Xbox program name (up to 32 characters; empty for \"Program N\")",
+        &config.xbox_names[at],
+    )?
+    else {
+        return Ok(());
+    };
+    config.xbox_names[at] = name.trim().to_owned();
+    mappings::save_config(path, &config).map_err(stage("validation"))?;
+    Ok(())
+}
 /// One Learn page's observation (v7 ticket 45).
 fn learn_on(ui: &mut impl Ui, page: usize) -> Result<Option<Learned>> {
     let press = |control: Option<Control>| control.map(Learned::Press);
@@ -6757,14 +6851,15 @@ fn configure_steps(
             // now, so only the chosen layer's assignment is looked up (and replaced).
             let context = if pad.message == crate::Message::Button {
                 let now = |context| {
-                    let default = (profile.is_none() && context == mappings::GAMEPAD_CONTEXT)
-                        .then(|| {
-                            crate::gamepad::default_layout()
-                                .into_iter()
-                                .find(|d| d.control == pad)
-                        })
-                        .flatten()
-                        .map(|d| format!("{} (default)", d.action_label()));
+                    let default = (profile.is_none()
+                        && mappings::xbox_program(context).is_some_and(|(_, layer2)| !layer2))
+                    .then(|| {
+                        crate::gamepad::default_layout()
+                            .into_iter()
+                            .find(|d| d.control == pad)
+                    })
+                    .flatten()
+                    .map(|d| format!("{} (default)", d.action_label()));
                     current
                         .iter()
                         .find(|m| m.context == context && m.control == pad)
@@ -6773,15 +6868,18 @@ fn configure_steps(
                         .unwrap_or_else(|| "free".into())
                 };
                 let layers = vec![
-                    format!("Layer 1 (normal): {}", now(mappings::GAMEPAD_CONTEXT)),
+                    format!(
+                        "Layer 1 (normal): {}",
+                        now(mappings::xbox_context(ui.xbox_program(), false))
+                    ),
                     format!(
                         "Layer 2 (while LB is held): {}",
-                        now(mappings::GAMEPAD_LAYER_2)
+                        now(mappings::xbox_context(ui.xbox_program(), true))
                     ),
                 ];
                 match choose(ui, &format!("Which layer is {} on?", pad.label()), &layers)? {
-                    Some(1) => mappings::GAMEPAD_LAYER_2,
-                    Some(_) => mappings::GAMEPAD_CONTEXT,
+                    Some(1) => mappings::xbox_context(ui.xbox_program(), true),
+                    Some(_) => mappings::xbox_context(ui.xbox_program(), false),
                     None => continue,
                 }
             } else {
@@ -6872,13 +6970,14 @@ fn configure_steps(
         if action == 6 {
             // v7 ticket 111: removing a built-in default silences it (saved as no action);
             // removing a changed button that has a default brings the default back.
-            let default = (profile.is_none() && pad_context == mappings::GAMEPAD_CONTEXT)
-                .then(|| {
-                    crate::gamepad::default_layout()
-                        .into_iter()
-                        .find(|d| d.control == pad)
-                })
-                .flatten();
+            let default = (profile.is_none()
+                && mappings::xbox_program(pad_context).is_some_and(|(_, layer2)| !layer2))
+            .then(|| {
+                crate::gamepad::default_layout()
+                    .into_iter()
+                    .find(|d| d.control == pad)
+            })
+            .flatten();
             if chose_default {
                 let keys = default
                     .as_ref()
@@ -8570,6 +8669,39 @@ mod tests {
         ui.reset_input_lights();
         assert!(!ui.input_light(now) && !ui.note_light(pad, now) && !ui.note_light(piano, now));
         assert!(ui.input.is_none() && ui.output.is_none());
+    }
+
+    /// v7 ticket 115: switching the Xbox program loads that program's buttons and names it;
+    /// Learn saves into the program in use.
+    #[test]
+    fn switching_the_xbox_program_loads_its_buttons() {
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-xbox-programs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let a = Control::button(0);
+        let mut third = Mapping::new(a, "F9", "hold").unwrap();
+        third.context = mappings::xbox_context(3, false);
+        let mut config = mappings::Config::default();
+        config.mappings = vec![third];
+        config.xbox_names[2] = "Editor".into();
+        mappings::save_config(&path, &config).unwrap();
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        let keys = |ui: &Terminal| {
+            ui.xbox_layout()
+                .unwrap()
+                .into_iter()
+                .find(|m| m.control == a)
+                .unwrap()
+                .keys
+        };
+        assert_eq!(keys(&ui), ["Enter"], "program 1: the default");
+        ui.set_xbox_program(3).unwrap();
+        assert_eq!(keys(&ui), ["F9"]);
+        assert_eq!(ui.notice, "Xbox · Program 3 — Editor");
+        assert_eq!(Ui::xbox_program(&ui), 3);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// v7 ticket 111: with a controller connected, the built-in Xbox defaults are listed;
@@ -12817,9 +12949,9 @@ mod tests {
             })
             .map(|l| format!("{l}\n"))
             .collect::<String>()
-            .replace("vibeconsole-mappings-v23", "vibeconsole-mappings-v14")
+            .replace("vibeconsole-mappings-v24", "vibeconsole-mappings-v14")
             .replace(
-                "tuning\t15\t30\t10\toff\toff\nsticks\tlinear\tlinear\nmidi-devices\t0\nmidi-active\t-\nprofiles\t0\nprofile-lock\t-\nfavourites\t0\n",
+                "tuning\t15\t30\t10\toff\toff\nsticks\tlinear\tlinear\nmidi-devices\t0\nmidi-active\t-\nxbox-programs\t-\t-\t-\t-\t-\t-\t-\t-\nprofiles\t0\nprofile-lock\t-\nfavourites\t0\n",
                 "",
             )
             .replace(
