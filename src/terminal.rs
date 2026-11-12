@@ -182,7 +182,8 @@ trait Ui {
     }
     /// Orca's agent terminals as (agent, folder) (v7 ticket 15).
     fn orca_agents(&mut self) -> Result<Vec<(String, String)>> {
-        let output = std::process::Command::new("orca")
+        // v7 ticket 102: Orca IDE's CLI, never the screen reader.
+        let output = std::process::Command::new(crate::actions::orca_program()?)
             .args(["terminal", "list", "--json"])
             .output()
             .map_err(|e| format!("Orca CLI unavailable: {e}"))?;

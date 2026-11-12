@@ -1365,20 +1365,39 @@ impl Positions {
     }
 }
 
-/// Orca's CLI: on PATH, else the shim Orca installs (the login service's PATH is short).
-fn orca_program() -> String {
-    let on_path = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .any(|dir| dir.join("orca").is_file());
-    match std::env::var_os("HOME") {
-        Some(home) if !on_path => {
-            let shim = Path::new(&home).join(".config/orca/linux-orca-cli-shim/orca");
-            if shim.is_file() {
-                return shim.to_string_lossy().into_owned();
-            }
-            "orca".into()
-        }
-        _ => "orca".into(),
-    }
+/// Orca IDE's CLI (v7 ticket 102), never GNOME's screen reader, which is also called `orca`
+/// (`/usr/bin/orca`, a Python script): Orca IDE's own shim first (the login service's PATH is
+/// short), else an `orca` on PATH that is Orca IDE's. Not found is an error; nothing else is
+/// ever started.
+pub fn orca_program() -> Result<String> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let path =
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect::<Vec<_>>();
+    find_orca_cli(home.as_deref(), &path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .ok_or_else(|| {
+            "Orca CLI unavailable: Orca IDE's command not found (~/.config/orca/linux-orca-cli-shim/orca); GNOME's screen reader is never used".into()
+        })
+}
+/// Where Orca IDE's command is, given the home folder and PATH (v7 ticket 102).
+fn find_orca_cli(home: Option<&Path>, path: &[PathBuf]) -> Option<PathBuf> {
+    let shim = home
+        .map(|h| h.join(".config/orca/linux-orca-cli-shim/orca"))
+        .filter(|p| p.is_file());
+    shim.or_else(|| {
+        path.iter()
+            .map(|dir| dir.join("orca"))
+            .filter(|p| p.is_file())
+            .find(|p| is_orca_ide(p))
+    })
+}
+/// Orca IDE's command lives under /opt/Orca or is a small script that runs `orca-ide`; the
+/// screen reader is neither.
+fn is_orca_ide(path: &Path) -> bool {
+    fs::canonicalize(path).is_ok_and(|p| p.starts_with("/opt/Orca"))
+        || fs::read(path).is_ok_and(|text| {
+            text.len() < 64 * 1024 && String::from_utf8_lossy(&text).contains("orca-ide")
+        })
 }
 /// Orca's terminals as (agent, folder, handle), from `orca terminal list --json`. Only
 /// those three fields are read; previews and titles (which hold your text) are not.
@@ -1981,7 +2000,7 @@ fn reach_agent(agent_name: &str, cancelled: &dyn Fn() -> bool) -> Result<Reached
             orca_reach(
                 &agent.launch,
                 &folder,
-                |args| command(&orca_program(), args, &cancelled),
+                |args| command(&orca_program()?, args, &cancelled),
                 || wait(AGENT_START, cancelled),
             )
             .map(Reached::Orca)
@@ -2129,7 +2148,7 @@ fn send_prompt_at(
                 return Err("prompt cancelled".into());
             }
             orca_send(&handle, &text, enter, |args| {
-                command(&orca_program(), args, &cancelled)
+                command(&orca_program()?, args, &cancelled)
             })?;
             return Ok(format!("Prompt {file} sent to {agent_name} in Orca"));
         }
@@ -2462,7 +2481,7 @@ fn perform(
             Ok(format!("herdr: focused {name}"))
         }
         Action::OrcaJump { agent, folder } => orca_jump(agent, folder, |args| {
-            command(&orca_program(), args, &cancelled)
+            command(&orca_program()?, args, &cancelled)
         }),
         Action::Shortcut => Err("shortcut belongs to keyboard output".into()),
         Action::Choice(_) | Action::Value { .. } => Err("knob actions run in the session".into()),
@@ -2780,6 +2799,50 @@ mod tests {
         assert_eq!(positions.current(pad, &reordered), Some(0));
         assert_eq!(positions.current(pad, &steps[..1]), Some(0));
         assert_eq!(Positions::default().label(pad, &steps), "1/3");
+    }
+
+    /// v7 ticket 102: Orca actions find Orca IDE's command, never GNOME's screen reader (also
+    /// called `orca`), even when the screen reader comes first on PATH.
+    #[test]
+    fn orca_ide_is_found_and_the_screen_reader_never_is() {
+        let root =
+            std::env::temp_dir().join(format!("vibeconsole-orca-cli-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (reader, ide, home) = (
+            root.join("usr-bin"),
+            root.join("ide-bin"),
+            root.join("home"),
+        );
+        for dir in [&reader, &ide, &home] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(
+            reader.join("orca"),
+            "#!/usr/bin/python3\n#\n# Orca\n# Copyright The Orca Team\n",
+        )
+        .unwrap();
+        fs::write(
+            ide.join("orca"),
+            "#!/usr/bin/env bash\nexec '/opt/Orca/resources/bin/orca-ide' \"$@\"\n",
+        )
+        .unwrap();
+        // The screen reader first on PATH: skipped; Orca IDE's script further on: used.
+        assert_eq!(
+            find_orca_cli(Some(&home), &[reader.clone(), ide.clone()]),
+            Some(ide.join("orca"))
+        );
+        // Only the screen reader: nothing; Orca actions then fail instead of starting it.
+        assert_eq!(find_orca_cli(Some(&home), &[reader.clone()]), None);
+        assert_eq!(find_orca_cli(None, &[]), None);
+        // Orca IDE's own shim wins over PATH.
+        let shim = home.join(".config/orca/linux-orca-cli-shim");
+        fs::create_dir_all(&shim).unwrap();
+        fs::write(shim.join("orca"), "#!/usr/bin/env bash\n").unwrap();
+        assert_eq!(
+            find_orca_cli(Some(&home), &[reader]),
+            Some(shim.join("orca"))
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// v7 ticket 98: Orca's keys go out only while Orca is focused; in another app nothing is
