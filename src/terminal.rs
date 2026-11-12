@@ -1237,29 +1237,40 @@ impl Terminal {
         mut attempt: impl FnMut(&mut Self) -> Result<()>,
     ) -> Result<bool> {
         let deadline = Instant::now() + window;
-        for tries in 1.. {
-            let error = match attempt(self) {
+        let mut tries = 0;
+        loop {
+            tries += 1;
+            let mut error = match attempt(self) {
                 Ok(()) => return Ok(true),
                 Err(error) => error,
             };
+            let last = Instant::now() + every > deadline;
+            if !last && !self.stop.load(Ordering::Relaxed) {
+                eprintln!("Automatic Flow startup failed (try {tries}), retrying: {error}");
+                let next = Instant::now() + every;
+                while Instant::now() < next && !self.stop.load(Ordering::Relaxed) {
+                    if let Err(e) = self.tick() {
+                        error = e; // e.g. the controller unplugged: paused, as before retries
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                if self.stop.load(Ordering::Relaxed) {
+                    break; // quit or SIGTERM: no further launch
+                }
+                if Instant::now() >= next {
+                    continue;
+                }
+            }
             self.pause()?;
-            let last = self.stop.load(Ordering::Relaxed) || Instant::now() + every > deadline;
-            self.error = if last {
-                format!("Automatic Flow startup failed after {tries} tries: {error}")
-            } else {
-                format!("Automatic Flow startup failed (try {tries}), retrying: {error}")
-            };
+            self.error = format!("Automatic Flow startup failed after {tries} tries: {error}");
             eprintln!("{}", self.error);
-            if last {
-                return Ok(false);
-            }
-            let next = Instant::now() + every;
-            while Instant::now() < next && !self.stop.load(Ordering::Relaxed) {
-                self.tick()?;
-                std::thread::sleep(Duration::from_millis(20));
-            }
+            return Ok(false);
         }
-        unreachable!()
+        self.pause()?;
+        self.error = format!("Automatic Flow startup stopped after {tries} tries");
+        eprintln!("{}", self.error);
+        Ok(false)
     }
     fn transition(&mut self, pad: Control, active: bool) -> Result<()> {
         let fired = self.fired(pad)?;
@@ -12985,6 +12996,27 @@ mod tests {
             "{}",
             ui.error
         );
+
+        // A stop during the wait between tries launches nothing more.
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        let (dispatcher, tries) = flow(usize::MAX, None);
+        ui.actions = dispatcher;
+        let stop = Arc::clone(&ui.stop);
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            stop.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        let slow = Duration::from_secs(1);
+        assert!(
+            !ui.retry_flow_startup(slow, Duration::from_secs(60), attempt)
+                .unwrap()
+        );
+        stopper.join().unwrap();
+        assert!(started.elapsed() < Duration::from_millis(900));
+        assert!(!ui.wanted_run && ui.suspended);
+        assert_eq!(tries.load(Ordering::SeqCst), 1);
+        assert!(ui.error.contains("stopped after 1 tries"), "{}", ui.error);
 
         let mut ui = Terminal::open_mode(&path, true).unwrap();
         let (dispatcher, tries) = flow(usize::MAX, Some(Arc::clone(&ui.stop)));
