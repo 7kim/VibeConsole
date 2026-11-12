@@ -6704,9 +6704,27 @@ fn configure_steps(
             None
         };
         let (pad, pad_context) = if let Some(pad) = learned {
-            // An Xbox button's saved mapping is looked up on layer 1; its layer is asked below.
+            // v7 ticket 97: an Xbox button's layer comes first, showing what each layer does
+            // now, so only the chosen layer's assignment is looked up (and replaced).
             let context = if pad.message == crate::Message::Button {
-                mappings::GAMEPAD_CONTEXT
+                let now = |context| {
+                    current
+                        .iter()
+                        .find(|m| m.context == context && m.control == pad)
+                        .map_or("free".into(), Mapping::action_label)
+                };
+                let layers = vec![
+                    format!("Layer 1 (normal): {}", now(mappings::GAMEPAD_CONTEXT)),
+                    format!(
+                        "Layer 2 (while LB is held): {}",
+                        now(mappings::GAMEPAD_LAYER_2)
+                    ),
+                ];
+                match choose(ui, &format!("Which layer is {} on?", pad.label()), &layers)? {
+                    Some(1) => mappings::GAMEPAD_LAYER_2,
+                    Some(_) => mappings::GAMEPAD_CONTEXT,
+                    None => continue,
+                }
             } else {
                 ui.context()
             };
@@ -6945,17 +6963,10 @@ fn configure_steps(
             };
             Mapping::new_action(pad, input, action).map_err(stage("validation"))?
         };
+        // v7 ticket 09: layer 2 is what an Xbox button does while LB is held; its layer was
+        // chosen when it was learned (ticket 97), or is the edited assignment's own.
         mapping.context = if pad.message == crate::Message::Button {
-            // v7 ticket 09: layer 2 is what the button does while LB is held.
-            match choose(
-                ui,
-                &format!("Which layer is {} on?", pad.label()),
-                &options(&["Layer 1 (normal)", "Layer 2 (while LB is held)"]),
-            )? {
-                Some(1) => mappings::GAMEPAD_LAYER_2,
-                Some(_) => mappings::GAMEPAD_CONTEXT,
-                None => continue,
-            }
+            pad_context
         } else {
             ui.context()
         };
@@ -8111,9 +8122,11 @@ mod tests {
         let (saved, _) = run(&[&mute, &prompt], keys, vec![b], VecDeque::new());
         let copy = saved.iter().find(|m| m.control == b).unwrap();
         assert!(matches!(copy.action, Action::Prompt { .. }) && copy.status);
-        // An Xbox button: its layer is asked, then Review.
-        let mut keys = favourites(11);
-        keys.extend([Enter, Enter, Enter, Tab, Tab, Enter]); // favourite, layer 1, save, finish
+        // An Xbox button: its layer is asked first (v7 ticket 97), then Review.
+        let mut keys = vec![Enter, Enter]; // learn, layer 1
+        keys.extend(vec![Down; 11]);
+        keys.push(Enter); // Favourites
+        keys.extend([Enter, Enter, Tab, Tab, Enter]); // favourite, save, finish
         let (saved, _) = run(&[&mute], keys, vec![Control::button(3)], VecDeque::new());
         let copy = saved
             .iter()
@@ -8219,8 +8232,7 @@ mod tests {
         let akai_finish = [Enter, Enter, Enter, Tab, Tab, Enter]; // + no hardware feedback
 
         // "Learn a pad", then an Xbox button: saved as that Xbox button on its layer.
-        let mut keys = shortcut(vec![Enter]);
-        keys.push(Enter); // layer 1
+        let mut keys = shortcut(vec![Enter, Enter]); // learn, layer 1 (v7 ticket 97)
         keys.extend(finish);
         let (saved, screens) = run(keys, vec![Control::button(3)], vec![]);
         assert!(screens.contains("Which layer is Xbox Y on?"), "{screens}");
@@ -8277,15 +8289,13 @@ mod tests {
         );
 
         // "Learn joystick", then an Xbox button: saved as the button.
-        let mut keys = shortcut(vec![Down, Down, Down, Enter]);
-        keys.push(Enter); // layer 1
+        let mut keys = shortcut(vec![Down, Down, Down, Enter, Enter]); // …, layer 1 (v7 ticket 97)
         keys.extend(finish);
         let (saved, _) = run(keys, vec![Control::button(1)], vec![]);
         assert_eq!(saved[0].control, Control::button(1));
 
         // "Learn an Xbox button" on layer 2.
-        let mut keys = shortcut(vec![Down, Down, Down, Down, Enter]);
-        keys.extend([Down, Enter]); // layer 2
+        let mut keys = shortcut(vec![Down, Down, Down, Down, Enter, Down, Enter]); // …, layer 2
         keys.extend(finish);
         let (saved, _) = run(keys, vec![Control::button(2)], vec![]);
         assert_eq!(saved[0].context, mappings::GAMEPAD_LAYER_2);
@@ -9070,9 +9080,10 @@ mod tests {
         mappings::save(&path, &[]).unwrap();
         let a = Control::button(0); // A
         assert_eq!(a.label(), "Xbox A");
-        let mut keys = vec![Enter, Enter, Enter, Enter, Space, Enter];
+        let mut keys = vec![Enter, Enter]; // learn, layer 1 (v7 ticket 97)
+        keys.extend([Enter, Enter, Enter, Space, Enter]);
         keys.extend(std::iter::repeat_n(Down, 7));
-        keys.extend([Enter, Enter, Enter]); // done, hold, layer 1
+        keys.extend([Enter, Enter]); // done, hold
         keys.push(Enter); // fire when pressed: no feedback step
         keys.extend([Enter, Tab, Tab, Enter]); // save, finish
         let mut ui = Script {
@@ -9116,12 +9127,12 @@ mod tests {
             mappings::save(&path, &[]).unwrap();
             let a = Control::button(0);
             let mut keys = vec![Enter]; // learn a pad
-            keys.extend([Down, Down, Enter]); // Fedora system action
-            keys.extend([Down, Down, Enter]); // Output mute
-            keys.push(layer);
+            keys.push(layer); // its layer comes first (v7 ticket 97)
             if layer == Down {
                 keys.push(Enter);
             }
+            keys.extend([Down, Down, Enter]); // Fedora system action
+            keys.extend([Down, Down, Enter]); // Output mute
             keys.extend([Enter, Enter, Tab, Tab, Enter]); // fire when, save, finish
             let mut ui = Script {
                 keys: keys.into(),
@@ -9164,7 +9175,8 @@ mod tests {
             let mut keys = vec![Enter]; // learn a pad: the stick is pushed into range 3
             keys.extend(std::iter::repeat_n(Down, downs));
             keys.push(Enter); // range, or "half circle clockwise"
-            keys.extend([Down, Down, Enter, Down, Down, Enter, Enter]); // Output mute, layer 1
+            keys.push(Enter); // layer 1 (v7 ticket 97)
+            keys.extend([Down, Down, Enter, Down, Down, Enter]); // Output mute
             keys.extend([Enter, Enter, Tab, Tab, Enter]); // fire when, save, finish
             let mut ui = Script {
                 keys: keys.into(),
@@ -9193,6 +9205,70 @@ mod tests {
         }
     }
 
+    /// v7 ticket 97: learning an Xbox button asks its layer first, showing what each layer
+    /// does; a free layer goes straight on (no Replace), and only a taken one asks.
+    #[test]
+    fn learning_an_xbox_button_asks_its_layer_first_and_replaces_only_that_layer() {
+        use Key::*;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-layer-first-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let x = Control::button(2);
+        let f8 = Mapping::new(x, "F8", "hold").unwrap(); // layer 1
+        mappings::save(&path, &[f8.clone()]).unwrap();
+        let mut keys = vec![Enter, Down, Enter]; // learn X, layer 2
+        keys.extend([Down, Down, Enter, Down, Down, Enter]); // Fedora system action, Output mute
+        keys.extend([Enter, Enter, Tab, Tab, Enter]); // fire when, save, finish
+        let mut ui = Script {
+            keys: keys.into(),
+            pads: [x].into(),
+            context: 2,
+            ..Default::default()
+        };
+        let mut current = vec![f8.clone()];
+        configure(&mut ui, &path, &mut current).unwrap();
+        let screens = ui.screens.join("\n----\n");
+        assert!(screens.contains("Which layer is Xbox X on?"), "{screens}");
+        assert!(screens.contains("Layer 1 (normal): F8"), "{screens}");
+        assert!(
+            screens.contains("Layer 2 (while LB is held): free"),
+            "{screens}"
+        );
+        assert!(
+            !screens.contains("Already assigned"),
+            "a free layer asks no Replace\n{screens}"
+        );
+        let saved = mappings::load_config(&path).unwrap().mappings;
+        assert_eq!(saved.len(), 2, "both layers kept\n{screens}");
+        assert!(
+            saved
+                .iter()
+                .any(|m| m.context == mappings::GAMEPAD_CONTEXT && m.keys == ["F8"])
+        );
+        assert!(saved.iter().any(|m| m.context == mappings::GAMEPAD_LAYER_2
+            && m.action == crate::actions::Action::OutputMute));
+        // Layer 2 is taken now: learning X there asks, naming that layer's action; Cancel keeps it.
+        let before = std::fs::read(&path).unwrap();
+        ui.screens.clear();
+        ui.pads = [x].into();
+        ui.keys = [Enter, Down, Enter, Enter, Escape].into(); // learn X, layer 2, Cancel, leave
+        configure(&mut ui, &path, &mut current).unwrap();
+        let screens = ui.screens.join("\n----\n");
+        assert!(
+            screens.contains("Layer 2 (while LB is held): Toggle default output mute"),
+            "{screens}"
+        );
+        assert!(screens.contains("Already assigned:"), "{screens}");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "Cancel changes nothing"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// v7 ticket 42: every non-shortcut family the user tried on an Xbox button saves there
     /// (the user's notes: launch with hold to quit, prompt, run command in tmux, sequence of
     /// steps, Orca, T3 Code, herdr, prompt sequence, terminal command).
@@ -9212,7 +9288,7 @@ mod tests {
                 .collect()
         }
         let family = |n: usize| {
-            let mut keys = vec![Enter]; // learn a pad
+            let mut keys = vec![Enter, Enter]; // learn a pad, layer 1 (v7 ticket 97)
             keys.extend(vec![Down; n]);
             keys.push(Enter);
             keys
@@ -9306,7 +9382,9 @@ mod tests {
             mappings::save(&path, &[]).unwrap();
             let a = Control::button(0);
             let mut ui = Script {
-                keys: [action, tail].concat().into(),
+                // Each tail starts with the layer answer it had before ticket 97; the layer is
+                // now asked first (in `family`), so it is dropped here.
+                keys: [action, tail[1..].to_vec()].concat().into(),
                 pads: [a].into(),
                 orca: vec![("claude".into(), "/work/a".into())],
                 t3: r#"[{"key":"mod+]","command":"thread.next"}]"#.into(),
@@ -9456,12 +9534,12 @@ mod tests {
                 mappings::save_config(&path, &config).unwrap();
                 let mut keys = vec![Down; page];
                 keys.push(Enter);
+                if kind == "Xbox button" {
+                    keys.push(Enter); // its layer, asked first (v7 ticket 97)
+                }
                 keys.extend(vec![Down; i]);
                 keys.push(Enter);
                 keys.extend(family_keys(family, kind));
-                if kind == "Xbox button" {
-                    keys.push(Enter); // its layer
-                }
                 keys.extend([Enter, Escape]); // save and configure another, leave
                 let (pads, motions) = match motion {
                     Some(input) => (VecDeque::new(), [(control, input, kind.into())].into()),
@@ -9603,7 +9681,7 @@ mod tests {
         let path = dir.join("mappings.tsv");
         mappings::save(&path, &[]).unwrap();
         let before = std::fs::read(&path).unwrap();
-        let mut keys = vec![Enter];
+        let mut keys = vec![Enter, Enter]; // learn, layer 1 (v7 ticket 97)
         keys.extend(vec![Down; 8]); // herdr, with no agents running
         keys.extend([Enter, Enter]); // herdr -> Back
         keys.extend([Tab, Tab, Enter]); // still in /configure: Finish
@@ -9758,10 +9836,10 @@ mod tests {
         let path = dir.join("mappings.tsv");
         mappings::save(&path, &[]).unwrap();
         let a = Control::button(0);
-        let mut keys = vec![Enter, Enter, Enter, Enter, Space, Enter];
+        let mut keys = vec![Enter, Down, Enter]; // learn, layer 2 (v7 ticket 97)
+        keys.extend([Enter, Enter, Enter, Space, Enter]);
         keys.extend(std::iter::repeat_n(Down, 7));
         keys.extend([Enter, Enter]); // done selecting keys, hold
-        keys.extend([Down, Enter]); // layer 2
         keys.push(Enter); // fire when pressed
         keys.extend([Enter, Tab, Tab, Enter]);
         let mut ui = Script {
@@ -9802,11 +9880,11 @@ mod tests {
         mappings::save(&path, &[]).unwrap();
         let a = Control::button(0);
         let map = |modifier: usize, save: Key| {
-            let mut keys = vec![Enter, Enter, Enter, Enter];
+            let mut keys = vec![Enter, Enter, Enter, Enter, Enter]; // learn, layer 1, …
             keys.extend(std::iter::repeat_n(Down, modifier));
             keys.extend([Space, Enter]);
             keys.extend(std::iter::repeat_n(Down, 7));
-            keys.extend([Enter, Enter, Enter, Enter]); // done, hold, layer 1, fire when
+            keys.extend([Enter, Enter, Enter]); // done, hold, fire when
             keys.push(save);
             keys
         };
@@ -9814,10 +9892,10 @@ mod tests {
         let mut keys = map(0, Enter); // Ctrl, save and configure another
         // A again: "Already assigned ... Replace it?" -> Replace; Ctrl off, Shift on.
         keys.extend([
-            Enter, Down, Enter, Enter, Enter, Enter, Space, Down, Space, Enter,
+            Enter, Enter, Down, Enter, Enter, Enter, Enter, Space, Down, Space, Enter,
         ]);
         keys.extend(std::iter::repeat_n(Down, 7));
-        keys.extend([Enter, Enter, Enter, Enter, Enter]); // done, hold, layer 1, fire, save
+        keys.extend([Enter, Enter, Enter, Enter]); // done, hold, fire, save
         keys.extend([Tab, Down, Enter, Enter, Down, Enter]); // remove A from the saved list
         keys.extend([Tab, Tab, Enter]); // finish
         let mut ui = Script {
