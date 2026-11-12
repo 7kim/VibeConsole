@@ -66,6 +66,8 @@ pub struct Keyboard {
     running: bool,
     /// Risky controls held but not yet fired, with their press time.
     armed: HashMap<Control, Instant>,
+    /// v7 ticket 99: a risky control let go before one second, until the session reads it.
+    early: Option<Control>,
 }
 
 impl Keyboard {
@@ -97,6 +99,7 @@ impl Keyboard {
             held: HashSet::new(),
             running: true,
             armed: HashMap::new(),
+            early: None,
         })
     }
 
@@ -156,12 +159,17 @@ impl Keyboard {
                 return Ok(None);
             }
             if self.armed.remove(&pad).is_some() {
-                return Ok(None); // released before ARM: nothing was sent
+                self.early = Some(pad); // released before ARM: nothing was sent
+                return Ok(None);
             }
         }
         self.activate(index, pressed, emit)
     }
 
+    /// v7 ticket 99: the risky control last let go before its one second, once.
+    pub fn take_early(&mut self) -> Option<Control> {
+        self.early.take()
+    }
     /// Fire risky controls held for at least `ARM` by `now`.
     pub fn fire_due(
         &mut self,
@@ -497,6 +505,10 @@ impl Output {
             node: std::path::PathBuf::new(),
             recorded: Vec::new(),
         })
+    }
+    /// v7 ticket 99: see [`Keyboard::take_early`].
+    pub fn take_early(&mut self) -> Option<Control> {
+        self.keyboard.take_early()
     }
     pub fn fire_due(&mut self) -> Result<Vec<(Control, bool)>> {
         let (device, recorded) = (&mut self.device, &mut self.recorded);
@@ -1420,5 +1432,52 @@ mod tests {
             downs, 2,
             "one per squeeze; hovering near the fire point taps nothing more"
         );
+    }
+
+    /// v7 ticket 99: a risky control let go before one second is reported once, so the
+    /// session can say "hold 1 s"; a full hold, or a pause during the hold, reports nothing.
+    #[test]
+    fn a_risky_control_let_go_early_is_reported_once() {
+        let pad = Control::from_note(10, 37).unwrap();
+        let mut command = Mapping::new_action(
+            pad,
+            crate::mappings::Input::Pad,
+            crate::actions::Action::OutputMute,
+        )
+        .unwrap();
+        command.risky = true;
+        let mut keyboard = Keyboard::new(&[command]).unwrap();
+        keyboard.resume();
+        let mut emit = |_, _| Ok(());
+        let t = Instant::now();
+        let ms = |n| t + Duration::from_millis(n);
+        let release = || Event::Release(pad, ReleaseType::NoteOff);
+        keyboard
+            .observe_at(Event::Press(pad), t, &mut emit)
+            .unwrap();
+        assert_eq!(
+            keyboard.observe_at(release(), ms(400), &mut emit).unwrap(),
+            None
+        );
+        assert_eq!(keyboard.take_early(), Some(pad));
+        assert_eq!(keyboard.take_early(), None, "once");
+        // Held a full second: it fires, and letting go is no "early" release.
+        keyboard
+            .observe_at(Event::Press(pad), ms(2000), &mut emit)
+            .unwrap();
+        assert_eq!(
+            keyboard.fire_due(ms(3000), &mut emit).unwrap(),
+            [(pad, true)]
+        );
+        keyboard.observe_at(release(), ms(3100), &mut emit).unwrap();
+        assert_eq!(keyboard.take_early(), None);
+        // Paused during the hold: cancelled quietly.
+        keyboard
+            .observe_at(Event::Press(pad), ms(4000), &mut emit)
+            .unwrap();
+        keyboard.pause(&mut emit).unwrap();
+        keyboard.resume();
+        keyboard.observe_at(release(), ms(4200), &mut emit).unwrap();
+        assert_eq!(keyboard.take_early(), None);
     }
 }

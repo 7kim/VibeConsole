@@ -1557,6 +1557,18 @@ impl Terminal {
                     }
                 }
             }
+            // v7 ticket 99: a hold-to-fire control let go early explains itself.
+            if let Some(pad) = self
+                .output
+                .as_mut()
+                .and_then(crate::keyboard::Output::take_early)
+            {
+                let what = self
+                    .fired(pad)?
+                    .map(|m| m.action_label())
+                    .unwrap_or_default();
+                self.notice = format!("{}: hold 1 s to run {what}", self.name(pad));
+            }
         }
         Ok(())
     }
@@ -11508,6 +11520,60 @@ mod tests {
     /// and the default A = Enter) through the session's event path types the keys, keeps the
     /// session running with no error, and leaves every key released. The keyboard records its
     /// keys instead of reaching the desktop.
+    /// v7 ticket 99: a terminal-command pad tapped shorter than a second runs nothing and the
+    /// notice says to hold it.
+    #[test]
+    fn a_tapped_risky_pad_says_to_hold_it() {
+        use crate::actions::Action;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-risky-tap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let pad = Control::from_note(10, 36).unwrap();
+        let mut command = Mapping::new_action(
+            pad,
+            mappings::Input::Pad,
+            Action::Command {
+                window: "Pad-1".into(),
+                dir: dir.to_string_lossy().into_owned(),
+                line: "sudo dnf check-update".into(),
+            },
+        )
+        .unwrap();
+        command.risky = true;
+        mappings::save(&path, &[command]).unwrap();
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        let (sent, ran) = std::sync::mpsc::channel();
+        ui.actions = crate::actions::Dispatcher::with(move |action, _, _| {
+            sent.send(action.clone()).unwrap();
+            Ok("done".into())
+        });
+        ui.run_mappings = ui.context_mappings(&mappings::load_config(&path).unwrap().mappings);
+        let mut output = crate::keyboard::Output::recording(&ui.run_mappings).unwrap();
+        output.keyboard.resume();
+        ui.output = Some(output);
+        ui.wanted_run = true;
+        ui.suspended = false;
+        ui.handle_events(vec![
+            Event::Press(pad),
+            Event::Release(pad, crate::ReleaseType::NoteOff),
+        ])
+        .unwrap();
+        // The pad's name depends on the verified program; the hint follows it.
+        assert!(
+            ui.notice
+                .contains(": hold 1 s to run Run `sudo dnf check-update`"),
+            "{}",
+            ui.notice
+        );
+        assert!(
+            ran.recv_timeout(Duration::from_millis(200)).is_err(),
+            "nothing ran"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn xbox_shortcuts_keep_a_verified_akai_session_running() {
         use crate::feedback::{Octave, Resolver, Settings, State};
