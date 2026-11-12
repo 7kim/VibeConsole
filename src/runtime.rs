@@ -186,6 +186,19 @@ fn login_doctor(installed: bool, mut systemctl: impl FnMut(&[&str]) -> Result<()
         "Login service: WARNING installed but disabled, so VibeConsole won't start at login; turn it on with: vibeconsole startup-enable".into()
     }
 }
+/// v7 ticket 95: what `systemctl --user status`'s exit code means. 0 (running) and 3 (not
+/// running) are answers, already printed by systemctl; anything else (4: no such unit) or a
+/// kill by a signal is an error naming its stage.
+fn status_outcome(code: Option<i32>) -> Result<()> {
+    match code {
+        Some(0 | 3) => Ok(()),
+        Some(code) => Err(format!(
+            "startup-status: systemctl --user status {UNIT} failed (exit status {code})"
+        )
+        .into()),
+        None => Err("startup-status: systemctl was stopped by a signal".into()),
+    }
+}
 /// Setup and login-service commands `main` hands to `command`.
 pub const COMMANDS: [&str; 8] = [
     "install",
@@ -261,10 +274,9 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
         "startup-status" => {
             let status = Command::new("systemctl")
                 .args(["--user", "status", UNIT, "--no-pager"])
-                .status()?;
-            if !status.success() {
-                return Err(format!("systemctl --user status {UNIT} failed ({status})").into());
-            }
+                .status()
+                .map_err(|e| format!("startup-status: systemctl unavailable: {e}"))?;
+            status_outcome(status.code())?;
         }
         "startup-disable" => {
             systemctl(&["disable", "--now", "vibeconsole.service"])?;
@@ -485,5 +497,24 @@ mod tests {
                 .contains(&format!("\"uuid\": \"{EXTENSION_UUID}\""))
         );
         assert!(EXTENSION_FILES[1].1.contains("org.vibeconsole.Windows"));
+    }
+
+    /// v7 ticket 95: a stopped service is an answer, not an error; a missing unit or a
+    /// killed systemctl is an error naming its stage.
+    #[test]
+    fn startup_status_reports_a_stopped_service_without_an_error() {
+        assert!(status_outcome(Some(0)).is_ok(), "running");
+        assert!(status_outcome(Some(3)).is_ok(), "installed but not running");
+        let missing = status_outcome(Some(4)).unwrap_err().to_string();
+        assert!(
+            missing.starts_with("startup-status: ") && missing.contains("exit status 4"),
+            "{missing}"
+        );
+        assert!(
+            status_outcome(None)
+                .unwrap_err()
+                .to_string()
+                .starts_with("startup-status: ")
+        );
     }
 }
