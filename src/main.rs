@@ -122,10 +122,16 @@ fn help(color: bool) -> String {
         ),
         (
             "XBOX DRIVER",
-            vec![(
-                "xbox-driver",
-                "<xpad|xone>  Switch the Xbox controller's driver (as root; Settings runs it through pkexec)".into(),
-            )],
+            vec![
+                (
+                    "xbox-driver",
+                    "<xpad|xone>  Switch the Xbox controller's driver (as root; Settings runs it through pkexec)".into(),
+                ),
+                (
+                    "xbox-light-rule",
+                    "<install|remove>  The udev rule that lets you write xone's Xbox button light (as root)".into(),
+                ),
+            ],
         ),
         (
             "FLAGS",
@@ -195,6 +201,19 @@ fn main() -> Result<()> {
             &loaded,
             installed,
             &mut run,
+        )?;
+        println!("{done}");
+        return Ok(());
+    }
+    // v7 ticket 130: run as root by Settings -> Xbox tuning through pkexec.
+    if let [command, action] = &args[..]
+        && command == "xbox-light-rule"
+    {
+        plain_output();
+        let done = vibeconsole_core::gamepad::light_rule(
+            action,
+            std::path::Path::new("/etc/udev/rules.d"),
+            &mut vibeconsole_core::gamepad::run_program(),
         )?;
         println!("{done}");
         return Ok(());

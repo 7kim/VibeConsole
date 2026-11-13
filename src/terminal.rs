@@ -142,6 +142,10 @@ trait Ui {
     fn run(&mut self, _args: &[&str]) -> Result<String> {
         Err("unavailable here".into())
     }
+    /// v7 ticket 130: whether VibeConsole's Xbox light rule is installed.
+    fn light_rule(&self) -> bool {
+        false
+    }
     fn learn_knob(&mut self) -> Result<Option<Learned>> {
         Err("knob learning unavailable".into())
     }
@@ -3269,6 +3273,9 @@ impl Ui for Terminal {
     fn run(&mut self, args: &[&str]) -> Result<String> {
         (crate::gamepad::run_program())(args)
     }
+    fn light_rule(&self) -> bool {
+        crate::gamepad::light_rule_installed()
+    }
     fn xbox_connected(&self) -> bool {
         self.gamepad
             .as_ref()
@@ -4622,6 +4629,55 @@ fn driver_menu(ui: &mut impl Ui) -> Result<()> {
     choose(ui, &message, &options(&["Back"]))?;
     Ok(())
 }
+/// v7 ticket 130: install or remove the udev rule that lets the user write xone's Xbox
+/// button light, after a confirm, as root through pkexec (`vibeconsole xbox-light-rule`).
+fn light_rule_menu(ui: &mut impl Ui) -> Result<()> {
+    let (action, what) = if ui.light_rule() {
+        (
+            "remove",
+            "Remove the Xbox button light rule? The light goes back to root-only, so VibeConsole can't change it.",
+        )
+    } else {
+        (
+            "install",
+            "Install the Xbox button light rule? It writes /etc/udev/rules.d/70-vibeconsole-xbox-light.rules, \
+          which lets the input group (you) set xone's controller light. You're asked for your password.",
+        )
+    };
+    let note = if ui.xbox_audio().0 == Some("xpad") {
+        "\nOn xpad this controller has no light; the rule takes effect once you switch to xone."
+    } else {
+        ""
+    };
+    let verb = if action == "install" {
+        "Install"
+    } else {
+        "Remove"
+    };
+    if choose(ui, &format!("{what}{note}"), &options(&[verb, "Back"]))? != Some(0) {
+        return Ok(());
+    }
+    let exe = std::env::current_exe()?;
+    let exe = exe
+        .to_str()
+        .ok_or("this program's path isn't text")?
+        .to_owned();
+    let message = match ui.run(&["pkexec", &exe, "xbox-light-rule", action]) {
+        Ok(_) if action == "install" => {
+            format!(
+                "Light rule installed.\n{}",
+                crate::gamepad::ButtonLight::status()
+            )
+        }
+        Ok(_) => "Light rule removed.".to_owned(),
+        Err(error) if error.to_string().contains("dismissed") => {
+            "Not changed: polkit: the password prompt was cancelled; nothing changed".to_owned()
+        }
+        Err(error) => format!("Not changed: {error}"),
+    };
+    choose(ui, &message, &options(&["Back"]))?;
+    Ok(())
+}
 /// v7 ticket 129: Test speaker / Test mic on the controller headset, xone only. The card id
 /// comes from ALSA's card list; the recording lives in VibeConsole's runtime folder and is
 /// deleted after it plays.
@@ -4768,6 +4824,14 @@ fn tuning_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
         ),
         "Test speaker (plays a test sound in the controller headset; xone only)".into(),
         "Test mic (records 5 s, then plays it back; xone only)".into(),
+        format!(
+            "Xbox button light rule: {}",
+            if ui.light_rule() {
+                "installed (Remove…)"
+            } else {
+                "not installed (Install…)"
+            }
+        ),
         "Back".to_string(),
     ];
     let title = format!(
@@ -4807,6 +4871,7 @@ fn tuning_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
         Some(7) => config.tuning.headset = !tuning.headset,
         Some(8) => return driver_menu(ui),
         Some(choice @ (9 | 10)) => return audio_test(ui, choice == 10),
+        Some(11) => return light_rule_menu(ui),
         Some(3) => {
             let Some(stick) = choose(
                 ui,
@@ -8577,8 +8642,12 @@ mod tests {
         ran: Vec<String>,
         run_error: Option<String>,
         xone_missing: bool,
+        rule: bool,
     }
     impl Ui for Script {
+        fn light_rule(&self) -> bool {
+            self.rule
+        }
         fn xbox_audio(&self) -> (Option<&'static str>, String) {
             (self.driver, self.cards.clone())
         }
@@ -10941,6 +11010,41 @@ mod tests {
                 .iter()
                 .any(|s| s.contains("unavailable: needs xone"))
         );
+        // v7 ticket 130: the light rule item asks first, then runs exactly the pkexec command.
+        let mut ui = Script {
+            keys: tuning(11, &[Enter, Enter]).into(),
+            driver: Some("xone"),
+            ..Default::default()
+        };
+        settings_menu(&mut ui, &path).unwrap();
+        assert!(ui.keys.is_empty(), "keys left: {:?}", ui.keys);
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains("Xbox button light rule: not installed (Install…)"))
+        );
+        assert_eq!(
+            ui.ran,
+            [format!("pkexec {} xbox-light-rule install", exe.display())]
+        );
+        let mut ui = Script {
+            keys: tuning(11, &[Enter, Enter]).into(),
+            driver: Some("xone"),
+            rule: true,
+            ..Default::default()
+        };
+        settings_menu(&mut ui, &path).unwrap();
+        assert_eq!(
+            ui.ran,
+            [format!("pkexec {} xbox-light-rule remove", exe.display())]
+        );
+        let mut ui = Script {
+            keys: tuning(11, &[Down, Enter]).into(), // Back at the confirm
+            driver: Some("xone"),
+            ..Default::default()
+        };
+        settings_menu(&mut ui, &path).unwrap();
+        assert!(ui.ran.is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

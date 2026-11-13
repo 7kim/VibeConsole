@@ -970,6 +970,59 @@ pub fn switch_driver(
     }
     Ok(format!("Xbox driver switched to {driver}"))
 }
+/// v7 ticket 130: VibeConsole's udev rule that lets the `input` group (the user is in it to
+/// read controllers) write xone's controller light. udev runs `RUN+=` programs with the
+/// device's sysfs path in `%p` (udev(7)); the same pattern as github.com/medusalix/xone's
+/// "LED control" rule and ublue-os/bazzite#5315.
+pub const LIGHT_RULE_FILE: &str = "70-vibeconsole-xbox-light.rules";
+pub const LIGHT_RULE: &str = "# Written by VibeConsole (Settings -> Xbox tuning -> Install the light rule).\n\
+ACTION==\"add\", SUBSYSTEM==\"leds\", KERNEL==\"gip*\", \
+RUN+=\"/usr/bin/chgrp input /sys%p/mode /sys%p/brightness\", \
+RUN+=\"/usr/bin/chmod g+w /sys%p/mode /sys%p/brightness\"\n";
+/// v7 ticket 130, run as root (`pkexec vibeconsole xbox-light-rule <install|remove>`): writes
+/// or removes only VibeConsole's own rule in `rules` (/etc/udev/rules.d), then reloads udev
+/// and replays the `leds` add events so it applies without a replug. Errors name the stage.
+pub fn light_rule(
+    action: &str,
+    rules: &std::path::Path,
+    run: &mut dyn FnMut(&[&str]) -> crate::Result<String>,
+) -> crate::Result<String> {
+    let file = rules.join(LIGHT_RULE_FILE);
+    match action {
+        "install" => crate::actions::write_atomic(&file, LIGHT_RULE)
+            .map_err(|e| format!("xbox-light-rule: save: {e}"))?,
+        "remove" => match std::fs::remove_file(&file) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(format!("xbox-light-rule: save: {e}").into());
+            }
+            _ => {}
+        },
+        _ => return Err("xbox-light-rule: choose install or remove".into()),
+    }
+    run(&["udevadm", "control", "--reload"])
+        .map_err(|e| format!("xbox-light-rule: reload: {e}"))?;
+    run(&[
+        "udevadm",
+        "trigger",
+        "--subsystem-match=leds",
+        "--action=add",
+    ])
+    .map_err(|e| format!("xbox-light-rule: apply: {e}"))?;
+    Ok(format!(
+        "Xbox light rule {}",
+        if action == "install" {
+            "installed"
+        } else {
+            "removed"
+        }
+    ))
+}
+/// Whether VibeConsole's light rule is installed.
+pub fn light_rule_installed() -> bool {
+    std::path::Path::new("/etc/udev/rules.d")
+        .join(LIGHT_RULE_FILE)
+        .exists()
+}
 /// Whether xone's modules are installed for the running kernel (`modinfo` finds them).
 pub fn xone_installed(run: &mut dyn FnMut(&[&str]) -> crate::Result<String>) -> bool {
     run(&["modinfo", "-n", "xone_wired"]).is_ok_and(|path| !path.trim().is_empty())
@@ -1406,7 +1459,8 @@ impl ButtonLight {
             .unwrap_or_default();
         if dirs.is_empty() {
             return Err("Xbox button light: unavailable: no xone controller light \
-                        (xpad has none for Xbox One/Series controllers)"
+                        (xpad has none for Xbox One/Series controllers; switch to xone in \
+                        Settings → Xbox tuning)"
                 .into());
         }
         dirs.sort();
@@ -1428,7 +1482,8 @@ impl ButtonLight {
                 _ => {
                     return Err(format!(
                         "Xbox button light: unavailable: {} is not writable \
-                         (a udev rule must give your user its mode and brightness)",
+                         (Settings → Xbox tuning → Install the light rule gives your user its \
+                         mode and brightness)",
                         dir.display()
                     ));
                 }
@@ -2142,6 +2197,42 @@ mod tests {
         assert_eq!(driver_in_use(&["xpad"]), Some("xpad"));
         assert_eq!(driver_in_use(&[]), None);
         std::fs::remove_dir_all(&etc).unwrap();
+    }
+
+    /// v7 ticket 130: the light rule is VibeConsole's own file with fixed text; install and
+    /// remove reload udev and replay the leds events; a bad word runs nothing.
+    #[test]
+    fn light_rule_writes_only_its_own_file_and_reloads_udev() {
+        let rules = std::env::temp_dir().join(format!("vibeconsole-rules-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&rules);
+        std::fs::create_dir_all(&rules).unwrap();
+        std::fs::write(rules.join("70-snap.snapd.rules"), "other\n").unwrap();
+        let mut ran = Vec::new();
+        let mut run = |args: &[&str]| -> crate::Result<String> {
+            ran.push(args.join(" "));
+            Ok(String::new())
+        };
+        light_rule("install", &rules, &mut run).unwrap();
+        let text = std::fs::read_to_string(rules.join(LIGHT_RULE_FILE)).unwrap();
+        assert!(text.contains(r#"KERNEL=="gip*""#) && text.contains("chgrp input /sys%p/mode"));
+        light_rule("remove", &rules, &mut run).unwrap();
+        assert!(!rules.join(LIGHT_RULE_FILE).exists());
+        assert_eq!(
+            std::fs::read_to_string(rules.join("70-snap.snapd.rules")).unwrap(),
+            "other\n"
+        );
+        assert_eq!(
+            ran,
+            [
+                "udevadm control --reload",
+                "udevadm trigger --subsystem-match=leds --action=add",
+                "udevadm control --reload",
+                "udevadm trigger --subsystem-match=leds --action=add"
+            ]
+        );
+        let mut never = |_: &[&str]| -> crate::Result<String> { panic!("nothing may run") };
+        assert!(light_rule("chmod", &rules, &mut never).is_err());
+        std::fs::remove_dir_all(&rules).unwrap();
     }
 
     /// Review fix: a trigger held through a transition doesn't fire again on jitter; it
