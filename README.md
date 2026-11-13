@@ -5,11 +5,15 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/open%20source-yes-brightgreen" />
+  <img src="https://img.shields.io/badge/license-MIT-brightgreen" />
   <img src="https://img.shields.io/badge/language-Rust%202024-orange" />
   <img src="https://img.shields.io/badge/devices-MIDI%20%7C%20Xbox-blueviolet" />
   <img src="https://img.shields.io/badge/agents-Claude%20Code%20%7C%20Codex-black" />
   <img src="https://img.shields.io/badge/desktop-Fedora%20GNOME%20Wayland-2563EB" />
+</p>
+
+<p align="center">
+  <img src="assets/devices/mpk-mini-mk3-34.png" width="70%" alt="Akai MPK Mini MK3" />
 </p>
 
 ---
@@ -53,7 +57,7 @@ Use a MIDI controller and an Xbox controller at the same time if you like.
 VibeConsole runs on Linux and needs [Rust](https://rustup.rs). It's tested on Fedora with GNOME on Wayland.
 
 ```bash
-sudo dnf install alsa-lib-devel alsa-utils usbutils acl tmux wl-clipboard
+sudo dnf install alsa-lib-devel systemd-devel alsa-utils usbutils acl tmux wl-clipboard
 git clone https://github.com/7kim/VibeConsole.git && cd VibeConsole
 scripts/install.sh       # builds and installs to ~/.local/bin
 vibeconsole doctor       # checks your setup
@@ -74,4 +78,4 @@ Open **Configure**, press a pad or button, and choose what it does.
 
 ## 🤝 Contributing
 
-VibeConsole is open source, and contributions are welcome. Commands, configuration, architecture and testing are in [README-DEVELOPER.md](README-DEVELOPER.md).
+VibeConsole is open source under the [MIT license](LICENSE), and contributions are welcome. The third-party 3D models in `assets/devices/split/` keep their own licences, listed in [CREDITS.md](assets/devices/split/CREDITS.md). Commands, configuration, architecture and testing are in [README-DEVELOPER.md](README-DEVELOPER.md).

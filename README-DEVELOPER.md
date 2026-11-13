@@ -16,27 +16,32 @@
 
 ---
 
-## 🆕 What's new in v7
+## 🧱 Layout and version
 
-`vibeconsole --version` names the spec version, last ticket and commit of a build (for example `v7 129, commit 4c82e7e`). The sections after this one describe the V1–V6 base, which v7 keeps.
+This guide describes **v7**, the terminal edition. `vibeconsole --version` names the spec version, last ticket and commit of a build (for example `v7 129, commit 4c82e7e`).
 
-- **Workspace:** `core/` (library: MIDI, gamepad, keyboard, mappings, actions, status) and the terminal app in `src/`.
-- **Any MIDI device** through `midir` (ALSA sequencer). Akai SysEx (lights, octave, tempo) is sent only to a verified Akai program; other MIDI devices get no device-specific messages.
-- **Xbox controllers over USB:** buttons, analog triggers, sticks (ranges, angle mode, gestures), a second layer, eight programs picked with View/Menu held + LB/LT/RB/RT, editable built-in defaults, rumble, and the Xbox button light as a status light. Settings → **Xbox tuning** switches between the installed `xpad` and `xone` drivers (`pkexec vibeconsole xbox-driver`), installs xone's light udev rule (`vibeconsole xbox-light-rule`), and can make the controller headset the default PipeWire sink and source.
-- **Both devices at once**, with one owner for held keys.
-- **Per-app profiles** (like Logitech G HUB): the focused app's profile applies, else Default. Profiles can be locked, switched from the controller, exported and imported.
-- **Actions:** prompt sequences that step one prompt per tap and are saved by name; hold-to-quit an app; mouse from a stick; terminal commands; favourites; saved and AI-made presets ("Ask Claude for a profile"); one-tap shortcuts.
-- **Orca IDE** action family and status lights for Orca-hosted agents. T3 Code and herdr families are parked.
-- **More status lights:** per-device light patterns, the keyboard's lock-key LEDs and a Razer light, on every connected controller and keyboard.
-- **Config** is `vibeconsole-mappings-v28` (see [Saved configuration](#-saved-configuration)).
-- **Coming in v8:** a Tauri tray app with a hints window and 3D device models (`assets/devices/`), PlayStation 5 DualSense and Steam Deck support.
+| Path | What it holds |
+|---|---|
+| `core/` | Library crate `vibeconsole-core`: MIDI (`midir`), gamepad (`gilrs`), keyboard state machine, mappings and config, actions, status sources, Akai feedback, motion, recording |
+| `src/` | The `vibeconsole` binary: CLI (`main.rs`), runtime and login service (`runtime.rs`), terminal UI and its scripted menu tests (`terminal.rs`) |
+| `extension/` | GNOME Shell extension: window state, minimize/close/restore, focused app for app profiles |
+| `scripts/` | `install.sh` (build, stop, install, restart service), PTY and installation checks |
+| `assets/devices/` | Blender scripts and renders of the 3D device models used by the v8 app |
+| `testdata/` | Recorded Akai program dumps |
+
+v8 (in progress) adds a Tauri tray app with a hints window and 3D device models, plus PlayStation 5 DualSense and Steam Deck support.
 
 ---
 
 ## ✨ Features
 
-VibeConsole is a Rust terminal application with saved per-program mappings, hold/toggle shortcuts, application launching, audio controls, and optional musical-setting feedback.
+VibeConsole is a Rust terminal application that maps MIDI controllers and Xbox controllers to shortcuts, apps, audio, prompts and agent controls, with per-app profiles and status lights.
 
+- **Devices:** any MIDI device through the ALSA sequencer; Xbox controllers over USB; both at once, with one owner for held keys. The Akai MPK Mini MK3 also gets program detection and musical-setting feedback. Other MIDI devices receive no device-specific messages.
+- **Xbox:** every button, analog trigger, D-pad and stick; a second layer while LB is held; eight programs; editable built-in defaults; mouse from a stick; rumble, the Xbox button light and the controller headset. See [Xbox controllers](#-xbox-controllers).
+- **App profiles, favourites and presets:** the focused app's profile overrides Default; lock, switch from the controller, export and import; save and load whole setups; ask Claude for a profile. See [App profiles](#-app-profiles-favourites-and-presets).
+- **Agent actions:** prompts, prompt sequences (one prompt per tap), sequences of steps, tmux commands, visible terminal commands, choice and value knobs, Orca IDE actions.
+- **Status lights** on every connected device: the Akai's tempo/arpeggiator/octave, the Xbox button light and rumble, and the keyboard's Caps/Num/Scroll or Razer light.
 - Learn Note-mode pads from both banks and piano keys; select shortcuts from menus or record a physical keyboard chord.
 - Use hold/toggle shortcuts with shared-key ownership, duplicate suppression, release guards, and cleanup on pause, program transitions, disconnect, and handled exit.
 - Configure absolute or relative knob directions/steps and calibrated joystick axes with neutral regions, hysteresis, and supported diagonals.
@@ -59,7 +64,7 @@ Implemented features and user-approved hardware/application behavior are disting
 Use a Rust toolchain supporting the 2024 edition. Connect the controller by USB, then run from the repository:
 
 ```bash
-sudo dnf install alsa-utils usbutils acl
+sudo dnf install alsa-lib-devel systemd-devel alsa-utils usbutils acl tmux wl-clipboard
 cargo build --locked
 ./target/debug/vibeconsole doctor
 ./target/debug/vibeconsole
@@ -71,7 +76,7 @@ Start explicitly paused with:
 ./target/debug/vibeconsole --paused
 ```
 
-VibeConsole reads and writes MIDI through the ALSA sequencer (the `midir` library; building needs `alsa-lib-devel`), uses `lsusb` for device identification, and Linux uinput for keyboard output. App launching uses `gio`; audio actions require `wpctl`; optional login startup uses the native user `systemctl`. AI coding controls use `tmux` (agents, commands) and `wl-copy` (focused-window prompts, hook copying): `sudo dnf install tmux wl-clipboard`. `doctor` reports prerequisites without creating a keyboard, injecting events, launching applications, or changing controller settings.
+VibeConsole reads and writes MIDI through the ALSA sequencer (the `midir` library; building needs `alsa-lib-devel`), reads Xbox controllers through `gilrs` (building needs `systemd-devel` for libudev), uses `lsusb` for device identification, and Linux uinput for keyboard output. App launching uses `gio`; audio actions require `wpctl`; optional login startup uses the native user `systemctl`. AI coding controls use `tmux` (agents, commands) and `wl-copy` (focused-window prompts, hook copying): `sudo dnf install tmux wl-clipboard`. `doctor` reports prerequisites without creating a keyboard, injecting events, launching applications, or changing controller settings.
 
 To inspect the connected device:
 
@@ -114,6 +119,8 @@ Recheck afterward. The ACL may need reapplying after reboot or device-node recre
 
 ## 🎚️ Programs and automatic detection
 
+This section is about the Akai MPK Mini MK3. Other MIDI devices have no program detection: their mappings apply directly. Xbox programs are in [Xbox controllers](#-xbox-controllers). Settings → **MIDI device** picks which MIDI device VibeConsole opens (takes effect next launch).
+
 The interactive app starts with **running intent**, but mapped effects wait until the current hardware program is identified. `--paused` performs detection while retaining PAUSED. Empty programs have no mapped effects. Piano programs retain the explicit Run confirmation for physical arpeggiator Off and intended octave.
 
 The **controller's current state takes priority** over the last program selected in VibeConsole. For example, selecting Program 3 in VibeConsole, quitting, physically selecting Program 1, and reopening should use Program 1 when its RAM matches uniquely. This uses the hardware as the source of truth; it does not blindly restore a saved program number.
@@ -149,6 +156,9 @@ Highlight commands with Up/Down and press Enter. These are menu entries, not she
 | `/pause` | Direct pause command: release synthetic keys, cancel pending mapped actions, and remain paused |
 | `/release-all` | Clear holds/toggles while retaining running mode |
 | `/list` | Inspect saved mappings and toggle states |
+| Settings | Agent directory, Flow, variables, login service, status lights, MIDI device, Xbox tuning, app profiles, favourites, presets |
+| Agents | Add, edit or remove tmux agents; prompts; Claude Code / Codex status hooks; status lights |
+| Reset settings | Back up and clear every program's mappings and idle feedback |
 | `/get` | Inspect an observed Note control in the selected context |
 | `/detect` | Show Bank A / Bank B pads, knobs, joystick and other notes live, without mapped effects |
 | `/prog-select` | Select and verify an actual hardware program |
@@ -208,6 +218,43 @@ Names represent physical keyboard keys; the desktop layout determines the result
 
 ---
 
+## 🎮 Xbox controllers
+
+Plug an Xbox controller in over USB. `gilrs` reads it (evdev underneath); MIDI and Xbox events share one stream, and each event carries its device. `/configure` has a **MIDI keyboard** pane and an **Xbox controller** pane; Xbox controls are listed by kind (button, trigger, D-pad, stick), never as pad notes.
+
+- **Defaults:** a built-in layout works on first plug-in. Configure lists it; you can edit a default, or **Remove** it to silence it.
+- **Reserved buttons:** **LB** is the layer key: held, every other button uses layer 2. Learning a button asks its layer first. The **Xbox button** held with the D-pad cycles app profiles (right/down forward, left/up back); held alone for a second it toggles the profile lock.
+- **Programs:** eight Xbox programs, picked with **View** or **Menu** held plus LB, LT, RB or RT, and named. View and Menu fire their own mapping on **release**, and only when no program combo was used while they were held.
+- **Triggers and sticks:** a trigger fires at a set percent of travel. A stick works as directions, angle ranges, or gestures in angle mode (half/full circle, quarter turn clockwise or counter-clockwise, flick, hold per range); ranges a gesture passes through don't fire.
+- **Mouse:** Settings → Xbox tuning → **Mouse** lets the left or right stick move the pointer through uinput, with a speed of 1–50.
+
+**Settings → Xbox tuning** holds the stick dead zone (0–90%), the trigger fire point (1–100%), the stick modes, mouse and speed, and:
+
+| Row | What it does |
+|---|---|
+| Rumble when an agent finishes or needs you | Rumble only while VibeConsole owns the controller; stopped on exit |
+| Use the controller headset as speaker and mic | Makes the controller's PipeWire sink and source the defaults; restores the old ones on unplug, option off and quit |
+| Xbox driver (xpad is the default) | After a confirm, switches between the **installed** `xpad` and `xone` drivers as root through pkexec (`vibeconsole xbox-driver <xpad\|xone>`). It unbinds the controller, binds the new driver, writes only `/etc/modprobe.d/vibeconsole-xbox-driver.conf`, and rolls back on a failed load. VibeConsole never installs, builds or signs a driver |
+| Test speaker / Test mic | Plays a test sound, or records 5 s and plays it back, through the headset (xone only) |
+| Xbox button light rule | Installs or removes the udev rule that makes xone's Xbox button light writable (`vibeconsole xbox-light-rule <install\|remove>`) |
+
+Headset audio over the 3.5 mm jack needs `xone`; under `xpad` it's reported as unavailable. Bluetooth controllers are not supported yet. Unplugging releases held keys; after replugging, only the next fresh press fires.
+
+---
+
+## 📁 App profiles, favourites and presets
+
+**App profiles** (Settings → **App profiles**) work like Logitech G HUB: while an app is focused, its profile applies. A profile has a name, one or more app IDs (desktop IDs such as `firefox.desktop`) and **overrides only**: buttons it doesn't set keep their Default meaning. An app with no profile uses Default. The focused app comes from VibeConsole's GNOME extension; without it, the focused app is unavailable and Default applies. Switching profiles releases held keys first and rebuilds status lights.
+
+- **Lock** pins one profile whatever is focused (also the Xbox button held for a second).
+- **Export / import** write and read one file per profile. An import is validated in full before anything is saved.
+
+**Favourites** (★) list starred assignments and profiles first. The **Favourites** action family gives a control the same action as a starred assignment.
+
+**Presets** save the whole setup by name and load it later, for one program or all programs. **Ask Claude for a profile** runs your installed `claude -p` and validates the reply like an import, then shows it for review; nothing is saved unvalidated and no API key is stored.
+
+---
+
 ## 🔊 Application and audio actions
 
 Launch application lists installed visible desktop entries by name and saves their exact identifier/path. GIO performs native desktop launching; VibeConsole does not run a parsed `Exec` line as a shell command. A successful launch request is separate from an observed window or application readiness. A failed launch says whether the entry is **missing** (file gone), **rejected** (hidden, NoDisplay, not for this desktop, or its TryExec program is missing) or **failed to start** (GIO's error). **Start or repair Wispr Flow** is also selectable here.
@@ -220,7 +267,7 @@ These actions use **Trigger**, not synthetic hold/toggle semantics. A fresh pad/
 
 ---
 
-## 🤖 AI coding controls (V5)
+## 🤖 AI coding controls
 
 **Agents** (Configure → **Agents**) have a name, a launch command, and a tmux window name; defaults are `claude` and `codex`. All agents run in one tmux session, `vibe`, which VibeConsole creates as needed: watch it with `tmux attach -t vibe`.
 
@@ -233,6 +280,11 @@ New actions in `/configure` → **Action family**:
 | **Sequence of steps** | Runs up to 32 steps in order: ensure agent, prompt, command, launch application, shortcut, wait 100–60000 ms. A failing step stops the rest; a re-press while running is ignored. |
 | **Choice knob** | Splits an absolute knob into 2–16 zones, one prompt each (e.g. `/model opus`). Resting 300 ms in a new zone sends that prompt once; sweeping sends nothing. |
 | **Value knob** | Writes the knob position, scaled to min–max with chosen decimals, to a file as `0.42` plus newline (atomic replace), for your own scripts. |
+| **Prompt sequence** | Tap 1 sends step 1, tap 2 step 2, and so on, with no size limit. Each step is a saved prompt or one written only in this sequence. After the last step, taps send nothing until the pad is held for one second, which starts over without sending. Sequences are saved by name and reused on any pad, each pad with its own position; a used one can't be deleted. Drained or replayed events never move the position. |
+| **Terminal command** | Runs a command such as `sudo dnf update` in a visible terminal, where sudo asks for the password. Risky: fires only after a one-second hold. VibeConsole never stores a password. |
+| **Orca** | Orca IDE actions: **needs me** (`Ctrl+J`, then `Ctrl+1`), **jump to an agent** (`orca terminal list --json` resolves the handle, then `orca terminal switch`), and Orca's own shortcuts, sent only while Orca is focused. Runs Orca IDE's CLI only, never GNOME's screen reader `orca`. Orca-hosted agents light their own octave. |
+
+A launcher pad can also **hold to quit**: holding it for one second while the app's window is open and not minimized closes the app; letting go early cancels. Shortcuts can be **one-tap**: they fire once per press, however long it's held. The T3 Code and herdr families exist but are parked.
 
 Prompts are plain UTF-8 files in `$XDG_CONFIG_HOME/vibeconsole/prompts/` (default `~/.config/vibeconsole/prompts/`); **New/Edit** opens `$VISUAL`, `$EDITOR`, or `nano`. Content is read at press time; empty or missing files show an error and send nothing.
 
@@ -254,7 +306,7 @@ Names are letters, digits and `_`, not starting with a digit; values are one lin
 
 **Agent status.** Agents → **Claude Code status hooks** / **Codex status hooks** shows whether the hooks are installed and offers **Install (merge, with backup)**: it adds only VibeConsole's missing entries to `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`) and `~/.codex/hooks.json` (or `$CODEX_HOME/hooks.json`), keeps every other setting and hook, writes `<file>.bak-vibeconsole-<time>` first, and refuses a file that is not valid JSON. **Copy with wl-copy** is still there if you prefer to merge by hand. `vibeconsole doctor` reports both, so a reinstall that wiped `~/.claude` shows up as missing hooks. Codex runs new hooks only after you trust them in Codex; restart running agents after installing. Hooks call `vibeconsole agent-status - <state>`, which only reports from a live pane in that agent's own `vibe` window (VibeConsole sets `VIBECONSOLE_AGENT` there), so other Claude/Codex sessions, and processes that outlive the window such as Codex's shared app-server daemon, do not change status. A busy agent whose window is gone (it exited, or `tmux kill-server`) goes back to idle. The screen shows busy agents only, for example `Agents: claude thinking · VibeConsole NEEDS INPUT`. A finished agent is waiting for you, so it reads **NEEDS INPUT**, like a permission question; idle and exited agents are left out. Finished clears when the attached `vibe` session shows that agent's window or a mapping sends to that agent.
 
-**Status lights** (Agents → **Status lights**, default On): while any agent is not idle, the controller's tempo, arpeggiator and octave lights show it. The **tempo** light says what the agent is doing; the **octave** light says which agent or folder it is (each agent's octave, ±1..±4, is set when you edit the agent; Claude +1, Codex −1). When every agent is idle, the program's own idle/pad feedback comes back; pausing, changing program and quitting restore the controller as usual. Status lights stay off in programs with piano mappings and in the login service, which show status on screen only.
+**Status lights** (Agents → **Status lights**, default On): while any agent is not idle, the controller's tempo, arpeggiator and octave lights show it. In v7 they show on every connected device, and keep showing on the others when one is unplugged: the Xbox button light and rumble have their own patterns per state, and your keyboard's Scroll Lock (or Caps/Num Lock) LED or a Razer light can show agent status too (put back on pause and quit). Razer G and RGB lights are reported unavailable with the reason. The **tempo** light says what the agent is doing; the **octave** light says which agent or folder it is (each agent's octave, ±1..±4, is set when you edit the agent; Claude +1, Codex −1). When every agent is idle, the program's own idle/pad feedback comes back; pausing, changing program and quitting restore the controller as usual. Status lights stay off in programs with piano mappings and in the login service, which show status on screen only.
 
 **Status light patterns** (Settings → **Status light patterns**) choose what each state shows: the tempo light **off / slow / fast** (two BPM values on the same screen, default 50 and 240) and the octave light **off / steady / blink / alternate** (the agent's octave and its opposite, twice a second). Defaults:
 
@@ -321,8 +373,12 @@ Use `./target/debug/vibeconsole` for the current local build. After installation
 | `vibeconsole startup-stop` | Stop the service |
 | `vibeconsole startup-disable` | Disable and stop the service |
 | `vibeconsole daemon` | Headless program-following runtime used by the optional service; old flags are accepted and ignored |
+| `vibeconsole xbox-driver <xpad\|xone>` | Switch the Xbox controller's driver (as root; Settings runs it through pkexec) |
+| `vibeconsole xbox-light-rule <install\|remove>` | The udev rule that makes xone's Xbox button light writable (as root) |
 | `vibeconsole --help` / `-h` / `help` | Show grouped CLI help (colored in a terminal; plain when piped or with `NO_COLOR`) |
-| `vibeconsole --version` / `-V` / `version` | Show the version |
+| `vibeconsole --version` / `-V` / `-v` / `version` | Show the version, spec version, last ticket and commit |
+
+`scripts/install.sh` does a full update in one step: it builds the release binary, stops the login service and any terminal session cleanly, installs, and starts the service again if it was running.
 
 Install/update after quitting the running VibeConsole session:
 
@@ -381,8 +437,11 @@ Do not concurrently edit an active configuration. If an interrupted save leaves 
 | "Knob turned faster than its action runs; extra steps skipped" | A fast knob turn sent more steps than the action queue holds; the extra steps were dropped and output keeps running. Turn more slowly for exact steps |
 | A launcher pad does not minimize, close or restore | Check `vibeconsole doctor` says the window extension is answering; after installing or updating it, log out and in once |
 | Status lights do not show | Agents → **Status lights** must be On, the header `RUNNING` on a verified program without piano mappings, and VibeConsole interactive (not the login service) |
+| Xbox controller not seen | Check `vibeconsole doctor`; another program (for example Steam) may hold it; try the other driver in Settings → Xbox tuning |
+| Xbox headset or button light unavailable | Both need the `xone` driver; the light also needs **Xbox button light rule** installed |
+| Buttons do something else in one app | That app has a profile; check Settings → App profiles, or unlock a locked profile |
 
-Unsupported or unverified areas include live relative-knob editor acceptance, wrapping absolute knobs, absolute-volume mapping, CC/Program Change pad holds, joystick system actions, indistinguishable joystick directions, pedals, brightness/media/lock actions, shell commands outside tmux, hardware-verified status-light blink rates, readiness detection for agents (sequence waits are fixed), independent pad LED control, and direct Flow listening-state integration. There is no GUI. Other desktop environments/controller models have not been verified.
+Unsupported or unverified areas include live relative-knob editor acceptance, wrapping absolute knobs, absolute-volume mapping, CC/Program Change pad holds, joystick system actions, indistinguishable joystick directions, pedals, brightness/media/lock actions, shell commands outside tmux, hardware-verified status-light blink rates, readiness detection for agents (sequence waits are fixed), independent pad LED control, and direct Flow listening-state integration. Xbox over Bluetooth, the T3 Code and herdr families (parked), and a GUI (v8) are not available yet. Other desktop environments and MIDI devices other than the Akai have not been verified live.
 
 Suspend/resume, forced-kill recovery, real output-backend failure recovery, and full daily-use acceptance remain open. Exact program matching also means externally transposed/edited RAM may need deliberate recovery; do not treat the older piano-transposition procedure as approved under the new monitor.
 
@@ -390,7 +449,7 @@ Suspend/resume, forced-kill recovery, real output-backend failure recovery, and 
 
 ## ✅ Verification and acceptance
 
-Latest recorded software checks passed (2026-10-24): **96 Rust tests, 17 isolated terminal checks, installation checks, formatting, check, and build**. Reproduce with:
+Latest recorded software checks (2026-11-13): **238 Rust tests, installation checks, formatting and check pass**. The PTY terminal check (`check-terminal.py`) currently fails at its configure-menu step (it expects `Remove assignment`). Reproduce with:
 
 ```bash
 cargo fmt --check
@@ -414,6 +473,7 @@ Rust checks use recorded/simulated MIDI, keyboard, feedback, application/audio, 
 | V5 AI coding controls (agents/tmux prompts, focused-window prompts, commands and risky hold, sequences, choice/value knobs, agent status) | Implemented and simulated only; live checks pending. tmux command forms were exercised on a separate tmux server, and `agent-status` was run for real |
 | V6 (stage-named errors, first-press pads, one Flow command, replace warning, launcher errors and window control, command terminals, status feedback, Settings, variables, Prompts pane) | **All 13 V6 live tests passed** (2026-10-23/24) on the MPK mini 3 under GNOME 50.5 Wayland, including the knob-queue, launcher-restore and dialog-wrap fixes found during testing |
 | Status lights (V5 ticket 14) | Implemented and simulated only; the hardware gate was skipped and the live check is pending |
+| v7 (any MIDI, Xbox, app profiles, prompt sequences, Orca, presets, keyboard lights, Xbox driver switch) | Built and tested in simulation; live checks are v7 developer tests. Those not yet checked live are marked `ready-for-human` in `docs/v7/` |
 | Joystick, transposition, final integration, controlled failures, forced termination, suspend and remaining persistence | Joystick guide 09 partially observed; USB reconnect fix awaits live retest. Others unperformed or blocked; optional login guide 17 deferred |
 
 ➡️ Specs, tickets and tests live in `docs/<version>/` and `archive/` (both local only, not in the public repo). V1–V6 history: `archive/tickets/SPEC.md`, `archive/tickets/README.md`, `archive/tests/README.md`. v7 and v8 are listed in `docs/README.md`. Only update acceptance checkboxes after the user's approval.
