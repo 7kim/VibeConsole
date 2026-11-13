@@ -550,9 +550,13 @@ pub enum Light {
     /// v7 ticket 133: the controller's slow blink (also its paused light) and fast fade.
     SlowBlink,
     FastPulse,
+    /// v7 ticket 134: on and off at the Status light patterns' slow or fast BPM, switched by
+    /// VibeConsole itself (`at_tempo`), like the MPK's tempo light.
+    TempoSlow,
+    TempoFast,
 }
 /// Every pattern word. The Xbox button light can show all of them.
-pub const LIGHTS: [(&str, Light); 7] = [
+pub const LIGHTS: [(&str, Light); 9] = [
     ("off", Light::Off),
     ("steady", Light::Steady),
     ("slow-pulse", Light::SlowPulse),
@@ -560,6 +564,8 @@ pub const LIGHTS: [(&str, Light); 7] = [
     ("blink", Light::Blink),
     ("slow-blink", Light::SlowBlink),
     ("fast-pulse", Light::FastPulse),
+    ("tempo-slow", Light::TempoSlow),
+    ("tempo-fast", Light::TempoFast),
 ];
 /// v7 ticket 133: what a keyboard's on/off lock LED can show; the controller-only modes are
 /// left out.
@@ -682,8 +688,30 @@ pub fn light_on(light: Light, ms: u64) -> bool {
         Light::FastBlink => ms % 250 < 125,
         Light::SlowPulse => ms % 2000 < 1000,
         // Not in `KEYBOARD_LIGHTS`, so a keyboard never gets them; the nearest on/off.
-        Light::SlowBlink => ms % 2000 < 1000,
-        Light::FastPulse => ms % 500 < 250,
+        Light::SlowBlink | Light::TempoSlow => ms % 2000 < 1000,
+        Light::FastPulse | Light::TempoFast => ms % 500 < 250,
+    }
+}
+/// v7 ticket 134: the shortest on or off time for a light VibeConsole switches itself, so it
+/// sends at most 8 changes a second whatever the tempo.
+pub const TEMPO_MIN_MS: u64 = 125;
+/// v7 ticket 134: whether a light blinking at `bpm` is lit `ms` milliseconds in: on for the
+/// first half of each beat, as the MPK's tempo light. Beats shorter than 250 ms are capped.
+pub fn tempo_on(bpm: u16, ms: u64) -> bool {
+    let beat = (60_000 / u64::from(bpm.max(1))).max(2 * TEMPO_MIN_MS);
+    ms % beat < beat / 2
+}
+/// v7 ticket 134: a tempo pattern as the steady or off it shows at `ms`; others unchanged.
+pub fn at_tempo(light: Light, ms: u64, patterns: &Patterns) -> Light {
+    let bpm = match light {
+        Light::TempoSlow => patterns.slow,
+        Light::TempoFast => patterns.fast,
+        other => return other,
+    };
+    if tempo_on(bpm, ms) {
+        Light::Steady
+    } else {
+        Light::Off
     }
 }
 /// The Xbox button light for these source states (v7 ticket 86): the pattern of the most

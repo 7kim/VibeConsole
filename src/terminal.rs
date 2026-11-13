@@ -1609,6 +1609,13 @@ impl Terminal {
     /// busy or its switches are off. A failed write gives the light up (restoring what it
     /// can) and says why.
     fn show_button_light(&mut self) {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        self.show_button_light_at(ms);
+    }
+    /// `ms` drives the tempo patterns (v7 ticket 134), which VibeConsole switches itself.
+    fn show_button_light_at(&mut self, ms: u64) {
         use crate::gamepad::Light;
         let states = self.alert_states();
         let states = states.iter().map(|(_, s)| *s).collect::<Vec<_>>();
@@ -1619,7 +1626,10 @@ impl Terminal {
             .and_then(|p| crate::status::xbox_light(&states, p));
         let light = match pattern {
             _ if !(self.output.is_some() && !self.suspended) => Light::Paused,
-            Some((pattern, brightness)) => Light::Agent(pattern, brightness),
+            Some((pattern, brightness)) => Light::Agent(
+                crate::status::at_tempo(pattern, ms, &self.light_patterns),
+                brightness,
+            ),
             None => Light::Running,
         };
         let result = self.button_light.as_mut().map(|l| l.show(light));
@@ -12916,6 +12926,64 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7 ticket 134: tempo-slow and tempo-fast blink the Xbox button light at the Status light
+    /// patterns' BPM, switched by VibeConsole itself: once a second at 60 BPM, at most 8
+    /// changes a second however fast the tempo; quit puts the light back.
+    #[test]
+    fn xbox_light_blinks_at_the_status_tempo_capped_and_is_restored() {
+        use crate::status::Light;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-tempo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let gip = dir.join("leds/gip0.0");
+        std::fs::create_dir_all(&gip).unwrap();
+        std::fs::write(gip.join("mode"), "3\n").unwrap();
+        std::fs::write(gip.join("brightness"), "20\n").unwrap();
+        let mode = || std::fs::read_to_string(gip.join("mode")).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        ui.button_light = Some(crate::gamepad::ButtonLight::open(&dir.join("leds")).unwrap());
+        let mut patterns = crate::status::DevicePatterns::default();
+        patterns.xbox[0].0 = Light::TempoFast; // needs a decision
+        patterns.xbox[2].0 = Light::TempoSlow; // thinking
+        ui.device_lights = Some(patterns);
+        ui.light_patterns.slow = 60;
+        ui.light_patterns.fast = 120;
+        ui.agent_states = vec![("claude".into(), "claude".into(), "thinking")];
+        ui.output = Some(crate::keyboard::Output::recording(&[]).unwrap());
+        ui.suspended = false;
+        let mut seen = |ui: &mut Terminal, from: u64, to: u64| {
+            let mut modes = Vec::new();
+            for ms in (from..to).step_by(10) {
+                ui.show_button_light_at(ms);
+                modes.push(mode());
+            }
+            modes
+        };
+        let changes = |modes: &[String]| modes.windows(2).filter(|w| w[0] != w[1]).count();
+        // 60 BPM: on for half a second, off for half, once a second.
+        let slow = seen(&mut ui, 0, 2000);
+        assert_eq!(
+            (&slow[0][..], &slow[60][..], &slow[100][..]),
+            ("1", "0", "1")
+        );
+        assert_eq!(changes(&slow), 3, "on, off, on, off over two seconds");
+        // The fast tempo (120 BPM): twice a second.
+        ui.agent_states[0].2 = "needs-decision";
+        let fast = seen(&mut ui, 2000, 3000);
+        assert_eq!(
+            (&fast[0][..], &fast[25][..], &fast[50][..]),
+            ("1", "0", "1")
+        );
+        // 300 BPM would be 10 changes a second; the cap holds it to 8.
+        ui.light_patterns.fast = 300;
+        let capped = seen(&mut ui, 3000, 4000);
+        assert!(changes(&capped) <= 8, "{} changes", changes(&capped));
+        ui.button_light = None; // quit
+        assert_eq!(mode(), "3", "the light found at open comes back");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// v7 ticket 114: with two Xbox controllers and two keyboards, every one shows the agent
     /// state at once; the Xbox switch stops only the controllers; an unplugged controller or
     /// keyboard is dropped and the others keep showing.
@@ -14129,6 +14197,8 @@ mod tests {
             "blink",
             "slow-blink",
             "fast-pulse",
+            "tempo-slow", // v7 ticket 134
+            "tempo-fast",
         ] {
             assert!(xbox.contains(word), "{word}: {xbox}");
         }
@@ -14136,7 +14206,9 @@ mod tests {
         let keyboard = screen("Keyboard · Thinking: LED");
         assert!(keyboard.contains("fast-blink"), "{keyboard}");
         assert!(
-            !keyboard.contains("slow-blink") && !keyboard.contains("fast-pulse"),
+            !["slow-blink", "fast-pulse", "tempo-slow", "tempo-fast"]
+                .iter()
+                .any(|w| keyboard.contains(w)),
             "{keyboard}"
         );
         let lights = mappings::load_config(&path).unwrap().device_lights;
@@ -14328,7 +14400,7 @@ mod tests {
             })
             .map(|l| format!("{l}\n"))
             .collect::<String>()
-            .replace("vibeconsole-mappings-v30", "vibeconsole-mappings-v14")
+            .replace("vibeconsole-mappings-v31", "vibeconsole-mappings-v14")
             .replace(
                 "tuning\t15\t30\t10\toff\toff\nsticks\tlinear\tlinear\nmidi-devices\t0\nmidi-active\t-\nxbox-programs\t-\t-\t-\t-\t-\t-\t-\t-\nprofiles\t0\nprofile-lock\t-\nfavourites\t0\nsequences\t0\n",
                 "",

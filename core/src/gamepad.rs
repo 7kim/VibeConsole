@@ -1571,6 +1571,9 @@ impl ButtonLight {
                     Pattern::SlowPulse => "8",
                     Pattern::SlowBlink => "4",
                     Pattern::FastPulse => "9",
+                    // v7 ticket 134: the session shows these as steady or off at the tempo
+                    // (`status::at_tempo`); unresolved, the light just stays on.
+                    Pattern::TempoSlow | Pattern::TempoFast => "1",
                 },
                 Some(brightness.to_string()),
             ),
