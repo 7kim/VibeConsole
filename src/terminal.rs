@@ -5261,7 +5261,7 @@ fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                     ),
                     devices.xbox_brightness[state].into(),
                     0,
-                    50,
+                    crate::status::XBOX_MAX_BRIGHTNESS.into(),
                 )?
                 else {
                     return Ok(());

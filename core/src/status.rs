@@ -569,7 +569,13 @@ pub const LIGHTS: [(&str, Light); 9] = [
 ];
 /// v7 ticket 133: what a keyboard's on/off lock LED can show; the controller-only modes are
 /// left out.
-pub const KEYBOARD_LIGHTS: &[(&str, Light)] = LIGHTS.split_at(5).0;
+pub const KEYBOARD_LIGHTS: [(&str, Light); 5] = [
+    ("off", Light::Off),
+    ("steady", Light::Steady),
+    ("slow-pulse", Light::SlowPulse),
+    ("fast-blink", Light::FastBlink),
+    ("blink", Light::Blink),
+];
 /// v7 ticket 86: a rumble as a state begins. Declared shortest first: `max` picks the longest.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Rumble {
@@ -638,8 +644,9 @@ impl Default for DevicePatterns {
         }
     }
 }
-/// xone's Xbox button light brightness at start-up; its maximum is 50.
+/// xone's Xbox button light brightness at start-up, and its maximum (`GIP_LED_BRIGHTNESS_MAX`).
 pub const XBOX_BRIGHTNESS: u8 = 20;
+pub const XBOX_MAX_BRIGHTNESS: u8 = 50;
 /// Why a keyboard row can't take this pattern word (v7 ticket 133).
 pub fn keyboard_light_error(word: &str) -> String {
     let words = KEYBOARD_LIGHTS.iter().map(|(w, _)| *w).collect::<Vec<_>>();
@@ -658,8 +665,14 @@ impl DevicePatterns {
         {
             return Err(keyboard_light_error(word(&LIGHTS, *l)).into());
         }
-        if let Some(b) = self.xbox_brightness.iter().find(|b| **b > 50) {
-            return Err(format!("Xbox light brightness must be 0–50, not {b}").into());
+        if let Some(b) = self
+            .xbox_brightness
+            .iter()
+            .find(|b| **b > XBOX_MAX_BRIGHTNESS)
+        {
+            return Err(
+                format!("Xbox light brightness must be 0–{XBOX_MAX_BRIGHTNESS}, not {b}").into(),
+            );
         }
         match self.ps5.iter().find(|(c, ..)| !COLOURS.contains(c)) {
             Some((c, ..)) => Err(format!(

@@ -1782,8 +1782,11 @@ fn parse_device_lights(
             p.xbox_brightness[i] = level
                 .parse()
                 .ok()
-                .filter(|b| *b <= 50)
-                .ok_or_else(|| format!("xbox-brightness must be 0–50, not {level}"))?;
+                .filter(|b| *b <= crate::status::XBOX_MAX_BRIGHTNESS)
+                .ok_or_else(|| {
+                    let max = crate::status::XBOX_MAX_BRIGHTNESS;
+                    format!("xbox-brightness must be 0–{max}, not {level}")
+                })?;
         }
     }
     Ok(p)
