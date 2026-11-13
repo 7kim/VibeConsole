@@ -53,7 +53,7 @@ fn help(color: bool) -> String {
         }
     };
     let states = status::STATES.join("|");
-    let sections: [(&str, Vec<(&str, String)>); 5] = [
+    let sections: [(&str, Vec<(&str, String)>); 6] = [
         (
             "SESSION",
             vec![
@@ -121,6 +121,13 @@ fn help(color: bool) -> String {
             ],
         ),
         (
+            "XBOX DRIVER",
+            vec![(
+                "xbox-driver",
+                "<xpad|xone>  Switch the Xbox controller's driver (as root; Settings runs it through pkexec)".into(),
+            )],
+        ),
+        (
             "FLAGS",
             vec![
                 ("-h, --help", "Show this help".into()),
@@ -173,6 +180,24 @@ fn main() -> Result<()> {
     // Called from agent hooks while the session or service runs: no MIDI, keyboard, or owner lock.
     if args.first().is_some_and(|s| s == "agent-status") {
         return status::command(&args[1..]);
+    }
+    // v7 ticket 129: run as root by Settings -> Xbox tuning through pkexec.
+    if let [command, driver] = &args[..]
+        && command == "xbox-driver"
+    {
+        plain_output();
+        let mut run = vibeconsole_core::gamepad::run_program();
+        let installed = vibeconsole_core::gamepad::xone_installed(&mut run);
+        let loaded = std::fs::read_to_string("/proc/modules").unwrap_or_default();
+        let done = vibeconsole_core::gamepad::switch_driver(
+            driver,
+            std::path::Path::new("/etc/modprobe.d"),
+            &loaded,
+            installed,
+            &mut run,
+        )?;
+        println!("{done}");
+        return Ok(());
     }
     if let Some(command) = args
         .first()
@@ -364,7 +389,13 @@ mod tests {
         let commands = super::SESSION
             .iter()
             .chain(crate::runtime::COMMANDS.iter())
-            .chain(&["agent-status", "daemon", "--help", "--version"]);
+            .chain(&[
+                "agent-status",
+                "daemon",
+                "xbox-driver",
+                "--help",
+                "--version",
+            ]);
         for command in commands {
             assert!(plain.contains(command), "{command} missing from help");
         }

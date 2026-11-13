@@ -133,6 +133,15 @@ trait Ui {
     fn xbox_program(&self) -> u8 {
         1
     }
+    /// v7 ticket 129: the driver holding the Xbox controller now, and ALSA's card list.
+    fn xbox_audio(&self) -> (Option<&'static str>, String) {
+        (None, String::new())
+    }
+    /// v7 ticket 129: runs a program with fixed arguments (pkexec, speaker-test, arecord,
+    /// aplay); unavailable unless the real terminal provides it.
+    fn run(&mut self, _args: &[&str]) -> Result<String> {
+        Err("unavailable here".into())
+    }
     fn learn_knob(&mut self) -> Result<Option<Learned>> {
         Err("knob learning unavailable".into())
     }
@@ -3252,6 +3261,14 @@ impl Ui for Terminal {
     fn xbox_program(&self) -> u8 {
         self.xbox_program
     }
+    fn xbox_audio(&self) -> (Option<&'static str>, String) {
+        let bound = crate::gamepad::bound_drivers();
+        let cards = std::fs::read_to_string("/proc/asound/cards").unwrap_or_default();
+        (crate::gamepad::driver_in_use(&bound), cards)
+    }
+    fn run(&mut self, args: &[&str]) -> Result<String> {
+        (crate::gamepad::run_program())(args)
+    }
     fn xbox_connected(&self) -> bool {
         self.gamepad
             .as_ref()
@@ -4528,6 +4545,149 @@ fn profile_menu(ui: &mut impl Ui, path: &Path, name: &str) -> Result<()> {
     }
 }
 
+/// v7 ticket 129: switch the Xbox driver. Confirm first; the switch itself runs as root
+/// through pkexec (`vibeconsole xbox-driver <xpad|xone>`), which asks for the password.
+/// Afterwards it says which driver holds the controller now.
+fn driver_menu(ui: &mut impl Ui) -> Result<()> {
+    let now = ui.xbox_audio().0;
+    let Some(choice) = choose_at(
+        ui,
+        &format!(
+            "Xbox driver (now: {})\n\
+             xpad: the kernel's own driver. No headset audio, and no Xbox button light for this controller.\n\
+             xone: headset audio through the controller's jack. Its Xbox button light needs the light rule (ticket 130).\n\
+             VibeConsole never installs xone (github.com/dlundqvist/xone).",
+            now.unwrap_or("no controller connected")
+        ),
+        &options(&["xpad", "xone", "Back"]),
+        usize::from(now == Some("xone")),
+    )?
+    else {
+        return Ok(());
+    };
+    let driver = match choice {
+        0 => "xpad",
+        1 => "xone",
+        _ => return Ok(()),
+    };
+    if Some(driver) == now {
+        choose(
+            ui,
+            &format!("{driver} already holds the controller."),
+            &options(&["Back"]),
+        )?;
+        return Ok(());
+    }
+    if driver == "xone" && !crate::gamepad::xone_installed(&mut |args| ui.run(args)) {
+        choose(
+            ui,
+            "xone: unavailable: it isn't installed. Install it yourself (github.com/dlundqvist/xone, its README), then come back.",
+            &options(&["Back"]),
+        )?;
+        return Ok(());
+    }
+    let warning = if driver == "xone" {
+        "The Xbox button light needs the light rule (ticket 130) to work on xone."
+    } else {
+        "The controller headset stops working, and this controller has no Xbox button light on xpad."
+    };
+    let confirm = format!(
+        "Switch the Xbox driver to {driver}?\n{warning}\n\
+         The controller disconnects (held buttons are released), you're asked for your password, \
+         and the choice stays after a reboot."
+    );
+    if choose(ui, &confirm, &options(&["Switch", "Back"]))? != Some(0) {
+        return Ok(());
+    }
+    let exe = std::env::current_exe()?;
+    let exe = exe
+        .to_str()
+        .ok_or("this program's path isn't text")?
+        .to_owned();
+    let result = ui.run(&["pkexec", &exe, "xbox-driver", driver]);
+    let message = match result {
+        Err(error) => format!(
+            "Not switched: {}",
+            if error.to_string().contains("126") || error.to_string().contains("dismissed") {
+                "polkit: the password prompt was cancelled; nothing changed".to_owned()
+            } else {
+                error.to_string()
+            }
+        ),
+        Ok(_) => match ui.xbox_audio().0 {
+            Some(found) if found == driver => format!("Switched: {driver} holds the controller."),
+            _ => format!("Switched to {driver}. Replug the controller so {driver} picks it up."),
+        },
+    };
+    choose(ui, &message, &options(&["Back"]))?;
+    Ok(())
+}
+/// v7 ticket 129: Test speaker / Test mic on the controller headset, xone only. The card id
+/// comes from ALSA's card list; the recording lives in VibeConsole's runtime folder and is
+/// deleted after it plays.
+fn audio_test(ui: &mut impl Ui, mic: bool) -> Result<()> {
+    let (driver, cards) = ui.xbox_audio();
+    let card = crate::gamepad::headset_card_id(&cards);
+    let message = match (driver, card) {
+        (Some("xone"), Some(card)) => {
+            let device = format!("plughw:{card}");
+            let result = if mic {
+                let dir = std::env::var_os("XDG_RUNTIME_DIR")
+                    .filter(|v| !v.is_empty())
+                    .map(std::path::PathBuf::from)
+                    .ok_or("XDG_RUNTIME_DIR is not set")?
+                    .join("vibeconsole");
+                std::fs::create_dir_all(&dir)?;
+                let file = dir.join("mic-test.wav");
+                let file = file.to_str().ok_or("runtime folder isn't text")?.to_owned();
+                ui.draw("Test mic: recording 5 seconds, speak now…")?;
+                let result = ui
+                    .run(&[
+                        "arecord", "-D", &device, "-f", "S16_LE", "-r", "48000", "-c", "1", "-d",
+                        "5", &file,
+                    ])
+                    .and_then(|_| {
+                        ui.draw("Test mic: playing it back…")?;
+                        ui.run(&["aplay", &file])
+                    });
+                let _ = std::fs::remove_file(&file);
+                result
+            } else {
+                ui.draw("Test speaker: playing a test sound in the headset…")?;
+                ui.run(&[
+                    "speaker-test",
+                    "-D",
+                    &device,
+                    "-c",
+                    "2",
+                    "-t",
+                    "wav",
+                    "-l",
+                    "1",
+                ])
+            };
+            match result {
+                Ok(_) if mic => "Test mic: done. Did you hear your voice?".to_owned(),
+                Ok(_) => "Test speaker: done. Did you hear it in the headset?".to_owned(),
+                Err(error) if error.to_string().contains("No such file") => format!(
+                    "Test {}: unavailable: alsa-utils isn't installed (speaker-test, arecord, aplay)",
+                    if mic { "mic" } else { "speaker" }
+                ),
+                Err(error) => format!(
+                    "Test {}: failed: {error}",
+                    if mic { "mic" } else { "speaker" }
+                ),
+            }
+        }
+        (Some("xone"), None) => {
+            "unavailable: no headset in the controller (no controller audio card)".into()
+        }
+        _ => "unavailable: needs xone and a headset in the controller".into(),
+    };
+    choose(ui, &message, &options(&["Back"]))?;
+    Ok(())
+}
+
 /// The keyboard lights chosen for agent status (v7 ticket 128), for a menu row.
 fn keyboard_leds_text(chosen: [bool; 4]) -> String {
     const NAMES: [&str; 4] = ["Scroll Lock", "Caps Lock", "Num Lock", "M light"];
@@ -4601,6 +4761,13 @@ fn tuning_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
             "Use the controller headset as speaker and mic: {}",
             if tuning.headset { "On" } else { "Off" }
         ),
+        // v7 ticket 129: what the system uses, not a saved copy.
+        format!(
+            "Xbox driver: {} (xpad is the default)",
+            ui.xbox_audio().0.unwrap_or("no controller connected")
+        ),
+        "Test speaker (plays a test sound in the controller headset; xone only)".into(),
+        "Test mic (records 5 s, then plays it back; xone only)".into(),
         "Back".to_string(),
     ];
     let title = format!(
@@ -4638,6 +4805,8 @@ fn tuning_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
         Some(2) => config.tuning.rumble = !tuning.rumble,
         // v7 ticket 108: applied by the running session within a status refresh.
         Some(7) => config.tuning.headset = !tuning.headset,
+        Some(8) => return driver_menu(ui),
+        Some(choice @ (9 | 10)) => return audio_test(ui, choice == 10),
         Some(3) => {
             let Some(stick) = choose(
                 ui,
@@ -8401,8 +8570,31 @@ mod tests {
         program: Option<(u8, crate::feedback::Payload)>,
         /// An Xbox controller is connected (v7 ticket 111).
         xbox: bool,
+        /// v7 ticket 129: the driver in use, the card list, every program run, and the
+        /// error a run gives (when set).
+        driver: Option<&'static str>,
+        cards: String,
+        ran: Vec<String>,
+        run_error: Option<String>,
+        xone_missing: bool,
     }
     impl Ui for Script {
+        fn xbox_audio(&self) -> (Option<&'static str>, String) {
+            (self.driver, self.cards.clone())
+        }
+        fn run(&mut self, args: &[&str]) -> Result<String> {
+            self.ran.push(args.join(" "));
+            if args.first() == Some(&"modinfo") {
+                return match self.xone_missing {
+                    false => Ok("/lib/modules/7.3.3/extra/xone_wired.ko.xz\n".into()),
+                    true => Err("modinfo: ERROR: Module xone_wired not found.".into()),
+                };
+            }
+            match &self.run_error {
+                Some(error) => Err(error.clone().into()),
+                None => Ok(String::new()),
+            }
+        }
         fn xbox_connected(&self) -> bool {
             self.xbox
         }
@@ -10616,6 +10808,139 @@ mod tests {
         settings_menu(&mut ui, &path).unwrap();
         assert!(ui.screens.iter().any(|s| s.contains("Not saved")));
         assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 129: Settings -> Xbox tuning shows the driver in use; switching asks first,
+    /// then runs exactly `pkexec <this program> xbox-driver xone`; a cancelled password prompt
+    /// says nothing changed. Test speaker and Test mic run the ALSA tools on the controller's
+    /// card only with xone; with xpad they're unavailable and nothing runs.
+    #[test]
+    fn xbox_driver_switch_asks_first_and_audio_tests_need_xone() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-driver-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let tuning = |item: usize, then: &[Key]| {
+            let mut keys = vec![Down; 8];
+            keys.push(Enter); // Xbox tuning
+            keys.extend(vec![Down; item]);
+            keys.push(Enter);
+            keys.extend(then);
+            keys.push(Escape);
+            keys
+        };
+        let mut ui = Script {
+            keys: tuning(8, &[Down, Enter, Enter, Enter]).into(), // xone, Switch, Back
+            driver: Some("xpad"),
+            ..Default::default()
+        };
+        settings_menu(&mut ui, &path).unwrap();
+        assert!(ui.keys.is_empty(), "keys left: {:?}", ui.keys);
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains("Xbox driver: xpad (xpad is the default)"))
+        );
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains("Switch the Xbox driver to xone?")
+                    && s.contains("needs the light rule"))
+        );
+        let exe = std::env::current_exe().unwrap();
+        assert_eq!(
+            ui.ran,
+            [
+                "modinfo -n xone_wired".to_owned(),
+                format!("pkexec {} xbox-driver xone", exe.display())
+            ]
+        );
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains("Replug the controller"))
+        );
+
+        // Cancelled password prompt.
+        let mut ui = Script {
+            keys: tuning(8, &[Down, Enter, Enter, Enter]).into(),
+            driver: Some("xpad"),
+            run_error: Some(
+                "pkexec: Error executing command as another user: Request dismissed".into(),
+            ),
+            ..Default::default()
+        };
+        settings_menu(&mut ui, &path).unwrap();
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains("Not switched: polkit"))
+        );
+
+        // xone not installed: says so before any password prompt.
+        let mut ui = Script {
+            keys: tuning(8, &[Down, Enter, Enter]).into(),
+            driver: Some("xpad"),
+            xone_missing: true,
+            ..Default::default()
+        };
+        settings_menu(&mut ui, &path).unwrap();
+        assert_eq!(ui.ran, ["modinfo -n xone_wired"]);
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains("xone: unavailable: it isn't installed"))
+        );
+
+        // Back at the confirm step: only the install check ran.
+        let mut ui = Script {
+            keys: tuning(8, &[Down, Enter, Down, Enter]).into(),
+            driver: Some("xpad"),
+            ..Default::default()
+        };
+        settings_menu(&mut ui, &path).unwrap();
+        assert_eq!(ui.ran, ["modinfo -n xone_wired"]);
+
+        // Test speaker and Test mic on xone with the headset card.
+        let cards = " 0 [Chroma         ]: USB-Audio - Razer Nommo Chroma\n 3 [Headset        ]: xone-gip-headse - Microsoft Xbox Headset\n".to_owned();
+        let mut ui = Script {
+            keys: [tuning(9, &[Enter]), tuning(10, &[Enter])].concat().into(),
+            driver: Some("xone"),
+            cards: cards.clone(),
+            ..Default::default()
+        };
+        settings_menu(&mut ui, &path).unwrap();
+        settings_menu(&mut ui, &path).unwrap();
+        assert!(ui.keys.is_empty(), "keys left: {:?}", ui.keys);
+        assert_eq!(ui.ran[0], "speaker-test -D plughw:Headset -c 2 -t wav -l 1");
+        let file = ui.ran[1].rsplit(' ').next().unwrap().to_owned();
+        assert_eq!(
+            ui.ran[1],
+            format!("arecord -D plughw:Headset -f S16_LE -r 48000 -c 1 -d 5 {file}")
+        );
+        assert_eq!(ui.ran[2], format!("aplay {file}"));
+        assert!(
+            !std::path::Path::new(&file).exists(),
+            "the recording is deleted"
+        );
+
+        // xpad: unavailable, nothing runs.
+        let mut ui = Script {
+            keys: tuning(9, &[Enter]).into(),
+            driver: Some("xpad"),
+            cards,
+            ..Default::default()
+        };
+        settings_menu(&mut ui, &path).unwrap();
+        assert!(ui.ran.is_empty());
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains("unavailable: needs xone"))
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
