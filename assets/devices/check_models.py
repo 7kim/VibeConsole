@@ -13,11 +13,7 @@ MPK = (["body", "joystick", "display"] + [f"key_{i:02}" for i in range(25)]
        + [f"knob_{i}" for i in range(1, 9)]
        + [f"button_{b}" for b in ("arp_on_off", "tap_tempo", "octave_down", "octave_up", "full_level",
                                    "note_repeat", "bank_a_b", "cc", "prog_change", "prog_select")])
-XBOX = ["body", "stick_left", "stick_right", "dpad", "button_a", "button_b", "button_x", "button_y",
-        "button_view", "button_menu", "button_share", "button_xbox", "bumper_left", "bumper_right",
-        "trigger_left", "trigger_right", "port_usb_c", "port_headset"]
-MODELS = {"mpk-mini-mk3.glb": (MPK, ["pad_1_light", "pad_8_light"]),
-          "xbox-series-robot-white.glb": (XBOX, ["button_xbox_light"])}
+MODELS = {"mpk-mini-mk3.glb": (MPK, ["pad_1_light", "pad_8_light"])}
 
 
 def glb(path):

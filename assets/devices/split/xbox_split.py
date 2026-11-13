@@ -155,9 +155,43 @@ print("PARTS", sorted((k, len(v)) for k, v in groups.items()))
 
 # 4b. Grip dots on the triggers, bumpers and the back of the grips: the source has no texture
 # there. Ticket 38's dot normal map, on its own box-projected UV map so the colour atlas stays.
-import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from xbox_series_white import DOTS, box_uv
+def dot_normals(px=512, dots=16):
+    """Tileable normal map of small raised dots: the controller's grip texture."""
+    import numpy as np
+
+    u = (np.arange(px) + 0.5) / px * dots
+    x, y = np.meshgrid(u, u)
+    h = np.zeros((px, px))
+    for o in (0.0, 0.5):  # two offset grids: a staggered dot field
+        r = np.hypot((x + o) % 1 - 0.5, (y + o) % 1 - 0.5) / 0.24
+        h = np.maximum(h, np.sqrt(np.clip(1 - r * r, 0, None)))
+    k = px / dots * 0.18  # bump steepness
+    gx = (np.roll(h, -1, 1) - np.roll(h, 1, 1)) / 2 * k  # wraps, so the tile repeats cleanly
+    gy = (np.roll(h, -1, 0) - np.roll(h, 1, 0)) / 2 * k
+    n = np.dstack((-gx, -gy, np.ones_like(h)))
+    n /= np.linalg.norm(n, axis=2, keepdims=True)
+    img = bpy.data.images.new("grip_dots", px, px)
+    img.colorspace_settings.name = "Non-Color"
+    img.pixels.foreach_set(np.dstack((n * 0.5 + 0.5, np.ones_like(h))).astype(np.float32).ravel())
+    img.pack()
+    return img
+
+
+DOTS = dot_normals()
+MM = 0.001
+TILE = 16  # mm per texture repeat: 1 mm dot pitch
+
+
+def box_uv(ob, name="UVMap"):
+    """Cube-projected UVs, TILE mm per repeat, so the dots keep one size on every part."""
+    me = ob.data
+    uv = me.uv_layers.new(name=name)
+    for poly in me.polygons:
+        a, b = [i for i in range(3) if i != max(range(3), key=lambda i: abs(poly.normal[i]))]
+        for li in poly.loop_indices:
+            co = me.vertices[me.loops[li].vertex_index].co
+            uv.data[li].uv = (co[a] / (TILE * MM), co[b] / (TILE * MM))
+    return ob
 
 
 GRIP = {}  # one dotted copy per source material, shared by every part (ticket 121)
