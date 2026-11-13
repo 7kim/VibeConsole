@@ -220,6 +220,9 @@ struct Terminal {
     /// The controller's Xbox button light (v7 ticket 64): steady while running, slow blink
     /// otherwise; dropping it (unplug, quit) puts back what it showed before.
     button_light: Option<crate::gamepad::ButtonLight>,
+    /// v7 ticket 108: the controller headset as default speaker and mic; dropping it puts
+    /// the old defaults back. None until the option is first on.
+    headset_audio: Option<crate::gamepad::HeadsetAudio>,
     /// LB held: Xbox buttons use layer 2 (v7 ticket 09).
     layer2: bool,
     /// v7 ticket 115: the Xbox program in use (1–8), its View/Menu picker, and whether the
@@ -750,6 +753,7 @@ impl Terminal {
             device: None,
             gamepad: None,
             button_light: None,
+            headset_audio: None,
             layer2: false,
             xbox_program: 1,
             program_keys: crate::gamepad::ProgramKeys::default(),
@@ -933,6 +937,18 @@ impl Terminal {
                 self.gamepad_transition("Stick mode changed: held keys released".into())
             {
                 self.notice = format!("stick mode change: {error}");
+            }
+        }
+        // v7 ticket 108: the controller headset follows its option and the plugged-in card.
+        if config.tuning.headset || self.headset_audio.as_ref().is_some_and(|h| h.holding()) {
+            let cards = std::fs::read_to_string("/proc/asound/cards").unwrap_or_default();
+            let audio = self.headset_audio.get_or_insert_with(|| {
+                crate::gamepad::HeadsetAudio::new(crate::gamepad::run_program())
+            });
+            if let Err(error) =
+                audio.follow(config.tuning.headset, crate::gamepad::headset_card(&cards))
+            {
+                self.notice = error.to_string();
             }
         }
         self.light_patterns = config.light_patterns;
@@ -4516,6 +4532,10 @@ fn tuning_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
         format!("Mouse speed: {}", tuning.mouse_speed),
         format!("Left stick: {}", stick_text(&tuning.sticks[0])),
         format!("Right stick: {}", stick_text(&tuning.sticks[1])),
+        format!(
+            "Use the controller headset as speaker and mic: {}",
+            if tuning.headset { "On" } else { "Off" }
+        ),
         "Back".to_string(),
     ];
     let title = format!(
@@ -4551,6 +4571,8 @@ fn tuning_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
             config.tuning.trigger = u8::try_from(value)?;
         }
         Some(2) => config.tuning.rumble = !tuning.rumble,
+        // v7 ticket 108: applied by the running session within a status refresh.
+        Some(7) => config.tuning.headset = !tuning.headset,
         Some(3) => {
             let Some(stick) = choose(
                 ui,
@@ -10473,6 +10495,23 @@ mod tests {
         };
         settings_menu(&mut ui, &path).unwrap();
         assert!(mappings::load_config(&path).unwrap().tuning.rumble);
+        // v7 ticket 108: the headset option is off until turned on, and saves.
+        assert!(!mappings::load_config(&path).unwrap().tuning.headset);
+        let mut keys = to_tuning.clone();
+        keys.push(Enter);
+        keys.extend(vec![Down; 7]);
+        keys.extend([Enter, Escape]);
+        let mut ui = Script {
+            keys: keys.into(),
+            ..Default::default()
+        };
+        settings_menu(&mut ui, &path).unwrap();
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains("Use the controller headset as speaker and mic: Off"))
+        );
+        assert!(mappings::load_config(&path).unwrap().tuning.headset);
         // v7 ticket 22: the left stick moves the pointer at speed 12.
         let mut keys = to_tuning.clone();
         keys.extend([Enter, Down, Down, Down, Enter, Down, Enter]);
@@ -13523,13 +13562,13 @@ mod tests {
         let v14 = saved
             .lines()
             .filter(|l| {
-                !["device-lights\t", "xbox-pattern\t", "ps5-pattern\t", "keyboard-lights\t", "keyboard-pattern\t"]
+                !["device-lights\t", "xbox-pattern\t", "ps5-pattern\t", "keyboard-lights\t", "keyboard-pattern\t", "xbox-headset\t"]
                     .iter()
                     .any(|p| l.starts_with(p))
             })
             .map(|l| format!("{l}\n"))
             .collect::<String>()
-            .replace("vibeconsole-mappings-v26", "vibeconsole-mappings-v14")
+            .replace("vibeconsole-mappings-v27", "vibeconsole-mappings-v14")
             .replace(
                 "tuning\t15\t30\t10\toff\toff\nsticks\tlinear\tlinear\nmidi-devices\t0\nmidi-active\t-\nxbox-programs\t-\t-\t-\t-\t-\t-\t-\t-\nprofiles\t0\nprofile-lock\t-\nfavourites\t0\nsequences\t0\n",
                 "",

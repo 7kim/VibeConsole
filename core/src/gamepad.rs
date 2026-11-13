@@ -826,18 +826,18 @@ pub fn retune(
 pub fn headset_status(bound: &[&str], cards: &str) -> String {
     let xone = bound.iter().any(|d| d.starts_with("xone"));
     let xpad = bound.contains(&"xpad");
-    let audio = cards.lines().any(|line| {
-        let line = line.to_lowercase();
-        line.contains("xbox") || line.contains("xone") || line.contains("gip")
-    });
+    let audio = headset_card(cards);
     match (xone, xpad, audio) {
         (true, _, true) => "Xbox headset audio: available (xone driver, controller audio device present)".into(),
         (true, _, false) => {
-            "Xbox headset audio: unavailable: xone is bound but no controller audio device is present".into()
+            "Xbox headset audio: unavailable: xone is bound but no controller audio device is present \
+             (plug a headset into the controller)"
+                .into()
         }
-        (false, true, _) => {
-            "Xbox headset audio: unavailable: needs the xone driver (the controller uses xpad)".into()
-        }
+        (false, true, _) => "Xbox headset audio: unavailable: needs the xone driver (the controller \
+             uses xpad); install xone yourself (github.com/dlundqvist/xone, its README), then \
+             replug the controller"
+            .into(),
         (false, false, _) => "Xbox headset audio: no Xbox controller on a USB driver".into(),
     }
 }
@@ -856,6 +856,171 @@ pub fn headset() -> String {
         .collect::<Vec<_>>();
     let cards = std::fs::read_to_string("/proc/asound/cards").unwrap_or_default();
     headset_status(&bound, &cards)
+}
+
+/// Runs a program with fixed arguments and returns its output; injected in tests.
+pub type Runner = Box<dyn FnMut(&[&str]) -> crate::Result<String> + Send>;
+/// The real runner: one argument per value, never a shell. A failure names the program.
+pub fn run_program() -> Runner {
+    Box::new(|args: &[&str]| {
+        let (program, rest) = args.split_first().ok_or("no program")?;
+        let output = std::process::Command::new(program)
+            .args(rest)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| format!("{program}: {e}"))?;
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("{program}: {}", err.trim()).into());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    })
+}
+
+/// v7 ticket 108: the controller headset's PipeWire nodes and the configured defaults,
+/// read from `pw-dump`. Nodes are found by their ALSA card name (xone's card is "Microsoft
+/// Xbox Headset"); ids are only used as `wpctl` arguments.
+#[derive(Debug, Default, PartialEq)]
+pub struct AudioGraph {
+    /// (id, node.name) of the controller's sink, then its source.
+    pub headset: [Option<(u32, String)>; 2],
+    /// `default.configured.audio.sink` and `.source` node names; None when not configured.
+    pub configured: [Option<String>; 2],
+    /// Every audio sink and source's (id, node.name), to find a remembered default again.
+    pub nodes: Vec<(u32, String)>,
+}
+pub fn audio_graph(pw_dump: &str) -> AudioGraph {
+    let mut graph = AudioGraph::default();
+    let Ok(serde_json::Value::Array(objects)) = serde_json::from_str(pw_dump) else {
+        return graph;
+    };
+    for object in &objects {
+        let props = &object["info"]["props"];
+        let kind = object["type"].as_str().unwrap_or_default();
+        if kind.ends_with(":Node") {
+            let slot = match props["media.class"].as_str() {
+                Some("Audio/Sink") => 0,
+                Some("Audio/Source") => 1,
+                _ => continue,
+            };
+            let (Some(id), Some(name)) = (object["id"].as_u64(), props["node.name"].as_str())
+            else {
+                continue;
+            };
+            let Ok(id) = u32::try_from(id) else { continue };
+            graph.nodes.push((id, name.to_owned()));
+            let card = props["alsa.card_name"].as_str().unwrap_or_default();
+            if card.to_lowercase().contains("xbox") && graph.headset[slot].is_none() {
+                graph.headset[slot] = Some((id, name.to_owned()));
+            }
+        } else if kind.ends_with(":Metadata") && object["props"]["metadata.name"] == "default" {
+            for entry in object["metadata"].as_array().into_iter().flatten() {
+                let slot = match entry["key"].as_str() {
+                    Some("default.configured.audio.sink") => 0,
+                    Some("default.configured.audio.source") => 1,
+                    _ => continue,
+                };
+                graph.configured[slot] = entry["value"]["name"].as_str().map(str::to_owned);
+            }
+        }
+    }
+    graph
+}
+
+/// v7 ticket 108: "Use the controller headset". While the option is on and the headset's
+/// nodes exist, they are the default speaker and mic; the defaults from before come back
+/// when it's unplugged, the option goes off, or VibeConsole quits (drop).
+pub struct HeadsetAudio {
+    run: Runner,
+    /// The configured defaults from before; Some while VibeConsole holds the headset.
+    previous: Option<[Option<String>; 2]>,
+    /// (option, card present) at the last `follow`, so a failure isn't retried each tick.
+    seen: Option<(bool, bool)>,
+}
+impl HeadsetAudio {
+    pub fn new(run: Runner) -> Self {
+        Self {
+            run,
+            previous: None,
+            seen: None,
+        }
+    }
+    pub fn holding(&self) -> bool {
+        self.previous.is_some()
+    }
+    fn graph(&mut self) -> crate::Result<AudioGraph> {
+        let dump = (self.run)(&["pw-dump"]).map_err(|e| format!("headset audio: read: {e}"))?;
+        Ok(audio_graph(&dump))
+    }
+    fn set_default(&mut self, id: u32) -> crate::Result<()> {
+        (self.run)(&["wpctl", "set-default", &id.to_string()])
+            .map(drop)
+            .map_err(|e| format!("headset audio: set default: {e}").into())
+    }
+    /// Makes the controller's speaker and mic the defaults, remembering the ones before.
+    pub fn use_headset(&mut self) -> crate::Result<()> {
+        let graph = self.graph()?;
+        let [Some(sink), Some(source)] = &graph.headset else {
+            return Err(
+                "Xbox headset audio: unavailable: no controller audio device in \
+                        PipeWire (needs xone and a headset in the controller)"
+                    .into(),
+            );
+        };
+        let (sink, source) = (sink.0, source.0);
+        if self.previous.is_none() {
+            self.previous = Some(graph.configured);
+        }
+        self.set_default(sink)?;
+        self.set_default(source)
+    }
+    /// Puts back the defaults from before; nothing when VibeConsole holds nothing. A default
+    /// that was never configured is cleared; one whose device is gone is left to WirePlumber.
+    pub fn restore(&mut self) -> crate::Result<()> {
+        let Some(previous) = self.previous.take() else {
+            return Ok(());
+        };
+        let graph = self.graph()?;
+        for (slot, name) in previous.into_iter().enumerate() {
+            match name {
+                None => {
+                    (self.run)(&["wpctl", "clear-default", &slot.to_string()])
+                        .map_err(|e| format!("headset audio: clear default: {e}"))?;
+                }
+                Some(name) => {
+                    if let Some((id, _)) = graph.nodes.iter().find(|(_, n)| *n == name) {
+                        self.set_default(*id)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    /// Each status refresh: `wanted` is the option, `present` whether the controller's audio
+    /// card is listed. Acts only when one of them changes, so a failure isn't repeated.
+    pub fn follow(&mut self, wanted: bool, present: bool) -> crate::Result<()> {
+        let changed = self.seen != Some((wanted, present));
+        self.seen = Some((wanted, present));
+        if self.holding() && !(wanted && present) {
+            return self.restore();
+        }
+        if wanted && present && !self.holding() && changed {
+            return self.use_headset();
+        }
+        Ok(())
+    }
+}
+impl Drop for HeadsetAudio {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+/// Whether ALSA lists the controller's audio card (xone's "Microsoft Xbox Headset").
+pub fn headset_card(cards: &str) -> bool {
+    cards.lines().any(|line| {
+        let line = line.to_lowercase();
+        line.contains("xbox") || line.contains("xone") || line.contains("gip")
+    })
 }
 
 /// v7 ticket 22: how far the pointer moves for one step of `dt` seconds with the mouse
@@ -1663,6 +1828,112 @@ mod tests {
             headset_status(&["xone-wired"], &format!("{cards}{xbox_card}")).contains("available")
         );
         assert!(headset_status(&["xpad"], xbox_card).contains("needs the xone driver"));
+    }
+
+    /// v7 ticket 108: the controller's speaker and mic are found in `pw-dump` by their card;
+    /// using the headset makes them the defaults, and unplug, the option going off or quit
+    /// puts the old ones back (a never-configured default is cleared). No node: nothing runs.
+    #[test]
+    fn controller_headset_becomes_the_default_and_the_old_defaults_come_back() {
+        let node = |id: u32, class: &str, name: &str, card: &str| {
+            format!(
+                r#"{{"id":{id},"type":"PipeWire:Interface:Node","info":{{"props":{{"media.class":"{class}","node.name":"{name}","alsa.card_name":"{card}"}}}}}}"#
+            )
+        };
+        let defaults = |sink: &str| {
+            format!(
+                r#"{{"id":30,"type":"PipeWire:Interface:Metadata","props":{{"metadata.name":"default"}},"metadata":[{{"subject":0,"key":"default.configured.audio.sink","type":"Spa:String:JSON","value":{{"name":"{sink}"}}}}]}}"#
+            )
+        };
+        let dump = format!(
+            "[{},{},{},{}]",
+            node(65, "Audio/Sink", "alsa_output.nommo", "Razer Nommo Chroma"),
+            node(
+                117,
+                "Audio/Sink",
+                "alsa_output.usb-Microsoft_Controller-00.stereo-fallback",
+                "Microsoft Xbox Headset"
+            ),
+            node(
+                71,
+                "Audio/Source",
+                "alsa_input.usb-Microsoft_Controller-00.mono-fallback",
+                "Microsoft Xbox Headset"
+            ),
+            defaults("alsa_output.nommo"),
+        );
+        let graph = audio_graph(&dump);
+        assert_eq!(graph.headset[0].as_ref().map(|n| n.0), Some(117));
+        assert_eq!(graph.headset[1].as_ref().map(|n| n.0), Some(71));
+        assert_eq!(
+            graph.configured,
+            [Some("alsa_output.nommo".to_owned()), None]
+        );
+
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let fake = |dump: String, calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>| -> Runner {
+            Box::new(move |args: &[&str]| {
+                calls.lock().unwrap().push(args.join(" "));
+                Ok(if args[0] == "pw-dump" {
+                    dump.clone()
+                } else {
+                    String::new()
+                })
+            })
+        };
+        let mut audio = HeadsetAudio::new(fake(dump.clone(), calls.clone()));
+        audio.follow(false, true).unwrap(); // option off: nothing
+        assert!(calls.lock().unwrap().is_empty());
+        audio.follow(true, true).unwrap();
+        audio.follow(true, true).unwrap(); // nothing changed: nothing again
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["pw-dump", "wpctl set-default 117", "wpctl set-default 71"]
+        );
+        calls.lock().unwrap().clear();
+        audio.follow(true, false).unwrap(); // unplugged
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["pw-dump", "wpctl set-default 65", "wpctl clear-default 1"]
+        );
+        calls.lock().unwrap().clear();
+        audio.follow(true, true).unwrap(); // back: used again, then quit puts it back
+        drop(audio);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                "pw-dump",
+                "wpctl set-default 117",
+                "wpctl set-default 71",
+                "pw-dump",
+                "wpctl set-default 65",
+                "wpctl clear-default 1"
+            ]
+        );
+
+        // xpad, or no headset node: unavailable with the reason; no default changes.
+        calls.lock().unwrap().clear();
+        let mut none = HeadsetAudio::new(fake(
+            format!(
+                "[{}]",
+                node(65, "Audio/Sink", "alsa_output.nommo", "Razer Nommo Chroma")
+            ),
+            calls.clone(),
+        ));
+        let error = none.follow(true, true).unwrap_err().to_string();
+        assert!(
+            error.contains("unavailable") && error.contains("xone"),
+            "{error}"
+        );
+        assert!(!none.holding());
+        drop(none);
+        assert_eq!(*calls.lock().unwrap(), ["pw-dump"]);
+        assert!(headset_card(
+            " 3 [Headset ]: xone-gip-headse - Microsoft Xbox Headset\n"
+        ));
+        assert!(!headset_card(
+            " 0 [Chroma ]: USB-Audio - Razer Nommo Chroma\n"
+        ));
     }
 
     /// Review fix: a trigger held through a transition doesn't fire again on jitter; it
