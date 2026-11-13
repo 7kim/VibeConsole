@@ -33,14 +33,29 @@ def go(master, source, target):
     os.write(master, b"\r")
 
 
-def read_until(master, token):
+def read_until(master, token, seconds=3):
     data = b""
-    deadline = time.monotonic() + 3
+    deadline = time.monotonic() + seconds
     while token not in data and time.monotonic() < deadline:
         if select.select([master], [], [], 0.1)[0]:
             data += os.read(master, 65536)
     assert token in data, (token, data)
     return data
+
+
+def pick(master, label, limit=20):
+    """Press Down until the row named `label` is highlighted, then Enter. Finds the row by its
+    label, so a menu that gains rows doesn't send the check somewhere else (v8 ticket 135)."""
+    token = b"> " + label.encode()
+    for _ in range(limit):
+        try:
+            read_until(master, token, seconds=0.5)
+            break
+        except AssertionError:
+            os.write(master, b"\x1b[B")
+    else:
+        raise AssertionError(f"no row named {label!r} within {limit} rows")
+    os.write(master, b"\r")
 
 
 for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_settings", "contexts", "default_running", "run_subcommand", "toggle_run_pause", "pause_alias", "modified_navigation", "flow_setting", "panes", "narrow_resize", "toggle_panel", "idle_no_device", "unverified_run"):
@@ -140,11 +155,10 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
             elif ending == "configuration_error":
                 go(master, "Run", "/configure")
                 read_until(master, b"Configure controls")
-                os.write(master, b"\x1b[B" * 5 + b"\r")
+                pick(master, "Remove saved assignment")
                 read_until(master, b"Saved assignments")
                 os.write(master, b"\r")
-                read_until(master, b"Remove assignment")
-                os.write(master, b"\x1b[B\r")
+                pick(master, "Remove assignment")
                 read_until(master, b"Operation failed")
                 assert path.read_bytes() == contents
                 os.write(master, b"\r")
@@ -154,7 +168,9 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
                 go(master, "Run", "/configure")
                 wide = read_until(master, b"Tab / Left / Right")
                 assert b"Learn a piano key" in wide and b"Learn a knob" in wide
-                assert re.search(rb"Learn controls[^\n]*Saved assignments", wide)
+                # v7 ticket 109: a MIDI keyboard pane (with its Xbox controller part) beside the saved one.
+                assert re.search(rb"MIDI keyboard[^\n]*Saved assignments", wide)
+                assert b"Learn an Xbox button" in wide
                 assert b"\x1b[1;38;2;26;27;38;48;2;122;162;247m" in wide or ending == "narrow_resize" or "NO_COLOR" in os.environ
                 if ending == "narrow_resize":
                     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 18, 50, 0, 0))
@@ -223,13 +239,13 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
                 read_until(master, b"Value: 0")
                 os.write(master, b"\r")
                 read_until(master, b"> Octave")
-                os.write(master, b"\x1b[B\r")
+                pick(master, "Tempo")
                 read_until(master, b"> Set BPM")
                 os.write(master, b"\r")
                 read_until(master, b"Value: 240")
                 os.write(master, b"\x1b")
                 read_until(master, b"> Tempo")
-                os.write(master, b"\x1b[B\r")
+                pick(master, "Arpeggiator")
                 read_until(master, b"> On")
                 os.write(master, b"\x1b")
                 read_until(master, b"> Arpeggiator")
