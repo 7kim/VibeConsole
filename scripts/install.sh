@@ -9,6 +9,11 @@ cd "$(dirname "$0")/.."
 unit=vibeconsole.service
 active() { systemctl --user is-active --quiet "$unit"; }
 
+# `vibeconsole --version` names the spec version, last ticket and commit of this build, from
+# the newest commit whose subject starts with "v<version> <ticket>", e.g. "v7 128".
+ticket=$(git log -1 --format=%s -E --grep='^v[0-9.]+ [0-9]' | sed -E 's/^(v[0-9.]+ [0-9, ]*[0-9]).*/\1/')
+commit=$(git rev-parse --short HEAD)$(git diff --quiet HEAD -- src core Cargo.toml Cargo.lock || echo "+changes")
+export VIBECONSOLE_BUILD="${ticket:-no ticket}, commit $commit"
 cargo build --release --locked
 
 restart=0

@@ -17,9 +17,13 @@ fn plain_output() {
     }
 }
 
-/// `vibeconsole <version>` from Cargo.toml (ticket 23).
+/// `vibeconsole <version>` from Cargo.toml (ticket 23), plus the spec version, last ticket
+/// and commit that `scripts/install.sh` built (`VIBECONSOLE_BUILD`), when it did.
 fn version() -> String {
-    format!("vibeconsole {}", env!("CARGO_PKG_VERSION"))
+    match option_env!("VIBECONSOLE_BUILD").filter(|b| !b.is_empty()) {
+        Some(build) => format!("vibeconsole {} ({build})", env!("CARGO_PKG_VERSION")),
+        None => format!("vibeconsole {}", env!("CARGO_PKG_VERSION")),
+    }
 }
 
 /// Commands that open the session or read the controller (no command = the session).
@@ -120,7 +124,10 @@ fn help(color: bool) -> String {
             "FLAGS",
             vec![
                 ("-h, --help", "Show this help".into()),
-                ("-V, --version", "Show the version".into()),
+                (
+                    "-V, -v, --version",
+                    "Show the version, spec version, last ticket and commit".into(),
+                ),
             ],
         ),
     ];
@@ -151,7 +158,9 @@ fn help(color: bool) -> String {
 
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    if args == ["--version"] || args == ["-V"] || args == ["version"] {
+    if let [arg] = &args[..]
+        && ["--version", "-V", "-v", "--v", "version"].contains(&arg.as_str())
+    {
         plain_output();
         println!("{}", version());
         return Ok(());
@@ -364,9 +373,8 @@ mod tests {
         }
         assert!(!plain.contains('\x1b'));
         assert!(super::help(true).contains("\x1b[1mUSAGE\x1b[0m"));
-        assert_eq!(
-            super::version(),
-            format!("vibeconsole {}", env!("CARGO_PKG_VERSION"))
+        assert!(
+            super::version().starts_with(&format!("vibeconsole {}", env!("CARGO_PKG_VERSION")))
         );
     }
 }
