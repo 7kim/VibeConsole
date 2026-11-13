@@ -95,10 +95,12 @@ fn session_hook(state: &str) -> Result<()> {
         &mut std::io::Read::take(std::io::stdin(), 1 << 20),
         &mut input,
     )?;
-    session_report(&dir()?, &input, state, agent_process())
+    let (pid, kind) = agent_process();
+    session_report(&dir()?, &input, state, pid, kind)
 }
 
-fn session_report(dir: &Path, input: &str, state: &str, pid: u32) -> Result<()> {
+/// `kind` is the agent program (`claude`, `codex`) or "" when unknown (v7 ticket 59).
+fn session_report(dir: &Path, input: &str, state: &str, pid: u32, kind: &str) -> Result<()> {
     if !STATES.contains(&state) {
         return Err(format!("unknown agent state {state:?}; use {}", STATES.join(", ")).into());
     }
@@ -126,23 +128,24 @@ fn session_report(dir: &Path, input: &str, state: &str, pid: u32) -> Result<()> 
         };
     }
     std::fs::create_dir_all(dir)?;
-    crate::actions::write_atomic(&file, &format!("{state}\t{pid}\t{cwd}\n"))
+    let kind = if kind.is_empty() { "-" } else { kind };
+    crate::actions::write_atomic(&file, &format!("{state}\t{pid}\t{kind}\t{cwd}\n"))
 }
 
-/// The Claude Code or Codex process this hook runs under (it runs hooks through a shell), or
-/// 0 when none is found; a session whose process is gone is dropped.
-fn agent_process() -> u32 {
+/// The Claude Code or Codex process this hook runs under (it runs hooks through a shell) and
+/// its program name, or (0, "") when none is found; a session whose process is gone is dropped.
+fn agent_process() -> (u32, &'static str) {
     // SAFETY: getppid has no preconditions.
     let mut pid = unsafe { libc::getppid() } as u32;
     for _ in 0..8 {
         let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-            return 0;
+            return (0, "");
         };
         let (Some(open), Some(close)) = (stat.find('('), stat.rfind(')')) else {
-            return 0;
+            return (0, "");
         };
-        if matches!(&stat[open + 1..close], "claude" | "codex") {
-            return pid;
+        if let Some(kind) = KINDS.into_iter().find(|k| *k == &stat[open + 1..close]) {
+            return (pid, kind);
         }
         match stat[close + 1..]
             .split_whitespace()
@@ -150,17 +153,21 @@ fn agent_process() -> u32 {
             .and_then(|p| p.parse().ok())
         {
             Some(parent) if parent > 1 => pid = parent,
-            _ => return 0,
+            _ => return (0, ""),
         }
     }
-    0
+    (0, "")
 }
+/// Agent programs whose hooks report sessions.
+const KINDS: [&str; 2] = ["claude", "codex"];
 
 /// A session outside VibeConsole's tmux: its state and working folder.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Session {
     pub state: &'static str,
     pub cwd: String,
+    /// The agent program that reported it (`claude`, `codex`); "" when not known (v7 ticket 59).
+    pub kind: &'static str,
 }
 
 /// Recorded sessions, dropping those whose agent process is gone, plus Orca's agents in
@@ -222,7 +229,11 @@ pub fn herdr_sessions(json: &str) -> Vec<Session> {
                 "idle" => "idle",
                 _ => return None,
             };
-            folder.map(|cwd| Session { state, cwd })
+            folder.map(|cwd| Session {
+                state,
+                cwd,
+                kind: "",
+            })
         })
         .collect()
 }
@@ -285,6 +296,7 @@ pub fn orca_sessions(text: &str) -> Vec<Session> {
             (folder.starts_with('/') && !folder.contains(['\t', '\n'])).then(|| Session {
                 state,
                 cwd: folder.to_owned(),
+                kind: "",
             })
         })
         .collect()
@@ -307,11 +319,16 @@ fn sessions_in(dir: &Path, alive: impl Fn(u32) -> bool) -> Vec<Session> {
             continue;
         }
         let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
-        let mut fields = text.trim_end_matches('\n').splitn(3, '\t');
-        let (Some(state), Some(pid), Some(cwd)) = (fields.next(), fields.next(), fields.next())
+        // `state pid kind cwd`; files from before v7 ticket 59 have no kind.
+        let mut fields = text.trim_end_matches('\n').splitn(4, '\t');
+        let (Some(state), Some(pid), Some(third)) = (fields.next(), fields.next(), fields.next())
         else {
             let _ = std::fs::remove_file(entry.path());
             continue;
+        };
+        let (kind, cwd) = match fields.next() {
+            Some(cwd) => (KINDS.into_iter().find(|k| *k == third).unwrap_or(""), cwd),
+            None => ("", third),
         };
         let state = STATES.into_iter().find(|s| *s == state);
         let pid = pid.parse::<u32>().ok();
@@ -321,6 +338,7 @@ fn sessions_in(dir: &Path, alive: impl Fn(u32) -> bool) -> Vec<Session> {
             (Some(state), Some(pid)) if pid == 0 || alive(pid) => found.push(Session {
                 state,
                 cwd: cwd.to_owned(),
+                kind,
             }),
             _ => {
                 let _ = std::fs::remove_file(entry.path());
@@ -328,6 +346,47 @@ fn sessions_in(dir: &Path, alive: impl Fn(u32) -> bool) -> Vec<Session> {
         }
     }
     found
+}
+
+/// v7 ticket 59: sessions that belong to one Orca-hosted agent, matched by host facts only:
+/// the same agent kind, inside the agent's folder (the most specific folder wins). `hosted`
+/// is (agent name, kind, folder). Returns each matched agent's most urgent state, and the
+/// sessions left for folder lights; a session two agents could claim stays a folder session.
+pub fn hosted_states(
+    sessions: Vec<Session>,
+    hosted: &[(String, String, String)],
+) -> (Vec<(String, &'static str)>, Vec<Session>) {
+    let urgency = |state: &str| {
+        std::cmp::Reverse(BUSY.iter().position(|s| *s == state).unwrap_or(BUSY.len()))
+    };
+    let mut states: Vec<(String, &'static str)> = Vec::new();
+    let mut rest = Vec::new();
+    for session in sessions {
+        let candidates = hosted
+            .iter()
+            .filter(|(_, kind, folder)| {
+                !session.kind.is_empty() && *kind == session.kind && within(&session.cwd, folder)
+            })
+            .collect::<Vec<_>>();
+        let longest = candidates
+            .iter()
+            .map(|(_, _, f)| f.trim_end_matches('/').len())
+            .max();
+        let best = candidates
+            .iter()
+            .filter(|(_, _, f)| Some(f.trim_end_matches('/').len()) == longest)
+            .collect::<Vec<_>>();
+        let [(name, _, _)] = best.as_slice() else {
+            rest.push(session); // none, or ambiguous: light by folder only
+            continue;
+        };
+        match states.iter_mut().find(|(n, _)| n == name) {
+            Some(entry) if urgency(session.state) > urgency(entry.1) => entry.1 = session.state,
+            Some(_) => {}
+            None => states.push((name.clone(), session.state)),
+        }
+    }
+    (states, rest)
 }
 
 /// Per light source, the most urgent state of the sessions it matches: the most specific
@@ -1157,11 +1216,13 @@ mod tests {
             [
                 Session {
                     state: "thinking",
-                    cwd: "/work/app".into()
+                    cwd: "/work/app".into(),
+                    kind: "",
                 },
                 Session {
                     state: "needs-input",
-                    cwd: "/work/lib".into()
+                    cwd: "/work/lib".into(),
+                    kind: "",
                 },
             ]
         );
@@ -1172,6 +1233,7 @@ mod tests {
         let hooks = vec![Session {
             state: "finished",
             cwd: "/work/app".into(),
+            kind: "",
         }];
         let all = with_fallback(hooks, orca);
         assert_eq!(all.len(), 2);
@@ -1196,15 +1258,18 @@ mod tests {
             [
                 Session {
                     state: "thinking",
-                    cwd: "/work/api".into()
+                    cwd: "/work/api".into(),
+                    kind: "",
                 },
                 Session {
                     state: "needs-input",
-                    cwd: "/work/docs".into()
+                    cwd: "/work/docs".into(),
+                    kind: "",
                 },
                 Session {
                     state: "finished",
-                    cwd: "/work/old".into()
+                    cwd: "/work/old".into(),
+                    kind: "",
                 },
             ]
         );
@@ -1217,8 +1282,65 @@ mod tests {
         let hooks = vec![Session {
             state: "idle",
             cwd: "/work/api".into(),
+            kind: "",
         }];
         assert_eq!(with_fallback(hooks, found).len(), 3);
+    }
+
+    /// v7 ticket 59: a session from Claude in an Orca-hosted agent's folder lights that
+    /// agent's own state; a session two agents could claim, or of another kind, stays a
+    /// folder session; files written before the kind was recorded still read.
+    #[test]
+    fn orca_hosted_agents_light_their_own_state_and_ambiguous_ones_light_by_folder() {
+        let dir = std::env::temp_dir().join(format!("vibeconsole-hosted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hook = |id: &str, cwd: &str| format!(r#"{{"session_id": "{id}", "cwd": "{cwd}"}}"#);
+        session_report(
+            &dir,
+            &hook("a1", "/work/app/src"),
+            "needs-input",
+            0,
+            "claude",
+        )
+        .unwrap();
+        session_report(&dir, &hook("b2", "/work/app"), "thinking", 0, "claude").unwrap();
+        session_report(&dir, &hook("c3", "/work/app"), "finished", 0, "codex").unwrap();
+        session_report(&dir, &hook("d4", "/work/both"), "thinking", 0, "claude").unwrap();
+        std::fs::write(dir.join("session-e5"), "thinking\t0\t/work/old\n").unwrap();
+        let mut sessions = sessions_in(&dir, |_| true);
+        sessions.sort_by(|a, b| (&a.cwd, a.kind).cmp(&(&b.cwd, b.kind)));
+        let hosted = [
+            (
+                "orca-claude".to_owned(),
+                "claude".to_owned(),
+                "/work/app/".to_owned(),
+            ),
+            (
+                "one".to_owned(),
+                "claude".to_owned(),
+                "/work/both".to_owned(),
+            ),
+            (
+                "two".to_owned(),
+                "claude".to_owned(),
+                "/work/both".to_owned(),
+            ),
+        ];
+        let (states, rest) = hosted_states(sessions, &hosted);
+        assert_eq!(states, [("orca-claude".to_owned(), "needs-input")]);
+        let rest = rest
+            .iter()
+            .map(|s| (s.cwd.as_str(), s.kind, s.state))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rest,
+            [
+                ("/work/app", "codex", "finished"),
+                ("/work/both", "claude", "thinking"),
+                ("/work/old", "", "thinking"),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Ticket 16: sessions outside tmux report by session_id and cwd, end on SessionEnd or
@@ -1230,14 +1352,14 @@ mod tests {
         let hook = |id: &str, cwd: &str| {
             format!(r#"{{"session_id": "{id}", "cwd": "{cwd}", "hook_event_name": "Stop"}}"#)
         };
-        session_report(&dir, &hook("a1", "/work/app/src"), "thinking", 0).unwrap();
-        session_report(&dir, &hook("b2", "/work/app"), "needs-input", 4242).unwrap();
-        session_report(&dir, &hook("c3", "/work/apple"), "finished", 7).unwrap(); // not in /work/app
-        session_report(&dir, &hook("d4", "/home/me"), "thinking", 0).unwrap();
-        assert!(session_report(&dir, &hook("../x", "/w"), "thinking", 0).is_err());
-        assert!(session_report(&dir, &hook("e5", "/w"), "busy", 0).is_err());
-        session_report(&dir, "{}", "thinking", 0).unwrap(); // not a hook payload: ignored
-        session_report(&dir, "", "thinking", 0).unwrap();
+        session_report(&dir, &hook("a1", "/work/app/src"), "thinking", 0, "").unwrap();
+        session_report(&dir, &hook("b2", "/work/app"), "needs-input", 4242, "").unwrap();
+        session_report(&dir, &hook("c3", "/work/apple"), "finished", 7, "").unwrap(); // not in /work/app
+        session_report(&dir, &hook("d4", "/home/me"), "thinking", 0, "").unwrap();
+        assert!(session_report(&dir, &hook("../x", "/w"), "thinking", 0, "").is_err());
+        assert!(session_report(&dir, &hook("e5", "/w"), "busy", 0, "").is_err());
+        session_report(&dir, "{}", "thinking", 0, "").unwrap(); // not a hook payload: ignored
+        session_report(&dir, "", "thinking", 0, "").unwrap();
         // The process of b2 is gone: dropped (and its file removed).
         let alive = |pid: u32| pid != 4242;
         let mut found = sessions_in(&dir, alive);
@@ -1246,7 +1368,7 @@ mod tests {
         assert_eq!(cwds, ["/home/me", "/work/app/src", "/work/apple"]);
         assert!(!dir.join("session-b2").exists());
         // SessionEnd ("ended" reaches here as idle) removes a session.
-        session_report(&dir, &hook("d4", "/home/me"), "idle", 0).unwrap();
+        session_report(&dir, &hook("d4", "/home/me"), "idle", 0, "").unwrap();
         assert_eq!(sessions_in(&dir, alive).len(), 2);
         let light = |octave: i8| octave;
         let folders = vec![
@@ -1257,22 +1379,27 @@ mod tests {
             Session {
                 state: "thinking",
                 cwd: "/work/app/src".into(),
+                kind: "",
             },
             Session {
                 state: "needs-input",
                 cwd: "/work/app".into(),
+                kind: "",
             },
             Session {
                 state: "finished",
                 cwd: "/work/apple".into(),
+                kind: "",
             },
             Session {
                 state: "thinking",
                 cwd: "/home/me".into(),
+                kind: "",
             },
             Session {
                 state: "idle",
                 cwd: "/work".into(),
+                kind: "",
             },
         ];
         // /work/app wins over /work; its two sessions combine to the most urgent.

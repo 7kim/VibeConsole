@@ -936,9 +936,25 @@ impl Terminal {
             }
         }
         self.light_patterns = config.light_patterns;
+        // v7 ticket 59: an Orca-hosted agent's sessions light its own octave light; the
+        // rest light by folder.
+        let (hosted, sessions) = if config.status_lights {
+            let orca = config
+                .agents
+                .iter()
+                .filter(|a| a.host == mappings::Host::Orca)
+                .filter_map(|a| {
+                    let folder = config.agent_directory(a).ok()??;
+                    Some((a.name.clone(), a.launch.clone(), folder))
+                })
+                .collect::<Vec<_>>();
+            crate::status::hosted_states(crate::status::sessions(), &orca)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         self.light_sessions = if config.status_lights {
             crate::status::source_states(
-                &crate::status::sessions(),
+                &sessions,
                 &config.light_folders,
                 config.light_other_on.then_some(config.light_other),
             )
@@ -978,6 +994,12 @@ impl Terminal {
                     .map(str::to_owned)
                     .collect::<Vec<_>>();
             self.clear_finished(&attended);
+        }
+        // After the tmux checks: a hosted agent has no tmux window to clear it by.
+        for (name, _, state) in &mut self.agent_states {
+            if let Some((_, hosted)) = hosted.iter().find(|(n, _)| n == name) {
+                *state = hosted;
+            }
         }
         // v7 tickets 11 and 86: rumble as a source newly enters a state whose Xbox pattern
         // rumbles, under the Status lights and Xbox switches.
