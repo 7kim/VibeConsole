@@ -1569,6 +1569,8 @@ impl ButtonLight {
                     Pattern::FastBlink => "2",
                     Pattern::Blink => "3",
                     Pattern::SlowPulse => "8",
+                    Pattern::SlowBlink => "4",
+                    Pattern::FastPulse => "9",
                 },
                 Some(brightness.to_string()),
             ),
@@ -2482,6 +2484,9 @@ mod tests {
             (Pattern::Blink, "3"),
             (Pattern::Steady, "1"),
             (Pattern::Off, "0"),
+            // v7 ticket 133: the controller's two other modes.
+            (Pattern::SlowBlink, "4"),
+            (Pattern::FastPulse, "9"),
         ] {
             light.show(Light::Agent(pattern, 20)).unwrap();
             assert_eq!(mode(&root, "gip0"), gip, "{pattern:?}");

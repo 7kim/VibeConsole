@@ -5186,12 +5186,14 @@ fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 keyboard_leds_menu(ui, &mut config.device_lights.keyboard_leds)?;
             } else if index > 12 {
                 let state = index - 13;
-                let lights = crate::status::LIGHTS.map(|(w, _)| w);
+                // v7 ticket 133: only what an on/off lock LED can show.
+                let keyboard = crate::status::KEYBOARD_LIGHTS;
+                let lights = keyboard.iter().map(|(w, _)| *w).collect::<Vec<_>>();
                 let Some(l) = choose_at(
                     ui,
                     &format!("Keyboard · {}: LED", NAMES[state]),
                     &options(&lights),
-                    crate::status::LIGHTS
+                    keyboard
                         .iter()
                         .position(|(_, v)| *v == devices.keyboard[state])
                         .unwrap_or(0),
@@ -5199,7 +5201,7 @@ fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 else {
                     return Ok(());
                 };
-                config.device_lights.keyboard[state] = crate::status::LIGHTS[l].1;
+                config.device_lights.keyboard[state] = keyboard[l].1;
             } else if index >= 8 {
                 let state = index - 8;
                 let (light, rumble) = devices.xbox[state];
@@ -5217,9 +5219,20 @@ fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                     return Ok(());
                 };
                 let rumbles = crate::status::RUMBLES.map(|(w, _)| w);
+                // v7 ticket 133: the controller's slow blink is also how paused looks.
+                let same_as_paused = if crate::status::LIGHTS[l].1
+                    == crate::status::Light::SlowBlink
+                {
+                    "\nNote: slow-blink is also the paused light, so this state looks like paused"
+                } else {
+                    ""
+                };
                 let Some(r) = choose_at(
                     ui,
-                    &format!("Xbox · {}: rumble as it begins", NAMES[state]),
+                    &format!(
+                        "Xbox · {}: rumble as it begins{same_as_paused}",
+                        NAMES[state]
+                    ),
                     &options(&rumbles),
                     crate::status::RUMBLES
                         .iter()
@@ -14078,6 +14091,59 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7 ticket 133: an Xbox row offers all seven of the controller's modes and says when
+    /// slow-blink looks like paused; a keyboard row offers only what a lock LED can show.
+    #[test]
+    fn xbox_rows_offer_every_mode_and_keyboard_rows_only_on_off() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-modes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut keys = vec![Down; 10];
+        keys.push(Enter); // Xbox · Thinking
+        keys.extend([Down, Down, Down, Enter]); // slow-pulse -> slow-blink
+        keys.extend([Enter, Enter]); // rumble off, brightness 20
+        keys.extend(vec![Down; 15]);
+        keys.extend([Enter, Escape, Escape]); // Keyboard · Thinking: look, cancel, leave
+        let mut ui = Script {
+            keys: keys.into(),
+            ..Default::default()
+        };
+        light_patterns_menu(&mut ui, &path).unwrap();
+        assert!(ui.keys.is_empty(), "keys left: {:?}", ui.keys);
+        let screen = |title: &str| {
+            ui.screens
+                .iter()
+                .find(|s| s.contains(title))
+                .unwrap_or_else(|| panic!("no {title} screen"))
+                .clone()
+        };
+        let xbox = screen("Xbox · Thinking: button light");
+        for word in [
+            "off",
+            "steady",
+            "slow-pulse",
+            "fast-blink",
+            "blink",
+            "slow-blink",
+            "fast-pulse",
+        ] {
+            assert!(xbox.contains(word), "{word}: {xbox}");
+        }
+        assert!(screen("rumble as it begins").contains("slow-blink is also the paused light"));
+        let keyboard = screen("Keyboard · Thinking: LED");
+        assert!(keyboard.contains("fast-blink"), "{keyboard}");
+        assert!(
+            !keyboard.contains("slow-blink") && !keyboard.contains("fast-pulse"),
+            "{keyboard}"
+        );
+        let lights = mappings::load_config(&path).unwrap().device_lights;
+        assert_eq!(lights.xbox[2].0, crate::status::Light::SlowBlink);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// v7 ticket 128: Status light patterns → Keyboard lights that show it turns Caps Lock
     /// and the M light on, says why G and RGB are unavailable, and saves the choice.
     #[test]
@@ -14262,7 +14328,7 @@ mod tests {
             })
             .map(|l| format!("{l}\n"))
             .collect::<String>()
-            .replace("vibeconsole-mappings-v29", "vibeconsole-mappings-v14")
+            .replace("vibeconsole-mappings-v30", "vibeconsole-mappings-v14")
             .replace(
                 "tuning\t15\t30\t10\toff\toff\nsticks\tlinear\tlinear\nmidi-devices\t0\nmidi-active\t-\nxbox-programs\t-\t-\t-\t-\t-\t-\t-\t-\nprofiles\t0\nprofile-lock\t-\nfavourites\t0\nsequences\t0\n",
                 "",

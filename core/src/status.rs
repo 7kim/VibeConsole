@@ -547,14 +547,23 @@ pub enum Light {
     FastBlink,
     /// Once a second.
     Blink,
+    /// v7 ticket 133: the controller's slow blink (also its paused light) and fast fade.
+    SlowBlink,
+    FastPulse,
 }
-pub const LIGHTS: [(&str, Light); 5] = [
+/// Every pattern word. The Xbox button light can show all of them.
+pub const LIGHTS: [(&str, Light); 7] = [
     ("off", Light::Off),
     ("steady", Light::Steady),
     ("slow-pulse", Light::SlowPulse),
     ("fast-blink", Light::FastBlink),
     ("blink", Light::Blink),
+    ("slow-blink", Light::SlowBlink),
+    ("fast-pulse", Light::FastPulse),
 ];
+/// v7 ticket 133: what a keyboard's on/off lock LED can show; the controller-only modes are
+/// left out.
+pub const KEYBOARD_LIGHTS: &[(&str, Light)] = LIGHTS.split_at(5).0;
 /// v7 ticket 86: a rumble as a state begins. Declared shortest first: `max` picks the longest.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Rumble {
@@ -625,8 +634,24 @@ impl Default for DevicePatterns {
 }
 /// xone's Xbox button light brightness at start-up; its maximum is 50.
 pub const XBOX_BRIGHTNESS: u8 = 20;
+/// Why a keyboard row can't take this pattern word (v7 ticket 133).
+pub fn keyboard_light_error(word: &str) -> String {
+    let words = KEYBOARD_LIGHTS.iter().map(|(w, _)| *w).collect::<Vec<_>>();
+    let (last, rest) = words.split_last().expect("keyboard patterns");
+    format!(
+        "keyboard light must be {} or {last}, not {word} (a lock LED is only on or off)",
+        rest.join(", ")
+    )
+}
 impl DevicePatterns {
     pub fn validate(&self) -> Result<()> {
+        if let Some(l) = self
+            .keyboard
+            .iter()
+            .find(|l| !KEYBOARD_LIGHTS.iter().any(|(_, k)| k == *l))
+        {
+            return Err(keyboard_light_error(word(&LIGHTS, *l)).into());
+        }
         if let Some(b) = self.xbox_brightness.iter().find(|b| **b > 50) {
             return Err(format!("Xbox light brightness must be 0–50, not {b}").into());
         }
@@ -656,6 +681,9 @@ pub fn light_on(light: Light, ms: u64) -> bool {
         Light::Blink => ms % 1000 < 500,
         Light::FastBlink => ms % 250 < 125,
         Light::SlowPulse => ms % 2000 < 1000,
+        // Not in `KEYBOARD_LIGHTS`, so a keyboard never gets them; the nearest on/off.
+        Light::SlowBlink => ms % 2000 < 1000,
+        Light::FastPulse => ms % 500 < 250,
     }
 }
 /// The Xbox button light for these source states (v7 ticket 86): the pattern of the most
