@@ -357,12 +357,29 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                 Ok(lights) => println!("Keyboard light: available ({})", lights.names().join(", ")),
                 Err(e) => println!("Keyboard light: {e}"),
             }
+            // v7 ticket 128: a Razer keyboard's M and G lights, and RGB.
+            let razer = std::path::Path::new(crate::keyboard::RAZER);
+            match crate::keyboard::macro_leds(razer).as_slice() {
+                [] => println!(
+                    "Keyboard M light: unavailable: OpenRazer's razerkbd driver isn't loaded, or its macro_led_state isn't writable (VibeConsole never installs it)"
+                ),
+                leds => println!(
+                    "Keyboard M light: available ({})",
+                    leds.iter()
+                        .map(|l| l.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            }
             println!(
-                "RGB keyboard: unavailable: {}",
+                "Keyboard G light: unavailable: lighting it turns on Razer game mode, which turns off the Super key"
+            );
+            println!(
+                "RGB keyboard: unavailable: neither OpenRazer nor OpenRGB can read the current effect back, so VibeConsole couldn't put it back ({})",
                 if Command::new("openrgb").arg("--version").output().is_ok() {
-                    "VibeConsole can't yet put OpenRGB's colours back afterwards, so it doesn't change them"
+                    "OpenRGB is installed"
                 } else {
-                    "OpenRGB is not installed (VibeConsole never installs it)"
+                    "OpenRGB is not installed; VibeConsole never installs it"
                 }
             );
             match crate::recording::permissions() {

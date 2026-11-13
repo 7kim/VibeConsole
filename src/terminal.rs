@@ -234,6 +234,8 @@ struct Terminal {
     /// open is said once, not retried every tick.
     lock_lights: Option<crate::keyboard::LockLights>,
     lock_failed: bool,
+    /// The keyboard lights `lock_lights` was opened with (v7 ticket 128).
+    lock_choice: [bool; 4],
     /// The focused app's profile (v7 ticket 12); None is Default.
     profile: Option<String>,
     /// Real sessions follow the focused app; tests never call the desktop.
@@ -760,6 +762,7 @@ impl Terminal {
             last_xbox: false,
             lock_lights: None,
             lock_failed: false,
+            lock_choice: [false; 4],
             profile: None,
             follow_apps: false,
             focus_unavailable: false,
@@ -1630,9 +1633,25 @@ impl Terminal {
             }
             return;
         };
+        // v7 ticket 128: a new choice of lights puts the old ones back and opens the new.
+        let chosen = self
+            .device_lights
+            .as_ref()
+            .map_or([false; 4], |p| p.keyboard_leds);
+        if chosen != self.lock_choice {
+            self.lock_lights = None;
+            self.lock_failed = false;
+            self.lock_choice = chosen;
+        }
         if self.lock_lights.is_none() && !self.lock_failed {
-            match crate::keyboard::LockLights::open() {
-                Ok(lights) => self.lock_lights = Some(lights),
+            let razer = std::path::Path::new(crate::keyboard::RAZER);
+            match crate::keyboard::LockLights::open_with(chosen, razer) {
+                Ok(lights) => {
+                    if !lights.missing.is_empty() {
+                        self.notice = lights.missing.join("; ");
+                    }
+                    self.lock_lights = Some(lights);
+                }
                 Err(error) => {
                     self.lock_failed = true;
                     self.notice = error.to_string();
@@ -4509,6 +4528,52 @@ fn profile_menu(ui: &mut impl Ui, path: &Path, name: &str) -> Result<()> {
     }
 }
 
+/// The keyboard lights chosen for agent status (v7 ticket 128), for a menu row.
+fn keyboard_leds_text(chosen: [bool; 4]) -> String {
+    const NAMES: [&str; 4] = ["Scroll Lock", "Caps Lock", "Num Lock", "M light"];
+    let names = NAMES
+        .iter()
+        .zip(chosen)
+        .filter(|(_, on)| *on)
+        .map(|(n, _)| *n)
+        .collect::<Vec<_>>();
+    if names.is_empty() {
+        "Scroll Lock (Caps Lock if there's none)".into()
+    } else {
+        names.join(", ")
+    }
+}
+/// v7 ticket 128: turn each keyboard light on or off for agent status. The G light and RGB
+/// are listed as unavailable with the reason, never offered.
+fn keyboard_leds_menu(ui: &mut impl Ui, chosen: &mut [bool; 4]) -> Result<()> {
+    const NAMES: [&str; 4] = [
+        "Scroll Lock LED",
+        "Caps Lock LED (the LED only; Caps Lock keeps typing as before)",
+        "Num Lock LED",
+        "M light (Razer, Fn+F9; needs OpenRazer's driver)",
+    ];
+    let mut at = 0;
+    loop {
+        let on = |b: bool| if b { "On" } else { "Off" };
+        let mut rows = NAMES
+            .iter()
+            .zip(*chosen)
+            .map(|(n, c)| format!("{n}: {}", on(c)))
+            .collect::<Vec<_>>();
+        rows.push("Back".into());
+        let title = "Keyboard lights that show agent status (none on: Scroll Lock, else Caps Lock)\n\
+                     G light (Fn+F10): unavailable: lighting it turns on Razer game mode, which turns off the Super key\n\
+                     RGB: unavailable: no installed tool can read your current effect back to restore it";
+        match choose_at(ui, title, &rows, at)? {
+            Some(i) if i < 4 => {
+                chosen[i] = !chosen[i];
+                at = i;
+            }
+            _ => return Ok(()),
+        }
+    }
+}
+
 /// Settings -> Xbox tuning (v7 ticket 08): the stick dead zone (drift inside it never
 /// fires) and how far a trigger is pulled before it fires.
 fn tuning_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
@@ -4802,7 +4867,7 @@ fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
         }
         // v7 ticket 113: the computer keyboard's lock-key LED, then its pattern per state.
         rows.push(format!(
-            "Keyboard light (Scroll Lock LED, else Caps Lock; LED only): {}",
+            "Keyboard light (LEDs only; typing is unaffected): {}",
             on(devices.keyboard_on)
         ));
         for (name, light) in NAMES.iter().zip(devices.keyboard) {
@@ -4812,6 +4877,11 @@ fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 crate::status::word(&crate::status::LIGHTS, light)
             ));
         }
+        // v7 ticket 128: which keyboard lights show it.
+        rows.push(format!(
+            "Keyboard lights that show it: {}",
+            keyboard_leds_text(devices.keyboard_leds)
+        ));
         let blind = NAMES
             .iter()
             .zip(patterns.states)
@@ -4869,6 +4939,8 @@ fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 config.device_lights.on[index - 6] = !devices.on[index - 6];
             } else if index == 12 {
                 config.device_lights.keyboard_on = !devices.keyboard_on;
+            } else if index == 17 {
+                keyboard_leds_menu(ui, &mut config.device_lights.keyboard_leds)?;
             } else if index > 12 {
                 let state = index - 13;
                 let lights = crate::status::LIGHTS.map(|(w, _)| w);
@@ -13504,6 +13576,44 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7 ticket 128: Status light patterns → Keyboard lights that show it turns Caps Lock
+    /// and the M light on, says why G and RGB are unavailable, and saves the choice.
+    #[test]
+    fn keyboard_lights_menu_chooses_leds_and_names_g_and_rgb_unavailable() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-kbd-leds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut keys = vec![Down; 17];
+        keys.push(Enter); // Keyboard lights that show it
+        keys.extend([Down, Enter]); // Caps Lock On
+        keys.extend([Down, Down, Enter]); // M light On
+        keys.extend([Escape, Escape]);
+        let mut ui = Script {
+            keys: keys.into(),
+            ..Default::default()
+        };
+        light_patterns_menu(&mut ui, &path).unwrap();
+        assert!(ui.keys.is_empty(), "keys left: {:?}", ui.keys);
+        assert!(ui.screens.iter().any(|s| {
+            s.contains("Keyboard lights that show it: Scroll Lock (Caps Lock if there's none)")
+        }));
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains("G light (Fn+F10): unavailable"))
+        );
+        assert!(ui.screens.iter().any(|s| s.contains("RGB: unavailable")));
+        let leds = mappings::load_config(&path)
+            .unwrap()
+            .device_lights
+            .keyboard_leds;
+        assert_eq!(leds, [false, true, false, true]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// v7 ticket 86: while running, the Xbox button light shows the most urgent agent
     /// state's Xbox pattern; the Xbox switch or the master Status lights switch off gives
     /// back the plain running light; paused stays paused; quitting restores the light.
@@ -13644,13 +13754,13 @@ mod tests {
         let v14 = saved
             .lines()
             .filter(|l| {
-                !["device-lights\t", "xbox-pattern\t", "ps5-pattern\t", "keyboard-lights\t", "keyboard-pattern\t", "xbox-headset\t"]
+                !["device-lights\t", "xbox-pattern\t", "ps5-pattern\t", "keyboard-lights\t", "keyboard-pattern\t", "xbox-headset\t", "keyboard-leds\t"]
                     .iter()
                     .any(|p| l.starts_with(p))
             })
             .map(|l| format!("{l}\n"))
             .collect::<String>()
-            .replace("vibeconsole-mappings-v27", "vibeconsole-mappings-v14")
+            .replace("vibeconsole-mappings-v28", "vibeconsole-mappings-v14")
             .replace(
                 "tuning\t15\t30\t10\toff\toff\nsticks\tlinear\tlinear\nmidi-devices\t0\nmidi-active\t-\nxbox-programs\t-\t-\t-\t-\t-\t-\t-\t-\nprofiles\t0\nprofile-lock\t-\nfavourites\t0\nsequences\t0\n",
                 "",

@@ -587,7 +587,13 @@ pub struct DevicePatterns {
     /// v7 ticket 113 (config v26): the computer keyboard's lock-key LED, off until turned on.
     pub keyboard_on: bool,
     pub keyboard: [Light; 4],
+    /// v7 ticket 128 (config v28): which keyboard lights show it, in `KEY_LEDS` order. None
+    /// chosen: Scroll Lock, else Caps Lock (ticket 113).
+    pub keyboard_leds: [bool; 4],
 }
+/// The keyboard lights a pattern can use (v7 ticket 128): lock-key LEDs, then a Razer
+/// keyboard's M (macro) light through OpenRazer's driver.
+pub const KEY_LEDS: [&str; 4] = ["scroll", "caps", "num", "macro"];
 impl Default for DevicePatterns {
     /// The design board's (version 34).
     fn default() -> Self {
@@ -610,6 +616,7 @@ impl Default for DevicePatterns {
             ],
             keyboard_on: false,
             keyboard: [FastBlink, FastBlink, SlowPulse, Blink],
+            keyboard_leds: [false; 4],
         }
     }
 }

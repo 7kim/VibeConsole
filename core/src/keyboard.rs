@@ -3,6 +3,7 @@ use crate::{Control, Event, Result};
 use evdev::{AttributeSet, EventType, InputEvent, KeyCode, uinput::VirtualDevice};
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -471,6 +472,42 @@ fn send(
 pub struct LockLights {
     leds: Vec<Led>,
     lit: Option<bool>,
+    /// Chosen lights no keyboard offers, as messages (v7 ticket 128).
+    pub missing: Vec<String>,
+}
+/// OpenRazer's keyboard driver in sysfs (v7 ticket 128).
+pub const RAZER: &str = "/sys/bus/hid/drivers/razerkbd";
+fn led_name(led: evdev::LedCode) -> &'static str {
+    match led {
+        evdev::LedCode::LED_CAPSL => "Caps Lock",
+        evdev::LedCode::LED_NUML => "Num Lock",
+        _ => "Scroll Lock",
+    }
+}
+/// v7 ticket 128: each Razer keyboard's M (macro) light, from OpenRazer's `macro_led_state`
+/// (read, then written `1`/`0`, github.com/openrazer/openrazer wiki "Using the keyboard
+/// driver"). Only files that can be read and written are used. The G light is never used:
+/// `game_led_state` turns on Razer game mode, which turns off the Super key.
+pub fn macro_leds(driver: &Path) -> Vec<Led> {
+    let mut dirs = std::fs::read_dir(driver)
+        .map(|entries| entries.flatten().map(|e| e.path()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    dirs.sort();
+    dirs.into_iter()
+        .filter_map(|dir| {
+            let file = dir.join("macro_led_state");
+            let was = std::fs::read_to_string(&file).ok()?.trim() == "1";
+            std::fs::OpenOptions::new().write(true).open(&file).ok()?;
+            let name = std::fs::read_to_string(dir.join("device_type"))
+                .map(|t| t.trim().to_owned())
+                .unwrap_or_else(|_| "Razer keyboard".into());
+            Some(Led::new(
+                &format!("{name}: M light"),
+                was,
+                Box::new(move |on| std::fs::write(&file, if on { "1" } else { "0" })),
+            ))
+        })
+        .collect()
 }
 /// One keyboard's LED: its name, what it showed before, and how to set it.
 pub struct Led {
@@ -495,46 +532,96 @@ impl LockLights {
     /// Every keyboard with a Scroll Lock or Caps Lock LED that can be opened for writing.
     /// Nothing is sent until `show`.
     pub fn open() -> Result<Self> {
+        Self::open_with([false; 4], Path::new(RAZER))
+    }
+    /// v7 ticket 128: the lights chosen in `crate::status::KEY_LEDS` order (Scroll, Caps, Num
+    /// lock LEDs on every writable keyboard that has them; a Razer keyboard's M light through
+    /// OpenRazer's driver files under `razer`). None chosen: Scroll Lock, else Caps Lock.
+    /// A chosen light no keyboard offers is named in `missing`; nothing is sent until `show`.
+    pub fn open_with(chosen: [bool; 4], razer: &Path) -> Result<Self> {
         use evdev::{EventType, InputEvent, LedCode};
+        let auto = chosen == [false; 4];
+        let codes = [LedCode::LED_SCROLLL, LedCode::LED_CAPSL, LedCode::LED_NUML];
         let mut leds = Vec::new();
+        let mut found = [false; 4];
         for (path, device) in evdev::enumerate() {
             let Some(supported) = device.supported_leds() else {
                 continue;
             };
-            let led = if supported.contains(LedCode::LED_SCROLLL) {
-                LedCode::LED_SCROLLL
-            } else if supported.contains(LedCode::LED_CAPSL) {
-                LedCode::LED_CAPSL
+            let wanted = if auto {
+                codes[..2]
+                    .iter()
+                    .find(|c| supported.contains(**c))
+                    .into_iter()
+                    .copied()
+                    .collect::<Vec<_>>()
             } else {
-                continue;
+                codes
+                    .iter()
+                    .zip(chosen)
+                    .filter(|(c, on)| *on && supported.contains(**c))
+                    .map(|(c, _)| *c)
+                    .collect()
             };
             let typing = device
                 .supported_keys()
                 .is_some_and(|k| k.contains(KeyCode::KEY_A));
             let writable = std::fs::OpenOptions::new().write(true).open(&path).is_ok();
-            if !typing || !writable {
+            if wanted.is_empty() || !typing || !writable {
                 continue;
             }
-            let Ok(mut device) = evdev::Device::open(&path) else {
-                continue;
-            };
-            let was = device.get_led_state().is_ok_and(|s| s.contains(led));
-            let name = device.name().unwrap_or("keyboard").to_owned();
-            leds.push(Led::new(
-                &name,
-                was,
-                Box::new(move |on| {
-                    device.send_events(&[InputEvent::new(EventType::LED.0, led.0, i32::from(on))])
-                }),
-            ));
+            for led in wanted {
+                let Ok(mut device) = evdev::Device::open(&path) else {
+                    continue;
+                };
+                let was = device.get_led_state().is_ok_and(|s| s.contains(led));
+                let name = device.name().unwrap_or("keyboard").to_owned();
+                if let Some(i) = codes.iter().position(|c| *c == led) {
+                    found[i] = true;
+                }
+                leds.push(Led::new(
+                    &format!("{name}: {}", led_name(led)),
+                    was,
+                    Box::new(move |on| {
+                        device.send_events(&[InputEvent::new(
+                            EventType::LED.0,
+                            led.0,
+                            i32::from(on),
+                        )])
+                    }),
+                ));
+            }
         }
+        if chosen[3] {
+            let macros = macro_leds(razer);
+            found[3] = !macros.is_empty();
+            leds.extend(macros);
+        }
+        let missing = crate::status::KEY_LEDS
+            .iter()
+            .zip(chosen.into_iter().zip(found))
+            .filter(|(_, (on, found))| *on && !found)
+            .map(|(name, _)| match *name {
+                "macro" => "M light: unavailable: OpenRazer's razerkbd driver isn't loaded, or its macro_led_state isn't writable (VibeConsole never installs it)".to_owned(),
+                other => format!("{other} lock LED: no writable keyboard has one"),
+            })
+            .collect::<Vec<_>>();
         if leds.is_empty() {
-            return Err("keyboard light unavailable: no keyboard with a Scroll Lock or Caps Lock LED can be written (check /dev/input permissions)".into());
+            return Err(match missing.first() {
+                Some(reason) => format!("keyboard light unavailable: {reason}").into(),
+                None => "keyboard light unavailable: no keyboard with a Scroll Lock or Caps Lock LED can be written (check /dev/input permissions)".into(),
+            });
         }
-        Ok(Self::with(leds))
+        let mut lights = Self::with(leds);
+        lights.missing = missing;
+        Ok(lights)
     }
     pub fn with(leds: Vec<Led>) -> Self {
-        Self { leds, lit: None }
+        Self {
+            leds,
+            lit: None,
+            missing: Vec::new(),
+        }
     }
     pub fn names(&self) -> Vec<&str> {
         self.leds.iter().map(|l| l.name.as_str()).collect()
@@ -1594,6 +1681,49 @@ mod tests {
 
     /// v7 ticket 113: the keyboard LED is written only when it changes, and put back to what
     /// it showed before on restore and on drop; a stand-in records every write.
+    /// v7 ticket 128: a Razer keyboard's M light comes from OpenRazer's `macro_led_state`:
+    /// read first, lit with `1`, put back on restore. No driver: the chosen M light is
+    /// unavailable with the reason, and nothing is written.
+    #[test]
+    fn razer_m_light_is_read_lit_and_put_back_and_missing_is_named() {
+        let dir = std::env::temp_dir().join(format!("vibeconsole-razer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let kbd = dir.join("0003:1532:021A.0001");
+        std::fs::create_dir_all(&kbd).unwrap();
+        std::fs::write(kbd.join("macro_led_state"), "0").unwrap();
+        std::fs::write(kbd.join("game_led_state"), "0").unwrap();
+        std::fs::write(
+            kbd.join("device_type"),
+            "Razer BlackWidow X Chroma Tournament Edition\n",
+        )
+        .unwrap();
+        let mut lights = LockLights::open_with([false, false, false, true], &dir).unwrap();
+        assert_eq!(
+            lights.names(),
+            ["Razer BlackWidow X Chroma Tournament Edition: M light"]
+        );
+        assert!(lights.missing.is_empty());
+        let state = || std::fs::read_to_string(kbd.join("macro_led_state")).unwrap();
+        lights.show(true).unwrap();
+        assert_eq!(state(), "1");
+        drop(lights);
+        assert_eq!(state(), "0", "quit puts it back");
+        assert_eq!(
+            std::fs::read_to_string(kbd.join("game_led_state")).unwrap(),
+            "0",
+            "G is never touched"
+        );
+        let error = LockLights::open_with([false, false, false, true], &dir.join("none"))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("M light: unavailable") && error.contains("razerkbd"),
+            "{error}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn lock_lights_write_changes_only_and_put_the_leds_back() {
         let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
