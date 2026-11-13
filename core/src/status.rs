@@ -590,6 +590,8 @@ pub struct DevicePatterns {
     /// v7 ticket 128 (config v28): which keyboard lights show it, in `KEY_LEDS` order. None
     /// chosen: Scroll Lock, else Caps Lock (ticket 113).
     pub keyboard_leds: [bool; 4],
+    /// v7 ticket 132 (config v29): the Xbox button light's brightness per state, 0–50.
+    pub xbox_brightness: [u8; 4],
 }
 /// The keyboard lights a pattern can use (v7 ticket 128): lock-key LEDs, then a Razer
 /// keyboard's M (macro) light through OpenRazer's driver.
@@ -617,11 +619,17 @@ impl Default for DevicePatterns {
             keyboard_on: false,
             keyboard: [FastBlink, FastBlink, SlowPulse, Blink],
             keyboard_leds: [false; 4],
+            xbox_brightness: [XBOX_BRIGHTNESS; 4],
         }
     }
 }
+/// xone's Xbox button light brightness at start-up; its maximum is 50.
+pub const XBOX_BRIGHTNESS: u8 = 20;
 impl DevicePatterns {
     pub fn validate(&self) -> Result<()> {
+        if let Some(b) = self.xbox_brightness.iter().find(|b| **b > 50) {
+            return Err(format!("Xbox light brightness must be 0–50, not {b}").into());
+        }
         match self.ps5.iter().find(|(c, ..)| !COLOURS.contains(c)) {
             Some((c, ..)) => Err(format!(
                 "light-bar colour must be one of {}, not {c}",
@@ -653,9 +661,10 @@ pub fn light_on(light: Light, ms: u64) -> bool {
 /// The Xbox button light for these source states (v7 ticket 86): the pattern of the most
 /// urgent busy state, in `BUSY` order as on the MPK; "off" turns it off. None when no source
 /// is busy: the plain running light shows.
-pub fn xbox_light(states: &[&str], patterns: &DevicePatterns) -> Option<Light> {
+/// With its brightness (v7 ticket 132).
+pub fn xbox_light(states: &[&str], patterns: &DevicePatterns) -> Option<(Light, u8)> {
     let busy = BUSY.iter().position(|s| states.contains(s))?;
-    Some(patterns.xbox[busy].0)
+    Some((patterns.xbox[busy].0, patterns.xbox_brightness[busy]))
 }
 /// The rumble due now: the longest of the states that sources newly entered.
 pub fn rumble_for(
@@ -998,22 +1007,28 @@ mod tests {
         );
         assert_eq!(
             xbox_light(&["thinking", "idle"], &p),
-            Some(Light::SlowPulse)
+            Some((Light::SlowPulse, 20))
         );
         assert_eq!(
             xbox_light(&["finished", "thinking"], &p),
-            Some(Light::SlowPulse),
+            Some((Light::SlowPulse, 20)),
             "BUSY order, as the MPK"
         );
+        let mut bright = p.clone();
+        bright.xbox_brightness = [50, 35, 5, 20]; // v7 ticket 132: each state's own brightness
         assert_eq!(
-            xbox_light(&["finished", "needs-decision"], &p),
-            Some(Light::FastBlink)
+            xbox_light(&["finished", "needs-decision"], &bright),
+            Some((Light::FastBlink, 50))
+        );
+        assert_eq!(
+            xbox_light(&["thinking"], &bright),
+            Some((Light::SlowPulse, 5))
         );
         let mut quiet = p.clone();
         quiet.xbox[0].0 = Light::Off;
         assert_eq!(
             xbox_light(&["needs-decision", "thinking"], &quiet),
-            Some(Light::Off),
+            Some((Light::Off, 20)),
             "a state set to off turns the light off"
         );
         let src = |s: &'static str| ("claude".to_string(), s);

@@ -1457,8 +1457,9 @@ pub enum Light {
     Running,
     /// Paused, or not running yet: slow blink.
     Paused,
-    /// v7 ticket 86: running, showing the most urgent agent state's pattern.
-    Agent(crate::status::Light),
+    /// v7 ticket 86: running, showing the most urgent agent state's pattern, at its
+    /// brightness (v7 ticket 132: 0–50, xone's range).
+    Agent(crate::status::Light, u8),
 }
 
 /// Where the kernel lists LEDs; xone's controller lights are the `gip*` folders.
@@ -1558,19 +1559,40 @@ impl ButtonLight {
             return Ok(());
         }
         use crate::status::Light as Pattern;
-        let mode = match light {
-            Light::Running | Light::Agent(Pattern::Steady) => "1",
-            Light::Paused => "4",
-            Light::Agent(Pattern::Off) => "0",
-            Light::Agent(Pattern::FastBlink) => "2",
-            Light::Agent(Pattern::Blink) => "3",
-            Light::Agent(Pattern::SlowPulse) => "8",
+        let (mode, brightness) = match light {
+            Light::Running => ("1", None),
+            Light::Paused => ("4", None),
+            Light::Agent(pattern, brightness) => (
+                match pattern {
+                    Pattern::Off => "0",
+                    Pattern::Steady => "1",
+                    Pattern::FastBlink => "2",
+                    Pattern::Blink => "3",
+                    Pattern::SlowPulse => "8",
+                },
+                Some(brightness.to_string()),
+            ),
         };
+        // v7 ticket 132: the running and paused lights keep the brightness found at open; a
+        // brightness is written only when it changes, so a mode change is one small message.
+        let shown_brightness = |shown: Option<Light>| match shown {
+            Some(Light::Agent(_, b)) => Some(b.to_string()),
+            _ => None,
+        };
+        let write_brightness = brightness != shown_brightness(self.shown) || self.shown.is_none();
         // v7 ticket 114: every controller's light; one that fails (unplugged) is dropped and
         // the others keep showing. Only when none is left is it an error.
         let mut failed = None;
-        self.saved
-            .retain(|(dir, ..)| match std::fs::write(dir.join("mode"), mode) {
+        self.saved.retain(|(dir, _, found)| {
+            let level = brightness.as_deref().unwrap_or(found);
+            let result = std::fs::write(dir.join("mode"), mode).and_then(|()| {
+                if write_brightness {
+                    std::fs::write(dir.join("brightness"), level)
+                } else {
+                    Ok(())
+                }
+            });
+            match result {
                 Ok(()) => true,
                 Err(e) => {
                     failed = Some(format!(
@@ -1579,7 +1601,8 @@ impl ButtonLight {
                     ));
                     false
                 }
-            });
+            }
+        });
         if let (Some(error), true) = (failed, self.saved.is_empty()) {
             return Err(error.into());
         }
@@ -2407,6 +2430,47 @@ mod tests {
 
     /// v7 ticket 86: the button light shows each agent pattern as xone's GIP mode (0 off,
     /// 1 steady, 2 fast blink, 3 blink, 8 fade for the slow pulse) and is restored on quit.
+    /// v7 ticket 132: each agent state sets the light's brightness (0–50) with its mode; the
+    /// running and paused lights keep the brightness found at open; quit puts both back.
+    #[test]
+    fn button_light_brightness_follows_each_state_and_is_restored_on_quit() {
+        use crate::status::Light as Pattern;
+        let root = leds("brightness", "3");
+        std::fs::write(root.join("gip0/brightness"), "17\n").unwrap();
+        let brightness =
+            |root: &std::path::Path| std::fs::read_to_string(root.join("gip0/brightness")).unwrap();
+        let mut light = ButtonLight::open(&root).unwrap();
+        light.show(Light::Agent(Pattern::FastBlink, 50)).unwrap();
+        assert_eq!(
+            (mode(&root, "gip0"), brightness(&root)),
+            ("2".into(), "50".into())
+        );
+        light.show(Light::Agent(Pattern::SlowPulse, 5)).unwrap();
+        assert_eq!(
+            (mode(&root, "gip0"), brightness(&root)),
+            ("8".into(), "5".into())
+        );
+        light.show(Light::Running).unwrap();
+        assert_eq!(
+            (mode(&root, "gip0"), brightness(&root)),
+            ("1".into(), "17".into())
+        );
+        light.show(Light::Agent(Pattern::Steady, 40)).unwrap();
+        light.show(Light::Paused).unwrap();
+        assert_eq!(
+            (mode(&root, "gip0"), brightness(&root)),
+            ("4".into(), "17".into())
+        );
+        light.show(Light::Agent(Pattern::Blink, 33)).unwrap();
+        drop(light);
+        assert_eq!(
+            (mode(&root, "gip0"), brightness(&root)),
+            ("3".into(), "17".into()),
+            "quit puts back the mode and brightness found at open"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn button_light_shows_agent_patterns_and_is_restored_on_quit() {
         use crate::status::Light as Pattern;
@@ -2419,7 +2483,7 @@ mod tests {
             (Pattern::Steady, "1"),
             (Pattern::Off, "0"),
         ] {
-            light.show(Light::Agent(pattern)).unwrap();
+            light.show(Light::Agent(pattern, 20)).unwrap();
             assert_eq!(mode(&root, "gip0"), gip, "{pattern:?}");
         }
         light.show(Light::Paused).unwrap();

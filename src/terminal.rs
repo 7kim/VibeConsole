@@ -1619,7 +1619,7 @@ impl Terminal {
             .and_then(|p| crate::status::xbox_light(&states, p));
         let light = match pattern {
             _ if !(self.output.is_some() && !self.suspended) => Light::Paused,
-            Some(pattern) => Light::Agent(pattern),
+            Some((pattern, brightness)) => Light::Agent(pattern, brightness),
             None => Light::Running,
         };
         let result = self.button_light.as_mut().map(|l| l.show(light));
@@ -5098,9 +5098,11 @@ fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
         let on = |b: bool| if b { "On" } else { "Off" };
         rows.push(format!("MPK lights: {}", on(devices.on[0])));
         rows.push(format!("Xbox lights and rumble: {}", on(devices.on[1])));
-        for (name, (light, rumble)) in NAMES.iter().zip(devices.xbox) {
+        for ((name, (light, rumble)), level) in
+            NAMES.iter().zip(devices.xbox).zip(devices.xbox_brightness)
+        {
             rows.push(format!(
-                "Xbox · {}: light {}, rumble {}",
+                "Xbox · {}: light {}, rumble {}, brightness {level}",
                 name.split(" (").next().unwrap_or(name),
                 crate::status::word(&crate::status::LIGHTS, light),
                 crate::status::word(&crate::status::RUMBLES, rumble)
@@ -5227,8 +5229,23 @@ fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 else {
                     return Ok(());
                 };
+                // v7 ticket 132: the light's brightness for this state, in xone's 0–50.
+                let Some(level) = number(
+                    ui,
+                    &format!(
+                        "Xbox · {}: button light brightness (0–50; xone starts at 20)",
+                        NAMES[state]
+                    ),
+                    devices.xbox_brightness[state].into(),
+                    0,
+                    50,
+                )?
+                else {
+                    return Ok(());
+                };
                 config.device_lights.xbox[state] =
                     (crate::status::LIGHTS[l].1, crate::status::RUMBLES[r].1);
+                config.device_lights.xbox_brightness[state] = u8::try_from(level)?;
             } else {
                 let fast = index == 5;
                 let current = if fast { patterns.fast } else { patterns.slow };
@@ -14027,6 +14044,8 @@ mod tests {
         keys.push(Enter); // Xbox lights and rumble: On -> Off
         keys.extend(vec![Down; 10]);
         keys.extend([Enter, Down, Enter, Down, Down, Enter]); // Xbox thinking: fast-blink, long
+        keys.extend(vec![Up; 40]); // v7 ticket 132: brightness 20 -> 50, and no further
+        keys.push(Enter);
         keys.push(Escape);
         let mut ui = Script {
             keys: keys.into(),
@@ -14037,7 +14056,12 @@ mod tests {
         assert!(
             ui.screens
                 .iter()
-                .any(|s| s.contains("Xbox · Thinking: light slow-pulse, rumble off"))
+                .any(|s| s.contains("Xbox · Thinking: light slow-pulse, rumble off, brightness 20"))
+        );
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains("brightness (0–50") && s.contains("Value: 50"))
         );
         assert!(
             ui.screens.iter().any(|s| s.contains("Xbox button light: ")),
@@ -14046,6 +14070,11 @@ mod tests {
         let lights = mappings::load_config(&path).unwrap().device_lights;
         assert_eq!(lights.on, [true, false, true]);
         assert_eq!(lights.xbox[2], (Light::FastBlink, Rumble::Long));
+        assert_eq!(
+            lights.xbox_brightness,
+            [20, 20, 50, 20],
+            "clamped at xone's 50"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -14227,13 +14256,13 @@ mod tests {
         let v14 = saved
             .lines()
             .filter(|l| {
-                !["device-lights\t", "xbox-pattern\t", "ps5-pattern\t", "keyboard-lights\t", "keyboard-pattern\t", "xbox-headset\t", "keyboard-leds\t"]
+                !["device-lights\t", "xbox-pattern\t", "ps5-pattern\t", "keyboard-lights\t", "keyboard-pattern\t", "xbox-headset\t", "keyboard-leds\t", "xbox-brightness\t"]
                     .iter()
                     .any(|p| l.starts_with(p))
             })
             .map(|l| format!("{l}\n"))
             .collect::<String>()
-            .replace("vibeconsole-mappings-v28", "vibeconsole-mappings-v14")
+            .replace("vibeconsole-mappings-v29", "vibeconsole-mappings-v14")
             .replace(
                 "tuning\t15\t30\t10\toff\toff\nsticks\tlinear\tlinear\nmidi-devices\t0\nmidi-active\t-\nxbox-programs\t-\t-\t-\t-\t-\t-\t-\t-\nprofiles\t0\nprofile-lock\t-\nfavourites\t0\nsequences\t0\n",
                 "",
