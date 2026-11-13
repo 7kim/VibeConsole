@@ -4560,10 +4560,7 @@ fn driver_menu(ui: &mut impl Ui) -> Result<()> {
     let Some(choice) = choose_at(
         ui,
         &format!(
-            "Xbox driver (now: {})\n\
-             xpad: the kernel's own driver. No headset audio, and no Xbox button light for this controller.\n\
-             xone: headset audio through the controller's jack. Its Xbox button light needs the light rule (ticket 130).\n\
-             VibeConsole never installs xone (github.com/dlundqvist/xone).",
+            "Xbox driver (now: {}). xpad: no headset, no button light. xone: headset and light.",
             now.unwrap_or("no controller connected")
         ),
         &options(&["xpad", "xone", "Back"]),
@@ -4599,9 +4596,7 @@ fn driver_menu(ui: &mut impl Ui) -> Result<()> {
         "The controller headset stops working, and this controller has no Xbox button light on xpad."
     };
     let confirm = format!(
-        "Switch the Xbox driver to {driver}?\n{warning}\n\
-         The controller disconnects (held buttons are released), you're asked for your password, \
-         and the choice stays after a reboot."
+        "Switch the Xbox driver to {driver}? {warning} You're asked for your password; the choice stays after a reboot."
     );
     let yes = format!("Yes, switch to {driver}");
     if choose(
@@ -5726,11 +5721,24 @@ fn choose_at(
         return Ok(None);
     }
     let mut cursor = initial.min(options.len() - 1);
+    // The options come first: a long title is cut (ending in "…") so at least five options,
+    // or all of them, stay on screen. Before, a long title left room for one row only.
+    let lines = crate::screen::wrap(title, ui.width().saturating_sub(5));
+    let want = options.len().min(5);
+    let room = ui.height().saturating_sub(10 + want).max(1);
+    let title = if lines.len() > room {
+        let mut kept = lines[..room.saturating_sub(1).max(1)].join("\n");
+        kept.push_str(" …");
+        kept
+    } else {
+        title.to_owned()
+    };
+    let title = title.as_str();
     loop {
         let visible = ui
             .height()
             .saturating_sub(crate::screen::wrap(title, ui.width().saturating_sub(5)).len() + 10)
-            .max(1);
+            .max(want);
         let first = cursor.saturating_sub(visible - 1);
         let rows = options
             .iter()
@@ -11058,6 +11066,30 @@ mod tests {
         settings_menu(&mut ui, &path).unwrap();
         assert!(ui.ran.is_empty());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Fix after developer test 129: a long title never pushes the options off screen; it's
+    /// cut instead, so a confirm always shows Yes and Back.
+    #[test]
+    fn a_long_title_is_cut_so_every_option_shows() {
+        let mut ui = Script {
+            keys: vec![Key::Down, Key::Enter].into(),
+            ..Default::default()
+        };
+        let title = vec!["A long explanation line that wraps."; 30].join("\n");
+        let chosen = choose(
+            &mut ui,
+            &title,
+            &options(&["Yes, switch to xpad", "Back (discard: nothing changes)"]),
+        )
+        .unwrap();
+        assert_eq!(chosen, Some(1));
+        let first = &ui.screens[0];
+        assert!(
+            first.contains("> Yes, switch to xpad") && first.contains("Back (discard"),
+            "{first}"
+        );
+        assert!(first.contains(" …"));
     }
 
     /// v7 ticket 75: Settings -> Xbox tuning sets each stick Linear or Angle; overlapping
