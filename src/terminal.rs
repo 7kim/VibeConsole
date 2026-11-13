@@ -4603,7 +4603,13 @@ fn driver_menu(ui: &mut impl Ui) -> Result<()> {
          The controller disconnects (held buttons are released), you're asked for your password, \
          and the choice stays after a reboot."
     );
-    if choose(ui, &confirm, &options(&["Switch", "Back"]))? != Some(0) {
+    let yes = format!("Yes, switch to {driver}");
+    if choose(
+        ui,
+        &confirm,
+        &options(&[&yes, "Back (discard: nothing changes)"]),
+    )? != Some(0)
+    {
         return Ok(());
     }
     let exe = std::env::current_exe()?;
@@ -4654,7 +4660,13 @@ fn light_rule_menu(ui: &mut impl Ui) -> Result<()> {
     } else {
         "Remove"
     };
-    if choose(ui, &format!("{what}{note}"), &options(&[verb, "Back"]))? != Some(0) {
+    let yes = format!("Yes, {}", verb.to_lowercase());
+    if choose(
+        ui,
+        &format!("{what}{note}"),
+        &options(&[&yes, "Back (discard: nothing changes)"]),
+    )? != Some(0)
+    {
         return Ok(());
     }
     let exe = std::env::current_exe()?;

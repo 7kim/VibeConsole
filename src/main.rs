@@ -198,6 +198,7 @@ fn main() -> Result<()> {
         let done = vibeconsole_core::gamepad::switch_driver(
             driver,
             std::path::Path::new("/etc/modprobe.d"),
+            std::path::Path::new("/sys/bus/usb/drivers"),
             &loaded,
             installed,
             &mut run,

@@ -903,15 +903,19 @@ pub const DRIVER_FILE: &str = "vibeconsole-xbox-driver.conf";
 /// xone's blacklist (its `install.sh`), set aside while xpad is chosen.
 pub const XONE_FILE: &str = "xone-blacklist.conf";
 const XONE_OFF: &str = "xone-blacklist.conf.vibeconsole-off";
-/// v7 ticket 129, run as root (`pkexec vibeconsole xbox-driver <xpad|xone>`): unloads the
-/// other driver, loads `driver` (a driver loaded after the controller is free binds it at
-/// once), and only then makes the choice survive a reboot. modprobe's `blacklist` stops only
-/// automatic loading, so: xpad writes `DRIVER_FILE` (blacklisting xone) and sets xone's own
-/// blacklist of xpad aside; xone undoes both. `etc` is /etc/modprobe.d, `loaded` the text
-/// of /proc/modules. Never installs, builds or signs a driver. Errors name their stage.
+/// v7 ticket 129, run as root (`pkexec vibeconsole xbox-driver <xpad|xone>`). First the
+/// controller is unbound from the old driver (its sound card goes with it, so PipeWire lets
+/// go), then the new driver is loaded and bound to it, and only then is the choice saved so
+/// it survives a reboot: modprobe's `blacklist` stops only automatic loading, so xpad writes
+/// `DRIVER_FILE` (blacklisting xone) and sets xone's own blacklist of xpad aside; xone undoes
+/// both. Unloading the old modules is best effort: one still in use stays loaded, bound to
+/// nothing. A failed load binds the controller back to the old driver. `etc` is
+/// /etc/modprobe.d, `usb` /sys/bus/usb/drivers, `loaded` the text of /proc/modules. Never
+/// installs, builds or signs a driver. Errors name their stage.
 pub fn switch_driver(
     driver: &str,
     etc: &std::path::Path,
+    usb: &std::path::Path,
     loaded: &str,
     xone_installed: bool,
     run: &mut dyn FnMut(&[&str]) -> crate::Result<String>,
@@ -922,6 +926,41 @@ pub fn switch_driver(
     if driver == "xone" && !xone_installed {
         return Err("xbox-driver: unavailable: xone isn't installed (github.com/dlundqvist/xone; install it yourself)".into());
     }
+    let (old, from, to, module) = if driver == "xpad" {
+        ("xone", "xone-wired", "xpad", "xpad")
+    } else {
+        ("xpad", "xpad", "xone-wired", "xone_wired")
+    };
+    let mut interfaces = std::fs::read_dir(usb.join(from))
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.contains(':'))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    interfaces.sort();
+    let attach = |dir: &str, file: &str| {
+        for interface in &interfaces {
+            std::fs::write(usb.join(dir).join(file), interface)?;
+        }
+        std::io::Result::Ok(())
+    };
+    attach(from, "unbind").map_err(|e| format!("xbox-driver: unbind: {e}"))?;
+    if let Err(e) = run(&["modprobe", module]) {
+        let back = match attach(from, "bind") {
+            Ok(()) => format!("the controller is back on {old}"),
+            Err(_) => "replug the controller".to_owned(),
+        };
+        return Err(format!("xbox-driver: load: {e}; {back}").into());
+    }
+    // Loading binds a free controller; an already loaded driver needs telling.
+    for interface in &interfaces {
+        if !usb.join(to).join(interface).exists() {
+            let _ = std::fs::write(usb.join(to).join("bind"), interface);
+        }
+    }
     let loaded = loaded
         .lines()
         .filter_map(|l| l.split_whitespace().next())
@@ -929,23 +968,14 @@ pub fn switch_driver(
     let mut unload = vec!["modprobe", "-r", "-a"];
     if driver == "xpad" {
         unload.extend(XONE_MODULES.iter().filter(|m| loaded.contains(m)));
-    } else {
-        // xone's idle modules too: loading them again lets them bind the free controller.
-        unload.extend(
-            std::iter::once(&"xpad")
-                .chain(XONE_MODULES.iter())
-                .filter(|m| loaded.contains(m)),
-        );
+    } else if loaded.contains(&"xpad") {
+        unload.push("xpad");
     }
-    if unload.len() > 3 {
-        run(&unload).map_err(|e| format!("xbox-driver: unload: {e}"))?;
-    }
-    let module = if driver == "xpad" {
-        "xpad"
+    let note = if unload.len() > 3 && run(&unload).is_err() {
+        format!("; some {old} modules stay loaded until a reboot (they hold nothing)")
     } else {
-        "xone_wired"
+        String::new()
     };
-    run(&["modprobe", module]).map_err(|e| format!("xbox-driver: load: {e}"))?;
     let save = |e: std::io::Error| format!("xbox-driver: save: {e}");
     if driver == "xpad" {
         if xone_installed {
@@ -968,7 +998,7 @@ pub fn switch_driver(
             _ => {}
         }
     }
-    Ok(format!("Xbox driver switched to {driver}"))
+    Ok(format!("Xbox driver switched to {driver}{note}"))
 }
 /// v7 ticket 130: VibeConsole's udev rule that lets the `input` group (the user is in it to
 /// read controllers) write xone's controller light. udev runs `RUN+=` programs with the
@@ -2126,9 +2156,18 @@ mod tests {
     /// leaves every file as it was; xone not installed, or another word, runs nothing.
     #[test]
     fn driver_switch_unloads_loads_then_saves_and_a_failure_changes_no_file() {
-        let etc = std::env::temp_dir().join(format!("vibeconsole-modprobe-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&etc);
+        let root =
+            std::env::temp_dir().join(format!("vibeconsole-modprobe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (etc, usb) = (root.join("etc"), root.join("usb"));
         std::fs::create_dir_all(&etc).unwrap();
+        for dir in ["xone-wired", "xpad"] {
+            std::fs::create_dir_all(usb.join(dir)).unwrap();
+        }
+        for interface in ["1-1:1.0", "1-1:1.1"] {
+            std::fs::write(usb.join("xone-wired").join(interface), "").unwrap();
+        }
+        let wrote = |dir: &str, file: &str| std::fs::read_to_string(usb.join(dir).join(file)).ok();
         std::fs::write(etc.join(XONE_FILE), "blacklist xpad\nblacklist mt76x2u\n").unwrap();
         let loaded = "xone_gip_headset 28672 3 - Live\nxone_gip_gamepad 20480 0 - Live\nxone_wired 24576 0 - Live\nxone_gip 81920 3 xone_gip_gamepad - Live\nsnd 1 0 - Live\n";
         let mut ran = Vec::new();
@@ -2136,12 +2175,16 @@ mod tests {
             ran.push(args.join(" "));
             Ok(String::new())
         };
-        switch_driver("xpad", &etc, loaded, true, &mut run).unwrap();
+        let done = switch_driver("xpad", &etc, &usb, loaded, true, &mut run).unwrap();
+        assert_eq!(done, "Xbox driver switched to xpad");
+        // Unbound from xone first, then xpad loaded and bound, then xone unloaded.
+        assert_eq!(wrote("xone-wired", "unbind").as_deref(), Some("1-1:1.1"));
+        assert_eq!(wrote("xpad", "bind").as_deref(), Some("1-1:1.1"));
         assert_eq!(
             ran,
             [
-                "modprobe -r -a xone_gip_gamepad xone_gip_headset xone_wired xone_gip",
-                "modprobe xpad"
+                "modprobe xpad",
+                "modprobe -r -a xone_gip_gamepad xone_gip_headset xone_wired xone_gip"
             ]
         );
         assert!(
@@ -2151,38 +2194,66 @@ mod tests {
         );
         assert!(!etc.join(XONE_FILE).exists() && etc.join(XONE_OFF).exists());
 
+        // A module still in use (the headset card held open) stays loaded; the switch holds.
+        let mut busy = |args: &[&str]| -> crate::Result<String> {
+            if args[1] == "-r" {
+                Err("modprobe: WARNING: Module xone_gip_headset is in use.".into())
+            } else {
+                Ok(String::new())
+            }
+        };
+        let done = switch_driver("xpad", &etc, &usb, loaded, true, &mut busy).unwrap();
+        assert!(done.contains("stay loaded until a reboot"), "{done}");
+
+        // Back to xone undoes both files.
+        std::fs::remove_dir_all(usb.join("xone-wired")).unwrap();
+        std::fs::create_dir_all(usb.join("xone-wired")).unwrap();
+        for interface in ["1-1:1.0", "1-1:1.1"] {
+            std::fs::write(usb.join("xpad").join(interface), "").unwrap();
+        }
         ran.clear();
         let mut run = |args: &[&str]| -> crate::Result<String> {
             ran.push(args.join(" "));
             Ok(String::new())
         };
-        switch_driver("xone", &etc, "xpad 61440 0 - Live\n", true, &mut run).unwrap();
-        assert_eq!(ran, ["modprobe -r -a xpad", "modprobe xone_wired"]);
+        switch_driver("xone", &etc, &usb, "xpad 61440 0 - Live\n", true, &mut run).unwrap();
+        assert_eq!(ran, ["modprobe xone_wired", "modprobe -r -a xpad"]);
+        assert_eq!(wrote("xone-wired", "bind").as_deref(), Some("1-1:1.1"));
         assert!(!etc.join(DRIVER_FILE).exists());
         assert!(etc.join(XONE_FILE).exists() && !etc.join(XONE_OFF).exists());
 
-        // A failed load: nothing saved.
+        // A failed load binds the controller back and saves nothing.
         let mut failing = |args: &[&str]| -> crate::Result<String> {
-            if args == ["modprobe", "xpad"] {
-                Err("modprobe: FATAL: Module xpad not found".into())
+            if args == ["modprobe", "xone_wired"] {
+                Err("modprobe: FATAL: Module xone_wired not found".into())
             } else {
                 Ok(String::new())
             }
         };
-        let error = switch_driver("xpad", &etc, loaded, true, &mut failing)
+        std::fs::remove_file(usb.join("xpad/bind")).ok();
+        std::fs::write(etc.join(DRIVER_FILE), "kept\n").unwrap();
+        let error = switch_driver("xone", &etc, &usb, "xpad 1 0 - Live\n", true, &mut failing)
             .unwrap_err()
             .to_string();
-        assert!(error.starts_with("xbox-driver: load:"), "{error}");
-        assert!(!etc.join(DRIVER_FILE).exists() && etc.join(XONE_FILE).exists());
+        assert!(
+            error.starts_with("xbox-driver: load:")
+                && error.ends_with("the controller is back on xpad"),
+            "{error}"
+        );
+        assert_eq!(wrote("xpad", "bind").as_deref(), Some("1-1:1.1"));
+        assert_eq!(
+            std::fs::read_to_string(etc.join(DRIVER_FILE)).unwrap(),
+            "kept\n"
+        );
 
         let mut never = |_: &[&str]| -> crate::Result<String> { panic!("nothing may run") };
         assert!(
-            switch_driver("xone", &etc, "", false, &mut never)
+            switch_driver("xone", &etc, &usb, "", false, &mut never)
                 .unwrap_err()
                 .to_string()
                 .contains("xone isn't installed")
         );
-        assert!(switch_driver("rm -rf", &etc, "", true, &mut never).is_err());
+        assert!(switch_driver("rm -rf", &etc, &usb, "", true, &mut never).is_err());
         assert_eq!(
             headset_card_id(
                 " 0 [Chroma         ]: USB-Audio - Razer Nommo Chroma\n 3 [Headset        ]: xone-gip-headse - Microsoft Xbox Headset\n"
@@ -2196,7 +2267,7 @@ mod tests {
         assert_eq!(driver_in_use(&["xone-wired"]), Some("xone"));
         assert_eq!(driver_in_use(&["xpad"]), Some("xpad"));
         assert_eq!(driver_in_use(&[]), None);
-        std::fs::remove_dir_all(&etc).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// v7 ticket 130: the light rule is VibeConsole's own file with fixed text; install and
