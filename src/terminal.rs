@@ -12341,6 +12341,88 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7 ticket 114: with two Xbox controllers and two keyboards, every one shows the agent
+    /// state at once; the Xbox switch stops only the controllers; an unplugged controller or
+    /// keyboard is dropped and the others keep showing.
+    #[test]
+    fn status_lights_run_on_every_connected_device() {
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-every-dev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for gip in ["gip0.0", "gip1.0"] {
+            let gip = dir.join("leds").join(gip);
+            std::fs::create_dir_all(&gip).unwrap();
+            std::fs::write(gip.join("mode"), "1\n").unwrap();
+            std::fs::write(gip.join("brightness"), "20\n").unwrap();
+        }
+        let mode = |gip: &str| std::fs::read_to_string(dir.join("leds").join(gip).join("mode"));
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        ui.button_light = Some(crate::gamepad::ButtonLight::open(&dir.join("leds")).unwrap());
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let led = |name: &'static str, works: std::sync::Arc<std::sync::atomic::AtomicBool>| {
+            let seen = writes.clone();
+            crate::keyboard::Led::new(
+                name,
+                false,
+                Box::new(move |on| {
+                    if !works.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err(std::io::Error::other("unplugged"));
+                    }
+                    seen.lock().unwrap().push((name, on));
+                    Ok(())
+                }),
+            )
+        };
+        let second = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        ui.lock_lights = Some(crate::keyboard::LockLights::with(vec![
+            led("one", std::sync::Arc::new(true.into())),
+            led("two", second.clone()),
+        ]));
+        let mut patterns = crate::status::DevicePatterns::default();
+        patterns.keyboard_on = true;
+        patterns.keyboard[1] = crate::status::Light::Steady; // needs input
+        ui.device_lights = Some(patterns);
+        ui.agent_states = vec![("claude".into(), "claude".into(), "needs-input")];
+        ui.output = Some(crate::keyboard::Output::recording(&[]).unwrap());
+        ui.suspended = false;
+        ui.show_button_light();
+        ui.show_lock_light();
+        assert_eq!(
+            (mode("gip0.0").unwrap(), mode("gip1.0").unwrap()),
+            ("2".into(), "2".into())
+        );
+        assert_eq!(*writes.lock().unwrap(), [("one", true), ("two", true)]);
+        // The Xbox switch off: both controllers show the plain running light, keyboards stay.
+        ui.device_lights.as_mut().unwrap().on[1] = false;
+        ui.show_button_light();
+        assert_eq!(
+            (mode("gip0.0").unwrap(), mode("gip1.0").unwrap()),
+            ("1".into(), "1".into())
+        );
+        ui.device_lights.as_mut().unwrap().on[1] = true;
+        // One controller and one keyboard unplugged: the others keep showing.
+        std::fs::remove_dir_all(dir.join("leds/gip1.0")).unwrap();
+        second.store(false, std::sync::atomic::Ordering::Relaxed);
+        ui.show_button_light();
+        assert_eq!(mode("gip0.0").unwrap(), "2");
+        assert!(ui.button_light.is_some(), "{}", ui.notice);
+        ui.agent_states[0].2 = "idle";
+        ui.show_lock_light();
+        ui.agent_states[0].2 = "needs-input";
+        ui.show_lock_light();
+        assert!(ui.lock_lights.is_some(), "{}", ui.notice);
+        assert_eq!(writes.lock().unwrap().last(), Some(&("one", true)));
+        drop(ui);
+        assert_eq!(
+            mode("gip0.0").unwrap(),
+            "1",
+            "quit restores the plugged-in one"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// v7 ticket 116: two pads on one saved sequence each keep their own position; an edit
     /// of the saved sequence reaches both and starts them at step 1.
     #[test]

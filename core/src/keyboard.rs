@@ -539,13 +539,23 @@ impl LockLights {
     pub fn names(&self) -> Vec<&str> {
         self.leds.iter().map(|l| l.name.as_str()).collect()
     }
-    /// Light every LED or put it out; nothing is sent when it already shows that.
+    /// Light every LED or put it out; nothing is sent when it already shows that. A keyboard
+    /// whose write fails (unplugged) is dropped and the others keep showing (v7 ticket 114);
+    /// only when none is left is it an error.
     pub fn show(&mut self, on: bool) -> io::Result<()> {
         if self.lit == Some(on) {
             return Ok(());
         }
-        for led in &mut self.leds {
-            (led.write)(on)?;
+        let mut failed = None;
+        self.leds.retain_mut(|led| match (led.write)(on) {
+            Ok(()) => true,
+            Err(e) => {
+                failed = Some(e);
+                false
+            }
+        });
+        if let (Some(error), true) = (failed, self.leds.is_empty()) {
+            return Err(error);
         }
         self.lit = Some(on);
         Ok(())

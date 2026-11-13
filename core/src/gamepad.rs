@@ -1364,9 +1364,22 @@ impl ButtonLight {
             Light::Agent(Pattern::Blink) => "3",
             Light::Agent(Pattern::SlowPulse) => "8",
         };
-        for (dir, ..) in &self.saved {
-            std::fs::write(dir.join("mode"), mode)
-                .map_err(|e| format!("Xbox button light: cannot set {}: {e}", dir.display()))?;
+        // v7 ticket 114: every controller's light; one that fails (unplugged) is dropped and
+        // the others keep showing. Only when none is left is it an error.
+        let mut failed = None;
+        self.saved
+            .retain(|(dir, ..)| match std::fs::write(dir.join("mode"), mode) {
+                Ok(()) => true,
+                Err(e) => {
+                    failed = Some(format!(
+                        "Xbox button light: cannot set {}: {e}",
+                        dir.display()
+                    ));
+                    false
+                }
+            });
+        if let (Some(error), true) = (failed, self.saved.is_empty()) {
+            return Err(error.into());
         }
         self.shown = Some(light);
         Ok(())
