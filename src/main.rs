@@ -162,7 +162,7 @@ fn help(color: bool) -> String {
         }
     }
     out += &format!(
-        "\n{}\n  $ vibeconsole                  # open the session\n  $ vibeconsole configure        # assign a pad\n  $ vibeconsole startup-enable   # run at every login\n\n{}\n  vibeconsole doctor checks your setup; README.md has the full guide.\n",
+        "\n{}\n  $ vibeconsole                  # open the session\n  $ vibeconsole configure        # assign a pad\n  $ vibeconsole startup-enable   # run at every login\n\n{}\n  vibeconsole doctor checks your setup; README-DEVELOPER.md has the full guide.\n",
         paint("1", "EXAMPLES"),
         paint("1", "LEARN MORE")
     );
