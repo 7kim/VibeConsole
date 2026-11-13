@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/devices/mpk-mini-mk3-34.png" width="70%" alt="Akai MPK Mini MK3" />
+  <img src="assets/readme/hero.webp" width="70%" alt="Akai MPK Mini MK3" />
 </p>
 
 ---
