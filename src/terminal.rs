@@ -344,6 +344,9 @@ struct Terminal {
     cc_values: BTreeMap<(u8, u8), u8>,
     bend: Option<(u8, u16)>,
     at_menu: bool,
+    /// v7 ticket 144: a screen that holds the Akai's own port (a program query, a rename, a
+    /// hardware check) is open: only the Xbox controller fires there.
+    akai_owned: bool,
     menu: usize,
     rendered: String,
     rendered_size: (usize, usize),
@@ -857,6 +860,7 @@ impl Terminal {
             cc_values: BTreeMap::new(),
             bend: None,
             at_menu: false,
+            akai_owned: false,
             menu: 1,
             rendered: String::new(),
             rendered_size: (0, 0),
@@ -1252,6 +1256,27 @@ impl Terminal {
         }
         Ok(())
     }
+    /// v7 ticket 144: a command's menus with mapped controls firing, as in `/configure`
+    /// (ticket 112). Entering and leaving are transitions (held keys released, queued presses
+    /// dropped). `akai_owned` is for screens that hold the Akai's own port: there the Akai's
+    /// pads stay silent and only the Xbox fires, and the screen itself suspends output
+    /// before every controller write.
+    fn menu_fires<T>(
+        &mut self,
+        akai_owned: bool,
+        menu: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        self.suspend()?;
+        self.configuring = true;
+        self.akai_owned = akai_owned;
+        let result = menu(self);
+        self.configuring = false;
+        self.akai_owned = false;
+        let left = self.suspend();
+        let result = result?;
+        left?;
+        Ok(result)
+    }
     /// A screen that waits for a press to detect (v7 ticket 112): the press is captured and
     /// fires nothing. Going in is a transition (held keys released); coming out, the next
     /// menu key read resumes output (`resume_configure`).
@@ -1300,7 +1325,7 @@ impl Terminal {
             self.output = Some(crate::keyboard::Output::new(&all)?);
         }
         self.suspended = false;
-        if self.context_verified {
+        if self.context_verified && !self.akai_owned {
             self.connecting = true; // `tick` rebuilds feedback and resumes the keyboard
             Ok(())
         } else {
@@ -1537,7 +1562,7 @@ impl Terminal {
     /// layout (saved buttons over the defaults), active beside any program.
     fn with_gamepad(&self, mappings: &[Mapping]) -> Result<Vec<Mapping>> {
         // v7 ticket 40: until a program is verified, MIDI pads stay out of the keyboard.
-        let mut all = if self.context_verified {
+        let mut all = if self.context_verified && !self.akai_owned {
             mappings.to_vec()
         } else {
             Vec::new()
@@ -2150,8 +2175,14 @@ impl Terminal {
                 "MPK (stored on the controller)",
                 "Xbox controller (saved in VibeConsole)",
             ]);
-            match choose(self, "Rename a program on which device?", &devices)? {
-                Some(1) => return rename_xbox_program(self, &self.path.clone()),
+            let device = self.menu_fires(true, |ui| {
+                choose(ui, "Rename a program on which device?", &devices)
+            })?;
+            match device {
+                Some(1) => {
+                    let path = self.path.clone();
+                    return self.menu_fires(false, |ui| rename_xbox_program(ui, &path));
+                }
                 Some(_) => {}
                 None => return Ok(()),
             }
@@ -2159,27 +2190,32 @@ impl Terminal {
         self.program_connection()?;
         let names = crate::feedback::names(self.input.as_mut().ok_or("MIDI disconnected")?)?;
         self.program_names = names.clone();
-        let Some(context) = choose_at(
-            self,
-            "Rename stored program (current RAM stays unchanged)",
-            &names,
-            self.context as usize,
-        )?
-        else {
-            return Ok(());
-        };
-        let Some(name) = program_name_prompt(self, &names[context])? else {
-            return Ok(());
-        };
-        if choose(
-            self,
-            &format!(
-                "Rename {} to {name:?}?\nOnly the stored name changes. Reselect via /prog-select to refresh current RAM.",
-                names[context]
-            ),
-            &options(&["Cancel", "Rename"]),
-        )? == Some(1)
-        {
+        // v7 ticket 144: the Xbox fires while the names are chosen; the write below runs
+        // with output suspended.
+        let renamed = self.menu_fires(true, |ui| {
+            let Some(context) = choose_at(
+                ui,
+                "Rename stored program (current RAM stays unchanged)",
+                &names,
+                ui.context as usize,
+            )?
+            else {
+                return Ok(None);
+            };
+            let Some(name) = program_name_prompt(ui, &names[context])? else {
+                return Ok(None);
+            };
+            let sure = choose(
+                ui,
+                &format!(
+                    "Rename {} to {name:?}?\nOnly the stored name changes. Reselect via /prog-select to refresh current RAM.",
+                    names[context]
+                ),
+                &options(&["Cancel", "Rename"]),
+            )? == Some(1);
+            Ok(sure.then_some((context, name)))
+        })?;
+        if let Some((context, name)) = renamed {
             crate::feedback::rename(
                 self.input.as_mut().ok_or("MIDI disconnected")?,
                 context as u8 + 1,
@@ -2192,6 +2228,9 @@ impl Terminal {
     }
 
     fn feedback_trial(&mut self) -> Result<()> {
+        self.menu_fires(true, Self::feedback_trial_screens)
+    }
+    fn feedback_trial_screens(&mut self) -> Result<()> {
         use crate::feedback::Settings;
         self.suspend()?;
         self.retry = None;
@@ -8695,7 +8734,11 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
                     tempo: ui.idle.tempo,
                     arp: ui.idle.arp,
                 };
-                let Some(feedback) = feedback_menu(&mut ui, initial, true, true)? else {
+                // v7 ticket 144: the Xbox fires while the values are chosen; the save and
+                // the controller write after it run with output suspended.
+                let Some(feedback) =
+                    ui.menu_fires(true, |ui| feedback_menu(ui, initial, true, true))?
+                else {
                     return Ok(());
                 };
                 let idle = crate::feedback::Settings {
@@ -8707,11 +8750,13 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
                     arp: feedback.arp,
                 }
                 .validate()?;
-                if choose(
-                    &mut ui,
-                    &format!("Save idle feedback: {feedback}?"),
-                    &options(&["Cancel", "Save"]),
-                )? == Some(1)
+                if ui.menu_fires(true, |ui| {
+                    choose(
+                        ui,
+                        &format!("Save idle feedback: {feedback}?"),
+                        &options(&["Cancel", "Save"]),
+                    )
+                })? == Some(1)
                 {
                     ui.retry = None;
                     ui.connecting = false;
@@ -8740,14 +8785,19 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
                     crate::feedback::names(ui.input.as_mut().ok_or("MIDI disconnected")?)?;
                 ui.program_names = contexts.clone();
                 let selected_program = usize::from(ui.context);
-                if let Some(context) = choose_at(
-                    &mut ui,
-                    "/prog-select — select the actual hardware preset.
+                // v7 ticket 144: the Xbox fires while the program is chosen; the selection
+                // below writes to the controller with output suspended.
+                let picked = ui.menu_fires(true, |ui| {
+                    choose_at(
+                        ui,
+                        "/prog-select — select the actual hardware preset.
 Selection replaces current RAM with the stored preset.
 Running/paused mode is retained; held keys and toggles start inactive.",
-                    &contexts,
-                    selected_program,
-                )? {
+                        &contexts,
+                        selected_program,
+                    )
+                })?;
+                if let Some(context) = picked {
                     ui.context_verified = false;
                     ui.feedback_allowed = false;
                     let input = ui
@@ -8803,10 +8853,10 @@ Running/paused mode is retained; held keys and toggles start inactive.",
                 );
                 Ok(())
             })(),
-            17 => (|| { ui.suspend()?; agents_menu(&mut ui, path) })(),
+            17 => ui.menu_fires(false, |ui| agents_menu(ui, path)),
             18 => (|| {
-                ui.suspend()?;
-                let shown = settings_menu(&mut ui, path);
+                // v7 ticket 144: mapped controls fire in Settings, as in /configure.
+                let shown = ui.menu_fires(false, |ui| settings_menu(ui, path));
                 // A preset (or anything else in Settings) may have replaced the mappings:
                 // pick them up, so resuming is a transition, never a stale set.
                 let config = mappings::load_config(path)?;
@@ -15206,6 +15256,64 @@ mod tests {
         assert_eq!(
             ran.recv_timeout(Duration::from_secs(2)).unwrap(),
             Action::MicrophoneMute
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 144: Settings and Agents fire mapped controls like `/configure`; the screens
+    /// that hold the Akai's own port keep the Akai's pads silent (only the Xbox fires there);
+    /// entering and leaving release held keys and the first press after leaving doesn't fire.
+    #[test]
+    fn menus_fire_in_settings_and_agents_and_only_the_xbox_in_the_akai_screens() {
+        let (dir, mut ui, ran, [mute, _, _, shift]) = configure_session("menus-fire");
+        // Settings, Agents: the Akai pad fires.
+        ui.script = Some(Play {
+            steps: VecDeque::from([tap(mute)]),
+            ..Play::default()
+        });
+        // (The action runs on a worker; leaving cancels what is still pending, so wait inside.)
+        ui.menu_fires(false, |ui| {
+            ui.key()?;
+            assert!(
+                ran.recv_timeout(Duration::from_secs(2)).is_ok(),
+                "settings: fires"
+            );
+            Ok(())
+        })
+        .unwrap();
+        // Leaving paused output: a press on the next screen does not fire (no replay).
+        assert!(ui.suspended);
+        ui.script.as_mut().unwrap().steps.push_back(tap(mute));
+        ui.key().unwrap();
+        assert!(
+            ran.recv_timeout(Duration::from_millis(300)).is_err(),
+            "left: silent"
+        );
+        // The Akai-port screens: the pad is silent and the Akai is out of the keyboard.
+        ui.script.as_mut().unwrap().steps.push_back(tap(mute));
+        ui.menu_fires(true, |ui| {
+            ui.key()?;
+            assert!(ui.with_gamepad(&ui.run_mappings).unwrap().is_empty());
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            ran.recv_timeout(Duration::from_millis(300)).is_err(),
+            "akai screen: silent"
+        );
+        assert!(!ui.akai_owned && !ui.configuring);
+        // Held keys are released on entering a screen.
+        ui.suspended = false;
+        ui.reload_keyboard().unwrap(); // as `run_mode` does after the command
+        ui.handle_events(vec![Event::Press(shift)]).unwrap();
+        assert_eq!(shifts(&ui), 1);
+        ui.menu_fires(false, |_| Ok(())).unwrap();
+        let recorded = &ui.output.as_ref().unwrap().recorded;
+        assert!(
+            recorded
+                .iter()
+                .any(|(key, down)| *key == evdev::KeyCode::KEY_LEFTSHIFT && !down),
+            "shift released"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
