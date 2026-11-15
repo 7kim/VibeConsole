@@ -118,6 +118,11 @@ trait Ui {
     fn applications(&self) -> Result<Vec<(String, String)>> {
         crate::actions::catalog()
     }
+    /// An assignment was saved or removed inside `/configure` (v7 ticket 112): the session
+    /// uses it from the next press.
+    fn applied(&mut self) -> Result<()> {
+        Ok(())
+    }
     /// The first control pressed (a note or an Xbox button) or moved (a CC or pitch bend).
     fn learn(&mut self) -> Result<Option<Control>>;
     /// "Learn an Xbox button" (v7 ticket 45): like `learn`, under its own title.
@@ -316,6 +321,13 @@ struct Terminal {
     run_mappings: Vec<Mapping>,
     wanted_run: bool,
     suspended: bool,
+    /// v7 ticket 112: inside `/configure` mapped controls fire in its menus (`configuring`),
+    /// except on a screen that waits for a press to detect (`detecting`).
+    configuring: bool,
+    detecting: bool,
+    /// Tests only: scripted keys and controller events instead of stdin.
+    #[cfg(test)]
+    script: Option<tests::Play>,
     retry: Option<Instant>,
     connecting: bool,
     reconnected: bool,
@@ -823,6 +835,10 @@ impl Terminal {
             run_mappings: Vec::new(),
             wanted_run: false,
             suspended: false,
+            configuring: false,
+            detecting: false,
+            #[cfg(test)]
+            script: None,
             retry: None,
             connecting: false,
             reconnected: false,
@@ -1208,6 +1224,82 @@ impl Terminal {
         Ok(())
     }
 
+    /// `/configure` from the command list. Entering and leaving are transitions: held keys
+    /// are released and the keyboard takes the saved mappings afresh.
+    fn configure(&mut self, path: &Path, current: &mut Vec<Mapping>) -> Result<()> {
+        self.suspend()?;
+        self.configuring = true;
+        let result = configure(self, path, current);
+        self.configuring = false;
+        let left = self.suspend(); // its menus ran mappings (v7 ticket 112)
+        result?;
+        left?;
+        // A reassigned pad must not keep its old action's status.
+        self.phases.clear();
+        self.probed.clear();
+        self.run_mappings = self.context_mappings(current);
+        let all = self.with_gamepad(&self.run_mappings)?;
+        if let Some(output) = &mut self.output {
+            output.keyboard.replace(&all)?;
+        }
+        Ok(())
+    }
+    /// A screen that waits for a press to detect (v7 ticket 112): the press is captured and
+    /// fires nothing. Going in is a transition (held keys released); coming out, the next
+    /// menu key read resumes output (`resume_configure`).
+    fn detecting<T>(&mut self, screen: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        self.suspend()?;
+        self.detecting = true;
+        let result = screen(self);
+        self.detecting = false;
+        result
+    }
+    /// v7 ticket 112: a `/configure` menu is about to read a key and output is suspended
+    /// (configure was just opened, a Learn step ended, or an assignment was saved): the
+    /// keyboard takes the saved mappings afresh and runs again, as after any transition.
+    fn resume_configure(&mut self) -> Result<()> {
+        if !(self.configuring && !self.detecting && self.suspended)
+            || !self.wanted_run
+            || self.flow_pending
+        {
+            return Ok(());
+        }
+        // Still suspended: presses queued meanwhile (a Learn screen, the editor) are read
+        // and dropped here, so none fires once output runs. No replay.
+        self.tick()?;
+        if !(self.suspended && self.wanted_run) {
+            return Ok(()); // the tick paused
+        }
+        let config = mappings::load_config(&self.path)?;
+        let mappings = self.context_mappings(&config.mappings);
+        if mappings.iter().any(|m| m.input == mappings::Input::Piano) {
+            // ponytail: piano mappings need Run's confirmation dialog, so with one saved
+            // configure stays silent as before; ask once per visit if that is ever wanted.
+            self.configuring = false;
+            return Ok(());
+        }
+        // A reassigned pad must not keep its old action's status.
+        self.phases.clear();
+        self.probed.clear();
+        self.run_mappings = mappings;
+        if self.output.is_none() {
+            // Run had nothing to fire yet (as `run_mode`): the first saved mapping needs
+            // the keyboard.
+            let all = self.with_gamepad(&self.run_mappings)?;
+            if all.is_empty() {
+                return Ok(());
+            }
+            self.output = Some(crate::keyboard::Output::new(&all)?);
+        }
+        self.suspended = false;
+        if self.context_verified {
+            self.connecting = true; // `tick` rebuilds feedback and resumes the keyboard
+            Ok(())
+        } else {
+            self.reload_keyboard() // unverified: the Xbox layout alone (ticket 40)
+        }
+    }
+
     fn release_all(&mut self) -> Result<()> {
         self.cancel_actions();
         self.holds.clear();
@@ -1444,6 +1536,11 @@ impl Terminal {
         };
         if self.gamepad.is_some() {
             all.extend(self.xbox_layout()?);
+        }
+        if self.configuring {
+            // v7 ticket 112: Shift, Ctrl, Alt or Super alone never fire inside configure.
+            let modifiers = &mappings::key_groups()[0].1;
+            all.retain(|m| m.keys.is_empty() || !m.keys.iter().all(|k| modifiers.contains(k)));
         }
         Ok(all)
     }
@@ -2934,7 +3031,6 @@ Changing musical settings while running is unsupported.",
     }
 
     fn learn_motion(&mut self, knob: bool) -> Result<Option<Learned>> {
-        self.suspend()?;
         let relative = if knob {
             match choose(self, "Knob mode", &options(&["Absolute", "Relative"]))? {
                 Some(mode) => mode == 1,
@@ -3132,8 +3228,7 @@ Changing musical settings while running is unsupported.",
     }
 
     fn learn_note(&mut self, piano: bool, title: &str) -> Result<Option<Control>> {
-        self.suspend()?;
-        if self.input.is_none() {
+        if self.input.is_none() && !self.scripted() {
             match self.open_input() {
                 Ok(input) => self.input = Some(input),
                 // An Xbox button can still be learned without a MIDI device.
@@ -3148,7 +3243,7 @@ Changing musical settings while running is unsupported.",
         let mut learned = None;
         loop {
             self.draw(&format!("{title}: press then release one control (or move a knob or the joystick).\nTurn arpeggiator OFF for piano input; hold/release must be observed.\nCC/Program Change pad mode is unsupported. Esc cancels.\n{}", self.last_event))?;
-            if self.input.is_none() && self.gamepad.is_none() {
+            if self.input.is_none() && self.gamepad.is_none() && !self.scripted() {
                 return Err(self.error.clone().into());
             }
             if learned.is_none() {
@@ -3181,6 +3276,7 @@ Changing musical settings while running is unsupported.",
                         .as_ref()
                         .is_some_and(|pad| pad.down.contains(&control));
                 if !held {
+                    self.detecting = false; // v7 ticket 112: detection is over; a menu again
                     if choose(
                         self,
                         &format!(
@@ -3207,6 +3303,14 @@ Changing musical settings while running is unsupported.",
                 return Ok(None);
             }
         }
+    }
+
+    /// Tests script the controller's events (`script`); then no real device is opened.
+    fn scripted(&self) -> bool {
+        #[cfg(test)]
+        return self.script.is_some();
+        #[cfg(not(test))]
+        false
     }
 
     fn byte(&self, timeout: i32) -> Result<Option<u8>> {
@@ -3370,7 +3474,12 @@ impl Ui for Terminal {
         self.screen("").details_size(size.0, size.1).0 + 5
     }
     fn key(&mut self) -> Result<Option<Key>> {
+        self.resume_configure()?;
         self.tick()?;
+        #[cfg(test)]
+        if self.script.is_some() {
+            return self.scripted_key();
+        }
         let key = match self.byte(50)? {
             Some(b'\n' | b'\r') => Some(Key::Enter),
             Some(b' ') => Some(Key::Space),
@@ -3407,25 +3516,26 @@ impl Ui for Terminal {
         )
     }
     fn record(&mut self) -> Result<Vec<String>> {
-        self.suspend()?;
-        self.draw("Recording for up to 60 seconds. Release all keys, then press and release ONE chord.\nPhysical shortcuts also reach the desktop. Escape is recordable; Ctrl+C quits (select it via menus).\nCapture closes before Use / Record again / Cancel.")?;
-        let mut capture = crate::recording::Capture::open()?;
-        let result = (|| {
-            loop {
-                self.tick()?;
-                if let Some(keys) = capture.poll()? {
-                    return Ok(keys);
+        self.detecting(|ui| {
+            ui.draw("Recording for up to 60 seconds. Release all keys, then press and release ONE chord.\nPhysical shortcuts also reach the desktop. Escape is recordable; Ctrl+C quits (select it via menus).\nCapture closes before Use / Record again / Cancel.")?;
+            let mut capture = crate::recording::Capture::open()?;
+            let result = (|| {
+                loop {
+                    ui.tick()?;
+                    if let Some(keys) = capture.poll()? {
+                        return Ok(keys);
+                    }
+                    ui.byte(20)?; // discard terminal text; physical events supply identities
                 }
-                self.byte(20)?; // discard terminal text; physical events supply identities
+            })();
+            drop(capture);
+            // Discard pass-through bytes on success, cancellation, and capture failures.
+            // SAFETY: borrowed terminal descriptor, flush input only.
+            unsafe {
+                libc::tcflush(0, libc::TCIFLUSH);
             }
-        })();
-        drop(capture);
-        // Discard pass-through bytes on success, cancellation, and capture failures.
-        // SAFETY: borrowed terminal descriptor, flush input only.
-        unsafe {
-            libc::tcflush(0, libc::TCIFLUSH);
-        }
-        result
+            result
+        })
     }
     fn context(&self) -> u8 {
         self.context
@@ -3460,20 +3570,28 @@ Labels assigned to other controls in this program are omitted.",
         )?
         .map(|i| labels[i].clone()))
     }
+    fn applied(&mut self) -> Result<()> {
+        if self.configuring {
+            self.suspend()?; // a transition; the next menu key read resumes on the new set
+        }
+        Ok(())
+    }
+    // ponytail: knob and joystick learning stay silent from start to end (their menus sit
+    // between controller writes), so they still need the keyboard's Enter.
     fn learn_knob(&mut self) -> Result<Option<Learned>> {
-        self.learn_motion(true)
+        self.detecting(|ui| ui.learn_motion(true))
     }
     fn learn_joystick(&mut self) -> Result<Option<Learned>> {
-        self.learn_motion(false)
+        self.detecting(|ui| ui.learn_motion(false))
     }
     fn learn(&mut self) -> Result<Option<Control>> {
-        self.learn_note(false, "Learn a pad in either bank")
+        self.detecting(|ui| ui.learn_note(false, "Learn a pad in either bank"))
     }
     fn learn_button(&mut self) -> Result<Option<Control>> {
-        self.learn_note(false, "Learn an Xbox button")
+        self.detecting(|ui| ui.learn_note(false, "Learn an Xbox button"))
     }
     fn learn_piano(&mut self) -> Result<Option<Control>> {
-        self.learn_note(true, "Learn a piano key")
+        self.detecting(|ui| ui.learn_note(true, "Learn a piano key"))
     }
 }
 
@@ -7721,6 +7839,7 @@ fn configure_steps(
                     .map_err(stage("validation"))?;
                     commit(path, current, pad, pad_context, Some(silent), profile)
                         .map_err(stage("file I/O"))?;
+                    ui.applied().map_err(stage("controller I/O"))?;
                 }
                 continue;
             }
@@ -7736,6 +7855,7 @@ fn configure_steps(
             {
                 commit(path, current, pad, pad_context, None, profile)
                     .map_err(stage("file I/O"))?;
+                ui.applied().map_err(stage("controller I/O"))?;
             }
             continue;
         }
@@ -8060,6 +8180,7 @@ fn configure_steps(
             Some(choice @ (0 | 1)) => {
                 commit(path, current, pad, mapping.context, Some(mapping), profile)
                     .map_err(stage("file I/O"))?;
+                ui.applied().map_err(stage("controller I/O"))?;
                 if choice == 1 {
                     return Ok(());
                 }
@@ -8349,19 +8470,7 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
         ui.at_menu = false;
         let was_running = ui.wanted_run;
         let result = match command {
-            0 => (|| {
-                ui.suspend()?;
-                configure(&mut ui, path, &mut current)?;
-                // A reassigned pad must not keep its old action's status.
-                ui.phases.clear();
-                ui.probed.clear();
-                ui.run_mappings = ui.context_mappings(&current);
-                let all = ui.with_gamepad(&ui.run_mappings)?;
-                if let Some(output) = &mut ui.output {
-                    output.keyboard.replace(&all)?;
-                }
-                Ok(())
-            })(),
+            0 => ui.configure(path, &mut current),
             1 if ui.wanted_run => ui.pause(),
             1 if !ui.context_verified => choose(
                 &mut ui,
@@ -14511,6 +14620,204 @@ mod tests {
         agents_menu(&mut ui, &path).unwrap();
         assert!(ui.keys.is_empty());
         assert!(!prompts.join("review").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 112's seam: a real `Terminal` driven by scripted keys and simulated
+    /// controller events. Keys VibeConsole types (recorded, never sent to the desktop) come
+    /// back as menu keys, as they would through the focused terminal.
+    pub(super) enum Step {
+        Key(Key),
+        Events(Vec<Event>),
+    }
+    #[derive(Default)]
+    pub(super) struct Play {
+        steps: VecDeque<Step>,
+        typed: VecDeque<Key>,
+        seen: usize,
+        screens: Vec<String>,
+    }
+    impl Terminal {
+        pub(super) fn scripted_key(&mut self) -> Result<Option<Key>> {
+            use evdev::KeyCode;
+            let mut play = self.script.take().unwrap();
+            play.screens.push(self.rendered.clone());
+            if let Some(output) = &self.output {
+                for (key, down) in output.recorded.iter().skip(play.seen) {
+                    match (*key, *down) {
+                        (KeyCode::KEY_DOWN, true) => play.typed.push_back(Key::Down),
+                        (KeyCode::KEY_ENTER, true) => play.typed.push_back(Key::Enter),
+                        _ => {}
+                    }
+                }
+                play.seen = output.recorded.len();
+            }
+            let step = match play.typed.pop_front() {
+                Some(key) => Step::Key(key),
+                None => play.steps.pop_front().unwrap_or_else(|| {
+                    panic!("script exhausted at:\n{}", self.rendered);
+                }),
+            };
+            self.script = Some(play);
+            match step {
+                Step::Key(key) => Ok(Some(key)),
+                Step::Events(events) => self.handle_events(events).map(|()| None),
+            }
+        }
+    }
+    /// A running session on Program 1 with a recording keyboard: pads A (Output mute),
+    /// B (Down), C (Enter) and D (Shift, held).
+    fn configure_session(
+        name: &str,
+    ) -> (
+        PathBuf,
+        Terminal,
+        std::sync::mpsc::Receiver<crate::actions::Action>,
+        [Control; 4],
+    ) {
+        let dir = std::env::temp_dir().join(format!("vibeconsole-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let pads = [36, 37, 38, 39].map(|note| Control::from_note(10, note).unwrap());
+        mappings::save(
+            &path,
+            &[
+                Mapping::new_action(
+                    pads[0],
+                    mappings::Input::Pad,
+                    crate::actions::Action::OutputMute,
+                )
+                .unwrap(),
+                Mapping::new(pads[1], "Down", "tap").unwrap(),
+                Mapping::new(pads[2], "Enter", "tap").unwrap(),
+                Mapping::new(pads[3], "Shift", "hold").unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        let (sent, ran) = std::sync::mpsc::channel();
+        ui.actions = crate::actions::Dispatcher::with(move |action, _, _| {
+            sent.send(action.clone()).unwrap();
+            Ok("done".into())
+        });
+        ui.run_mappings = ui.context_mappings(&mappings::load_config(&path).unwrap().mappings);
+        let mut output = crate::keyboard::Output::recording(&ui.run_mappings).unwrap();
+        output.keyboard.resume();
+        ui.output = Some(output);
+        ui.wanted_run = true;
+        ui.suspended = false;
+        (dir, ui, ran, pads)
+    }
+    fn tap(pad: Control) -> Step {
+        Step::Events(vec![
+            Event::Press(pad),
+            Event::Release(pad, crate::ReleaseType::NoteOff),
+        ])
+    }
+    fn shifts(ui: &Terminal) -> usize {
+        let recorded = &ui.output.as_ref().unwrap().recorded;
+        recorded
+            .iter()
+            .filter(|(key, down)| *key == evdev::KeyCode::KEY_LEFTSHIFT && *down)
+            .count()
+    }
+
+    /// v7 ticket 112: in `/configure`'s menus a mapped pad fires, and pads mapped to Down and
+    /// Enter drive the menu with no keyboard; on the Learn screen the same press is learned
+    /// and fires nothing; a Shift-only pad fires in Run but not inside configure.
+    #[test]
+    fn mapped_controls_fire_in_configure_menus_but_not_while_learning() {
+        use crate::actions::Action;
+        let (dir, mut ui, ran, [mute, down, enter, shift]) = configure_session("configure-fires");
+        let path = dir.join("mappings.tsv");
+        ui.handle_events(vec![
+            Event::Press(shift),
+            Event::Release(shift, crate::ReleaseType::NoteOff),
+        ])
+        .unwrap();
+        assert_eq!(shifts(&ui), 1, "Shift fires in Run");
+        ui.script = Some(Play {
+            steps: VecDeque::from([
+                tap(mute),                              // Configure menu: fires
+                tap(shift),                             // modifier-only: silent here
+                tap(enter),                             // confirms "Learn a pad"
+                Step::Events(vec![Event::Press(mute)]), // learned, fires nothing
+                Step::Events(vec![Event::Release(mute, crate::ReleaseType::NoteOff)]),
+                tap(down),              // to "Use observed control"
+                tap(enter),             // confirms it
+                Step::Key(Key::Escape), // back out of the assignment
+                Step::Key(Key::Escape), // leave configure
+            ]),
+            ..Play::default()
+        });
+        let mut current = mappings::load_config(&path).unwrap().mappings;
+        ui.configure(&path, &mut current).unwrap();
+        let play = ui.script.take().unwrap();
+        assert!(play.steps.is_empty(), "every step was read");
+        let screens = play.screens.join("\n");
+        assert!(
+            screens.contains("Learn a pad in either bank"),
+            "Enter pad opened Learn"
+        );
+        assert!(
+            screens.contains("Observed press/release"),
+            "the press was learned"
+        );
+        assert!(
+            screens.contains("Already assigned"),
+            "Down then Enter pads confirmed it"
+        );
+        assert_eq!(
+            ran.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Action::OutputMute
+        );
+        assert!(
+            ran.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the press on the Learn screen fired nothing"
+        );
+        assert_eq!(shifts(&ui), 1, "Shift stayed silent inside configure");
+        // Back in Run (the session resumes after the menu), Shift fires again.
+        ui.suspended = false;
+        ui.reload_keyboard().unwrap();
+        ui.handle_events(vec![Event::Press(shift)]).unwrap();
+        assert_eq!(shifts(&ui), 2, "Shift fires in Run after configure");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 112: the gate every detecting screen shares (Learn an Xbox button, knob and
+    /// joystick learning and shortcut capture can't be scripted: they open real devices).
+    /// Nothing fires inside it, the next menu key read fires again, and a saved assignment
+    /// applies from the next press.
+    #[test]
+    fn nothing_fires_on_a_detecting_screen_and_menus_fire_again_after() {
+        use crate::actions::Action;
+        let (dir, mut ui, ran, [mute, ..]) = configure_session("configure-detecting");
+        ui.configuring = true;
+        ui.script = Some(Play {
+            steps: VecDeque::from([tap(mute), tap(mute)]),
+            ..Play::default()
+        });
+        ui.detecting(|ui| ui.key()).unwrap();
+        assert!(
+            ran.recv_timeout(Duration::from_millis(300)).is_err(),
+            "detecting: silent"
+        );
+        ui.key().unwrap();
+        assert!(
+            ran.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "menu: fires"
+        );
+        // A saved assignment applies at once: the next press runs the new action.
+        let mic = Mapping::new_action(mute, mappings::Input::Pad, Action::MicrophoneMute);
+        mappings::save(&dir.join("mappings.tsv"), &[mic.unwrap()]).unwrap();
+        ui.applied().unwrap();
+        ui.script.as_mut().unwrap().steps.push_back(tap(mute));
+        ui.key().unwrap();
+        assert_eq!(
+            ran.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Action::MicrophoneMute
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
