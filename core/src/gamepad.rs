@@ -822,12 +822,18 @@ pub fn retune(
 /// v7 ticket 27: whether headset audio through the controller's 3.5 mm jack can work, from
 /// which driver holds the controller (`bound`: driver names with a device bound) and ALSA's
 /// card list. Only `xone` carries controller audio; VibeConsole never loads or unloads a
-/// kernel module, it only says what it found.
-pub fn headset_status(bound: &[&str], cards: &str) -> String {
+/// kernel module, it only says what it found. v7 ticket 107: `bluetooth` is a controller on
+/// Bluetooth; its firmware carries no headset audio there (github.com/atar-axis/xpadneo README:
+/// "the firmware doesn't support audio in Bluetooth mode").
+pub fn headset_status(bound: &[&str], cards: &str, bluetooth: bool) -> String {
     let xone = bound.iter().any(|d| d.starts_with("xone"));
     let xpad = bound.contains(&"xpad");
     let audio = headset_card(cards);
     match (xone, xpad, audio) {
+        (false, false, _) if bluetooth => "Xbox headset audio: unavailable: the controller is on \
+             Bluetooth, and its firmware carries no headset audio over Bluetooth; connect it by \
+             USB cable with the xone driver"
+            .into(),
         (true, _, true) => "Xbox headset audio: available (xone driver, controller audio device present)".into(),
         (true, _, false) => {
             "Xbox headset audio: unavailable: xone is bound but no controller audio device is present \
@@ -854,11 +860,31 @@ pub fn bound_drivers() -> Vec<&'static str> {
         })
         .collect()
 }
-/// The real inputs for `headset_status`: drivers in /sys with a device bound, and
-/// /proc/asound/cards.
+/// The real inputs for `headset_status`: drivers in /sys with a device bound,
+/// /proc/asound/cards, and whether an Xbox controller is on Bluetooth.
 pub fn headset() -> String {
     let cards = std::fs::read_to_string("/proc/asound/cards").unwrap_or_default();
-    headset_status(&bound_drivers(), &cards)
+    let bluetooth = bluetooth_xbox(std::path::Path::new("/sys/class/input"));
+    headset_status(&bound_drivers(), &cards, bluetooth)
+}
+/// v7 ticket 107: an input device in `dir` (/sys/class/input) named Xbox on bus 0005
+/// (Bluetooth, linux/input.h `BUS_BLUETOOTH`).
+pub fn bluetooth_xbox(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries.flatten().any(|e| {
+            let read = |f: &str| std::fs::read_to_string(e.path().join(f)).unwrap_or_default();
+            read("id/bustype").trim() == "0005" && read("name").to_lowercase().contains("xbox")
+        })
+    })
+}
+/// v7 ticket 107: how a controller is connected, from its gilrs uuid. On Linux gilrs builds
+/// it SDL-style, the bus type first, little-endian (gilrs-core 0.6.8 `create_uuid`).
+pub fn connection(uuid: [u8; 16]) -> String {
+    match u16::from_le_bytes([uuid[0], uuid[1]]) {
+        0x03 => "USB".into(),
+        0x05 => "Bluetooth".into(),
+        bus => format!("bus {bus:#06x}"),
+    }
 }
 /// v7 ticket 129: which driver holds the controller now, from `bound_drivers`.
 pub fn driver_in_use(bound: &[&str]) -> Option<&'static str> {
@@ -1439,6 +1465,13 @@ impl Pad {
         self.gilrs
             .gamepads()
             .map(|(_, pad)| pad.name().to_owned())
+            .collect()
+    }
+    /// Each controller's name with its connection (v7 ticket 107), for `doctor`.
+    pub fn connections(&self) -> Vec<String> {
+        self.gilrs
+            .gamepads()
+            .map(|(_, pad)| format!("{} ({})", pad.name(), connection(pad.uuid())))
             .collect()
     }
 }
@@ -2064,13 +2097,106 @@ mod tests {
     fn headset_audio_is_reported_from_the_driver_and_cards_never_guessed() {
         let cards = " 0 [M3 ]: USB-Audio - MPK mini 3\n";
         let xbox_card = " 5 [Controller ]: XboxGIP - Xbox Wireless Controller audio\n";
-        assert!(headset_status(&[], cards).contains("no Xbox controller"));
-        assert!(headset_status(&["xpad"], cards).contains("needs the xone driver"));
-        assert!(headset_status(&["xone-wired"], cards).contains("no controller audio device"));
+        assert!(headset_status(&[], cards, false).contains("no Xbox controller"));
+        assert!(headset_status(&["xpad"], cards, false).contains("needs the xone driver"));
         assert!(
-            headset_status(&["xone-wired"], &format!("{cards}{xbox_card}")).contains("available")
+            headset_status(&["xone-wired"], cards, false).contains("no controller audio device")
         );
-        assert!(headset_status(&["xpad"], xbox_card).contains("needs the xone driver"));
+        assert!(
+            headset_status(&["xone-wired"], &format!("{cards}{xbox_card}"), false)
+                .contains("available")
+        );
+        assert!(headset_status(&["xpad"], xbox_card, false).contains("needs the xone driver"));
+        // v7 ticket 107: on Bluetooth only, never available, and the reason says why.
+        let bluetooth = headset_status(&[], cards, true);
+        assert!(
+            bluetooth.contains("unavailable: the controller is on Bluetooth"),
+            "{bluetooth}"
+        );
+        // A USB controller on xone with its audio card still counts, Bluetooth or not.
+        assert!(headset_status(&["xone-wired"], xbox_card, true).contains(": available"),);
+    }
+
+    /// v7 ticket 107: `doctor` names each controller's connection from its gilrs uuid, and the
+    /// headset check finds a Bluetooth Xbox controller in /sys/class/input (fixture files).
+    #[test]
+    fn bluetooth_controllers_are_named_and_found_in_sysfs() {
+        let uuid = |bus: u8| {
+            let mut id = [0; 16];
+            id[0] = bus;
+            id
+        };
+        assert_eq!(connection(uuid(0x03)), "USB");
+        assert_eq!(connection(uuid(0x05)), "Bluetooth");
+        assert_eq!(connection(uuid(0x06)), "bus 0x0006");
+        let dir = std::env::temp_dir().join(format!("vibeconsole-input-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = |name: &str, bus: &str, label: &str| {
+            let id = dir.join(name).join("id");
+            std::fs::create_dir_all(&id).unwrap();
+            std::fs::write(id.join("bustype"), format!("{bus}\n")).unwrap();
+            std::fs::write(dir.join(name).join("name"), format!("{label}\n")).unwrap();
+        };
+        assert!(!bluetooth_xbox(&dir), "no folder: nothing found");
+        device("input3", "0003", "Microsoft X-Box One pad");
+        device("input9", "0005", "HyperX Cloud III S");
+        assert!(
+            !bluetooth_xbox(&dir),
+            "USB Xbox and a Bluetooth headset aren't it"
+        );
+        device("input43", "0005", "Xbox Wireless Controller");
+        assert!(bluetooth_xbox(&dir));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// v7 ticket 107: a Bluetooth drop is the same gilrs Disconnected as an unplug: the held
+    /// key is released, the release from before the drop sends nothing, and after reconnecting
+    /// the first press fires once.
+    #[test]
+    fn a_bluetooth_drop_releases_held_keys_and_the_first_press_after_reconnect_fires() {
+        use evdev::KeyCode;
+        let mut keyboard = crate::keyboard::Keyboard::new(&layout(&[])).unwrap();
+        let mut sent = Vec::new();
+        let mut down = HashSet::new();
+        let a = Kind::Pressed(gilrs::Button::South);
+        let up = Kind::Released(gilrs::Button::South);
+        let pad = "Xbox Wireless Controller";
+        let mut feed = |kind,
+                        down: &mut HashSet<Control>,
+                        keyboard: &mut crate::keyboard::Keyboard,
+                        sent: &mut Vec<_>| {
+            let mut emit = |key, on| {
+                sent.push((key, on));
+                Ok(())
+            };
+            match change(down, kind, pad) {
+                Some(Change::Event(event)) => {
+                    keyboard.observe(event, &mut emit).unwrap();
+                }
+                // The session's transition (gamepad_transition): every held key released.
+                Some(Change::Disconnected(_) | Change::Connected(_)) => {
+                    keyboard.clear(&mut emit).unwrap();
+                }
+                None => {}
+            }
+        };
+        feed(a, &mut down, &mut keyboard, &mut sent);
+        feed(Kind::Disconnected, &mut down, &mut keyboard, &mut sent);
+        assert_eq!(
+            sent,
+            [(KeyCode::KEY_ENTER, true), (KeyCode::KEY_ENTER, false)]
+        );
+        assert!(down.is_empty());
+        sent.clear();
+        feed(up, &mut down, &mut keyboard, &mut sent);
+        feed(Kind::Connected, &mut down, &mut keyboard, &mut sent);
+        assert!(sent.is_empty(), "nothing replays: {sent:?}");
+        feed(a, &mut down, &mut keyboard, &mut sent);
+        feed(up, &mut down, &mut keyboard, &mut sent);
+        assert_eq!(
+            sent,
+            [(KeyCode::KEY_ENTER, true), (KeyCode::KEY_ENTER, false)]
+        );
     }
 
     /// v7 ticket 108: the controller's speaker and mic are found in `pw-dump` by their card;

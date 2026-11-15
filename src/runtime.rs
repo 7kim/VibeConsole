@@ -344,8 +344,8 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                 Err(e) => println!("MIDI unavailable: {e}"),
             }
             match crate::gamepad::Pad::open() {
-                Ok(pad) => match pad.connected().as_slice() {
-                    [] => println!("Xbox controllers: none connected (USB)"),
+                Ok(pad) => match pad.connections().as_slice() {
+                    [] => println!("Xbox controllers: none connected (USB or Bluetooth)"),
                     names => println!("Xbox controllers: {}", names.join(", ")),
                 },
                 Err(e) => println!("Xbox controllers: {e}"),
