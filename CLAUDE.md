@@ -36,7 +36,7 @@ Rules:
 
 ## Start here
 
-- Before implementation, debugging or changing scope, read the highest version's spec (`docs/<version>/spec/`) and its tickets. [docs/README.md](docs/README.md) lists the versions.
+- Before implementation, debugging or changing scope, read from the highest version's spec (`docs/<version>/spec/`) its **Safety Rules** and the sections the task touches, then the ticket being worked on and its blockers. Don't read the other tickets: find them with `ls` and `grep Status:`. [docs/README.md](docs/README.md) lists the versions.
 - Each spec restates the Project rules it relies on, under **Safety Rules** (`/to-spec` does it). A spec may change a rule only with the user's agreement, and says so.
 - Recorded hardware limitations are under "Known limitations" in [docs/README.md](docs/README.md). Don't reopen them unless a ticket asks.
 - V1–V6 tickets and tests are in `archive/tickets/` and `archive/tests/`. Read them for history; don't add to them.
