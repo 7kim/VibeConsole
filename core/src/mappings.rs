@@ -830,7 +830,18 @@ pub fn profile_request(config: &Config, app: &str, wish: &str) -> Result<String>
         .filter(|m| m.input == Input::Pad && !m.feedback.enabled())
         .take(2)
         .cloned()
-        .collect::<Vec<_>>();
+        .zip(["Ctrl+T", "Ctrl+W"])
+        .map(|(mut m, keys)| {
+            // v7 ticket 104: the example always shows a plain shortcut, so Claude copies a
+            // field-14 value that parses; a launcher or knob row made it invent one.
+            m.action = crate::actions::Action::Shortcut;
+            m.keys = parse_shortcut(keys)?;
+            m.behavior = Behavior::Hold;
+            m.risky = false;
+            m.status = false;
+            Ok(m)
+        })
+        .collect::<Result<Vec<_>>>()?;
     if overrides.is_empty() {
         let pad = Control::from_note(10, 36).ok_or("example pad")?;
         overrides.push(Mapping::new(pad, "Ctrl+T", "hold")?);
@@ -847,7 +858,8 @@ pub fn profile_request(config: &Config, app: &str, wish: &str) -> Result<String>
         .collect::<Vec<_>>()
         .join("\n");
     Ok(format!(
-        "Write one VibeConsole app profile for the app `{app}`. {wish}\n\n         Reply with only the profile file, in exactly this tab-separated format (the first          line is the header, then one profile line whose last field is the number of override          lines, then the override lines, each with exactly the same 16 fields as this example):\n\n         {}\n         Rules: a profile name of 1–32 characters (not Default); overrides only for pads or Xbox          buttons, behaviour hold or toggle, keyboard shortcuts as Key+Key names, no feedback.          The controls this setup has:\n{controls}\n",
+        "Write one VibeConsole app profile for the app `{app}`. {wish}\n\n         Reply with only the profile file, in exactly this tab-separated format (the first          line is the header, then one profile line whose last field is the number of override          lines, then the override lines, each with exactly the same 16 fields as this example):\n\n         {}\n         Rules: a profile name of 1–32 characters (not Default); overrides only for pads or Xbox          buttons, behaviour hold or toggle, keyboard shortcuts as Key+Key names in the keys field, the
+         action field always the word `shortcut` as in the example, no feedback.          The controls this setup has:\n{controls}\n",
         export_profile(&example)?
     ))
 }
@@ -4238,7 +4250,10 @@ mod tests {
             [request.find(PROFILE_HEADER).unwrap()..request.find("Rules:").unwrap()]
             .to_owned();
         assert!(
-            example.contains("\tF1\t") && !example.contains("Shift") && !example.contains("Right"),
+            example.contains("\tCtrl+T\t")
+                && example.contains("\tshortcut\t")
+                && !example.contains("Shift")
+                && !example.contains("Right"),
             "{example}"
         );
         // No pad at all: a stand-in pad still shows the format.
