@@ -1,6 +1,7 @@
 archive/
 /target
 docs/v*/
+docs/skipped/
 docs/README.md
 notes.md
 SPEC-BEHAVIOR.md
