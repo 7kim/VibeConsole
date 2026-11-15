@@ -374,14 +374,14 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
             println!(
                 "Keyboard G light: unavailable: lighting it turns on Razer game mode, which turns off the Super key"
             );
-            println!(
-                "RGB keyboard: unavailable: neither OpenRazer nor OpenRGB can read the current effect back, so VibeConsole couldn't put it back ({})",
-                if Command::new("openrgb").arg("--version").output().is_ok() {
-                    "OpenRGB is installed"
-                } else {
-                    "OpenRGB is not installed; VibeConsole never installs it"
-                }
-            );
+            // v7 ticket 128: opened only (brightness read), nothing sent.
+            match crate::keyboard::RgbKeyboards::open(razer, crate::status::Rgb::Spectrum) {
+                Ok(rgb) => println!(
+                    "RGB keyboard: available ({}; on pause and quit it goes back to the resting effect you pick in Status light patterns)",
+                    rgb.names().join(", ")
+                ),
+                Err(e) => println!("{e}"),
+            }
             match crate::recording::permissions() {
                 Ok(n) => {
                     println!("Physical-key recording: {n} readable keyboard(s); no events captured")

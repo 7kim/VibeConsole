@@ -662,6 +662,130 @@ impl Drop for LockLights {
     }
 }
 
+/// v7 ticket 128: Razer keyboards' RGB backlight through OpenRazer's razerkbd files
+/// (github.com/openrazer/openrazer `driver/razerkbd_driver.c`): `matrix_effect_static` and
+/// `matrix_effect_breath` take 3 raw RGB bytes, `matrix_effect_reactive` a speed byte (1–4)
+/// then RGB, `matrix_effect_wave` a direction `1`/`2`, `matrix_effect_spectrum` and
+/// `matrix_effect_none` any write; `matrix_brightness` is 0–255 as text and can be read.
+/// The effect files are write-only, so the effect from before can't be read back: by the
+/// user's choice (15 Nov 2026) the resting effect they pick is what goes back on pause, quit
+/// and error, and the brightness read at the start is written back.
+pub struct RgbKeyboards {
+    boards: Vec<RgbBoard>,
+    shown: Option<(crate::status::Rgb, u8)>,
+    pub rest: crate::status::Rgb,
+}
+struct RgbBoard {
+    dir: std::path::PathBuf,
+    name: String,
+    brightness: u8,
+}
+fn write_rgb(dir: &Path, effect: crate::status::Rgb) -> io::Result<()> {
+    use crate::status::{Rgb, rgb_bytes};
+    let (file, bytes) = match effect {
+        Rgb::Off => ("matrix_effect_none", b"1".to_vec()),
+        Rgb::Spectrum => ("matrix_effect_spectrum", b"1".to_vec()),
+        Rgb::Wave => ("matrix_effect_wave", b"1".to_vec()),
+        Rgb::Static(c) => ("matrix_effect_static", rgb_bytes(c).to_vec()),
+        Rgb::Breath(c) => ("matrix_effect_breath", rgb_bytes(c).to_vec()),
+        // Speed 2 of 1–4 (`razer_chroma_standard_matrix_effect_reactive` clamps it).
+        Rgb::Reactive(c) => ("matrix_effect_reactive", [&[2][..], &rgb_bytes(c)].concat()),
+    };
+    std::fs::write(dir.join(file), bytes)
+}
+impl RgbKeyboards {
+    /// Every keyboard under `driver` whose brightness can be read and whose effect files can
+    /// be written. Nothing is sent until `show`.
+    pub fn open(driver: &Path, rest: crate::status::Rgb) -> Result<Self> {
+        let mut dirs = std::fs::read_dir(driver)
+            .map(|entries| entries.flatten().map(|e| e.path()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        dirs.sort();
+        let writable = |dir: &Path, file: &str| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(dir.join(file))
+                .is_ok()
+        };
+        let boards = dirs
+            .into_iter()
+            .filter_map(|dir| {
+                let brightness = std::fs::read_to_string(dir.join("matrix_brightness"))
+                    .ok()?
+                    .trim()
+                    .parse()
+                    .ok()?;
+                let files = [
+                    "matrix_brightness",
+                    "matrix_effect_none",
+                    "matrix_effect_spectrum",
+                    "matrix_effect_wave",
+                    "matrix_effect_static",
+                    "matrix_effect_breath",
+                    "matrix_effect_reactive",
+                ];
+                if !files.iter().all(|f| writable(&dir, f)) {
+                    return None;
+                }
+                let name = std::fs::read_to_string(dir.join("device_type"))
+                    .map(|t| t.trim().to_owned())
+                    .unwrap_or_else(|_| "Razer keyboard".into());
+                Some(RgbBoard {
+                    dir,
+                    name,
+                    brightness,
+                })
+            })
+            .collect::<Vec<_>>();
+        if boards.is_empty() {
+            return Err("RGB keyboard: unavailable: OpenRazer's razerkbd driver isn't loaded, or its matrix effect files aren't writable (VibeConsole never installs it)".into());
+        }
+        Ok(Self {
+            boards,
+            shown: None,
+            rest,
+        })
+    }
+    pub fn names(&self) -> Vec<&str> {
+        self.boards.iter().map(|b| b.name.as_str()).collect()
+    }
+    /// Show an effect at a brightness; nothing is sent when it already shows them. A keyboard
+    /// whose write fails (unplugged) is dropped; only when none is left is it an error.
+    pub fn show(&mut self, effect: crate::status::Rgb, brightness: u8) -> io::Result<()> {
+        if self.shown == Some((effect, brightness)) {
+            return Ok(());
+        }
+        let mut failed = None;
+        self.boards.retain(|board| {
+            let sent = std::fs::write(board.dir.join("matrix_brightness"), brightness.to_string())
+                .and_then(|()| write_rgb(&board.dir, effect));
+            sent.map_err(|e| failed = Some(e)).is_ok()
+        });
+        if let (Some(error), true) = (failed, self.boards.is_empty()) {
+            return Err(error);
+        }
+        self.shown = Some((effect, brightness));
+        Ok(())
+    }
+    /// The resting effect and each keyboard's own brightness back, once something was shown.
+    pub fn restore(&mut self) {
+        if self.shown.take().is_some() {
+            for board in &self.boards {
+                let _ = write_rgb(&board.dir, self.rest);
+                let _ = std::fs::write(
+                    board.dir.join("matrix_brightness"),
+                    board.brightness.to_string(),
+                );
+            }
+        }
+    }
+}
+impl Drop for RgbKeyboards {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
 impl Output {
     pub fn new(mappings: &[Mapping]) -> Result<Self> {
         let mut keyboard = Keyboard::new(mappings)?;
@@ -1684,6 +1808,82 @@ mod tests {
     /// v7 ticket 128: a Razer keyboard's M light comes from OpenRazer's `macro_led_state`:
     /// read first, lit with `1`, put back on restore. No driver: the chosen M light is
     /// unavailable with the reason, and nothing is written.
+    /// v7 ticket 128: the RGB backlight through fake OpenRazer files: each effect is written
+    /// in the driver's format, the brightness read first goes back with the resting effect on
+    /// restore (and on drop), nothing is sent before `show` or twice, an unplugged keyboard is
+    /// dropped, and no driver is named as unavailable.
+    #[test]
+    fn razer_rgb_shows_each_effect_and_restores_the_resting_effect_and_brightness() {
+        use crate::status::Rgb;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-rgb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let error = RgbKeyboards::open(&dir, Rgb::Spectrum)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("unavailable: OpenRazer's razerkbd driver"),
+            "{error}"
+        );
+        let board = |name: &str| {
+            let kbd = dir.join(name);
+            std::fs::create_dir_all(&kbd).unwrap();
+            std::fs::write(kbd.join("matrix_brightness"), "180\n").unwrap();
+            std::fs::write(kbd.join("device_type"), format!("{name} board\n")).unwrap();
+            for f in ["none", "spectrum", "wave", "static", "breath", "reactive"] {
+                std::fs::write(kbd.join(format!("matrix_effect_{f}")), "").unwrap();
+            }
+            kbd
+        };
+        let one = board("0003:1532:021A.0001");
+        let two = board("0003:1532:021A.0002");
+        let read = |kbd: &Path, f: &str| std::fs::read(kbd.join(f)).unwrap();
+        let mut rgb = RgbKeyboards::open(&dir, Rgb::Wave).unwrap();
+        assert_eq!(rgb.names().len(), 2);
+        assert!(
+            read(&one, "matrix_effect_static").is_empty(),
+            "nothing before show"
+        );
+        rgb.show(Rgb::Static("red"), 255).unwrap();
+        assert_eq!(read(&one, "matrix_effect_static"), [255, 0, 0]);
+        assert_eq!(read(&two, "matrix_brightness"), b"255");
+        std::fs::write(one.join("matrix_effect_static"), "").unwrap();
+        rgb.show(Rgb::Static("red"), 255).unwrap();
+        assert!(
+            read(&one, "matrix_effect_static").is_empty(),
+            "not sent twice"
+        );
+        rgb.show(Rgb::Breath("blue"), 255).unwrap();
+        assert_eq!(read(&one, "matrix_effect_breath"), [0, 0, 255]);
+        rgb.show(Rgb::Reactive("green"), 100).unwrap();
+        assert_eq!(read(&one, "matrix_effect_reactive"), [2, 0, 255, 0]);
+        assert_eq!(read(&one, "matrix_brightness"), b"100");
+        rgb.show(Rgb::Spectrum, 100).unwrap();
+        assert_eq!(read(&one, "matrix_effect_spectrum"), b"1");
+        rgb.show(Rgb::Off, 100).unwrap();
+        assert_eq!(read(&one, "matrix_effect_none"), b"1");
+        rgb.restore();
+        assert_eq!(read(&one, "matrix_effect_wave"), b"1", "the resting effect");
+        assert_eq!(
+            read(&one, "matrix_brightness"),
+            b"180",
+            "the brightness from before"
+        );
+        // Restored already: a second restore (or the drop) sends nothing.
+        std::fs::write(one.join("matrix_effect_wave"), "").unwrap();
+        rgb.restore();
+        assert!(read(&one, "matrix_effect_wave").is_empty());
+        // One keyboard unplugged: the other keeps showing; quitting (drop) restores it.
+        std::fs::remove_dir_all(&two).unwrap();
+        rgb.show(Rgb::Static("white"), 50).unwrap();
+        assert_eq!(rgb.names().len(), 1);
+        assert_eq!(read(&one, "matrix_effect_static"), [255, 255, 255]);
+        drop(rgb);
+        assert_eq!(read(&one, "matrix_effect_wave"), b"1");
+        assert_eq!(read(&one, "matrix_brightness"), b"180");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn razer_m_light_is_read_lit_and_put_back_and_missing_is_named() {
         let dir = std::env::temp_dir().join(format!("vibeconsole-razer-{}", std::process::id()));

@@ -613,6 +613,73 @@ pub struct DevicePatterns {
     pub keyboard_leds: [bool; 4],
     /// v7 ticket 132 (config v29): the Xbox button light's brightness per state, 0–50.
     pub xbox_brightness: [u8; 4],
+    /// v7 ticket 128 (config v32): a Razer keyboard's RGB backlight, off until turned on:
+    /// its effect per state, the resting effect it gets back on pause and quit (the user
+    /// picks it: nothing can read the old effect back), and the brightness while it shows.
+    pub rgb_on: bool,
+    pub rgb: [Rgb; 4],
+    pub rgb_rest: Rgb,
+    pub rgb_brightness: u8,
+}
+/// v7 ticket 128: an RGB backlight effect, through OpenRazer's `matrix_effect_*` files.
+/// Colours are `COLOURS` names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Rgb {
+    Off,
+    Spectrum,
+    Wave,
+    Static(&'static str),
+    Breath(&'static str),
+    Reactive(&'static str),
+}
+/// Every RGB effect, as its config word: off, spectrum, wave, then static-, breath- and
+/// reactive- with each colour.
+pub fn rgb_effects() -> Vec<Rgb> {
+    let mut all = vec![Rgb::Off, Rgb::Spectrum, Rgb::Wave];
+    let kinds: [fn(&'static str) -> Rgb; 3] = [Rgb::Static, Rgb::Breath, Rgb::Reactive];
+    for kind in kinds {
+        all.extend(COLOURS.map(kind));
+    }
+    all
+}
+pub fn rgb_word(effect: Rgb) -> String {
+    match effect {
+        Rgb::Off => "off".into(),
+        Rgb::Spectrum => "spectrum".into(),
+        Rgb::Wave => "wave".into(),
+        Rgb::Static(c) => format!("static-{c}"),
+        Rgb::Breath(c) => format!("breath-{c}"),
+        Rgb::Reactive(c) => format!("reactive-{c}"),
+    }
+}
+pub fn parse_rgb(word: &str) -> Result<Rgb> {
+    rgb_effects()
+        .into_iter()
+        .find(|e| rgb_word(*e) == word)
+        .ok_or_else(|| {
+            format!(
+                "keyboard RGB effect must be off, spectrum, wave, or static-, breath- or reactive- with {}, not {word}",
+                COLOURS.join(", ")
+            )
+            .into()
+        })
+}
+/// A colour name's red, green and blue.
+pub fn rgb_bytes(colour: &str) -> [u8; 3] {
+    match colour {
+        "blue" => [0, 0, 255],
+        "orange" => [255, 128, 0],
+        "red" => [255, 0, 0],
+        "green" => [0, 255, 0],
+        "purple" => [128, 0, 255],
+        _ => [255, 255, 255],
+    }
+}
+/// v7 ticket 128: the RGB effect for these source states: the most urgent busy state's.
+/// None when nothing is busy (the resting effect then shows).
+pub fn keyboard_rgb(states: &[&str], patterns: &DevicePatterns) -> Option<Rgb> {
+    let busy = BUSY.iter().position(|s| states.contains(s))?;
+    Some(patterns.rgb[busy])
 }
 /// The keyboard lights a pattern can use (v7 ticket 128): lock-key LEDs, then a Razer
 /// keyboard's M (macro) light through OpenRazer's driver.
@@ -641,6 +708,15 @@ impl Default for DevicePatterns {
             keyboard: [FastBlink, FastBlink, SlowPulse, Blink],
             keyboard_leds: [false; 4],
             xbox_brightness: [XBOX_BRIGHTNESS; 4],
+            rgb_on: false,
+            rgb: [
+                Rgb::Static("red"),
+                Rgb::Static("orange"),
+                Rgb::Breath("blue"),
+                Rgb::Static("green"),
+            ],
+            rgb_rest: Rgb::Spectrum,
+            rgb_brightness: 255,
         }
     }
 }

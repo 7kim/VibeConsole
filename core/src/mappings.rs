@@ -1672,6 +1672,16 @@ fn device_lights_text(p: &crate::status::DevicePatterns) -> String {
     // v29 (v7 ticket 132): the Xbox button light's brightness per state.
     let levels = p.xbox_brightness.map(|b| b.to_string());
     text.push_str(&format!("xbox-brightness\t{}\n", levels.join("\t")));
+    // v32 (v7 ticket 128): the keyboard RGB switch, resting effect, brightness, then the
+    // effect per state.
+    let effects = p.rgb.map(crate::status::rgb_word);
+    text.push_str(&format!(
+        "keyboard-rgb\t{}\t{}\t{}\t{}\n",
+        on(p.rgb_on),
+        crate::status::rgb_word(p.rgb_rest),
+        p.rgb_brightness,
+        effects.join("\t")
+    ));
     text
 }
 fn parse_device_lights(
@@ -1789,6 +1799,29 @@ fn parse_device_lights(
                 })?;
         }
     }
+    if version >= 32 {
+        let fields = next("keyboard-rgb")?;
+        let [switch, rest, level, effects @ ..] = &fields[..] else {
+            return Err(
+                "expected keyboard-rgb on|off, resting effect, brightness and 4 effects".into(),
+            );
+        };
+        if effects.len() != BUSY.len() {
+            return Err("expected keyboard-rgb effects for each of the 4 states".into());
+        }
+        p.rgb_on = match switch.as_str() {
+            "on" => true,
+            "off" => false,
+            other => return Err(format!("keyboard-rgb must be on or off, not {other}").into()),
+        };
+        p.rgb_rest = crate::status::parse_rgb(rest)?;
+        p.rgb_brightness = level
+            .parse()
+            .map_err(|_| format!("keyboard-rgb brightness must be 0–255, not {level}"))?;
+        for (slot, word) in p.rgb.iter_mut().zip(effects) {
+            *slot = crate::status::parse_rgb(word)?;
+        }
+    }
     Ok(p)
 }
 
@@ -1845,9 +1878,11 @@ fn parse_config(contents: &str) -> Result<Config> {
         Some("30") => 30,
         // v31 (v7 ticket 134): the Xbox light words `tempo-slow` and `tempo-fast`.
         Some("31") => 31,
+        // v32 (v7 ticket 128): `keyboard-rgb`, the Razer keyboard's RGB per state.
+        Some("32") => 32,
         _ => {
             return Err(
-                "invalid configuration header; expected vibeconsole-mappings-v1..v31".into(),
+                "invalid configuration header; expected vibeconsole-mappings-v1..v32".into(),
             );
         }
     };
@@ -2461,7 +2496,7 @@ pub fn serialize_config(config: &Config) -> Result<String> {
     validate_variables(&config.vars, "user")?;
     config.validate_references()?;
     let mut contents = format!(
-        "vibeconsole-mappings-v31\nidle\t{}\t{}\t{}\n",
+        "vibeconsole-mappings-v32\nidle\t{}\t{}\t{}\n",
         opt_text(config.idle.octave),
         opt_text(config.idle.tempo),
         arp_text(config.idle.arp)
@@ -2965,7 +3000,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v31\n")
+                .starts_with("vibeconsole-mappings-v32\n")
         );
         assert!(
             load_config(&path)
@@ -3151,7 +3186,7 @@ mod tests {
         };
         save_config(&path, &tuned).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v31\n"));
+        assert!(text.starts_with("vibeconsole-mappings-v32\n"));
         assert!(text.contains("\ntuning\t20\t60\t25\ton\toff\n"));
         assert!(text.contains("\nxbox-headset\ton\n")); // v7 ticket 108
         assert_eq!(load_config(&path).unwrap(), tuned);
@@ -3192,6 +3227,9 @@ mod tests {
     /// A line only a v20 file has (v7 ticket 86), dropped when a test writes an older one.
     /// The same file without the records only a v26 file has (v7 ticket 113), for tests that
     /// write it under an older header.
+    /// The default `keyboard-rgb` line (v32), which files before v32 don't have.
+    const DEFAULT_RGB: &str =
+        "keyboard-rgb\toff\tspectrum\t255\tstatic-red\tstatic-orange\tbreath-blue\tstatic-green\n";
     fn before_v26(text: &str) -> String {
         text.lines()
             .filter(|l| {
@@ -3200,6 +3238,7 @@ mod tests {
                     && !l.starts_with("xbox-headset\t")
                     && !l.starts_with("keyboard-leds\t")
                     && !l.starts_with("xbox-brightness\t")
+                    && !l.starts_with("keyboard-rgb\t")
             })
             .map(|l| format!("{l}\n"))
             .collect()
@@ -3214,6 +3253,7 @@ mod tests {
             "xbox-headset\t",
             "keyboard-leds\t",
             "xbox-brightness\t",
+            "keyboard-rgb\t",
         ]
         .iter()
         .any(|p| line.starts_with(p))
@@ -3234,7 +3274,7 @@ mod tests {
         assert_eq!(config.device_lights, DevicePatterns::default());
         save_config(&path, &config).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v31\n"), "{text}");
+        assert!(text.starts_with("vibeconsole-mappings-v32\n"), "{text}");
         assert!(
             text.contains(concat!(
                 "device-lights\ton\ton\ton\n",
@@ -3247,7 +3287,7 @@ mod tests {
             "{text}"
         );
         let v19 = text
-            .replace("vibeconsole-mappings-v31", "vibeconsole-mappings-v19")
+            .replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v19")
             .lines()
             .filter(|l| !v20_record(l))
             .map(|l| format!("{l}\n"))
@@ -3296,11 +3336,12 @@ mod tests {
         assert_eq!(config.device_lights.xbox_brightness, [20; 4]);
         config.device_lights.xbox_brightness = [50, 35, 5, 0];
         let text = serialize_config(&config).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v31\n"), "{text}");
+        assert!(text.starts_with("vibeconsole-mappings-v32\n"), "{text}");
         assert!(text.contains("\nxbox-brightness\t50\t35\t5\t0\n"), "{text}");
         assert_eq!(parse_config(&text).unwrap(), config);
         let v28 = text
-            .replace("vibeconsole-mappings-v31", "vibeconsole-mappings-v28")
+            .replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v28")
+            .replace(DEFAULT_RGB, "")
             .replace("xbox-brightness\t50\t35\t5\t0\n", "");
         assert_eq!(
             parse_config(&v28).unwrap().device_lights.xbox_brightness,
@@ -3325,7 +3366,7 @@ mod tests {
         config.device_lights.xbox[0].0 = Light::SlowBlink;
         config.device_lights.xbox[3].0 = Light::FastPulse;
         let text = serialize_config(&config).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v31\n"), "{text}");
+        assert!(text.starts_with("vibeconsole-mappings-v32\n"), "{text}");
         assert!(
             text.contains("\nxbox-pattern\tneeds-decision\tslow-blink\tshort\n")
                 && text.contains("\nxbox-pattern\tfinished\tfast-pulse\tshort\n"),
@@ -3334,7 +3375,8 @@ mod tests {
         assert_eq!(parse_config(&text).unwrap(), config);
         let v29 = serialize_config(&Config::default())
             .unwrap()
-            .replace("vibeconsole-mappings-v31", "vibeconsole-mappings-v29");
+            .replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v29")
+            .replace(DEFAULT_RGB, "");
         assert_eq!(parse_config(&v29).unwrap(), Config::default());
         let keyboard = text.replace(
             "keyboard-pattern\tthinking\tslow-pulse",
@@ -3358,7 +3400,7 @@ mod tests {
         config.device_lights.xbox[1].0 = Light::TempoFast;
         config.device_lights.xbox[2].0 = Light::TempoSlow;
         let text = serialize_config(&config).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v31\n"), "{text}");
+        assert!(text.starts_with("vibeconsole-mappings-v32\n"), "{text}");
         assert!(
             text.contains("\nxbox-pattern\tneeds-input\ttempo-fast\toff\n")
                 && text.contains("\nxbox-pattern\tthinking\ttempo-slow\toff\n"),
@@ -3367,7 +3409,8 @@ mod tests {
         assert_eq!(parse_config(&text).unwrap(), config);
         let v30 = serialize_config(&Config::default())
             .unwrap()
-            .replace("vibeconsole-mappings-v31", "vibeconsole-mappings-v30");
+            .replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v30")
+            .replace(DEFAULT_RGB, "");
         assert_eq!(parse_config(&v30).unwrap(), Config::default());
         let keyboard = text.replace(
             "keyboard-pattern\tthinking\tslow-pulse",
@@ -3390,7 +3433,7 @@ mod tests {
             "{text}"
         );
         assert_eq!(parse_config(&text).unwrap(), config);
-        let v25 = before_v26(&text).replace("vibeconsole-mappings-v31", "vibeconsole-mappings-v25");
+        let v25 = before_v26(&text).replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v25");
         let loaded = parse_config(&v25).unwrap();
         assert!(!loaded.device_lights.keyboard_on);
         assert_eq!(
@@ -3408,7 +3451,8 @@ mod tests {
         );
         assert_eq!(parse_config(&text).unwrap(), config);
         let v27 = text
-            .replace("vibeconsole-mappings-v31", "vibeconsole-mappings-v27")
+            .replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v27")
+            .replace(DEFAULT_RGB, "")
             .replace("keyboard-leds\tscroll,caps,macro\n", "")
             .replace("xbox-brightness\t20\t20\t20\t20\n", "");
         assert_eq!(
@@ -3416,6 +3460,53 @@ mod tests {
             [false; 4]
         );
         assert!(parse_config(&text.replace("scroll,caps,macro", "scroll,game")).is_err());
+    }
+
+    /// v7 ticket 128: the keyboard RGB switch, resting effect, brightness and effects
+    /// round-trip in v32; a v31 file loads with RGB off; unknown effects, colours and
+    /// brightness are refused with the reason.
+    #[test]
+    fn keyboard_rgb_round_trips_in_v32_and_older_files_have_it_off() {
+        use crate::status::Rgb;
+        let mut config = Config::default();
+        let text = serialize_config(&config).unwrap();
+        assert!(text.contains(&format!("\n{DEFAULT_RGB}")), "{text}");
+        let v31 = text
+            .replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v31")
+            .replace(DEFAULT_RGB, "");
+        assert!(!parse_config(&v31).unwrap().device_lights.rgb_on);
+        config.device_lights.rgb_on = true;
+        config.device_lights.rgb = [Rgb::Wave, Rgb::Reactive("purple"), Rgb::Off, Rgb::Spectrum];
+        config.device_lights.rgb_rest = Rgb::Static("white");
+        config.device_lights.rgb_brightness = 90;
+        let text = serialize_config(&config).unwrap();
+        assert!(
+            text.contains(
+                "\nkeyboard-rgb\ton\tstatic-white\t90\twave\treactive-purple\toff\tspectrum\n"
+            ),
+            "{text}"
+        );
+        assert_eq!(parse_config(&text).unwrap(), config);
+        let line = "keyboard-rgb\ton\tstatic-white\t90\twave\treactive-purple";
+        for (wrong, reason) in [
+            (
+                "keyboard-rgb\ton\tstatic-white\t90\twave\treactive-pink",
+                "keyboard RGB effect must be",
+            ),
+            (
+                "keyboard-rgb\ton\tstatic-white\t256\twave\treactive-purple",
+                "brightness must be 0–255",
+            ),
+            (
+                "keyboard-rgb\tmaybe\tstatic-white\t90\twave\treactive-purple",
+                "must be on or off",
+            ),
+        ] {
+            let error = parse_config(&text.replace(line, wrong))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(reason), "{error}");
+        }
     }
 
     /// v7 ticket 116: saved prompt sequences round-trip in v25; a v24 file can't hold them; a
@@ -3447,7 +3538,7 @@ mod tests {
         assert!(text.contains("\tsaved-sequence:release-notes\t"), "{text}");
         assert_eq!(parse_config(&text).unwrap(), config);
         assert_eq!(saved_sequence(&config, "release-notes").unwrap().len(), 2);
-        let v24 = before_v26(&text).replace("vibeconsole-mappings-v31", "vibeconsole-mappings-v24");
+        let v24 = before_v26(&text).replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v24");
         assert!(parse_config(&v24).unwrap_err().to_string().contains("v25"));
         let mut missing = config.clone();
         missing.sequences.clear();
@@ -3485,12 +3576,12 @@ mod tests {
         assert_eq!(parse_config(&text).unwrap(), config);
         assert_eq!(xbox_program_name(&config, 2), "Browser");
         assert_eq!(xbox_program_name(&config, 3), "Program 3");
-        let v23 = before_v26(&text).replace("vibeconsole-mappings-v31", "vibeconsole-mappings-v23");
+        let v23 = before_v26(&text).replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v23");
         assert!(parse_config(&v23).unwrap_err().to_string().contains("v24"));
         config.mappings.retain(|m| m.context == GAMEPAD_CONTEXT);
         config.xbox_names = Default::default();
         let old = before_v26(&serialize_config(&config).unwrap())
-            .replace("vibeconsole-mappings-v31", "vibeconsole-mappings-v23")
+            .replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v23")
             .replace("xbox-programs\t-\t-\t-\t-\t-\t-\t-\t-\n", "");
         let loaded = parse_config(&old).unwrap();
         assert_eq!(loaded, config, "a v23 file loads as is");
@@ -3515,11 +3606,11 @@ mod tests {
         ];
         let text = serialize_config(&config).unwrap();
         assert!(
-            text.starts_with("vibeconsole-mappings-v31\n") && text.contains("\tnothing\t"),
+            text.starts_with("vibeconsole-mappings-v32\n") && text.contains("\tnothing\t"),
             "{text}"
         );
         assert_eq!(parse_config(&text).unwrap(), config);
-        let v22 = before_v26(&text).replace("vibeconsole-mappings-v31", "vibeconsole-mappings-v22");
+        let v22 = before_v26(&text).replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v22");
         assert!(parse_config(&v22).unwrap_err().to_string().contains("v23"));
     }
 
@@ -3571,9 +3662,9 @@ mod tests {
             .unwrap(),
         ];
         let text = serialize_config(&config).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v31\n"), "{text}");
+        assert!(text.starts_with("vibeconsole-mappings-v32\n"), "{text}");
         assert_eq!(parse_config(&text).unwrap(), config);
-        let v21 = before_v26(&text).replace("vibeconsole-mappings-v31", "vibeconsole-mappings-v21");
+        let v21 = before_v26(&text).replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v21");
         assert!(parse_config(&v21).unwrap_err().to_string().contains("v22"));
         // An old needs-me pad (a plain sequence) becomes Orca keys; another sequence doesn't.
         let old = v21.replace("orca-keys:", "sequence:");
@@ -3593,14 +3684,14 @@ mod tests {
         let mut config = Config::default();
         config.mappings = vec![Mapping::new(pad, "Ctrl+T", "tap").unwrap()];
         let text = serialize_config(&config).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v31\n"), "{text}");
+        assert!(text.starts_with("vibeconsole-mappings-v32\n"), "{text}");
         assert!(text.contains("\ttap\tCtrl+T\t"), "{text}");
         assert_eq!(parse_config(&text).unwrap(), config);
-        let v20 = before_v26(&text).replace("vibeconsole-mappings-v31", "vibeconsole-mappings-v20");
+        let v20 = before_v26(&text).replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v20");
         assert!(parse_config(&v20).unwrap_err().to_string().contains("v21"));
         config.mappings = vec![Mapping::new(pad, "Ctrl+T", "hold").unwrap()];
         let old = before_v26(&serialize_config(&config).unwrap())
-            .replace("vibeconsole-mappings-v31", "vibeconsole-mappings-v20");
+            .replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v20");
         assert_eq!(
             parse_config(&old).unwrap(),
             config,
@@ -3628,7 +3719,7 @@ mod tests {
         save_config(&path, &config).unwrap();
         let v18 = fs::read_to_string(&path)
             .unwrap()
-            .replace("vibeconsole-mappings-v31", "vibeconsole-mappings-v18")
+            .replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v18")
             .lines()
             .filter(|l| !v20_record(l))
             .map(|l| format!("{l}\n"))
@@ -3647,7 +3738,7 @@ mod tests {
         config.mappings[0].action = Action::PromptSequence(vec![own, saved("build")]);
         save_config(&path, &config).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v31\n"), "{text}");
+        assert!(text.starts_with("vibeconsole-mappings-v32\n"), "{text}");
         assert_eq!(load_config(&path).unwrap(), config);
         let mut bad = config.clone();
         bad.mappings[0].action = Action::PromptSequence(vec![Action::PromptOwn {
@@ -3686,7 +3777,7 @@ mod tests {
         ));
         assert_eq!(load_config(&path).unwrap(), config);
         let v17 = text
-            .replace("vibeconsole-mappings-v31", "vibeconsole-mappings-v17")
+            .replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v17")
             .lines()
             .filter(|l| !v20_record(l))
             .map(|l| format!("{l}\n"))
@@ -3770,7 +3861,7 @@ mod tests {
         config.agents = vec![Agent::new("claude", "claude", "claude").unwrap()];
         let v16 = serialize_config(&config)
             .unwrap()
-            .replace("vibeconsole-mappings-v31", "vibeconsole-mappings-v16")
+            .replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v16")
             .lines()
             .filter(|l| !v20_record(l))
             .map(|l| format!("{l}\n"))
@@ -3786,7 +3877,7 @@ mod tests {
         herdr.host = Host::Herdr;
         config.agents.extend([orca, herdr]);
         let text = serialize_config(&config).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v31\n"), "{text}");
+        assert!(text.starts_with("vibeconsole-mappings-v32\n"), "{text}");
         assert!(
             text.contains("\nagent\tclaude\tclaude\tclaude\t-\t1\ttmux\n"),
             "{text}"
@@ -4263,7 +4354,7 @@ mod tests {
         let path = dir.join("mappings.tsv");
         save_config(&path, &config).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
-        assert!(saved.starts_with("vibeconsole-mappings-v31\n"));
+        assert!(saved.starts_with("vibeconsole-mappings-v32\n"));
         assert!(saved.contains("\tflow\t") && !saved.contains("flow-start"));
         assert_eq!(load_config(&path).unwrap(), config);
         fs::remove_dir_all(dir).unwrap();
@@ -4289,7 +4380,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v31\n")
+                .starts_with("vibeconsole-mappings-v32\n")
         );
         assert_eq!(load_config(&path).unwrap(), config);
         fs::remove_dir_all(dir).unwrap();
@@ -4310,7 +4401,7 @@ mod tests {
         let path = dir.join("mappings.tsv");
         save_config(&path, &config).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v31\n") && text.contains("\tstatus\n"));
+        assert!(text.starts_with("vibeconsole-mappings-v32\n") && text.contains("\tstatus\n"));
         assert_eq!(load_config(&path).unwrap(), config);
         let pad = Control::from_note(10, 37).unwrap();
         for (action, observable) in [
@@ -4387,7 +4478,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v31\n")
+                .starts_with("vibeconsole-mappings-v32\n")
         );
         assert_eq!(load_config(&path).unwrap(), config);
         // ${NAME}: user variable, then startup variable; other text stays; no environment.

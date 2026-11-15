@@ -254,6 +254,9 @@ struct Terminal {
     lock_failed: bool,
     /// The keyboard lights `lock_lights` was opened with (v7 ticket 128).
     lock_choice: [bool; 4],
+    /// v7 ticket 128: Razer keyboards' RGB backlight, opened when an effect is first due.
+    rgb: Option<crate::keyboard::RgbKeyboards>,
+    rgb_failed: bool,
     /// The focused app's profile (v7 ticket 12); None is Default.
     profile: Option<String>,
     /// Real sessions follow the focused app; tests never call the desktop.
@@ -788,6 +791,8 @@ impl Terminal {
             lock_lights: None,
             lock_failed: false,
             lock_choice: [false; 4],
+            rgb: None,
+            rgb_failed: false,
             profile: None,
             follow_apps: false,
             focus_unavailable: false,
@@ -1195,6 +1200,9 @@ impl Terminal {
         self.program_keys.cancel();
         if let Some(lights) = &mut self.lock_lights {
             lights.restore(); // v7 ticket 113: paused, the keyboard LED shows its own state
+        }
+        if let Some(rgb) = &mut self.rgb {
+            rgb.restore(); // v7 ticket 128: paused, the resting effect
         }
         self.holds.clear();
         if let Some(pad) = &mut self.gamepad {
@@ -1788,6 +1796,45 @@ impl Terminal {
         if let Some(Err(error)) = shown {
             self.lock_lights = None; // dropping it restores what it can
             self.notice = format!("Keyboard light: {error}; given up");
+        }
+    }
+    /// v7 ticket 128: while running, a Razer keyboard's RGB shows the most urgent agent
+    /// state's effect; idle, paused or switched off, its resting effect goes back. A missing
+    /// driver is named once, and asked again only after RGB is switched off and on.
+    fn show_rgb(&mut self) {
+        let states = self.alert_states();
+        let states = states.iter().map(|(_, s)| *s).collect::<Vec<_>>();
+        let running = self.output.is_some() && !self.suspended;
+        let switched = self.device_lights.as_ref().filter(|p| p.rgb_on);
+        if switched.is_none() {
+            self.rgb_failed = false;
+        }
+        let wanted = switched.filter(|_| running).and_then(|p| {
+            let effect = crate::status::keyboard_rgb(&states, p)?;
+            Some((effect, p.rgb_brightness, p.rgb_rest))
+        });
+        let Some((effect, brightness, rest)) = wanted else {
+            if let Some(rgb) = &mut self.rgb {
+                rgb.restore();
+            }
+            return;
+        };
+        if self.rgb.is_none() && !self.rgb_failed {
+            let razer = std::path::Path::new(crate::keyboard::RAZER);
+            match crate::keyboard::RgbKeyboards::open(razer, rest) {
+                Ok(rgb) => self.rgb = Some(rgb),
+                Err(error) => {
+                    self.rgb_failed = true;
+                    self.notice = error.to_string();
+                }
+            }
+        }
+        if let Some(rgb) = &mut self.rgb {
+            rgb.rest = rest;
+            if let Err(error) = rgb.show(effect, brightness) {
+                self.rgb = None; // dropping it restores what it can
+                self.notice = format!("RGB keyboard: {error}; given up");
+            }
         }
     }
     /// v7 ticket 40: Run with no verified MIDI program (none connected, or not detected yet)
@@ -2797,6 +2844,7 @@ impl Terminal {
         self.move_pointer();
         self.show_button_light();
         self.show_lock_light();
+        self.show_rgb();
         if let Some(action) = self.guide.tick(Instant::now()) {
             if let Err(error) = self.guide_action(action) {
                 self.error = format!("Profile lock failed: {error}");
@@ -4914,7 +4962,7 @@ fn keyboard_leds_menu(ui: &mut impl Ui, chosen: &mut [bool; 4]) -> Result<()> {
         rows.push("Back".into());
         let title = "Keyboard lights that show agent status (none on: Scroll Lock, else Caps Lock)\n\
                      G light (Fn+F10): unavailable: lighting it turns on Razer game mode, which turns off the Super key\n\
-                     RGB: unavailable: no installed tool can read your current effect back to restore it";
+                     RGB: its own rows below (Keyboard RGB), with a resting effect you pick";
         match choose_at(ui, title, &rows, at)? {
             Some(i) if i < 4 => {
                 chosen[i] = !chosen[i];
@@ -5253,6 +5301,27 @@ fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
             "Keyboard lights that show it: {}",
             keyboard_leds_text(devices.keyboard_leds)
         ));
+        // v7 ticket 128: the Razer keyboard's RGB, its effect per state, resting effect and
+        // brightness.
+        rows.push(format!(
+            "Keyboard RGB (Razer, needs OpenRazer's driver): {}",
+            on(devices.rgb_on)
+        ));
+        for (name, effect) in NAMES.iter().zip(devices.rgb) {
+            rows.push(format!(
+                "Keyboard RGB · {}: {}",
+                name.split(" (").next().unwrap_or(name),
+                crate::status::rgb_word(effect)
+            ));
+        }
+        rows.push(format!(
+            "Keyboard RGB resting effect (shown when idle, paused and after quit): {}",
+            crate::status::rgb_word(devices.rgb_rest)
+        ));
+        rows.push(format!(
+            "Keyboard RGB brightness while it shows a state: {} of 255",
+            devices.rgb_brightness
+        ));
         let blind = NAMES
             .iter()
             .zip(patterns.states)
@@ -5310,6 +5379,52 @@ fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 config.device_lights.on[index - 6] = !devices.on[index - 6];
             } else if index == 12 {
                 config.device_lights.keyboard_on = !devices.keyboard_on;
+            } else if index == 18 {
+                config.device_lights.rgb_on = !devices.rgb_on;
+            } else if index == 24 {
+                let Some(level) = number(
+                    ui,
+                    "Keyboard RGB brightness while it shows a state (0–255; yours comes back after)",
+                    devices.rgb_brightness.into(),
+                    0,
+                    255,
+                )?
+                else {
+                    return Ok(());
+                };
+                config.device_lights.rgb_brightness = u8::try_from(level)?;
+            } else if index > 18 {
+                let effects = crate::status::rgb_effects();
+                let words = effects
+                    .iter()
+                    .map(|e| crate::status::rgb_word(*e))
+                    .collect::<Vec<_>>();
+                let (title, current) = if index == 23 {
+                    (
+                        "Keyboard RGB resting effect: what VibeConsole puts back when idle, paused and on quit (it can't read your own effect back)".to_owned(),
+                        devices.rgb_rest,
+                    )
+                } else {
+                    let state = index - 19;
+                    (
+                        format!("Keyboard RGB · {}: effect", NAMES[state]),
+                        devices.rgb[state],
+                    )
+                };
+                let Some(e) = choose_at(
+                    ui,
+                    &title,
+                    &words,
+                    effects.iter().position(|e| *e == current).unwrap_or(0),
+                )?
+                else {
+                    return Ok(());
+                };
+                if index == 23 {
+                    config.device_lights.rgb_rest = effects[e];
+                } else {
+                    config.device_lights.rgb[index - 19] = effects[e];
+                }
             } else if index == 17 {
                 keyboard_leds_menu(ui, &mut config.device_lights.keyboard_leds)?;
             } else if index > 12 {
@@ -13035,6 +13150,97 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7 ticket 128: while output runs, the Razer RGB (fake OpenRazer files) shows the most
+    /// urgent agent state's effect; idle or paused, the resting effect and the old brightness
+    /// go back; quitting restores it too.
+    #[test]
+    fn keyboard_rgb_follows_agents_and_rests_on_idle_pause_and_quit() {
+        use crate::status::Rgb;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-rgb-session-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let kbd = dir.join("razerkbd/0003:1532:021A.0001");
+        std::fs::create_dir_all(&kbd).unwrap();
+        std::fs::write(kbd.join("matrix_brightness"), "200\n").unwrap();
+        for f in ["none", "spectrum", "wave", "static", "breath", "reactive"] {
+            std::fs::write(kbd.join(format!("matrix_effect_{f}")), "").unwrap();
+        }
+        let read = |f: &str| std::fs::read(kbd.join(f)).unwrap();
+        let clear = || {
+            for f in [
+                "matrix_effect_static",
+                "matrix_effect_spectrum",
+                "matrix_effect_breath",
+            ] {
+                std::fs::write(kbd.join(f), "").unwrap();
+            }
+        };
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        ui.rgb = Some(
+            crate::keyboard::RgbKeyboards::open(&dir.join("razerkbd"), Rgb::Spectrum).unwrap(),
+        );
+        let mut patterns = crate::status::DevicePatterns::default();
+        patterns.rgb_on = true;
+        patterns.rgb_brightness = 120;
+        ui.device_lights = Some(patterns);
+        ui.agent_states = vec![("claude".into(), "claude".into(), "needs-input")];
+        ui.output = Some(crate::keyboard::Output::recording(&[]).unwrap());
+        ui.suspended = false;
+        ui.show_rgb();
+        assert_eq!(
+            read("matrix_effect_static"),
+            [255, 128, 0],
+            "needs input: orange"
+        );
+        assert_eq!(read("matrix_brightness"), b"120");
+        ui.agent_states[0].2 = "idle";
+        ui.show_rgb();
+        assert_eq!(
+            read("matrix_effect_spectrum"),
+            b"1",
+            "idle: the resting effect"
+        );
+        assert_eq!(
+            read("matrix_brightness"),
+            b"200",
+            "idle: the brightness from before"
+        );
+        clear();
+        ui.agent_states[0].2 = "thinking";
+        ui.show_rgb();
+        assert_eq!(
+            read("matrix_effect_breath"),
+            [0, 0, 255],
+            "thinking: breathing blue"
+        );
+        ui.suspend().unwrap();
+        assert_eq!(
+            read("matrix_effect_spectrum"),
+            b"1",
+            "paused: the resting effect"
+        );
+        clear();
+        ui.show_rgb();
+        assert!(
+            read("matrix_effect_breath").is_empty(),
+            "nothing while paused"
+        );
+        ui.suspended = false;
+        ui.show_rgb();
+        assert_eq!(read("matrix_effect_breath"), [0, 0, 255]);
+        clear();
+        drop(ui);
+        assert_eq!(
+            read("matrix_effect_spectrum"),
+            b"1",
+            "quit: the resting effect"
+        );
+        assert_eq!(read("matrix_brightness"), b"200");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// v7 ticket 134: tempo-slow and tempo-fast blink the Xbox button light at the Status light
     /// patterns' BPM, switched by VibeConsole itself: once a second at 60 BPM, at most 8
     /// changes a second however fast the tempo; quit puts the light back.
@@ -14354,12 +14560,59 @@ mod tests {
                 .iter()
                 .any(|s| s.contains("G light (Fn+F10): unavailable"))
         );
-        assert!(ui.screens.iter().any(|s| s.contains("RGB: unavailable")));
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains("RGB: its own rows below"))
+        );
         let leds = mappings::load_config(&path)
             .unwrap()
             .device_lights
             .keyboard_leds;
         assert_eq!(leds, [false, true, false, true]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 128: Status light patterns turns Keyboard RGB on, picks a state's effect and
+    /// the resting effect, and saves them.
+    #[test]
+    fn keyboard_rgb_rows_pick_effects_and_the_resting_effect() {
+        use crate::status::Rgb;
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-rgb-menu-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut keys = vec![Down; 18];
+        keys.push(Enter); // Keyboard RGB: Off -> On
+        keys.extend(vec![Down; 20]);
+        keys.push(Enter); // Keyboard RGB · Needs input: static-orange
+        keys.extend([Up, Up, Up, Enter]); // spectrum
+        keys.extend(vec![Down; 23]);
+        keys.push(Enter); // resting effect: spectrum
+        keys.extend([Down, Enter]); // wave
+        keys.push(Escape);
+        let mut ui = Script {
+            keys: keys.into(),
+            ..Default::default()
+        };
+        light_patterns_menu(&mut ui, &path).unwrap();
+        assert!(ui.keys.is_empty(), "keys left: {:?}", ui.keys);
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains("Keyboard RGB (Razer, needs OpenRazer's driver): On"))
+        );
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains("it can't read your own effect back"))
+        );
+        let lights = mappings::load_config(&path).unwrap().device_lights;
+        assert!(lights.rgb_on);
+        assert_eq!(lights.rgb[1], Rgb::Spectrum);
+        assert_eq!(lights.rgb_rest, Rgb::Wave);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -14503,13 +14756,13 @@ mod tests {
         let v14 = saved
             .lines()
             .filter(|l| {
-                !["device-lights\t", "xbox-pattern\t", "ps5-pattern\t", "keyboard-lights\t", "keyboard-pattern\t", "xbox-headset\t", "keyboard-leds\t", "xbox-brightness\t"]
+                !["device-lights\t", "xbox-pattern\t", "ps5-pattern\t", "keyboard-lights\t", "keyboard-pattern\t", "xbox-headset\t", "keyboard-leds\t", "xbox-brightness\t", "keyboard-rgb\t"]
                     .iter()
                     .any(|p| l.starts_with(p))
             })
             .map(|l| format!("{l}\n"))
             .collect::<String>()
-            .replace("vibeconsole-mappings-v31", "vibeconsole-mappings-v14")
+            .replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v14")
             .replace(
                 "tuning\t15\t30\t10\toff\toff\nsticks\tlinear\tlinear\nmidi-devices\t0\nmidi-active\t-\nxbox-programs\t-\t-\t-\t-\t-\t-\t-\t-\nprofiles\t0\nprofile-lock\t-\nfavourites\t0\nsequences\t0\n",
                 "",

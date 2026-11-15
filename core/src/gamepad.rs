@@ -2161,10 +2161,10 @@ mod tests {
         let a = Kind::Pressed(gilrs::Button::South);
         let up = Kind::Released(gilrs::Button::South);
         let pad = "Xbox Wireless Controller";
-        let mut feed = |kind,
-                        down: &mut HashSet<Control>,
-                        keyboard: &mut crate::keyboard::Keyboard,
-                        sent: &mut Vec<_>| {
+        let feed = |kind,
+                    down: &mut HashSet<Control>,
+                    keyboard: &mut crate::keyboard::Keyboard,
+                    sent: &mut Vec<_>| {
             let mut emit = |key, on| {
                 sent.push((key, on));
                 Ok(())
