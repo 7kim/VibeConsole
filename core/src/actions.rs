@@ -2710,6 +2710,117 @@ fn flow(node: &Path, cancelled: &impl Fn() -> bool) -> Result<String> {
     result.map_err(|e| format!("{e}. Manual recovery: fully Quit Wispr Flow from its tray; keep VibeConsole's keyboard ready; reopen Wispr Flow; test physical Shift; then select Run. No forced stop or settings reset was attempted.").into())
 }
 
+/// v7 ticket 141: every action as it is saved, with one example and what it does, for
+/// `vibeconsole describe` and the VibeConsole skills. `<US>` stands for the unit separator
+/// that joins steps. A test parses every example and checks the skills list each family.
+pub const ACTION_FORMS: [(&str, &str); 24] = [
+    (
+        "shortcut",
+        "Press the keys in the keys field (a pad's default)",
+    ),
+    (
+        "sequence:keys:Ctrl+T<US>wait:500<US>keys:Ctrl+L",
+        "Run steps in order: keys, waits, prompts, commands",
+    ),
+    ("saved-sequence:name", "Run a saved prompt sequence by name"),
+    ("nothing", "Silence a control"),
+    (
+        "orca-keys:keys:Ctrl+K<US>wait:200",
+        "Press keys inside Orca IDE only while it is focused",
+    ),
+    (
+        "choice:prompt:a:@ctrl-v:paste<US>prompt:b:@ctrl-v:paste",
+        "A knob that picks one of 2-16 prompts",
+    ),
+    (
+        "value:2:0:100:/tmp/value",
+        "A knob that writes a number between min and max to a file",
+    ),
+    (
+        "prompt:review:@ctrl-v:paste",
+        "Paste (or send with Enter) a saved prompt into an agent or the focused window",
+    ),
+    (
+        "prompt-own:step1:@ctrl-v:paste:6869",
+        "A sequence step's own prompt text (hex)",
+    ),
+    (
+        "prompts:prompt:a:@ctrl-v:paste<US>prompt:b:@ctrl-v:paste",
+        "Send prompts one per press",
+    ),
+    (
+        "command:dev:/tmp:cargo test",
+        "Type a command line in a tmux window (needs a one-second hold)",
+    ),
+    (
+        "app:/usr/share/applications/firefox.desktop",
+        "Launch an installed app",
+    ),
+    (
+        "app-toggle:minimize:/usr/share/applications/firefox.desktop",
+        "Launch it, or minimize it when focused",
+    ),
+    (
+        "app-toggle:close:/usr/share/applications/firefox.desktop",
+        "Launch it, or close it when focused",
+    ),
+    (
+        "app-toggle:minimize+hold-quit:/usr/share/applications/firefox.desktop",
+        "Tap launches or minimizes; a one-second hold quits",
+    ),
+    (
+        "app-quit:/usr/share/applications/firefox.desktop",
+        "Quit an app (needs a one-second hold)",
+    ),
+    (
+        "volume-up:5",
+        "Raise the default output volume by a percent",
+    ),
+    (
+        "volume-down:5",
+        "Lower the default output volume by a percent",
+    ),
+    ("output-mute", "Toggle the default output mute"),
+    ("microphone-mute", "Toggle the microphone mute"),
+    ("flow", "Start or repair Wispr Flow"),
+    (
+        "orca-jump:claude:/tmp",
+        "Jump to an agent in Orca IDE for a folder",
+    ),
+    ("t3:chat.new", "Run a T3 Code command"),
+    ("herdr-focus:claude", "Focus a herdr agent"),
+];
+impl Action {
+    /// The action's family name, as the skills and `describe` list it. The match has no
+    /// wildcard: a new action breaks the build here, then needs a row in `ACTION_FORMS`.
+    pub fn family(&self) -> &'static str {
+        match self {
+            Self::Shortcut => "shortcut",
+            Self::Sequence(_) => "sequence",
+            Self::SavedSequence(_) => "saved-sequence",
+            Self::Nothing => "nothing",
+            Self::OrcaKeys(_) => "orca-keys",
+            Self::Choice(_) => "choice",
+            Self::Value { .. } => "value",
+            Self::Prompt { .. } => "prompt",
+            Self::Command { .. } => "command",
+            Self::Application(_) => "app",
+            Self::AppToggle { .. } => "app-toggle",
+            Self::Volume { .. } => "volume",
+            Self::OutputMute => "output-mute",
+            Self::MicrophoneMute => "microphone-mute",
+            Self::Flow => "flow",
+            Self::OrcaJump { .. } => "orca-jump",
+            Self::AppToggleQuit(_) => "app-toggle-quit",
+            Self::AppQuit(_) => "app-quit",
+            Self::PromptSequence(_) => "prompts",
+            Self::PromptOwn { .. } => "prompt-own",
+            Self::HerdrFocus(_) => "herdr-focus",
+            Self::T3(_) => "t3",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4072,5 +4183,22 @@ mod tests {
         let at = args.iter().position(|a| *a == "-e").unwrap();
         assert_eq!(args[at + 1], "ANTHROPIC_MODEL=opus");
         assert!(at < args.iter().position(|a| *a == "sh").unwrap()); // options before the command
+    }
+}
+
+#[cfg(test)]
+mod forms_tests {
+    use super::*;
+    #[test]
+    fn every_action_form_parses_and_every_family_has_one() {
+        let mut families = std::collections::BTreeSet::new();
+        for (example, _) in ACTION_FORMS {
+            let saved = example.replace("<US>", &STEP_SEPARATOR.to_string());
+            let action = Action::parse(&saved).unwrap_or_else(|e| panic!("{example}: {e}"));
+            assert_eq!(action.encode(), saved, "{example}");
+            families.insert(action.family());
+        }
+        // ponytail: 22 families; a new Action breaks `family()`, then this count.
+        assert_eq!(families.len(), 22, "{families:?}");
     }
 }

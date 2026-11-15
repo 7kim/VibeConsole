@@ -4609,6 +4609,41 @@ fn import_profile_file(ui: &mut impl Ui, path: &Path) -> Result<()> {
 }
 /// v7 ticket 26: ask Claude for a profile; its reply is checked in full like an import and
 /// shown for review; nothing is saved unless confirmed.
+/// v7 ticket 141: pick one or more devices (Space toggles, Enter confirms); none picked or
+/// Esc cancels.
+fn pick_devices(
+    ui: &mut impl Ui,
+    devices: &[mappings::ProfileDevice],
+) -> Result<Option<Vec<usize>>> {
+    let (mut cursor, mut picked) = (0, Vec::new());
+    loop {
+        let rows = devices
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                format!(
+                    "{} [{}] {}",
+                    if i == cursor { ">" } else { " " },
+                    if picked.contains(&i) { "x" } else { " " },
+                    d.name
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        ui.draw(&format!(
+            "Which devices is the profile for?\nSpace: toggle | Enter: continue | Esc: cancel\n{rows}"
+        ))?;
+        match ui.key()? {
+            Some(Key::Up) => cursor = (cursor + devices.len() - 1) % devices.len(),
+            Some(Key::Down) => cursor = (cursor + 1) % devices.len(),
+            Some(Key::Space) if picked.contains(&cursor) => picked.retain(|i| *i != cursor),
+            Some(Key::Space) => picked.push(cursor),
+            Some(Key::Enter) if !picked.is_empty() => return Ok(Some(picked)),
+            Some(Key::Escape) => return Ok(None),
+            _ => {}
+        }
+    }
+}
 fn ai_profile(ui: &mut impl Ui, path: &Path) -> Result<()> {
     let Some(app) = pick_app(ui)? else {
         return Ok(());
@@ -4617,19 +4652,43 @@ fn ai_profile(ui: &mut impl Ui, path: &Path) -> Result<()> {
         return Ok(());
     };
     let mut config = mappings::load_config(path)?;
-    let request = mappings::profile_request(&config, &app, &wish)?;
+    // v7 ticket 141: which devices the profile is for; Claude is given each one's controls.
+    let all = mappings::profile_devices(&config, ui.context(), ui.program().as_ref());
+    let Some(picked) = pick_devices(ui, &all)? else {
+        return Ok(());
+    };
+    let devices = all
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| picked.contains(i))
+        .map(|(_, d)| d)
+        .collect::<Vec<_>>();
+    let request = mappings::profile_request(&app, &wish, &devices)?;
     ui.draw("Asking Claude (claude -p)… this can take a minute.")?;
     let reply = ui.ask_claude(&request)?;
     let text = mappings::profile_text_from_reply(&reply)
         .ok_or("Claude's reply has no profile in VibeConsole's format; nothing saved")?;
-    let profile = mappings::import_profile(&text, &config)
+    let mut profile = mappings::import_profile(&text, &config)
         .map_err(|e| format!("Claude's profile: {e}; nothing saved"))?;
-    let summary = profile
-        .mappings
-        .iter()
-        .map(|m| format!("  {}: {}", m.label, m.action_label()))
-        .collect::<Vec<_>>()
-        .join("\n");
+    mappings::check_profile_controls(&mut profile, &devices)
+        .map_err(|e| format!("Claude's profile: {e}; nothing saved"))?;
+    // By device, every control by its name, then the whole thing in plain words.
+    let mut summary = String::new();
+    for device in &devices {
+        let rows = profile
+            .mappings
+            .iter()
+            .filter(|m| m.context == device.context)
+            .map(|m| format!("  {}: {}\n", m.label, m.action_label()))
+            .collect::<String>();
+        if !rows.is_empty() {
+            summary += &format!("{}:\n{rows}", device.name);
+        }
+    }
+    summary += &format!(
+        "\nIn plain words:\n{}",
+        mappings::profile_in_words(&profile)
+    );
     if choose(
         ui,
         &format!(
@@ -8915,6 +8974,8 @@ mod tests {
         herdr: Vec<String>,
         /// Claude's reply (v7 ticket 26).
         claude: String,
+        /// Every request sent to Claude (v7 ticket 141).
+        asked: Vec<String>,
         /// The verified program, when a test needs its pad and knob table (v7 ticket 45).
         program: Option<(u8, crate::feedback::Payload)>,
         /// An Xbox controller is connected (v7 ticket 111).
@@ -8962,6 +9023,7 @@ mod tests {
         }
         fn ask_claude(&mut self, request: &str) -> Result<String> {
             assert!(request.contains("vibeconsole-profile-v1"));
+            self.asked.push(request.to_owned());
             Ok(self.claude.clone())
         }
         fn write_t3_key_file(&mut self, text: &str) -> Result<String> {
@@ -12617,6 +12679,7 @@ mod tests {
             let mut keys = vec![Down; 9];
             keys.extend([Enter, Down, Down, Enter]); // App profiles -> Ask Claude
             keys.extend([Enter, Enter]); // the app, no wish
+            keys.extend([Space, Enter]); // the Akai
             keys.extend(confirm);
             keys.extend([Escape, Escape]);
             let mut ui = Script {
@@ -12649,6 +12712,79 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), before);
         ask(reply, vec![Down, Enter]); // Save this profile
         assert_eq!(mappings::load_config(&path).unwrap().profiles, [profile]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7 ticket 141: the devices are asked first (one or both), the request names every
+    /// control of each, the review is grouped by device and restated in plain words, and a
+    /// reply with a control the devices lack saves nothing.
+    #[test]
+    fn claude_profiles_ask_for_devices_and_name_every_control() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-ai-dev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let pad = Control::from_note(10, 36).unwrap();
+        let profile = mappings::Profile {
+            name: "Both".into(),
+            apps: vec!["firefox.desktop".into()],
+            mappings: vec![
+                Mapping::new(pad, "Ctrl+T", "hold").unwrap(),
+                Mapping::new(Control::button(0), "Ctrl+T", "hold").unwrap(),
+            ],
+        };
+        let reply = format!("```\n{}```\n", mappings::export_profile(&profile).unwrap());
+        let run = |claude: String, devices: Vec<Key>, then: Vec<Key>| {
+            let mut keys = vec![Down; 9];
+            keys.extend([Enter, Down, Down, Enter]); // App profiles -> Ask Claude
+            keys.extend([Enter, Enter]); // the app, no wish
+            keys.extend(devices);
+            keys.extend(then);
+            keys.extend([Escape, Escape]);
+            let mut ui = Script {
+                keys: keys.into(),
+                claude,
+                apps: vec![(
+                    "Firefox".into(),
+                    "/usr/share/applications/firefox.desktop".into(),
+                )],
+                ..Default::default()
+            };
+            settings_menu(&mut ui, &path).unwrap();
+            assert!(ui.keys.is_empty());
+            (ui.screens, ui.asked)
+        };
+        // Enter with nothing picked stays on the chooser; Esc cancels without asking Claude.
+        let (screens, asked) = run(reply.clone(), vec![Enter, Escape], vec![]);
+        assert!(screens.iter().any(|s| s.starts_with("Which devices")));
+        assert!(asked.is_empty());
+        // Both devices: every control of each, by name, in the one request.
+        let (screens, asked) = run(reply.clone(), vec![Space, Down, Space, Enter], vec![Enter]);
+        assert!(asked[0].contains("Akai MPK mini 3 and Xbox controller"));
+        assert!(asked[0].contains("- Bank A Pad 1: ") && asked[0].contains("- Xbox A: "));
+        let review = screens
+            .iter()
+            .find(|s| s.starts_with("Claude suggests profile Both"))
+            .unwrap();
+        assert!(
+            review.contains("Akai MPK mini 3:\n  Bank A Pad 1: Ctrl+T"),
+            "{review}"
+        );
+        assert!(
+            review.contains("Xbox controller:\n  Xbox A: Ctrl+T"),
+            "{review}"
+        );
+        assert!(
+            review.contains("Xbox A on the Xbox controller presses Ctrl+T in firefox.desktop."),
+            "{review}"
+        );
+        assert!(!review.to_lowercase().contains("note 1"), "{review}");
+        // Only the Akai asked for: an Xbox override in the reply is refused, nothing saved.
+        let (screens, _) = run(reply, vec![Space, Enter], vec![Enter]);
+        assert!(screens.iter().any(|s| s.contains("Claude's profile: override 2: Xbox A isn't a control of the chosen devices; nothing saved")));
+        assert!(mappings::load_config(&path).unwrap().profiles.is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

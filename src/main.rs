@@ -108,6 +108,10 @@ fn help(color: bool) -> String {
                     "doctor",
                     "Check MIDI, uinput, tools, hooks and the window extension".into(),
                 ),
+                (
+                    "describe",
+                    "List each device's controls by name and every action (read-only)".into(),
+                ),
             ],
         ),
         (
@@ -181,6 +185,21 @@ fn main() -> Result<()> {
     if args == ["--help"] || args == ["-h"] || args == ["help"] {
         plain_output();
         print!("{}", help(color()));
+        return Ok(());
+    }
+    // v7 ticket 141: read-only, no session, no owner lock, nothing opened for writing.
+    if args == ["describe"] {
+        plain_output();
+        let config = mappings::config_path()
+            .and_then(|path| mappings::load_config(&path))
+            .unwrap_or_default();
+        let xbox = vibeconsole_core::gamepad::Pad::open()
+            .map(|pad| pad.connections())
+            .unwrap_or_default();
+        print!(
+            "{}",
+            mappings::describe_text(&config, input_port().ok().as_deref(), &xbox)
+        );
         return Ok(());
     }
     // Called from agent hooks while the session or service runs: no MIDI, keyboard, or owner lock.
@@ -427,5 +446,149 @@ mod tests {
         assert!(
             super::version().starts_with(&format!("vibeconsole {}", env!("CARGO_PKG_VERSION")))
         );
+    }
+
+    /// v7 ticket 141: the VibeConsole skills stay true to the code. `reference/actions.md` and
+    /// `reference/controls.md` are generated (run with `UPDATE_SKILLS=1` to rewrite them);
+    /// every link must resolve; the example profiles must import; every `vibeconsole <command>`
+    /// named must exist; and nothing may point at the private docs folder or hold a path or secret.
+    #[test]
+    fn vibeconsole_skills_match_the_code() {
+        use std::path::{Path, PathBuf};
+        use vibeconsole_core::{actions, mappings};
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(".claude/skills");
+        let hub = root.join("vibeconsole/reference");
+        let actions_md = format!(
+            "# Every action\n\nGenerated from the code (`UPDATE_SKILLS=1 cargo test vibeconsole_skills`). `<US>` joins steps. A pad's default is `shortcut`.\n\n{}",
+            actions::ACTION_FORMS
+                .iter()
+                .map(|(example, what)| format!("- `{example}`: {what}\n"))
+                .collect::<String>()
+        );
+        let controls_md = format!(
+            "# Controls per device\n\nGenerated from the code (`UPDATE_SKILLS=1 cargo test vibeconsole_skills`). Profiles may set only these. The Akai's pad names come from the program in use.\n\n{}",
+            mappings::profile_devices(&mappings::Config::default(), 0, None)
+                .iter()
+                .map(|d| format!(
+                    "## {}\n\n{}\n\n",
+                    d.name,
+                    d.controls
+                        .iter()
+                        .map(|(_, name)| format!("- {name}\n"))
+                        .collect::<String>()
+                ))
+                .collect::<String>()
+        );
+        for (file, text) in [("actions.md", &actions_md), ("controls.md", &controls_md)] {
+            if std::env::var_os("UPDATE_SKILLS").is_some() {
+                std::fs::write(hub.join(file), text).unwrap();
+            }
+            assert_eq!(
+                &std::fs::read_to_string(hub.join(file)).unwrap_or_default(),
+                text,
+                "{file} is out of date: run UPDATE_SKILLS=1 cargo test vibeconsole_skills"
+            );
+        }
+        // The ten skills, each a name, a "Use when" description, and links that resolve.
+        let want = [
+            "vibeconsole",
+            "vibeconsole-agents",
+            "vibeconsole-doctor",
+            "vibeconsole-hardware-test",
+            "vibeconsole-lights",
+            "vibeconsole-profiles",
+            "vibeconsole-recipes",
+            "vibeconsole-release",
+            "vibeconsole-safety-review",
+            "vibeconsole-why-silent",
+        ];
+        let mut found = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("vibeconsole"))
+            .collect::<Vec<_>>();
+        found.sort();
+        assert_eq!(found, want);
+        let commands = super::help(false);
+        let mut files: Vec<PathBuf> = Vec::new();
+        let mut walk = vec![root.clone()];
+        while let Some(dir) = walk.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if !path.starts_with(root.join("to-spec"))
+                        && !path.starts_with(root.join("to-tickets"))
+                    {
+                        walk.push(path);
+                    }
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        for file in files.iter().filter(|f| {
+            f.strip_prefix(&root)
+                .is_ok_and(|rest| rest.to_string_lossy().starts_with("vibeconsole"))
+        }) {
+            let text = std::fs::read_to_string(file).unwrap();
+            let name = file.strip_prefix(&root).unwrap().display().to_string();
+            assert!(
+                !text.contains("docs/")
+                    && !text.contains("/home/")
+                    && !text.contains("ROOT_PASSWORD"),
+                "{name}: no private folder, path or secret"
+            );
+            if file.file_name().is_some_and(|n| n == "SKILL.md") {
+                let dir = file
+                    .parent()
+                    .unwrap()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                assert!(text.contains(&format!("\nname: {dir}\n")), "{name}: name");
+                assert!(
+                    text.contains("\ndescription: Use when"),
+                    "{name}: description"
+                );
+            }
+            // Relative markdown links resolve.
+            for part in text.split("](").skip(1) {
+                let link = part.split(')').next().unwrap();
+                if link.starts_with("http") {
+                    continue;
+                }
+                assert!(
+                    file.parent().unwrap().join(link).exists(),
+                    "{name}: broken link {link}"
+                );
+            }
+            // Every `vibeconsole <command>` is a command this build has.
+            for part in text.split("`vibeconsole ").skip(1) {
+                let word = part.split(['`', ' ']).next().unwrap();
+                if !word.is_empty() && !word.starts_with(['<', '-']) {
+                    assert!(
+                        commands
+                            .lines()
+                            .any(|l| l.trim_start().split_whitespace().next() == Some(word)),
+                        "{name}: unknown command `vibeconsole {word}`"
+                    );
+                }
+            }
+        }
+        // Every example profile imports and uses only controls a device has.
+        let config = mappings::Config::default();
+        let devices = mappings::profile_devices(&config, 0, None);
+        for file in files
+            .iter()
+            .filter(|f| f.extension().is_some_and(|e| e == "profile"))
+        {
+            let mut profile =
+                mappings::import_profile(&std::fs::read_to_string(file).unwrap(), &config)
+                    .unwrap_or_else(|e| panic!("{}: {e}", file.display()));
+            mappings::check_profile_controls(&mut profile, &devices)
+                .unwrap_or_else(|e| panic!("{}: {e}", file.display()));
+        }
     }
 }

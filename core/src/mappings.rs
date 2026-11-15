@@ -818,52 +818,195 @@ pub fn profile_text_from_reply(reply: &str) -> Option<String> {
     }
     Some(text.trim_end().to_owned() + "\n")
 }
-/// The request sent to Claude for a profile: the format by example and the controls the
-/// user has, so its overrides land on real pads.
-pub fn profile_request(config: &Config, app: &str, wish: &str) -> Result<String> {
-    // v7 ticket 104: the example uses mappings a profile may hold (pads and Xbox buttons
-    // without feedback); a setup whose first mappings are knobs or lit pads would otherwise
-    // fail before Claude is asked. With none, a stand-in pad shows the format.
-    let mut overrides = config
-        .mappings
-        .iter()
-        .filter(|m| m.input == Input::Pad && !m.feedback.enabled())
-        .take(2)
-        .cloned()
-        .zip(["Ctrl+T", "Ctrl+W"])
-        .map(|(mut m, keys)| {
-            // v7 ticket 104: the example always shows a plain shortcut, so Claude copies a
-            // field-14 value that parses; a launcher or knob row made it invent one.
-            m.action = crate::actions::Action::Shortcut;
-            m.keys = parse_shortcut(keys)?;
-            m.behavior = Behavior::Hold;
-            m.risky = false;
-            m.status = false;
-            Ok(m)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    if overrides.is_empty() {
-        let pad = Control::from_note(10, 36).ok_or("example pad")?;
-        overrides.push(Mapping::new(pad, "Ctrl+T", "hold")?);
-    }
-    let example = Profile {
-        name: "Example".into(),
-        apps: vec![app.to_owned()],
-        mappings: overrides,
+/// v7 ticket 141: a device a profile can be made for, with every control it has by the
+/// name the user sees, and the program (context) its overrides belong to.
+pub struct ProfileDevice {
+    pub name: &'static str,
+    pub context: u8,
+    pub controls: Vec<(Control, String)>,
+}
+pub const AKAI_NAME: &str = "Akai MPK mini 3";
+pub const XBOX_NAME: &str = "Xbox controller";
+/// The devices a profile can be asked for: the Akai's pads of the program in use (all 16 of
+/// the verified program, else the pads this setup already maps, else the standard ones), and
+/// the Xbox buttons that aren't VibeConsole's own.
+pub fn profile_devices(
+    config: &Config,
+    context: u8,
+    program: Option<&(u8, crate::feedback::Payload)>,
+) -> Vec<ProfileDevice> {
+    let akai = match program.filter(|(slot, _)| *slot == context) {
+        Some((_, payload)) => pad_controls(payload)
+            .into_iter()
+            .flatten()
+            .map(|c| (c, control_name(c, Some(Input::Pad), context, program)))
+            .collect(),
+        None => {
+            // No verified program: the names this setup saved when each pad was learned,
+            // else the standard pads.
+            let mut mapped = config
+                .mappings
+                .iter()
+                .filter(|m| {
+                    m.context == context
+                        && m.input == Input::Pad
+                        && m.control.message == crate::Message::Note
+                })
+                .map(|m| (m.control, m.label.clone()))
+                .collect::<Vec<_>>();
+            mapped.sort();
+            mapped.dedup_by_key(|(c, _)| *c);
+            if mapped.is_empty() {
+                mapped = (36..52)
+                    .filter_map(|n| Control::from_note(10, n))
+                    .map(|c| (c, c.label()))
+                    .collect();
+            }
+            mapped
+        }
     };
-    let controls = config
-        .mappings
+    let xbox = (0..crate::gamepad::BUTTONS.len() as u8)
+        .map(Control::button)
+        .filter(|c| !crate::gamepad::is_reserved(*c))
+        .map(|c| (c, c.label()))
+        .collect();
+    vec![
+        ProfileDevice {
+            name: AKAI_NAME,
+            context,
+            controls: akai,
+        },
+        ProfileDevice {
+            name: XBOX_NAME,
+            context: GAMEPAD_CONTEXT,
+            controls: xbox,
+        },
+    ]
+}
+fn override_line(device: &ProfileDevice, control: Control, name: &str) -> Result<String> {
+    let mut mapping = Mapping::new(control, "Ctrl+T", "hold")?;
+    mapping.context = device.context;
+    mapping.label = name.to_owned();
+    mapping_line(&mapping)
+}
+/// The request sent to Claude for a profile: the format by example, then for each chosen
+/// device every control by its name with a ready override line (v7 ticket 141), so
+/// Claude copies a line and changes only the keys.
+pub fn profile_request(app: &str, wish: &str, devices: &[ProfileDevice]) -> Result<String> {
+    let first = devices
         .iter()
-        .map(|m| format!("- {} (now: {})", m.label, m.action_label()))
+        .find_map(|d| d.controls.first().map(|(c, n)| (d, *c, n)))
+        .ok_or("no device or control to make a profile for")?;
+    let names = devices
+        .iter()
+        .map(|d| d.name)
         .collect::<Vec<_>>()
-        .join("\n");
+        .join(" and ");
+    let mut lines = format!("{PROFILE_HEADER}\nprofile\tExample\t{app}\t1\n");
+    lines += &override_line(first.0, first.1, first.2)?;
+    let mut controls = String::new();
+    for device in devices {
+        controls += &format!("\n{}:\n", device.name);
+        for (control, name) in &device.controls {
+            controls += &format!("- {name}: {}", override_line(device, *control, name)?);
+        }
+    }
     Ok(format!(
-        "Write one VibeConsole app profile for the app `{app}`. {wish}\n\n         Reply with only the profile file, in exactly this tab-separated format (the first          line is the header, then one profile line whose last field is the number of override          lines, then the override lines, each with exactly the same 16 fields as this example):\n\n         {}\n         Rules: a profile name of 1–32 characters (not Default); overrides only for pads or Xbox          buttons, behaviour hold or toggle, keyboard shortcuts as Key+Key names in the keys field, the
-         action field always the word `shortcut` as in the example, no feedback.          The controls this setup has:\n{controls}\n",
-        export_profile(&example)?
+        "Write one VibeConsole app profile for the app `{app}`, for the {names}. {wish}\n\n\
+         Reply with only the profile file, in exactly this tab-separated format (the first line is the header, then one profile line whose last field is the number of override lines, then the override lines, each with exactly the same 16 fields as this example):\n\n{lines}\n\
+         Rules: a profile name of 1-32 characters (not Default); overrides only for the controls listed below, behaviour hold or toggle, keyboard shortcuts as Key+Key names in the keys field (the 9th field), the action field always the word `shortcut` as in the example, no feedback. To give the same function on more than one device, write one override line per device. Copy a control's line below as it is and change only the keys (and behaviour if needed); never invent a control. The controls:\n{controls}"
     ))
 }
+/// v7 ticket 141: every override is a control of a chosen device, named as the user sees
+/// it; anything else is refused, naming the override.
+pub fn check_profile_controls(profile: &mut Profile, devices: &[ProfileDevice]) -> Result<()> {
+    for (n, mapping) in profile.mappings.iter_mut().enumerate() {
+        let name = devices
+            .iter()
+            .filter(|d| d.context == mapping.context)
+            .flat_map(|d| &d.controls)
+            .find(|(c, _)| *c == mapping.control)
+            .map(|(_, name)| name.clone())
+            .ok_or_else(|| {
+                format!(
+                    "override {}: {} isn't a control of the chosen devices",
+                    n + 1,
+                    mapping.label
+                )
+            })?;
+        mapping.label = name;
+    }
+    Ok(())
+}
+/// The device an override belongs to.
+pub fn device_name(mapping: &Mapping) -> &'static str {
+    if mapping.control.message == crate::Message::Button {
+        XBOX_NAME
+    } else {
+        AKAI_NAME
+    }
+}
+/// v7 ticket 141: a profile in plain words, one sentence per override, for the user to
+/// confirm before it is saved.
+pub fn profile_in_words(profile: &Profile) -> String {
+    let apps = profile.apps.join(", ");
+    profile
+        .mappings
+        .iter()
+        .map(|m| {
+            let verb = if m.action == crate::actions::Action::Shortcut {
+                "presses"
+            } else {
+                "runs"
+            };
+            format!(
+                "{} on the {} {verb} {} in {apps}.",
+                m.label,
+                device_name(m),
+                m.action_label()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
+/// v7 ticket 141: `vibeconsole describe`: what each device has by the names the user sees,
+/// and every action, as plain text for Claude and the user. Read-only: `akai` and `xbox`
+/// say what was seen connected; nothing is opened for writing.
+pub fn describe_text(config: &Config, akai: Option<&str>, xbox: &[String]) -> String {
+    let mut out = String::from(
+        "VibeConsole: what each device has (read-only; nothing is sent to any device)\n",
+    );
+    for device in profile_devices(config, 0, None) {
+        let connected = if device.name == AKAI_NAME {
+            akai.map_or("not connected".to_owned(), |p| format!("connected ({p})"))
+        } else if xbox.is_empty() {
+            "not connected".to_owned()
+        } else {
+            format!("connected ({})", xbox.join(", "))
+        };
+        out += &format!("\n{}: {connected}\n", device.name);
+        out += &format!(
+            "  Controls a profile can set: {}\n",
+            device
+                .controls
+                .iter()
+                .map(|(_, name)| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        if device.name == AKAI_NAME {
+            out += "  Also on it (not profile controls): Knobs 1-8 (increase and decrease), the joystick, piano keys\n  Pad names come from the program in use; with none verified, from what this setup saved.\n";
+        } else {
+            out += "  VibeConsole keeps for itself: LB (layer 2) and the Xbox button (profiles and lock)\n  Also on it (not profile controls): sticks, triggers' ranges and gestures\n";
+        }
+    }
+    out += "\nActions (as saved; <US> joins steps):\n";
+    for (example, what) in crate::actions::ACTION_FORMS {
+        out += &format!("  {example}\n      {what}\n");
+    }
+    out
+}
 /// A profile's export file name: letters, digits, `-` and `_` only, so it stays in its
 /// folder whatever the profile is called.
 pub fn profile_file_name(name: &str) -> String {
@@ -4228,40 +4371,52 @@ mod tests {
         assert!(import_profile(&profile_text_from_reply(&broken).unwrap(), &config).is_err());
         let mut with_pads = Config::default();
         with_pads.mappings = vec![Mapping::new(pad, "F1", "hold").unwrap()];
-        let request = profile_request(&with_pads, "firefox.desktop", "Tabs on the pads.").unwrap();
+        let devices = profile_devices(&with_pads, 0, None);
+        let request = profile_request("firefox.desktop", "Tabs on the pads.", &devices).unwrap();
         assert!(request.contains("vibeconsole-profile-v1") && request.contains("Bank A Pad 1"));
-        // v7 ticket 104: a setup whose first mappings are a knob and a lit pad (like the user's)
-        // still makes a request; its example holds only what a profile may.
-        let knob = Control {
-            channel: 1,
-            id: 20,
-            message: crate::Message::Cc,
-            direction: 1,
-        };
-        let mut turn = Mapping::new(knob, "Right", "pulse").unwrap();
-        turn.input = Input::RelativeKnob { step: 1 };
-        let mut lit = Mapping::new(Control::from_note(10, 37).unwrap(), "Shift", "hold").unwrap();
-        lit.feedback.octave = Some(crate::feedback::Octave::Offset(-1));
-        let mut users = Config::default();
-        users.mappings = vec![turn, lit, Mapping::new(pad, "F1", "hold").unwrap()];
-        let request = profile_request(&users, "firefox.desktop", "Tabs.").unwrap();
-        // The example sits between the header and the rules; the controls list follows them.
+        // v7 ticket 104: whatever the setup holds (knobs, lit pads), the example is a plain
+        // shortcut on a real control, so Claude copies a line that parses.
         let example = request
             [request.find(PROFILE_HEADER).unwrap()..request.find("Rules:").unwrap()]
             .to_owned();
         assert!(
-            example.contains("\tCtrl+T\t")
-                && example.contains("\tshortcut\t")
-                && !example.contains("Shift")
-                && !example.contains("Right"),
+            example.contains("\tCtrl+T\t") && example.contains("\tshortcut\t"),
             "{example}"
         );
-        // No pad at all: a stand-in pad still shows the format.
-        let request = profile_request(&Config::default(), "firefox.desktop", "Tabs.").unwrap();
+        // v7 ticket 141: both devices list every control by name with a ready line, and a
+        // reply naming a control the devices lack is refused.
+        let devices = profile_devices(&Config::default(), 0, None);
+        let request = profile_request("firefox.desktop", "Tabs.", &devices).unwrap();
+        assert!(request.contains("Akai MPK mini 3:") && request.contains("Xbox controller:"));
+        assert!(request.contains("- Bank B Pad 8: ") && request.contains("- Xbox A: "));
+        assert!(!request.contains("Guide") && !request.contains("- Xbox LB: "));
+        assert!(!request.to_lowercase().contains("note 123"));
+        let mut good = Profile {
+            name: "Both".into(),
+            apps: vec!["firefox.desktop".into()],
+            mappings: vec![
+                Mapping::new(Control::from_note(10, 36).unwrap(), "Ctrl+T", "hold").unwrap(),
+                Mapping::new(Control::button(0), "Ctrl+T", "hold").unwrap(),
+            ],
+        };
+        good.mappings[0].label = "raw".into();
+        check_profile_controls(&mut good, &devices).unwrap();
+        assert_eq!(good.mappings[0].label, "Bank A Pad 1");
+        let words = profile_in_words(&good);
         assert!(
-            profile_text_from_reply(&request)
-                .unwrap()
-                .contains("Ctrl+T")
+            words
+                .contains("Bank A Pad 1 on the Akai MPK mini 3 presses Ctrl+T in firefox.desktop.")
+        );
+        assert!(words.contains("Xbox A on the Xbox controller presses Ctrl+T"));
+        let mut odd = good.clone();
+        odd.mappings
+            .push(Mapping::new(Control::note(3, 123).unwrap(), "F1", "hold").unwrap());
+        let error = check_profile_controls(&mut odd, &devices)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("override 3:") && error.contains("chosen devices"),
+            "{error}"
         );
     }
 
