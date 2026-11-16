@@ -20,7 +20,7 @@ binary = Path(__file__).resolve().parents[1] / "target/debug/vibeconsole"
 # are skipped). The session starts on 1 Live with Run/Pause selected.
 TABS = {
     b"1": ["▶ Resume", "Release all", "Quit"],
-    b"2": ["/configure", "/list", "Favourites", "Presets", "⚠ Reset settings"],
+    b"2": ["/configure", "/list", "Favourites", "Presets", "Undo last change", "History…", "⚠ Reset settings"],
     # v7.7 ticket 152: 3 Agents, 4 Prompts, 6 and 7 list the config's own items; no scenario opens them.
     b"5": ["/prog-select", "/program-name", "/feedback-idle", "/feedback-check", "/prog-select (Xbox)",
            "/program-name (Xbox)", "/detect", "/get", "MIDI device"],
