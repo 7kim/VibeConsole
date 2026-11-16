@@ -352,6 +352,14 @@ struct Terminal {
     /// v7.7 ticket 160: the controller map shows Bank B / Layer 2 (the view only).
     map_bank_b: bool,
     map_layer2: bool,
+    /// v7.7 ticket 161: per agent (or outside session), its state and since when; seconds
+    /// busy (not idle) per 7½-minute slot, the last eight kept; in memory only.
+    agent_since: BTreeMap<String, (&'static str, Instant)>,
+    busy: BTreeMap<String, std::collections::VecDeque<(u64, u32)>>,
+    tracked_at: Instant,
+    started: Instant,
+    /// v7.7 ticket 161: `z` Focus: only the agents that need you.
+    focus: bool,
     /// v7 ticket 86: each device's switch and patterns; None while Status lights is off.
     device_lights: Option<crate::status::DevicePatterns>,
     /// Agents' status-light settings, in `agent_states` order; None while Status lights is Off.
@@ -527,7 +535,7 @@ impl Terminal {
         let hints = match (self.at_menu, size.0 < 75) {
             (true, true) => "Tab 1–0 · ↑↓ · Enter · Esc · Ctrl+C: quit",
             (true, false) => {
-                "Tab ←→ 1–0: tabs | Up/Down: move | Enter: open | /: find | Esc: quit | Ctrl+C: quit"
+                "Tab ←→ 1–0: tabs | Up/Down: move | Enter: open | /: find | z: focus | Esc: quit | Ctrl+C: quit"
             }
             (false, true) => "↑↓ · Enter · Space · Esc · Ctrl+C: quit",
             (false, false) => {
@@ -970,6 +978,11 @@ impl Terminal {
             skills_installed: false,
             map_bank_b: false,
             map_layer2: false,
+            agent_since: BTreeMap::new(),
+            busy: BTreeMap::new(),
+            tracked_at: Instant::now(),
+            started: Instant::now(),
+            focus: false,
             device_lights: None,
             light_agents: None,
             light_sessions: Vec::new(),
@@ -1117,6 +1130,35 @@ impl Terminal {
     /// v7.7 ticket 151: every agent and outside session, most urgent first: needs input,
     /// decision, working, idle, finished (stable within a state).
     fn agent_rows(&self) -> Vec<AgentRow> {
+        self.agent_rows_at(Instant::now())
+    }
+    /// v7.7 ticket 161: what was tracked, seen at `now`: the wait and the last hour.
+    fn agent_rows_at(&self, now: Instant) -> Vec<AgentRow> {
+        let waiting = |name: &str, state: &str| {
+            matches!(state, "needs-input" | "needs-decision" | "finished")
+                .then(|| self.agent_since.get(name))
+                .flatten()
+                .filter(|(since, _)| *since == state)
+                .map(|(_, at)| now.saturating_duration_since(*at))
+        };
+        let hour = |name: &str| {
+            let slot = now.saturating_duration_since(self.started).as_secs() / 450;
+            let busy = self.busy.get(name);
+            (slot.saturating_sub(7)..=slot)
+                .map(|s| {
+                    let secs = busy
+                        .and_then(|b| b.iter().find(|(at, _)| *at == s))
+                        .map_or(0, |(_, secs)| *secs);
+                    match secs {
+                        0 => ' ',
+                        1..=112 => '▁',
+                        113..=225 => '▃',
+                        226..=337 => '▅',
+                        _ => '█',
+                    }
+                })
+                .collect::<String>()
+        };
         let project = |folder: &Option<String>| {
             folder
                 .as_ref()
@@ -1140,28 +1182,65 @@ impl Terminal {
                     folder,
                     state,
                     host: Some(host),
+                    wait: waiting(name, state),
+                    hour: hour(name),
                 }
             })
             .chain(self.light_sessions.iter().map(|(folder, state, _)| {
                 let folder = Some(folder.clone());
+                let name = folder_name(folder.as_deref().unwrap_or_default()).to_owned();
                 AgentRow {
-                    name: folder_name(folder.as_deref().unwrap_or_default()).into(),
                     project: project(&folder),
                     window: String::new(),
                     folder,
                     state,
                     host: None,
+                    wait: waiting(&name, state),
+                    hour: hour(&name),
+                    name,
                 }
             }))
             .collect::<Vec<_>>();
-        rows.sort_by_key(|row| match row.state {
-            "needs-input" => 0,
-            "needs-decision" => 1,
-            "thinking" => 2,
-            "finished" => 4,
-            _ => 3,
+        // Most urgent first; within a state, the longest wait on top.
+        rows.sort_by_key(|row| {
+            let rank = match row.state {
+                "needs-input" => 0,
+                "needs-decision" => 1,
+                "thinking" => 2,
+                "finished" => 4,
+                _ => 3,
+            };
+            (rank, std::cmp::Reverse(row.wait))
         });
         rows
+    }
+    /// v7.7 ticket 161: each agent's state change time and busy seconds, at `now` (the status
+    /// refresh calls it; tests pass a clock).
+    fn track_agents(&mut self, now: Instant) {
+        let elapsed = now
+            .saturating_duration_since(self.tracked_at)
+            .min(Duration::from_secs(5));
+        self.tracked_at = now;
+        let slot = now.saturating_duration_since(self.started).as_secs() / 450;
+        let states = (self.agent_states.iter().map(|(n, _, s)| (n.clone(), *s)))
+            .chain((self.light_sessions.iter()).map(|(f, s, _)| (folder_name(f).to_owned(), *s)))
+            .collect::<Vec<_>>();
+        for (name, state) in states {
+            let since = self.agent_since.entry(name.clone()).or_insert((state, now));
+            if since.0 != state {
+                *since = (state, now);
+            }
+            if state != "idle" {
+                let busy = self.busy.entry(name).or_default();
+                match busy.back_mut() {
+                    Some((at, secs)) if *at == slot => *secs += elapsed.as_secs() as u32,
+                    _ => busy.push_back((slot, elapsed.as_secs() as u32)),
+                }
+                while busy.front().is_some_and(|(at, _)| *at + 7 < slot) {
+                    busy.pop_front();
+                }
+            }
+        }
     }
     /// v7.7 ticket 151: Enter on an agent: Orca jump or herdr focus through the dispatcher,
     /// tmux `select-window` through the runner, identifiers as single arguments. Going to a
@@ -1418,6 +1497,9 @@ impl Terminal {
     /// v7.7 ticket 152: a tab's panes (Live's from [`Self::live_panes`]); one-line entries
     /// that open something get `> ` when `selected`, else two spaces.
     fn tab_panes(&self, tab: usize, width: usize, selected: usize) -> Vec<(String, Vec<Entry>)> {
+        if self.focus {
+            return self.focus_panes(selected);
+        }
         if tab == 0 {
             return self.live_panes(width, selected);
         }
@@ -1467,6 +1549,8 @@ impl Terminal {
                         window: String::new(),
                         state,
                         host: None,
+                        wait: None,
+                        hour: String::new(),
                     }
                     .place();
                     rows.push(one(
@@ -1785,6 +1869,47 @@ impl Terminal {
         }
         panes
     }
+    /// v7.7 ticket 161: `z` Focus: only the agents that need input or a decision, longest
+    /// wait first, then how many are doing what; Enter goes to one.
+    fn focus_panes(&self, selected: usize) -> Vec<(String, Vec<Entry>)> {
+        let rows = self.agent_rows();
+        let mut entries = Vec::new();
+        for (number, row) in rows.iter().enumerate() {
+            if !matches!(row.state, "needs-input" | "needs-decision") {
+                continue;
+            }
+            let open = row.host.is_some().then_some(Open::Agent(number));
+            let mark = if entries.len() == selected && open.is_some() {
+                "> "
+            } else {
+                "  "
+            };
+            let line = format!(
+                "{mark}● {}   {}   {}{}",
+                row.name,
+                row.project,
+                state_word(row.state),
+                wait_text(row.wait, false)
+            );
+            entries.push((vec![line], open));
+        }
+        if entries.is_empty() {
+            entries.push((vec!["  Nobody needs you right now.".into()], None));
+        }
+        let count = |state: &str| rows.iter().filter(|r| r.state == state).count();
+        let rest = format!(
+            "  {} more working · {} idle · {} finished",
+            count("thinking"),
+            count("idle"),
+            count("finished")
+        );
+        entries.push((vec![String::new()], None));
+        entries.push((vec![rest], None));
+        vec![(
+            "Focus · the agents that need you, longest wait first · z or Esc leaves".into(),
+            entries,
+        )]
+    }
     /// v7.7 ticket 151: Live's panes: its buttons, Agents, Pads and buttons, Toggles. Each
     /// entry is its lines and what Enter does; entry `selected` (counted over every pane)
     /// gets `> `, or a double border when it is an agent card.
@@ -1817,15 +1942,20 @@ impl Terminal {
                 let open = row.host.is_some().then_some(Open::Agent(number));
                 let chosen = buttons.len() + agents.len() == selected && open.is_some();
                 let lines = [
-                    format!("● {}", state_word(row.state)),
+                    format!(
+                        "● {}{}  {}",
+                        state_word(row.state),
+                        wait_text(row.wait, false),
+                        row.hour
+                    ),
                     format!("{} · {}", row.project, row.place()),
                 ];
                 let card = crate::screen::card(&row.name, &lines, width, chosen);
                 agents.push((card, open));
             }
         } else {
-            // Below 100 columns FOLDER goes, then PROJECT (v7.7 spec, Sizes).
-            let (project, folder) = (width >= 55, width >= 90);
+            // Below 100 columns LAST HOUR goes, then FOLDER, then PROJECT (v7.7 spec, Sizes).
+            let (project, folder, hour) = (width >= 55, width >= 90, width >= 108);
             let mut head = format!("── {}", fit("AGENT", 18));
             let line = |row: &AgentRow| {
                 let mut text = format!("● {}", fit(&row.name, 18));
@@ -1846,7 +1976,12 @@ impl Terminal {
                     };
                     text += &fit(&place, 28);
                 }
-                text + state_word(row.state)
+                let status = format!("{}{}", state_word(row.state), wait_text(row.wait, true));
+                if hour {
+                    text + &fit(&status, 18) + &row.hour
+                } else {
+                    text + &status
+                }
             };
             if project {
                 head += &fit("PROJECT", 16);
@@ -1854,7 +1989,14 @@ impl Terminal {
             if folder {
                 head += &fit("FOLDER", 28);
             }
-            agents.push(one(head + "STATUS", None));
+            agents.push(one(
+                head + if hour {
+                    "STATUS            LAST HOUR"
+                } else {
+                    "STATUS"
+                },
+                None,
+            ));
             for (number, row) in rows.iter().enumerate() {
                 let open = row.host.is_some().then_some(Open::Agent(number));
                 let text = line(row);
@@ -2071,6 +2213,7 @@ impl Terminal {
                 *state = hosted;
             }
         }
+        self.track_agents(Instant::now()); // v7.7 ticket 161
         // v7 tickets 11 and 86: rumble as a source newly enters a state whose Xbox pattern
         // rumbles, under the Status lights and Xbox switches.
         let rumble = self
@@ -5349,6 +5492,23 @@ struct AgentRow {
     window: String,
     state: &'static str,
     host: Option<mappings::Host>,
+    /// v7.7 ticket 161: how long it has waited for you (needs input, decision, finished).
+    wait: Option<Duration>,
+    /// v7.7 ticket 161: how busy it was in each 7½ minutes of the last hour (▁▃▅█).
+    hour: String,
+}
+/// v7.7 ticket 161: a wait as `40s`, `4m`, `1h` (short) or `40 s`, `4 min`, `1 h`.
+fn wait_text(wait: Option<Duration>, short: bool) -> String {
+    let Some(wait) = wait else {
+        return String::new();
+    };
+    let secs = wait.as_secs();
+    let (n, unit) = match secs {
+        0..60 => (secs, if short { "s" } else { " s" }),
+        60..3600 => (secs / 60, if short { "m" } else { " min" }),
+        _ => (secs / 3600, if short { "h" } else { " h" }),
+    };
+    format!(" {n}{unit}")
 }
 impl AgentRow {
     /// The folder with the home folder as `~`, or `—` (a herdr agent without one).
@@ -10268,6 +10428,16 @@ fn command_menu(ui: &mut Terminal) -> Result<Option<usize>> {
                 }
                 continue;
             }
+            Some(Key::Escape) if ui.focus => {
+                ui.focus = false;
+                ui.menu = 0;
+                continue;
+            }
+            Some(Key::Character(b'z')) => {
+                ui.focus = !ui.focus;
+                ui.menu = 0;
+                continue;
+            }
             Some(Key::Escape) => return Ok(None),
             Some(Key::Character(b'/')) => {
                 ui.find()?;
@@ -12136,6 +12306,67 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7.7 ticket 161: with a fake clock, waits render (`NEEDS INPUT 4m`) and the longest
+    /// wait sorts first within a state; the last hour fills as an agent works; `z` Focus lists
+    /// only the agents needing input or a decision and counts the rest; Esc leaves Focus.
+    #[test]
+    fn agent_waits_sort_and_focus_lists_only_who_needs_you() {
+        let (dir, mut ui, _ran, _) = configure_session("waits");
+        ui.status_at = Instant::now() + Duration::from_secs(3600);
+        let t0 = ui.started;
+        ui.agent_states = vec![
+            ("newer".into(), "w1".into(), "thinking"),
+            ("older".into(), "w2".into(), "thinking"),
+            ("worker".into(), "w3".into(), "thinking"),
+            ("rester".into(), "w4".into(), "idle"),
+        ];
+        // All working for 20 minutes, sampled every 5 s.
+        for tick in 0..240 {
+            ui.track_agents(t0 + Duration::from_secs(5 * tick));
+        }
+        ui.agent_states[1].2 = "needs-input"; // older asks first
+        ui.track_agents(t0 + Duration::from_secs(1200));
+        ui.agent_states[0].2 = "needs-input"; // newer a minute later
+        ui.track_agents(t0 + Duration::from_secs(1260));
+        let now = t0 + Duration::from_secs(1200 + 240);
+        let rows = ui.agent_rows_at(now);
+        let names = rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            ["older", "newer", "worker", "rester"],
+            "longest wait first"
+        );
+        assert_eq!(wait_text(rows[0].wait, true), " 4m");
+        assert_eq!(wait_text(rows[1].wait, false), " 3 min");
+        assert_eq!(rows[2].wait, None, "working has no wait");
+        assert!(
+            rows[2].hour.contains('█'),
+            "busy last hour: {:?}",
+            rows[2].hour
+        );
+        assert_eq!(rows[3].hour.trim(), "", "idle all along");
+
+        ui.at_menu = true;
+        ui.script = Some(Play {
+            steps: [Key::Character(b'z'), Key::Escape, Key::Escape]
+                .map(Step::Key)
+                .into(),
+            ..Play::default()
+        });
+        assert_eq!(command_menu(&mut ui).unwrap(), None);
+        let play = ui.script.take().unwrap();
+        let focus = play
+            .screens
+            .iter()
+            .find(|s| s.contains("Focus · the agents that need you"))
+            .expect("z opened Focus");
+        assert!(focus.contains("older") && focus.contains("newer"));
+        assert!(!focus.contains("● worker") && !focus.contains("● rester"));
+        assert!(focus.contains("1 more working · 1 idle · 0 finished"));
+        assert!(!ui.focus, "Esc left Focus");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// v7.7 ticket 160: the controller map: the Akai's first row is Pads 5–8 with the
     /// fixture's labels per bank, the pressed pad is marked ◆, unmapped cells ·; every Xbox
     /// control sits at its grid place and Layer 2 changes labels, not places; the header's
@@ -12663,7 +12894,10 @@ mod tests {
             "IDLE",
             "FINISHED",
         ]) {
-            assert!(line.contains('●') && line.ends_with(word), "{line}");
+            assert!(
+                line.contains('●') && line.trim_end().ends_with(word),
+                "{line}"
+            );
         }
         assert!(lines[2].contains("VibeConsole") && lines[2].contains("/VibeConsole/docs"));
         assert!(
