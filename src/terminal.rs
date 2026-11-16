@@ -349,6 +349,9 @@ struct Terminal {
     problems_at: Option<Instant>,
     /// v7.7 ticket 158: every VibeConsole skill is in `~/.claude/skills` (read on 3 Agents).
     skills_installed: bool,
+    /// v7.7 ticket 160: the controller map shows Bank B / Layer 2 (the view only).
+    map_bank_b: bool,
+    map_layer2: bool,
     /// v7 ticket 86: each device's switch and patterns; None while Status lights is off.
     device_lights: Option<crate::status::DevicePatterns>,
     /// Agents' status-light settings, in `agent_states` order; None while Status lights is Off.
@@ -494,8 +497,18 @@ impl Terminal {
         } else {
             format!("{program} (select hardware to verify)")
         };
+        // v7.7 ticket 160: the app profile in use, as a chip.
+        let chip = match (
+            self.view.as_ref().and_then(|c| c.lock.clone()),
+            &self.profile,
+        ) {
+            (Some(mappings::Lock::Profile(lock)), _) => format!("{lock} profile · locked"),
+            (Some(mappings::Lock::Default), _) => "Default · locked".into(),
+            (None, Some(profile)) => format!("{profile} profile · focused"),
+            (None, None) => "Default".into(),
+        };
         let header = format!(
-            "{connection_line}\n{program} | {}",
+            "{connection_line}\n{program} | {chip} | {}",
             state_lines.next().unwrap_or_default()
         );
         let mut live = state_lines.map(String::from).collect::<Vec<_>>();
@@ -955,6 +968,8 @@ impl Terminal {
             problems: Vec::new(),
             problems_at: None,
             skills_installed: false,
+            map_bank_b: false,
+            map_layer2: false,
             device_lights: None,
             light_agents: None,
             light_sessions: Vec::new(),
@@ -1860,6 +1875,32 @@ impl Terminal {
                 agents,
             ),
         ];
+        // v7.7 ticket 160: the controller map.
+        if let Some(config) = &self.view {
+            let bank = if self.map_bank_b {
+                "View: Bank A  [Bank B]"
+            } else {
+                "View: [Bank A]  Bank B"
+            };
+            let layer = if self.map_layer2 {
+                "View: Layer 1  [Layer 2 (LB)]"
+            } else {
+                "View: [Layer 1]  Layer 2 (LB)"
+            };
+            let mut map = vec![
+                one(bank.into(), Some(Open::MapBank)),
+                one(layer.into(), Some(Open::MapLayer)),
+            ];
+            map.extend(
+                self.map_rows(config, width)
+                    .into_iter()
+                    .map(|row| one(row, None)),
+            );
+            panes.push((
+                "Controller map · ◆ pressed ▶ running ● on · nothing mapped".into(),
+                map,
+            ));
+        }
         let pads = self.status_lines();
         if !pads.is_empty() {
             panes.push((
@@ -2556,13 +2597,125 @@ impl Terminal {
         Ok(self.xbox_layout_in(&mappings::load_config(&self.path)?))
     }
     fn xbox_layout_in(&self, config: &mappings::Config) -> Vec<Mapping> {
-        let layer = crate::gamepad::layer_in(&config.mappings, self.xbox_program, self.layer2);
+        self.xbox_layer_in(config, self.layer2)
+    }
+    fn xbox_layer_in(&self, config: &mappings::Config, layer2: bool) -> Vec<Mapping> {
+        let layer = crate::gamepad::layer_in(&config.mappings, self.xbox_program, layer2);
         let profile = self
             .profile
             .as_deref()
             .and_then(|name| config.profile(name));
-        let context = mappings::xbox_context(self.xbox_program, self.layer2);
+        let context = mappings::xbox_context(self.xbox_program, layer2);
         mappings::overlay(&layer, profile, context)
+    }
+    /// v7.7 ticket 160: one map cell `width` wide: a mark (◆ pressed in the last second,
+    /// ▶ running, ● toggle on, · nothing mapped), the control's short name and its action's
+    /// short label (shortcuts as ⌃⇧⌥⌘).
+    fn map_cell(
+        &self,
+        name: &str,
+        control: Option<Control>,
+        mapped: &[Mapping],
+        width: usize,
+    ) -> String {
+        let mapping = control.and_then(|c| mapped.iter().find(|m| m.control == c));
+        let now = Instant::now();
+        let mark = match (control, mapping) {
+            (_, None) => '·',
+            (Some(c), Some(_))
+                if self.pressed.is_some_and(|(p, at)| {
+                    p == c && now.duration_since(at) < Duration::from_secs(1)
+                }) =>
+            {
+                '◆'
+            }
+            (Some(c), Some(_)) if self.probed.get(&c).copied().flatten() == Some(true) => '▶',
+            (Some(c), Some(m))
+                if m.behavior == mappings::Behavior::Toggle
+                    && self.output.as_ref().is_some_and(|o| o.keyboard.active(c)) =>
+            {
+                '●'
+            }
+            _ => ' ',
+        };
+        let label = mapping.map_or(String::new(), |m| {
+            m.action_label()
+                .replace("Ctrl+", "⌃")
+                .replace("Shift+", "⇧")
+                .replace("Alt+", "⌥")
+                .replace("Super+", "⌘")
+        });
+        crate::screen::fit(&format!("{mark}{name} {label}"), width.saturating_sub(1)) + " "
+    }
+    /// v7.7 ticket 160: the controller map's rows: the Akai's shown bank (Pads 5–8 over 1–4,
+    /// then the knobs) and the Xbox laid out like the controller on an 8 × 5 grid; below
+    /// 95 columns only the device used last. Labels come from the shown bank and layer.
+    fn map_rows(&self, config: &mappings::Config, width: usize) -> Vec<String> {
+        let mut rows = Vec::new();
+        let both = width >= 90;
+        if both || !self.last_xbox {
+            let bank = if self.map_bank_b { 'B' } else { 'A' };
+            let program = self.program();
+            let pads = program
+                .as_ref()
+                .filter(|(slot, _)| *slot == self.context)
+                .map(|(_, payload)| mappings::pad_controls(payload));
+            let pad = |n: usize| -> Option<Control> {
+                let k = n - 1 + if self.map_bank_b { 8 } else { 0 };
+                match &pads {
+                    Some(pads) => pads[k],
+                    None => (self.run_mappings.iter())
+                        .find(|m| m.label == format!("Bank {bank} Pad {n}"))
+                        .map(|m| m.control),
+                }
+            };
+            let cell = width / 4;
+            rows.push(format!("── Akai MPK mini 3 · Bank {bank}"));
+            for line in [[5, 6, 7, 8], [1, 2, 3, 4]] {
+                rows.push(
+                    line.iter()
+                        .map(|&n| {
+                            self.map_cell(&format!("Pad {n}"), pad(n), &self.run_mappings, cell)
+                        })
+                        .collect(),
+                );
+            }
+            let knob = |n: usize| {
+                (self.run_mappings.iter())
+                    .find(|m| m.label.starts_with(&format!("Knob {n}")))
+                    .map(|m| m.control)
+            };
+            rows.push(
+                (1..=8)
+                    .map(|n| {
+                        self.map_cell(&format!("K{n}"), knob(n), &self.run_mappings, width / 8)
+                    })
+                    .collect(),
+            );
+        }
+        if both || self.last_xbox {
+            let layout = self.xbox_layer_in(config, self.map_layer2);
+            let layer = if self.map_layer2 {
+                "Layer 2 (LB)"
+            } else {
+                "Layer 1"
+            };
+            rows.push(format!("── Xbox · {layer}"));
+            let cell = width / 8;
+            for line in XBOX_GRID {
+                rows.push(
+                    line.iter()
+                        .map(|spot| match spot {
+                            Some((button, name)) => {
+                                self.map_cell(name, Some(Control::button(*button)), &layout, cell)
+                            }
+                            None => " ".repeat(cell),
+                        })
+                        .collect(),
+                );
+            }
+        }
+        rows
     }
     /// v7.7 ticket 156: for each screen key, the controls mapped to it on the device used
     /// last (the Xbox's active layer and profile, or the open MIDI program), else the
@@ -2926,6 +3079,7 @@ impl Terminal {
             self.last_event = crate::describe_event(&event, |control| self.name(control));
             if let Event::Press(pad) = &event {
                 self.last_press = Some(*pad);
+                self.pressed = Some((*pad, Instant::now())); // v7.7 ticket 160: the map's ◆
             }
             // v7 ticket 21: hold-to-quit pads decide on release (tap) or at one second (quit).
             if let Event::Press(pad) | Event::Release(pad, _) = &event {
@@ -5107,6 +5261,61 @@ enum Clicked {
     Tab(usize),
     Entry(usize),
 }
+/// v7.7 ticket 160: where each Xbox control sits on the map, as on the controller (8 × 5):
+/// LT LB … RB RT; L3, View Xbox Menu, the Y X B A diamond; the D-pad cross; R3 bottom
+/// middle. (button index in `gamepad::BUTTONS`, short name). Layer 2 changes labels only.
+const XBOX_GRID: [[Option<(u8, &str)>; 8]; 5] = [
+    [
+        Some((6, "LT")),
+        Some((4, "LB")),
+        None,
+        None,
+        None,
+        None,
+        Some((5, "RB")),
+        Some((7, "RT")),
+    ],
+    [
+        Some((11, "L3")),
+        None,
+        None,
+        Some((8, "View")),
+        Some((10, "Xbox")),
+        Some((9, "Menu")),
+        Some((3, "Y")),
+        None,
+    ],
+    [
+        None,
+        Some((13, "↑")),
+        None,
+        None,
+        None,
+        Some((2, "X")),
+        None,
+        Some((1, "B")),
+    ],
+    [
+        Some((15, "←")),
+        None,
+        Some((16, "→")),
+        None,
+        None,
+        None,
+        Some((0, "A")),
+        None,
+    ],
+    [
+        None,
+        Some((14, "↓")),
+        None,
+        None,
+        Some((12, "R3")),
+        None,
+        None,
+        None,
+    ],
+];
 /// What Enter does on a tab row (v7.7 tickets 150, 151).
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Open {
@@ -5122,6 +5331,9 @@ enum Open {
     Problem(usize),
     /// Install the VibeConsole skills (v7.7 ticket 158).
     InstallSkills,
+    /// The controller map's Bank A | B and Layer 1 | 2 switches (v7.7 ticket 160).
+    MapBank,
+    MapLayer,
     /// Show "What moved in 7.7" again (v7.7 ticket 155).
     WhatMoved,
 }
@@ -10021,6 +10233,8 @@ fn command_menu(ui: &mut Terminal) -> Result<Option<usize>> {
                             ui.notice = format!("config: {error}; nothing saved");
                         }
                     }
+                    Some(Open::MapBank) => ui.map_bank_b = !ui.map_bank_b,
+                    Some(Open::MapLayer) => ui.map_layer2 = !ui.map_layer2,
                     Some(Open::InstallSkills) => {
                         ui.notice = match home_dir() {
                             Some(home) => {
@@ -11919,6 +12133,80 @@ mod tests {
             mappings::xbox_program_name(&mappings::load_config(&path).unwrap(), 1),
             "Browser"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 160: the controller map: the Akai's first row is Pads 5–8 with the
+    /// fixture's labels per bank, the pressed pad is marked ◆, unmapped cells ·; every Xbox
+    /// control sits at its grid place and Layer 2 changes labels, not places; the header's
+    /// chip names the profile in use.
+    #[test]
+    fn controller_map_labels_marks_places_and_profile_chip() {
+        let (dir, mut ui, _ran, [mute, down, ..]) = configure_session("map");
+        let path = dir.join("mappings.tsv");
+        let mut config = mappings::load_config(&path).unwrap();
+        for m in &mut config.mappings {
+            m.label = match m.control {
+                c if c == mute => "Bank A Pad 5".into(),
+                c if c == down => "Bank B Pad 1".into(),
+                _ => m.label.clone(),
+            };
+        }
+        for (layer2, key) in [(false, "Enter"), (true, "Space")] {
+            let mut a = Mapping::new(Control::button(0), key, "tap").unwrap();
+            a.context = mappings::xbox_context(1, layer2);
+            config.mappings.push(a);
+        }
+        mappings::save_config(&path, &config).unwrap();
+        ui.run_mappings = ui.context_mappings(&config.mappings);
+        ui.read_view(Some(config.clone()));
+        let rows = ui.map_rows(&config, 120);
+        assert_eq!(rows[0], "── Akai MPK mini 3 · Bank A");
+        assert!(
+            rows[1].starts_with(" Pad 5 Toggle default output"),
+            "first row is Pads 5–8: {}",
+            rows[1]
+        );
+        assert!(
+            rows[1].contains("·Pad 6") && rows[2].starts_with("·Pad 1"),
+            "{rows:?}"
+        );
+        ui.pressed = Some((mute, Instant::now()));
+        assert!(ui.map_rows(&config, 120)[1].starts_with("◆Pad 5"));
+        ui.map_bank_b = true;
+        let bank_b = ui.map_rows(&config, 120);
+        assert!(
+            bank_b[2].starts_with(" Pad 1 Down"),
+            "Bank B's labels: {}",
+            bank_b[2]
+        );
+        let xbox = |ui: &Terminal| {
+            let rows = ui.map_rows(&config, 120);
+            let at = rows.iter().position(|r| r.starts_with("── Xbox")).unwrap();
+            rows[at + 1..].to_vec()
+        };
+        let layer1 = xbox(&ui);
+        ui.map_layer2 = true;
+        let layer2 = xbox(&ui);
+        let place = |rows: &[String]| {
+            let row = rows.iter().position(|r| r.contains(" A ")).unwrap();
+            (
+                row,
+                rows[row][..rows[row].find(" A ").unwrap()].chars().count(),
+            )
+        };
+        assert_eq!(place(&layer1), place(&layer2), "same place");
+        assert_eq!(place(&layer1).0, 3, "A is the diamond's bottom (row 4)");
+        assert!(layer1[3].contains(" A Enter") && layer2[3].contains(" A Space"));
+        for name in [
+            "LT", "LB", "RB", "RT", "View", "Xbox", "Menu", "Y", "X", "B", "R3", "L3",
+        ] {
+            assert!(layer1.iter().any(|r| r.contains(name)), "{name}");
+        }
+        ui.profile = Some("Orca".into());
+        assert!(ui.screen("").header.contains("Orca profile · focused"));
+        ui.profile = None;
+        assert!(ui.screen("").header.contains("| Default |"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
