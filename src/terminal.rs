@@ -360,6 +360,10 @@ struct Terminal {
     started: Instant,
     /// v7.7 ticket 161: `z` Focus: only the agents that need you.
     focus: bool,
+    /// v7.7 ticket 162: per agent, (percent used, window size, tokens so far) from its
+    /// context file and transcript; read in the status refresh; transcripts by bytes read.
+    contexts: BTreeMap<String, (Option<u8>, Option<u64>, Option<u64>)>,
+    token_cache: BTreeMap<PathBuf, (u64, u64)>,
     /// v7 ticket 86: each device's switch and patterns; None while Status lights is off.
     device_lights: Option<crate::status::DevicePatterns>,
     /// Agents' status-light settings, in `agent_states` order; None while Status lights is Off.
@@ -983,6 +987,8 @@ impl Terminal {
             tracked_at: Instant::now(),
             started: Instant::now(),
             focus: false,
+            contexts: BTreeMap::new(),
+            token_cache: BTreeMap::new(),
             device_lights: None,
             light_agents: None,
             light_sessions: Vec::new(),
@@ -1184,6 +1190,7 @@ impl Terminal {
                     host: Some(host),
                     wait: waiting(name, state),
                     hour: hour(name),
+                    context: self.contexts.get(name).copied(),
                 }
             })
             .chain(self.light_sessions.iter().map(|(folder, state, _)| {
@@ -1197,6 +1204,7 @@ impl Terminal {
                     host: None,
                     wait: waiting(&name, state),
                     hour: hour(&name),
+                    context: None,
                     name,
                 }
             }))
@@ -1213,6 +1221,29 @@ impl Terminal {
             (rank, std::cmp::Reverse(row.wait))
         });
         rows
+    }
+    /// v7.7 ticket 162: each agent's context file and transcript tokens (new lines only).
+    fn read_contexts(&mut self) {
+        let Ok(dir) = crate::status::state_dir() else {
+            return;
+        };
+        let names = self
+            .agent_states
+            .iter()
+            .map(|(n, _, _)| n.clone())
+            .collect::<Vec<_>>();
+        self.contexts.clear();
+        for name in names {
+            let Some(context) = crate::status::read_context(&dir, &name) else {
+                continue;
+            };
+            let tokens = context.transcript.and_then(|path| {
+                let cache = self.token_cache.entry(path.clone()).or_default();
+                crate::status::transcript_tokens(&path, cache).ok()
+            });
+            self.contexts
+                .insert(name, (context.used, context.size, tokens));
+        }
     }
     /// v7.7 ticket 161: each agent's state change time and busy seconds, at `now` (the status
     /// refresh calls it; tests pass a clock).
@@ -1551,6 +1582,7 @@ impl Terminal {
                         host: None,
                         wait: None,
                         hour: String::new(),
+                        context: None,
                     }
                     .place();
                     rows.push(one(
@@ -1949,13 +1981,23 @@ impl Terminal {
                         row.hour
                     ),
                     format!("{} · {}", row.project, row.place()),
+                    match row.context {
+                        Some((used, size, tokens)) => format!(
+                            "Context {} of {} · {} tokens",
+                            used.map_or("—".into(), |u| format!("{u}%")),
+                            tokens_text(size),
+                            tokens_text(tokens)
+                        ),
+                        None => "Context — · tokens —".into(),
+                    },
                 ];
                 let card = crate::screen::card(&row.name, &lines, width, chosen);
                 agents.push((card, open));
             }
         } else {
             // Below 100 columns LAST HOUR goes, then FOLDER, then PROJECT (v7.7 spec, Sizes).
-            let (project, folder, hour) = (width >= 55, width >= 90, width >= 108);
+            let (project, folder) = (width >= 55, width >= 100);
+            let (context, hour) = (width >= 75, width >= 118);
             let mut head = format!("── {}", fit("AGENT", 18));
             let line = |row: &AgentRow| {
                 let mut text = format!("● {}", fit(&row.name, 18));
@@ -1977,10 +2019,20 @@ impl Terminal {
                     text += &fit(&place, 28);
                 }
                 let status = format!("{}{}", state_word(row.state), wait_text(row.wait, true));
-                if hour {
-                    text + &fit(&status, 18) + &row.hour
-                } else {
-                    text + &status
+                let (used, tokens) = row.context.map_or((None, None), |(u, _, t)| (u, t));
+                match (context, hour) {
+                    (false, _) => text + &status,
+                    (true, false) => {
+                        text + &fit(&status, 18)
+                            + &fit(&context_text(used), 11)
+                            + &tokens_text(tokens)
+                    }
+                    (true, true) => {
+                        text + &fit(&status, 18)
+                            + &fit(&context_text(used), 11)
+                            + &fit(&tokens_text(tokens), 7)
+                            + &row.hour
+                    }
                 }
             };
             if project {
@@ -1990,10 +2042,10 @@ impl Terminal {
                 head += &fit("FOLDER", 28);
             }
             agents.push(one(
-                head + if hour {
-                    "STATUS            LAST HOUR"
-                } else {
-                    "STATUS"
+                head + match (context, hour) {
+                    (false, _) => "STATUS",
+                    (true, false) => "STATUS            CONTEXT    TOKENS",
+                    (true, true) => "STATUS            CONTEXT    TOKENS LAST HOUR",
                 },
                 None,
             ));
@@ -2214,6 +2266,7 @@ impl Terminal {
             }
         }
         self.track_agents(Instant::now()); // v7.7 ticket 161
+        self.read_contexts();
         // v7 tickets 11 and 86: rumble as a source newly enters a state whose Xbox pattern
         // rumbles, under the Status lights and Xbox switches.
         let rumble = self
@@ -5496,6 +5549,28 @@ struct AgentRow {
     wait: Option<Duration>,
     /// v7.7 ticket 161: how busy it was in each 7½ minutes of the last hour (▁▃▅█).
     hour: String,
+    /// v7.7 ticket 162: percent of the context window used, its size, tokens so far; `None`
+    /// for an agent that doesn't report them.
+    context: Option<(Option<u8>, Option<u64>, Option<u64>)>,
+}
+/// v7.7 ticket 162: `▰▰▰▱▱ 62%`, or `—`.
+fn context_text(used: Option<u8>) -> String {
+    match used {
+        Some(p) => {
+            let filled = usize::from(p.min(100) + 10) / 20;
+            format!("{}{} {p}%", "▰".repeat(filled), "▱".repeat(5 - filled))
+        }
+        None => "—".into(),
+    }
+}
+/// v7.7 ticket 162: `1.4M`, `240k`, `950`, or `—`.
+fn tokens_text(tokens: Option<u64>) -> String {
+    match tokens {
+        Some(t) if t >= 1_000_000 => format!("{:.1}M", t as f64 / 1e6),
+        Some(t) if t >= 1_000 => format!("{}k", t / 1000),
+        Some(t) => t.to_string(),
+        None => "—".into(),
+    }
 }
 /// v7.7 ticket 161: a wait as `40s`, `4m`, `1h` (short) or `40 s`, `4 min`, `1 h`.
 fn wait_text(wait: Option<Duration>, short: bool) -> String {
@@ -5629,7 +5704,18 @@ fn agent_choice(ui: &mut impl Ui, path: &Path, index: usize) -> Result<()> {
             &text,
             &options(&["Install (merge, with backup)", "Copy with wl-copy", "Back"]),
         )? {
-            Some(0) => match crate::status::install_hooks(codex) {
+            Some(0) => match crate::status::install_hooks(codex).and_then(|note| {
+                if codex {
+                    return Ok(note);
+                }
+                // v7.7 ticket 162: Claude Code's status line reports context and tokens.
+                let line = crate::status::install_statusline(
+                    &crate::status::hooks_file(false)?,
+                    &crate::runtime::statusline_saved()?,
+                )
+                .unwrap_or_else(|e| format!("Status line not changed: {e}"));
+                Ok(format!("{note}\n{line}"))
+            }) {
                 Ok(note) => {
                     choose(ui, &note, &options(&["Back"]))?;
                 }
@@ -12306,6 +12392,52 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7.7 ticket 162: CONTEXT and TOKENS render from what an agent reports (`▰▰▰▱▱ 62%`,
+    /// `1.4M`) and read `—` for one that reports nothing; cards say it in words.
+    #[test]
+    fn agent_context_and_tokens_render_and_dash_without_them() {
+        assert_eq!(context_text(Some(62)), "▰▰▰▱▱ 62%");
+        assert_eq!(context_text(Some(0)), "▱▱▱▱▱ 0%");
+        assert_eq!(context_text(None), "—");
+        assert_eq!(tokens_text(Some(1_400_000)), "1.4M");
+        assert_eq!(tokens_text(Some(240_500)), "240k");
+        let (dir, mut ui, _ran, _) = configure_session("context");
+        ui.status_at = Instant::now() + Duration::from_secs(3600);
+        ui.agent_states = vec![
+            ("claude".into(), "w1".into(), "thinking"),
+            ("codex".into(), "w2".into(), "idle"),
+        ];
+        ui.contexts
+            .insert("claude".into(), (Some(62), Some(200_000), Some(1_400_000)));
+        let rows = ui.live_panes(120, usize::MAX).remove(1).1;
+        let lines = rows.iter().map(|(l, _)| l[0].clone()).collect::<Vec<_>>();
+        assert!(
+            lines[1].contains("CONTEXT") && lines[1].contains("TOKENS"),
+            "{}",
+            lines[1]
+        );
+        let claude = lines.iter().find(|l| l.contains("claude")).unwrap();
+        assert!(
+            claude.contains("▰▰▰▱▱ 62%") && claude.contains("1.4M"),
+            "{claude}"
+        );
+        let codex = lines.iter().find(|l| l.contains("codex")).unwrap();
+        assert!(
+            codex.contains("IDLE") && codex.matches('—').count() >= 2,
+            "{codex}"
+        );
+        ui.agent_cards = true;
+        let cards = ui.live_panes(120, usize::MAX).remove(1).1;
+        let text = cards
+            .iter()
+            .flat_map(|(l, _)| l.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Context 62% of 200k · 1.4M tokens"), "{text}");
+        assert!(text.contains("Context — · tokens —"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// v7.7 ticket 161: with a fake clock, waits render (`NEEDS INPUT 4m`) and the longest
     /// wait sorts first within a state; the last hour fills as an agent works; `z` Focus lists
     /// only the agents needing input or a decision and counts the rest; Esc leaves Focus.
@@ -12894,10 +13026,7 @@ mod tests {
             "IDLE",
             "FINISHED",
         ]) {
-            assert!(
-                line.contains('●') && line.trim_end().ends_with(word),
-                "{line}"
-            );
+            assert!(line.contains('●') && line.contains(word), "{line}");
         }
         assert!(lines[2].contains("VibeConsole") && lines[2].contains("/VibeConsole/docs"));
         assert!(

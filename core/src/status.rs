@@ -13,6 +13,10 @@ pub const STATES: [&str; 5] = [
 /// Set in every tmux window VibeConsole launches, so hooks from other sessions are ignored.
 pub const AGENT_ENV: &str = "VIBECONSOLE_AGENT";
 
+/// Where agent state and context files live (`$XDG_RUNTIME_DIR/vibeconsole`).
+pub fn state_dir() -> Result<PathBuf> {
+    dir()
+}
 pub(crate) fn dir() -> Result<PathBuf> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .filter(|v| !v.is_empty())
@@ -1067,6 +1071,143 @@ fn status_in(path: &Path, events: &Events) -> Result<String> {
 
 /// Merges VibeConsole's hooks into the tool's settings: a timestamped backup first, then an
 /// atomic replace that keeps the file's permissions. Invalid files are refused unchanged.
+/// v7.7 ticket 162: an agent's context as Claude Code's status line reports it: the
+/// percent of the window used, the window's size, the transcript. Absent fields stay `None`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Context {
+    pub used: Option<u8>,
+    pub size: Option<u64>,
+    pub transcript: Option<PathBuf>,
+}
+/// `<dir>/<agent>.context`, beside the agent's state file.
+pub fn context_file(dir: &Path, agent: &str) -> PathBuf {
+    dir.join(format!("{agent}.context"))
+}
+/// v7.7 ticket 162: `vibeconsole statusline`: Claude Code's status line JSON (`input`) to
+/// the agent's context file (atomic). Only for a valid agent name; nothing is guessed.
+pub fn write_context(input: &str, agent: &str, dir: &Path) -> Result<()> {
+    if !crate::mappings::simple_name(agent) {
+        return Err("not a VibeConsole agent".into());
+    }
+    let json: serde_json::Value = serde_json::from_str(input)?;
+    let window = &json["context_window"];
+    let used = window["used_percentage"]
+        .as_f64()
+        .map(|p| p.clamp(0.0, 100.0).round() as u8);
+    let size = window["context_window_size"].as_u64();
+    let transcript = json["transcript_path"]
+        .as_str()
+        .filter(|p| p.starts_with('/'));
+    let text = format!(
+        "{}\t{}\t{}\n",
+        used.map_or("-".into(), |u| u.to_string()),
+        size.map_or("-".into(), |s| s.to_string()),
+        transcript.unwrap_or("-")
+    );
+    std::fs::create_dir_all(dir)?;
+    let temporary = dir.join(format!(".{agent}.context.tmp"));
+    std::fs::write(&temporary, text)?;
+    std::fs::rename(&temporary, context_file(dir, agent))?;
+    Ok(())
+}
+/// The context file of `agent`, or `None` when it reports nothing.
+pub fn read_context(dir: &Path, agent: &str) -> Option<Context> {
+    let text = std::fs::read_to_string(context_file(dir, agent)).ok()?;
+    let mut fields = text.trim_end().split('\t');
+    let mut next = || fields.next().filter(|f| *f != "-");
+    Some(Context {
+        used: next().and_then(|f| f.parse().ok()),
+        size: next().and_then(|f| f.parse().ok()),
+        transcript: next().map(PathBuf::from),
+    })
+}
+/// v7.7 ticket 162: the session's tokens so far, summed from the transcript's per-message
+/// usage (input, output and cache writes; cache reads are the same tokens read again, so
+/// they aren't counted). `cache` holds (bytes read, sum): only new lines are read.
+pub fn transcript_tokens(path: &Path, cache: &mut (u64, u64)) -> std::io::Result<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    if file.metadata()?.len() < cache.0 {
+        *cache = (0, 0); // a new transcript in the same place
+    }
+    file.seek(SeekFrom::Start(cache.0))?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    let complete = text.rfind('\n').map_or(0, |at| at + 1);
+    for line in text[..complete].lines() {
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let usage = &json["message"]["usage"];
+        cache.1 += [
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+        ]
+        .iter()
+        .filter_map(|k| usage[*k].as_u64())
+        .sum::<u64>();
+    }
+    cache.0 += complete as u64;
+    Ok(cache.1)
+}
+/// The command VibeConsole puts in Claude Code's `statusLine`.
+pub const STATUSLINE: &str = "vibeconsole statusline";
+/// v7.7 ticket 162: point Claude Code's `statusLine` at `vibeconsole statusline`, after a
+/// backup. A status line command the user already had is kept in `saved` and the wrapper
+/// runs it and prints its output, so their status line stays as it was.
+pub fn install_statusline(settings: &Path, saved: &Path) -> Result<String> {
+    let text = match std::fs::read_to_string(settings) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    let mut json: serde_json::Value = match &text {
+        Some(text) => serde_json::from_str(text)
+            .map_err(|e| format!("{} not changed: not valid JSON: {e}", settings.display()))?,
+        None => serde_json::json!({}),
+    };
+    let current = json["statusLine"]["command"].as_str().map(str::to_owned);
+    if current.as_deref() == Some(STATUSLINE) {
+        return Ok("Status line: already installed".into());
+    }
+    let object = json
+        .as_object_mut()
+        .ok_or_else(|| format!("{} not changed: not a JSON object", settings.display()))?;
+    if let Some(theirs) = &current {
+        if let Some(folder) = saved.parent() {
+            std::fs::create_dir_all(folder)?;
+        }
+        std::fs::write(saved, theirs)?;
+    }
+    let mut line = object
+        .get("statusLine")
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    line.insert("type".into(), "command".into());
+    line.insert("command".into(), STATUSLINE.into());
+    object.insert("statusLine".into(), serde_json::Value::Object(line));
+    let mut note = "Status line: installed".to_string();
+    if text.is_some() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let backup = PathBuf::from(format!("{}.bak-vibeconsole-{stamp}", settings.display()));
+        std::fs::copy(settings, &backup)?;
+        note.push_str(&format!("; backup {}", backup.display()));
+    }
+    if current.is_some() {
+        note.push_str("; your own status line still shows (VibeConsole runs it)");
+    }
+    if let Some(folder) = settings.parent() {
+        std::fs::create_dir_all(folder)?;
+    }
+    let temporary = settings.with_extension("json.vibeconsole-tmp");
+    std::fs::write(&temporary, serde_json::to_string_pretty(&json)? + "\n")?;
+    std::fs::rename(&temporary, settings)?;
+    Ok(note)
+}
+
 pub fn install_hooks(codex: bool) -> Result<String> {
     let note = install_in(&hooks_file(codex)?, if codex { CODEX } else { CLAUDE })?;
     Ok(if codex && note.starts_with("Installed") {
@@ -1128,6 +1269,93 @@ fn hooks(events: &[(&str, Option<&str>, &str)]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// v7.7 ticket 162: the status line JSON becomes the agent's context file; tokens are
+    /// summed from the transcript and only new lines are read; installing wraps an existing
+    /// `statusLine` command and keeps it, once.
+    #[test]
+    fn statusline_context_tokens_and_install_keep_theirs() {
+        use super::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-ctx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let transcript = dir.join("t.jsonl");
+        let input = format!(
+            r#"{{"session_id":"s","transcript_path":"{}","context_window":{{"context_window_size":200000,"used_percentage":61.6,"total_input_tokens":1}}}}"#,
+            transcript.display()
+        );
+        write_context(&input, "claude", &dir).unwrap();
+        assert_eq!(
+            read_context(&dir, "claude"),
+            Some(Context {
+                used: Some(62),
+                size: Some(200000),
+                transcript: Some(transcript.clone())
+            })
+        );
+        write_context(
+            r#"{"context_window":{"used_percentage":null}}"#,
+            "early",
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(
+            read_context(&dir, "early"),
+            Some(Context::default()),
+            "nothing guessed"
+        );
+        assert!(write_context(&input, "../x", &dir).is_err());
+        assert_eq!(read_context(&dir, "codex"), None);
+
+        let usage = |i: u64, o: u64, c: u64| {
+            format!(
+                r#"{{"message":{{"usage":{{"input_tokens":{i},"output_tokens":{o},"cache_creation_input_tokens":{c},"cache_read_input_tokens":999}}}}}}"#
+            )
+        };
+        let lines = format!(
+            "{}\n{{\"type\":\"user\"}}\n{}\n",
+            usage(10, 20, 30),
+            usage(1, 2, 3)
+        );
+        std::fs::write(&transcript, lines).unwrap();
+        let mut cache = (0, 0);
+        assert_eq!(transcript_tokens(&transcript, &mut cache).unwrap(), 66);
+        let read = cache.0;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        let more = format!("{}\n{{\"partial", usage(100, 0, 0));
+        std::io::Write::write_all(&mut file, more.as_bytes()).unwrap();
+        assert_eq!(transcript_tokens(&transcript, &mut cache).unwrap(), 166);
+        assert!(cache.0 > read, "only the new line was read");
+
+        let settings = dir.join(".claude/settings.json");
+        let saved = dir.join("statusline-command");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(
+            &settings,
+            r#"{"model":"opus","statusLine":{"type":"command","command":"~/my-line.sh","padding":2}}"#,
+        )
+        .unwrap();
+        let note = install_statusline(&settings, &saved).unwrap();
+        assert!(
+            note.contains("backup") && note.contains("your own status line"),
+            "{note}"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(json["statusLine"]["command"], STATUSLINE);
+        assert_eq!(json["statusLine"]["padding"], 2);
+        assert_eq!(json["model"], "opus");
+        assert_eq!(std::fs::read_to_string(&saved).unwrap(), "~/my-line.sh");
+        assert!(
+            install_statusline(&settings, &saved)
+                .unwrap()
+                .contains("already installed")
+        );
+        assert_eq!(std::fs::read_to_string(&saved).unwrap(), "~/my-line.sh");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
     /// v7 ticket 86: the Xbox button light shows the most urgent busy state whose pattern
     /// lights it; rumble fires once for a source newly in a state that rumbles, the longest
     /// winning; the defaults are the board's (version 34).

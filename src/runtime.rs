@@ -315,6 +315,41 @@ pub fn skills_installed(home: &Path) -> bool {
     })
 }
 
+/// v7.7 ticket 162: where the user's own status line command is kept once VibeConsole's
+/// wrapper takes `statusLine` over.
+pub fn statusline_saved() -> Result<PathBuf> {
+    Ok(crate::mappings::config_path()?.with_file_name("statusline-command"))
+}
+/// v7.7 ticket 162: `vibeconsole statusline`, Claude Code's `statusLine` command: the JSON on
+/// stdin becomes the context file of the agent in `$VIBECONSOLE_AGENT` (outside VibeConsole's
+/// agents nothing is written), then the user's own status line command, if they had one,
+/// runs with the same input and its output is the status line. Never fails the line.
+pub fn statusline() -> Result<()> {
+    use std::io::{Read, Write};
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input)?;
+    if let (Ok(agent), Ok(dir)) = (
+        std::env::var(crate::status::AGENT_ENV),
+        crate::status::state_dir(),
+    ) {
+        let _ = crate::status::write_context(&input, &agent, &dir);
+    }
+    let Ok(theirs) = fs::read_to_string(statusline_saved()?) else {
+        return Ok(());
+    };
+    // Their command is the one Claude Code ran as a shell line before; it runs the same way.
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(theirs.trim())
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(input.as_bytes());
+    }
+    child.wait()?;
+    Ok(())
+}
+
 /// v7.7 ticket 157: a problem `doctor` reports, with its fix.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Problem {

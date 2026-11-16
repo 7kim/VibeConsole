@@ -121,6 +121,10 @@ fn help(color: bool) -> String {
                     "agent-status",
                     "<agent|-> <state>  Report an agent's state (for hooks)".into(),
                 ),
+                (
+                    "statusline",
+                    "Claude Code's status line: report context, then run your own line".into(),
+                ),
                 ("", format!("state: {states}")),
             ],
         ),
@@ -205,6 +209,10 @@ fn main() -> Result<()> {
     // Called from agent hooks while the session or service runs: no MIDI, keyboard, or owner lock.
     if args.first().is_some_and(|s| s == "agent-status") {
         return status::command(&args[1..]);
+    }
+    // v7.7 ticket 162: Claude Code runs it for its status line; nothing else is opened.
+    if args.first().is_some_and(|s| s == "statusline") {
+        return runtime::statusline();
     }
     // v7 ticket 129: run as root by Settings -> Xbox tuning through pkexec.
     if let [command, driver] = &args[..]
@@ -430,6 +438,7 @@ mod tests {
             .chain(crate::runtime::COMMANDS.iter())
             .chain(&[
                 "agent-status",
+                "statusline",
                 "daemon",
                 "xbox-driver",
                 "--help",
