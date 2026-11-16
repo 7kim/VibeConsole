@@ -8646,6 +8646,11 @@ pub fn start(path: &Path, current: Vec<Mapping>, initial: &str) -> Result<()> {
 fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> {
     let mut ui = Terminal::open(path)?;
     let config = mappings::load_config(path)?;
+    // v7.7 ticket 149: a saved value this build doesn't know loaded as its default.
+    let look_notice = config.look.notice.clone();
+    if let Some(notice) = &look_notice {
+        ui.notice = notice.clone();
+    }
     ui.idle = config.idle;
     ui.start_flow_enabled = config.start_flow;
     ui.run_mappings = ui.context_mappings(&current);
@@ -8673,6 +8678,13 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
     if (initial == "run" || initial == "session") && flow_ready {
         ui.wanted_run = true;
         ui.notice = "Detecting the controller’s current program before enabling actions.".into();
+    }
+    if let Some(notice) = look_notice.filter(|n| !ui.notice.starts_with(n.as_str())) {
+        ui.notice = if ui.notice.is_empty() {
+            notice
+        } else {
+            format!("{notice}. {}", ui.notice)
+        };
     }
     loop {
         ui.run_mappings = ui.context_mappings(&current);
@@ -14942,13 +14954,13 @@ mod tests {
         let v14 = saved
             .lines()
             .filter(|l| {
-                !["device-lights\t", "xbox-pattern\t", "ps5-pattern\t", "keyboard-lights\t", "keyboard-pattern\t", "xbox-headset\t", "keyboard-leds\t", "xbox-brightness\t", "keyboard-rgb\t"]
+                !["device-lights\t", "xbox-pattern\t", "ps5-pattern\t", "keyboard-lights\t", "keyboard-pattern\t", "xbox-headset\t", "keyboard-leds\t", "xbox-brightness\t", "keyboard-rgb\t", "theme\t", "ai-share-usage\t", "seen-7.7\t", "agents-view\t", "default-agent\t"]
                     .iter()
                     .any(|p| l.starts_with(p))
             })
             .map(|l| format!("{l}\n"))
             .collect::<String>()
-            .replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v14")
+            .replace("vibeconsole-mappings-v33", "vibeconsole-mappings-v14")
             .replace(
                 "tuning\t15\t30\t10\toff\toff\nsticks\tlinear\tlinear\nmidi-devices\t0\nmidi-active\t-\nxbox-programs\t-\t-\t-\t-\t-\t-\t-\t-\nprofiles\t0\nprofile-lock\t-\nfavourites\t0\nsequences\t0\n",
                 "",

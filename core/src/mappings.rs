@@ -608,6 +608,148 @@ pub struct Config {
     pub favourites: Vec<String>,
     /// v7 ticket 116 (config v25): prompt sequences saved by name, each its steps.
     pub sequences: Vec<(String, Vec<crate::actions::Action>)>,
+    /// v7.7 ticket 149 (config v33): the screen's theme and views, and what the AI tab asks.
+    pub look: Look,
+}
+/// The 14 themes (v7.7 spec, Themes); the first is the default.
+pub const THEMES: [&str; 14] = [
+    "Tokyo Night",
+    "Terminal colours",
+    "Tokyo Night Storm",
+    "Catppuccin Mocha",
+    "Catppuccin Macchiato",
+    "Catppuccin Latte",
+    "Gruvbox Dark",
+    "Gruvbox Light",
+    "Nord",
+    "Dracula",
+    "One Dark",
+    "Kanagawa Wave",
+    "Everforest Dark",
+    "Ayu Mirage",
+];
+/// Agents the AI tab can ask (v7.7 spec, Default agent); the first is the default.
+pub const AGENT_NAMES: [&str; 8] = [
+    "Claude Code",
+    "Codex",
+    "OpenCode",
+    "Oh My Pi",
+    "Ollama",
+    "Gemini CLI",
+    "Qwen Code",
+    "GitHub Copilot CLI",
+];
+/// v7.7 ticket 149: the `look` line of config v33.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Look {
+    /// One of [`THEMES`].
+    pub theme: String,
+    /// The Live Agents pane shows cards instead of the table.
+    pub agent_cards: bool,
+    /// The user said yes to sending usage counts to the default agent (ticket 146).
+    pub share_usage: bool,
+    /// "What moved in 7.7" was shown; false after loading a v32 or older file.
+    pub seen_moved: bool,
+    /// One of [`AGENT_NAMES`].
+    pub default_agent: String,
+    /// Why a saved value was replaced by its default while loading; never saved.
+    pub notice: Option<String>,
+}
+impl Default for Look {
+    fn default() -> Self {
+        Self {
+            theme: THEMES[0].into(),
+            agent_cards: false,
+            share_usage: false,
+            seen_moved: true,
+            default_agent: AGENT_NAMES[0].into(),
+            notice: None,
+        }
+    }
+}
+impl Look {
+    /// The five v33 lines, in the order the spec names them.
+    const KEYS: [&str; 5] = [
+        "theme",
+        "ai-share-usage",
+        "seen-7.7",
+        "agents-view",
+        "default-agent",
+    ];
+    fn text(&self) -> Result<String> {
+        if !THEMES.contains(&self.theme.as_str()) {
+            return Err(format!("unknown theme {:?}", self.theme).into());
+        }
+        if !AGENT_NAMES.contains(&self.default_agent.as_str()) {
+            return Err(format!("unknown default agent {:?}", self.default_agent).into());
+        }
+        let on = |b: bool| if b { "on" } else { "off" };
+        let values = [
+            self.theme.as_str(),
+            on(self.share_usage),
+            on(self.seen_moved),
+            if self.agent_cards { "gallery" } else { "table" },
+            self.default_agent.as_str(),
+        ];
+        Ok(Self::KEYS
+            .iter()
+            .zip(values)
+            .map(|(key, value)| format!("{key}\t{value}\n"))
+            .collect())
+    }
+    /// Lenient on purpose (ticket 149): a value this build doesn't know loads as its default
+    /// and says so, so a config from a newer build still opens. A missing or misnamed line
+    /// is still an error.
+    fn parse<'a>(lines: &mut impl Iterator<Item = &'a str>) -> Result<Self> {
+        let mut values = Vec::new();
+        for key in Self::KEYS {
+            let line = lines.next().ok_or_else(|| format!("missing {key}"))?;
+            let value = line
+                .strip_prefix(key)
+                .and_then(|rest| rest.strip_prefix('\t'))
+                .filter(|value| !value.contains('\t'))
+                .ok_or_else(|| format!("expected {key} <value>"))?;
+            values.push(value);
+        }
+        let [theme, share, seen, view, agent] = values[..] else {
+            unreachable!("five keys")
+        };
+        let mut look = Self::default();
+        let mut unknown = Vec::new();
+        if THEMES.contains(&theme) {
+            look.theme = theme.into();
+        } else {
+            unknown.push(format!("theme {theme:?} (using {})", THEMES[0]));
+        }
+        let mut on_off = |key: &str, value: &str, default: bool| match value {
+            "on" => true,
+            "off" => false,
+            other => {
+                let using = if default { "on" } else { "off" };
+                unknown.push(format!("{key} {other:?} (using {using})"));
+                default
+            }
+        };
+        look.share_usage = on_off("ai-share-usage", share, false);
+        look.seen_moved = on_off("seen-7.7", seen, true);
+        match view {
+            "table" => {}
+            "gallery" => look.agent_cards = true,
+            other => unknown.push(format!("agents-view {other:?} (using table)")),
+        }
+        if AGENT_NAMES.contains(&agent) {
+            look.default_agent = agent.into();
+        } else {
+            unknown.push(format!(
+                "default-agent {agent:?} (using {})",
+                AGENT_NAMES[0]
+            ));
+        }
+        if !unknown.is_empty() {
+            look.notice = Some(format!("config: unknown {}", unknown.join(", ")));
+        }
+        Ok(look)
+    }
 }
 /// A mapping's favourite key: its context and control, which stay the same when its
 /// action is edited.
@@ -1300,6 +1442,7 @@ impl Default for Config {
             lock: None,
             favourites: Vec::new(),
             sequences: Vec::new(),
+            look: Look::default(),
         }
     }
 }
@@ -2035,9 +2178,12 @@ fn parse_config(contents: &str) -> Result<Config> {
         Some("31") => 31,
         // v32 (v7 ticket 128): `keyboard-rgb`, the Razer keyboard's RGB per state.
         Some("32") => 32,
+        // v33 (v7.7 ticket 149): `theme`, `ai-share-usage`, `seen-7.7`, `agents-view` and
+        // `default-agent`.
+        Some("33") => 33,
         _ => {
             return Err(
-                "invalid configuration header; expected vibeconsole-mappings-v1..v32".into(),
+                "invalid configuration header; expected vibeconsole-mappings-v1..v33".into(),
             );
         }
     };
@@ -2473,6 +2619,15 @@ fn parse_config(contents: &str) -> Result<Config> {
         }
         validate_sequences(&sequences)?;
     }
+    // Older files never showed "What moved in 7.7", so it shows once (ticket 155).
+    let look = if version >= 33 {
+        Look::parse(&mut lines)?
+    } else {
+        Look {
+            seen_moved: false,
+            ..Look::default()
+        }
+    };
     let mut mappings = Vec::new();
     let mut seen = HashSet::new();
     let mut labels = HashSet::new();
@@ -2555,6 +2710,7 @@ fn parse_config(contents: &str) -> Result<Config> {
         lock,
         favourites,
         sequences,
+        look,
     })
 }
 
@@ -2651,7 +2807,7 @@ pub fn serialize_config(config: &Config) -> Result<String> {
     validate_variables(&config.vars, "user")?;
     config.validate_references()?;
     let mut contents = format!(
-        "vibeconsole-mappings-v32\nidle\t{}\t{}\t{}\n",
+        "vibeconsole-mappings-v33\nidle\t{}\t{}\t{}\n",
         opt_text(config.idle.octave),
         opt_text(config.idle.tempo),
         arp_text(config.idle.arp)
@@ -2797,6 +2953,7 @@ pub fn serialize_config(config: &Config) -> Result<String> {
             crate::actions::Action::PromptSequence(steps.clone()).encode()
         ));
     }
+    contents.push_str(&config.look.text()?);
     for mapping in &config.mappings {
         contents.push_str(&mapping_line(mapping)?);
     }
@@ -3155,7 +3312,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v32\n")
+                .starts_with("vibeconsole-mappings-v33\n")
         );
         assert!(
             load_config(&path)
@@ -3341,7 +3498,7 @@ mod tests {
         };
         save_config(&path, &tuned).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v32\n"));
+        assert!(text.starts_with("vibeconsole-mappings-v33\n"));
         assert!(text.contains("\ntuning\t20\t60\t25\ton\toff\n"));
         assert!(text.contains("\nxbox-headset\ton\n")); // v7 ticket 108
         assert_eq!(load_config(&path).unwrap(), tuned);
@@ -3382,6 +3539,126 @@ mod tests {
     /// A line only a v20 file has (v7 ticket 86), dropped when a test writes an older one.
     /// The same file without the records only a v26 file has (v7 ticket 113), for tests that
     /// write it under an older header.
+    /// The default v33 lines (ticket 149), which files before v33 don't have.
+    const DEFAULT_LOOK: &str = "theme\tTokyo Night\nai-share-usage\toff\nseen-7.7\ton\nagents-view\ttable\ndefault-agent\tClaude Code\n";
+    /// A file from before v33 loads with "What moved" unseen (ticket 149); the rest of the
+    /// comparison is unchanged.
+    fn seen(mut config: Config) -> Config {
+        assert!(
+            !config.look.seen_moved,
+            "an older file shows What moved once"
+        );
+        config.look.seen_moved = true;
+        config
+    }
+    /// v7.7 ticket 149: config v33's five lines round-trip; a v32 file loads every default
+    /// with "What moved" still to show; an unknown value loads as its default and names the
+    /// stage; a missing line is refused; a save that can't validate keeps the last file.
+    #[test]
+    fn config_v33_screen_and_ai_lines() {
+        let default = serialize_config(&Config::default()).unwrap();
+        assert!(default.contains(&format!("\n{DEFAULT_LOOK}")), "{default}");
+        let v32 = default
+            .replace(DEFAULT_LOOK, "")
+            .replace("vibeconsole-mappings-v33", "vibeconsole-mappings-v32");
+        let old = parse_config(&v32).unwrap();
+        assert_eq!(
+            old.look,
+            Look {
+                seen_moved: false,
+                ..Look::default()
+            }
+        );
+        assert_eq!(
+            (old.look.theme.as_str(), old.look.default_agent.as_str()),
+            ("Tokyo Night", "Claude Code")
+        );
+        assert!(!old.look.share_usage && !old.look.agent_cards && old.look.notice.is_none());
+        // Saving keeps What moved unseen until ticket 155 shows it.
+        assert!(
+            serialize_config(&old)
+                .unwrap()
+                .contains("\nseen-7.7\toff\n")
+        );
+
+        let mut config = Config::default();
+        config.look = Look {
+            theme: "Nord".into(),
+            agent_cards: true,
+            share_usage: true,
+            seen_moved: false,
+            default_agent: "Codex".into(),
+            notice: None,
+        };
+        let text = serialize_config(&config).unwrap();
+        assert!(
+            text.contains(
+                "\ntheme\tNord\nai-share-usage\ton\nseen-7.7\toff\nagents-view\tgallery\ndefault-agent\tCodex\n"
+            ),
+            "{text}"
+        );
+        assert_eq!(parse_config(&text).unwrap(), config);
+        for theme in THEMES {
+            config.look.theme = theme.into();
+            let text = serialize_config(&config).unwrap();
+            assert_eq!(parse_config(&text).unwrap().look.theme, theme);
+        }
+        for agent in AGENT_NAMES {
+            config.look.default_agent = agent.into();
+            let text = serialize_config(&config).unwrap();
+            assert_eq!(parse_config(&text).unwrap().look.default_agent, agent);
+        }
+
+        let bad = default
+            .replace("theme\tTokyo Night", "theme\tSolarized")
+            .replace("default-agent\tClaude Code", "default-agent\tbash -c rm")
+            .replace("agents-view\ttable", "agents-view\tgrid")
+            .replace("ai-share-usage\toff", "ai-share-usage\tyes");
+        let loaded = parse_config(&bad).unwrap();
+        let notice = loaded.look.notice.clone().unwrap();
+        assert!(notice.starts_with("config: unknown theme"), "{notice}");
+        for part in [
+            "Solarized",
+            "default-agent",
+            "agents-view",
+            "ai-share-usage",
+        ] {
+            assert!(notice.contains(part), "{notice}");
+        }
+        assert_eq!(
+            Look {
+                notice: None,
+                ..loaded.look
+            },
+            Look::default(),
+            "every unknown value loads as its default"
+        );
+        assert_eq!(
+            serialize_config(&parse_config(&bad).unwrap()).unwrap(),
+            default,
+            "the notice is never saved"
+        );
+
+        let missing = default.replace("seen-7.7\ton\n", "");
+        let error = parse_config(&missing).unwrap_err().to_string();
+        assert!(error.contains("seen-7.7"), "{error}");
+
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-config-v33-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        save_config(&path, &Config::default()).unwrap();
+        let before = fs::read(&path).unwrap();
+        let mut unsaveable = Config::default();
+        unsaveable.look.theme = "../../etc".into();
+        assert!(save_config(&path, &unsaveable).is_err());
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "a failed save keeps the last file"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
     /// The default `keyboard-rgb` line (v32), which files before v32 don't have.
     const DEFAULT_RGB: &str =
         "keyboard-rgb\toff\tspectrum\t255\tstatic-red\tstatic-orange\tbreath-blue\tstatic-green\n";
@@ -3429,7 +3706,7 @@ mod tests {
         assert_eq!(config.device_lights, DevicePatterns::default());
         save_config(&path, &config).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v32\n"), "{text}");
+        assert!(text.starts_with("vibeconsole-mappings-v33\n"), "{text}");
         assert!(
             text.contains(concat!(
                 "device-lights\ton\ton\ton\n",
@@ -3442,13 +3719,14 @@ mod tests {
             "{text}"
         );
         let v19 = text
-            .replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v19")
+            .replace(DEFAULT_LOOK, "")
+            .replace("vibeconsole-mappings-v33", "vibeconsole-mappings-v19")
             .lines()
             .filter(|l| !v20_record(l))
             .map(|l| format!("{l}\n"))
             .collect::<String>();
         assert_eq!(
-            parse_config(&v19).unwrap(),
+            seen(parse_config(&v19).unwrap()),
             config,
             "v19 loads the defaults"
         );
@@ -3491,11 +3769,12 @@ mod tests {
         assert_eq!(config.device_lights.xbox_brightness, [20; 4]);
         config.device_lights.xbox_brightness = [50, 35, 5, 0];
         let text = serialize_config(&config).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v32\n"), "{text}");
+        assert!(text.starts_with("vibeconsole-mappings-v33\n"), "{text}");
         assert!(text.contains("\nxbox-brightness\t50\t35\t5\t0\n"), "{text}");
         assert_eq!(parse_config(&text).unwrap(), config);
         let v28 = text
-            .replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v28")
+            .replace(DEFAULT_LOOK, "")
+            .replace("vibeconsole-mappings-v33", "vibeconsole-mappings-v28")
             .replace(DEFAULT_RGB, "")
             .replace("xbox-brightness\t50\t35\t5\t0\n", "");
         assert_eq!(
@@ -3521,7 +3800,7 @@ mod tests {
         config.device_lights.xbox[0].0 = Light::SlowBlink;
         config.device_lights.xbox[3].0 = Light::FastPulse;
         let text = serialize_config(&config).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v32\n"), "{text}");
+        assert!(text.starts_with("vibeconsole-mappings-v33\n"), "{text}");
         assert!(
             text.contains("\nxbox-pattern\tneeds-decision\tslow-blink\tshort\n")
                 && text.contains("\nxbox-pattern\tfinished\tfast-pulse\tshort\n"),
@@ -3530,9 +3809,10 @@ mod tests {
         assert_eq!(parse_config(&text).unwrap(), config);
         let v29 = serialize_config(&Config::default())
             .unwrap()
-            .replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v29")
+            .replace(DEFAULT_LOOK, "")
+            .replace("vibeconsole-mappings-v33", "vibeconsole-mappings-v29")
             .replace(DEFAULT_RGB, "");
-        assert_eq!(parse_config(&v29).unwrap(), Config::default());
+        assert_eq!(seen(parse_config(&v29).unwrap()), Config::default());
         let keyboard = text.replace(
             "keyboard-pattern\tthinking\tslow-pulse",
             "keyboard-pattern\tthinking\tslow-blink",
@@ -3555,7 +3835,7 @@ mod tests {
         config.device_lights.xbox[1].0 = Light::TempoFast;
         config.device_lights.xbox[2].0 = Light::TempoSlow;
         let text = serialize_config(&config).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v32\n"), "{text}");
+        assert!(text.starts_with("vibeconsole-mappings-v33\n"), "{text}");
         assert!(
             text.contains("\nxbox-pattern\tneeds-input\ttempo-fast\toff\n")
                 && text.contains("\nxbox-pattern\tthinking\ttempo-slow\toff\n"),
@@ -3564,9 +3844,10 @@ mod tests {
         assert_eq!(parse_config(&text).unwrap(), config);
         let v30 = serialize_config(&Config::default())
             .unwrap()
-            .replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v30")
+            .replace(DEFAULT_LOOK, "")
+            .replace("vibeconsole-mappings-v33", "vibeconsole-mappings-v30")
             .replace(DEFAULT_RGB, "");
-        assert_eq!(parse_config(&v30).unwrap(), Config::default());
+        assert_eq!(seen(parse_config(&v30).unwrap()), Config::default());
         let keyboard = text.replace(
             "keyboard-pattern\tthinking\tslow-pulse",
             "keyboard-pattern\tthinking\ttempo-slow",
@@ -3588,7 +3869,9 @@ mod tests {
             "{text}"
         );
         assert_eq!(parse_config(&text).unwrap(), config);
-        let v25 = before_v26(&text).replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v25");
+        let v25 = before_v26(&text)
+            .replace(DEFAULT_LOOK, "")
+            .replace("vibeconsole-mappings-v33", "vibeconsole-mappings-v25");
         let loaded = parse_config(&v25).unwrap();
         assert!(!loaded.device_lights.keyboard_on);
         assert_eq!(
@@ -3606,7 +3889,8 @@ mod tests {
         );
         assert_eq!(parse_config(&text).unwrap(), config);
         let v27 = text
-            .replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v27")
+            .replace(DEFAULT_LOOK, "")
+            .replace("vibeconsole-mappings-v33", "vibeconsole-mappings-v27")
             .replace(DEFAULT_RGB, "")
             .replace("keyboard-leds\tscroll,caps,macro\n", "")
             .replace("xbox-brightness\t20\t20\t20\t20\n", "");
@@ -3627,7 +3911,8 @@ mod tests {
         let text = serialize_config(&config).unwrap();
         assert!(text.contains(&format!("\n{DEFAULT_RGB}")), "{text}");
         let v31 = text
-            .replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v31")
+            .replace(DEFAULT_LOOK, "")
+            .replace("vibeconsole-mappings-v33", "vibeconsole-mappings-v31")
             .replace(DEFAULT_RGB, "");
         assert!(!parse_config(&v31).unwrap().device_lights.rgb_on);
         config.device_lights.rgb_on = true;
@@ -3693,7 +3978,9 @@ mod tests {
         assert!(text.contains("\tsaved-sequence:release-notes\t"), "{text}");
         assert_eq!(parse_config(&text).unwrap(), config);
         assert_eq!(saved_sequence(&config, "release-notes").unwrap().len(), 2);
-        let v24 = before_v26(&text).replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v24");
+        let v24 = before_v26(&text)
+            .replace(DEFAULT_LOOK, "")
+            .replace("vibeconsole-mappings-v33", "vibeconsole-mappings-v24");
         assert!(parse_config(&v24).unwrap_err().to_string().contains("v25"));
         let mut missing = config.clone();
         missing.sequences.clear();
@@ -3731,14 +4018,17 @@ mod tests {
         assert_eq!(parse_config(&text).unwrap(), config);
         assert_eq!(xbox_program_name(&config, 2), "Browser");
         assert_eq!(xbox_program_name(&config, 3), "Program 3");
-        let v23 = before_v26(&text).replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v23");
+        let v23 = before_v26(&text)
+            .replace(DEFAULT_LOOK, "")
+            .replace("vibeconsole-mappings-v33", "vibeconsole-mappings-v23");
         assert!(parse_config(&v23).unwrap_err().to_string().contains("v24"));
         config.mappings.retain(|m| m.context == GAMEPAD_CONTEXT);
         config.xbox_names = Default::default();
         let old = before_v26(&serialize_config(&config).unwrap())
-            .replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v23")
+            .replace(DEFAULT_LOOK, "")
+            .replace("vibeconsole-mappings-v33", "vibeconsole-mappings-v23")
             .replace("xbox-programs\t-\t-\t-\t-\t-\t-\t-\t-\n", "");
-        let loaded = parse_config(&old).unwrap();
+        let loaded = seen(parse_config(&old).unwrap());
         assert_eq!(loaded, config, "a v23 file loads as is");
         assert_eq!(xbox_program(loaded.mappings[0].context), Some((1, false)));
         let mut bad = config.clone();
@@ -3761,11 +4051,13 @@ mod tests {
         ];
         let text = serialize_config(&config).unwrap();
         assert!(
-            text.starts_with("vibeconsole-mappings-v32\n") && text.contains("\tnothing\t"),
+            text.starts_with("vibeconsole-mappings-v33\n") && text.contains("\tnothing\t"),
             "{text}"
         );
         assert_eq!(parse_config(&text).unwrap(), config);
-        let v22 = before_v26(&text).replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v22");
+        let v22 = before_v26(&text)
+            .replace(DEFAULT_LOOK, "")
+            .replace("vibeconsole-mappings-v33", "vibeconsole-mappings-v22");
         assert!(parse_config(&v22).unwrap_err().to_string().contains("v23"));
     }
 
@@ -3817,9 +4109,11 @@ mod tests {
             .unwrap(),
         ];
         let text = serialize_config(&config).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v32\n"), "{text}");
+        assert!(text.starts_with("vibeconsole-mappings-v33\n"), "{text}");
         assert_eq!(parse_config(&text).unwrap(), config);
-        let v21 = before_v26(&text).replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v21");
+        let v21 = before_v26(&text)
+            .replace(DEFAULT_LOOK, "")
+            .replace("vibeconsole-mappings-v33", "vibeconsole-mappings-v21");
         assert!(parse_config(&v21).unwrap_err().to_string().contains("v22"));
         // An old needs-me pad (a plain sequence) becomes Orca keys; another sequence doesn't.
         let old = v21.replace("orca-keys:", "sequence:");
@@ -3839,16 +4133,19 @@ mod tests {
         let mut config = Config::default();
         config.mappings = vec![Mapping::new(pad, "Ctrl+T", "tap").unwrap()];
         let text = serialize_config(&config).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v32\n"), "{text}");
+        assert!(text.starts_with("vibeconsole-mappings-v33\n"), "{text}");
         assert!(text.contains("\ttap\tCtrl+T\t"), "{text}");
         assert_eq!(parse_config(&text).unwrap(), config);
-        let v20 = before_v26(&text).replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v20");
+        let v20 = before_v26(&text)
+            .replace(DEFAULT_LOOK, "")
+            .replace("vibeconsole-mappings-v33", "vibeconsole-mappings-v20");
         assert!(parse_config(&v20).unwrap_err().to_string().contains("v21"));
         config.mappings = vec![Mapping::new(pad, "Ctrl+T", "hold").unwrap()];
         let old = before_v26(&serialize_config(&config).unwrap())
-            .replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v20");
+            .replace(DEFAULT_LOOK, "")
+            .replace("vibeconsole-mappings-v33", "vibeconsole-mappings-v20");
         assert_eq!(
-            parse_config(&old).unwrap(),
+            seen(parse_config(&old).unwrap()),
             config,
             "a v20 file loads as is"
         );
@@ -3874,13 +4171,14 @@ mod tests {
         save_config(&path, &config).unwrap();
         let v18 = fs::read_to_string(&path)
             .unwrap()
-            .replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v18")
+            .replace(DEFAULT_LOOK, "")
+            .replace("vibeconsole-mappings-v33", "vibeconsole-mappings-v18")
             .lines()
             .filter(|l| !v20_record(l))
             .map(|l| format!("{l}\n"))
             .collect::<String>();
         assert_eq!(
-            parse_config(&v18).unwrap(),
+            seen(parse_config(&v18).unwrap()),
             config,
             "a v18 file loads as is"
         );
@@ -3893,7 +4191,7 @@ mod tests {
         config.mappings[0].action = Action::PromptSequence(vec![own, saved("build")]);
         save_config(&path, &config).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v32\n"), "{text}");
+        assert!(text.starts_with("vibeconsole-mappings-v33\n"), "{text}");
         assert_eq!(load_config(&path).unwrap(), config);
         let mut bad = config.clone();
         bad.mappings[0].action = Action::PromptSequence(vec![Action::PromptOwn {
@@ -3932,7 +4230,8 @@ mod tests {
         ));
         assert_eq!(load_config(&path).unwrap(), config);
         let v17 = text
-            .replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v17")
+            .replace(DEFAULT_LOOK, "")
+            .replace("vibeconsole-mappings-v33", "vibeconsole-mappings-v17")
             .lines()
             .filter(|l| !v20_record(l))
             .map(|l| format!("{l}\n"))
@@ -4016,7 +4315,8 @@ mod tests {
         config.agents = vec![Agent::new("claude", "claude", "claude").unwrap()];
         let v16 = serialize_config(&config)
             .unwrap()
-            .replace("vibeconsole-mappings-v32", "vibeconsole-mappings-v16")
+            .replace(DEFAULT_LOOK, "")
+            .replace("vibeconsole-mappings-v33", "vibeconsole-mappings-v16")
             .lines()
             .filter(|l| !v20_record(l))
             .map(|l| format!("{l}\n"))
@@ -4032,7 +4332,7 @@ mod tests {
         herdr.host = Host::Herdr;
         config.agents.extend([orca, herdr]);
         let text = serialize_config(&config).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v32\n"), "{text}");
+        assert!(text.starts_with("vibeconsole-mappings-v33\n"), "{text}");
         assert!(
             text.contains("\nagent\tclaude\tclaude\tclaude\t-\t1\ttmux\n"),
             "{text}"
@@ -4524,7 +4824,7 @@ mod tests {
         let path = dir.join("mappings.tsv");
         save_config(&path, &config).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
-        assert!(saved.starts_with("vibeconsole-mappings-v32\n"));
+        assert!(saved.starts_with("vibeconsole-mappings-v33\n"));
         assert!(saved.contains("\tflow\t") && !saved.contains("flow-start"));
         assert_eq!(load_config(&path).unwrap(), config);
         fs::remove_dir_all(dir).unwrap();
@@ -4550,7 +4850,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v32\n")
+                .starts_with("vibeconsole-mappings-v33\n")
         );
         assert_eq!(load_config(&path).unwrap(), config);
         fs::remove_dir_all(dir).unwrap();
@@ -4571,7 +4871,7 @@ mod tests {
         let path = dir.join("mappings.tsv");
         save_config(&path, &config).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("vibeconsole-mappings-v32\n") && text.contains("\tstatus\n"));
+        assert!(text.starts_with("vibeconsole-mappings-v33\n") && text.contains("\tstatus\n"));
         assert_eq!(load_config(&path).unwrap(), config);
         let pad = Control::from_note(10, 37).unwrap();
         for (action, observable) in [
@@ -4648,7 +4948,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .starts_with("vibeconsole-mappings-v32\n")
+                .starts_with("vibeconsole-mappings-v33\n")
         );
         assert_eq!(load_config(&path).unwrap(), config);
         // ${NAME}: user variable, then startup variable; other text stays; no environment.
