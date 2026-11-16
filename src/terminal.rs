@@ -319,6 +319,11 @@ struct Terminal {
     view: Option<mappings::Config>,
     prompt_names: Vec<String>,
     tuning_rows: Vec<String>,
+    /// v7.7 ticket 156: a MIDI press was seen (with `last_xbox`: the device used last); an
+    /// Xbox controller was connected at some point; the hint line for the device used last.
+    midi_used: bool,
+    xbox_seen: bool,
+    hint_line: String,
     /// v7 ticket 86: each device's switch and patterns; None while Status lights is off.
     device_lights: Option<crate::status::DevicePatterns>,
     /// Agents' status-light settings, in `agent_states` order; None while Status lights is Off.
@@ -491,8 +496,33 @@ impl Terminal {
                 "Up/Down: move | Enter: confirm | Space: select | Esc: back | Ctrl+C: quit"
             }
         };
+        let hints = if self.at_menu && !self.hint_line.is_empty() {
+            &self.hint_line
+        } else {
+            hints
+        };
+        // v7.7 ticket 156: badges while their state lasts.
+        let waiting = (self.agent_rows().iter())
+            .filter(|row| matches!(row.state, "needs-input" | "needs-decision"))
+            .count();
+        let unplugged = self.input.is_none()
+            || (self.xbox_seen
+                && self
+                    .gamepad
+                    .as_ref()
+                    .is_some_and(|p| p.connected().is_empty()));
+        let mut tabs = TABS
+            .iter()
+            .map(|(label, _)| (*label).to_owned())
+            .collect::<Vec<_>>();
+        if waiting > 0 {
+            tabs[2] += &format!(" ●{waiting}");
+        }
+        if unplugged {
+            tabs[4] += " !";
+        }
         let mut screen = crate::screen::Screen {
-            tabs: TABS.iter().map(|(label, _)| (*label).to_owned()).collect(),
+            tabs,
             groups: TAB_GROUPS.to_vec(),
             active_tab: self.tab,
             header,
@@ -891,6 +921,9 @@ impl Terminal {
             view: None,
             prompt_names: Vec::new(),
             tuning_rows: Vec::new(),
+            midi_used: false,
+            xbox_seen: false,
+            hint_line: String::new(),
             device_lights: None,
             light_agents: None,
             light_sessions: Vec::new(),
@@ -1777,6 +1810,11 @@ impl Terminal {
             Vec::new()
         };
         self.agent_cards = config.look.agent_cards;
+        self.xbox_seen |= self
+            .gamepad
+            .as_ref()
+            .is_some_and(|p| !p.connected().is_empty());
+        self.hint_line = self.hints_for(&config);
         self.read_view(Some(config.clone()));
         self.agent_places = config
             .agents
@@ -2354,14 +2392,61 @@ impl Terminal {
     /// The Xbox layout on the current layer (saved buttons over the defaults), with the
     /// focused app's profile on top.
     fn xbox_layout(&self) -> Result<Vec<Mapping>> {
-        let config = mappings::load_config(&self.path)?;
+        Ok(self.xbox_layout_in(&mappings::load_config(&self.path)?))
+    }
+    fn xbox_layout_in(&self, config: &mappings::Config) -> Vec<Mapping> {
         let layer = crate::gamepad::layer_in(&config.mappings, self.xbox_program, self.layer2);
         let profile = self
             .profile
             .as_deref()
             .and_then(|name| config.profile(name));
         let context = mappings::xbox_context(self.xbox_program, self.layer2);
-        Ok(mappings::overlay(&layer, profile, context))
+        mappings::overlay(&layer, profile, context)
+    }
+    /// v7.7 ticket 156: for each screen key, the controls mapped to it on the device used
+    /// last (the Xbox's active layer and profile, or the open MIDI program), else the
+    /// keyboard key with "(keyboard)". Never fires anything.
+    fn hints_for(&self, config: &mappings::Config) -> String {
+        const HINTS: [(&str, &[&str], &str); 6] = [
+            ("tabs", &["Tab", "Left", "Right"], "1–0 · Tab · ←→"),
+            ("find", &["slash", "/"], "/"),
+            ("move", &["Up", "Down"], "↑↓"),
+            ("open", &["Enter", "Return"], "Enter"),
+            ("select", &["Space"], "Space"),
+            ("back", &["Escape", "Esc"], "Esc"),
+        ];
+        let (device, mapped) = if self.last_xbox {
+            ("Xbox (used last)", self.xbox_layout_in(config))
+        } else if self.midi_used {
+            ("Akai (used last)", self.run_mappings.clone())
+        } else {
+            ("Keys", Vec::new())
+        };
+        let mut parts = HINTS
+            .iter()
+            .map(|(hint, keys, keyboard)| {
+                let mut names = (mapped.iter())
+                    .filter(|m| m.action == crate::actions::Action::Shortcut)
+                    .filter(|m| match m.keys.as_slice() {
+                        [key] => keys.iter().any(|k| k.eq_ignore_ascii_case(key)),
+                        _ => false,
+                    })
+                    .map(|m| self.name(m.control))
+                    .collect::<Vec<_>>();
+                names.dedup();
+                match (names.is_empty(), mapped.is_empty()) {
+                    (_, true) => format!("{hint} {keyboard}"),
+                    (true, false) => format!("{hint} {keyboard} (keyboard)"),
+                    (false, false) => format!("{hint} {}", names.join(" / ")),
+                }
+            })
+            .collect::<Vec<_>>();
+        parts.push(if mapped.is_empty() {
+            "quit Ctrl+C".into()
+        } else {
+            "quit Ctrl+C (keyboard)".into()
+        });
+        format!("{device}: {}", parts.join(" | "))
     }
     /// The mapping a press fires, as the keyboard has it: the open context's, or for an Xbox
     /// button the Xbox layout's (v7 ticket 43: `run_mappings` holds the MIDI context only).
@@ -3573,6 +3658,7 @@ impl Terminal {
             };
             if let Some(event) = self.detector.observe(message) {
                 self.last_xbox = false; // v7 ticket 115: the header follows the device used
+                self.midi_used = true;
                 events.push(event);
             }
             self.handle_events(events)?;
@@ -11596,6 +11682,61 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7.7 ticket 156: the hint line names the controls mapped to each screen key on the
+    /// device used last (Xbox A for open, Right stick press for select; Akai pads), and the
+    /// keyboard key with "(keyboard)" when that device has none; badges come and go with
+    /// their state.
+    #[test]
+    fn hints_follow_the_device_used_last_and_badges_follow_their_state() {
+        let (dir, mut ui, _ran, [_, down, enter, _]) = configure_session("hints");
+        let path = dir.join("mappings.tsv");
+        let mut config = mappings::load_config(&path).unwrap();
+        for (button, key) in [(0, "Enter"), (12, "Space")] {
+            let mut m = Mapping::new(Control::button(button), key, "tap").unwrap();
+            m.context = mappings::xbox_context(1, false);
+            config.mappings.push(m);
+        }
+        mappings::save_config(&path, &config).unwrap();
+        assert!(
+            ui.hints_for(&config)
+                .starts_with("Keys: tabs 1–0 · Tab · ←→ | find /")
+        );
+        ui.midi_used = true;
+        let akai = ui.hints_for(&config);
+        assert!(akai.starts_with("Akai (used last): "), "{akai}");
+        for part in [
+            format!("move {}", ui.name(down)),
+            format!("open {}", ui.name(enter)),
+            "back Esc (keyboard)".into(),
+            "quit Ctrl+C (keyboard)".into(),
+        ] {
+            assert!(akai.contains(&part), "{part} in {akai}");
+        }
+        ui.last_xbox = true;
+        let xbox = ui.hints_for(&config);
+        let (a, r3) = (ui.name(Control::button(0)), ui.name(Control::button(12)));
+        for part in [
+            "Xbox (used last): ".into(),
+            format!("open {a}"),
+            format!("select {r3}"),
+            "find / (keyboard)".into(),
+        ] {
+            assert!(xbox.contains(&part), "{part} in {xbox}");
+        }
+        assert!(
+            !xbox.contains(&ui.name(enter)),
+            "no Akai pad in the Xbox line"
+        );
+
+        ui.status_at = Instant::now() + Duration::from_secs(3600);
+        ui.agent_states = vec![("claude".into(), "w".into(), "needs-input")];
+        assert_eq!(ui.screen("").tabs[2], "3 Agents ●1");
+        assert_eq!(ui.screen("").tabs[4], "5 Devices !", "no MIDI device open");
+        ui.agent_states[0].2 = "thinking";
+        assert_eq!(ui.screen("").tabs[2], "3 Agents", "gone when it clears");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// v7.7 ticket 155: `/` Find goes to a row by its label ("presets" → 2 Mappings ›
     /// Presets) and by its old name ("settings xbox tuning" → 7 Xbox); Esc closes; the query
     /// stops at 64 characters. "What moved in 7.7" shows once for a v32 config and not again.
@@ -11784,7 +11925,7 @@ mod tests {
             .map(|screen| {
                 TABS.iter()
                     .map(|(label, _)| *label)
-                    .find(|label| screen.contains(&format!("[{label}]")))
+                    .find(|label| screen.contains(&format!("[{label}")))
                     .unwrap_or_else(|| panic!("no active tab in:\n{screen}"))
             })
             .collect::<Vec<_>>();

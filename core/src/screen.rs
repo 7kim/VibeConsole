@@ -534,7 +534,19 @@ fn tab_bar(tabs: &[String], groups: &[usize], active: usize, width: usize, color
                 let slot = if index == active {
                     paint(&slot, Role::ActiveTab, color)
                 } else {
-                    slot
+                    // v7.7 ticket 156: a badge (` ●N` red, ` !` yellow) keeps its mark.
+                    match slot.find(" ●").or_else(|| slot.find(" !")) {
+                        Some(at) => {
+                            let (name, badge) = slot.split_at(at);
+                            let role = if badge.contains('●') {
+                                Role::Error
+                            } else {
+                                Role::Paused
+                            };
+                            format!("{name}{}", paint(badge, role, color))
+                        }
+                        None => slot,
+                    }
                 };
                 format!("{}{slot}", paint(gap(index), Role::Border, color))
             })
