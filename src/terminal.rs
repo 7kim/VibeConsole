@@ -1110,6 +1110,16 @@ impl Terminal {
         self.notice = format!("Went to {}.", row.name);
         Ok(())
     }
+    /// v7.7 ticket 154: theme `index`, saved (config v33 `theme`, an atomic save) and drawn at
+    /// once; it only changes the terminal's colours, never the controller's lights.
+    fn pick_theme(&mut self, index: usize) -> Result<()> {
+        let name = *mappings::THEMES.get(index).ok_or("no such theme")?;
+        let mut config = mappings::load_config(&self.path)?;
+        config.look.theme = name.into();
+        mappings::save_config(&self.path, &config)?;
+        self.read_view(Some(config));
+        Ok(())
+    }
     /// v7.7 ticket 151: Table ↔ Gallery, saved as `agents-view` (an atomic save; a failure
     /// keeps the file and the view).
     fn switch_agents_view(&mut self) -> Result<()> {
@@ -1132,6 +1142,7 @@ impl Terminal {
             self.tuning_rows = tuning_items(self, &config.tuning);
         }
         self.agent_cards = config.look.agent_cards;
+        crate::screen::set_theme(&config.look.theme); // v7.7 ticket 154
         self.view = Some(config);
     }
     /// v7.7 ticket 152: the tab's one primary row (skill `primary-action`), by what it opens;
@@ -1402,40 +1413,67 @@ impl Terminal {
                     ],
                 )]
             }
-            7 => vec![(
-                "System · VibeConsole itself: login, Wispr Flow, variables".into(),
-                vec![
-                    head("Login service"),
-                    one("Start at login".into(), Some(SETTING + 6)),
-                    head("Wispr Flow"),
-                    one(
-                        format!(
-                            "Start Wispr Flow with VibeConsole · {} (next launch)",
-                            on(self.start_flow_enabled)
+            7 => vec![
+                (
+                    "System · VibeConsole itself: login, Wispr Flow, variables".into(),
+                    vec![
+                        head("Login service"),
+                        one("Start at login".into(), Some(SETTING + 6)),
+                        head("Wispr Flow"),
+                        one(
+                            format!(
+                                "Start Wispr Flow with VibeConsole · {} (next launch)",
+                                on(self.start_flow_enabled)
+                            ),
+                            Some(16),
                         ),
-                        Some(16),
-                    ),
-                    one(
-                        "Start or repair Wispr Flow · output pauses meanwhile".into(),
-                        Some(12),
-                    ),
-                    head("Variables"),
-                    one(
-                        format!(
-                            "Startup variables ({}) · exported into tmux",
-                            config.env.len()
+                        one(
+                            "Start or repair Wispr Flow · output pauses meanwhile".into(),
+                            Some(12),
                         ),
-                        Some(SETTING + 2),
-                    ),
-                    one(
-                        format!(
-                            "User variables ({}) · ${{NAME}} in commands",
-                            config.vars.len()
+                        head("Variables"),
+                        one(
+                            format!(
+                                "Startup variables ({}) · exported into tmux",
+                                config.env.len()
+                            ),
+                            Some(SETTING + 2),
                         ),
-                        Some(SETTING + 3),
-                    ),
-                ],
-            )],
+                        one(
+                            format!(
+                                "User variables ({}) · ${{NAME}} in commands",
+                                config.vars.len()
+                            ),
+                            Some(SETTING + 3),
+                        ),
+                    ],
+                ),
+                {
+                    // v7.7 ticket 154: the 14 themes, each with a strip of its colours.
+                    let picked = mappings::THEMES
+                        .iter()
+                        .position(|t| *t == config.look.theme)
+                        .unwrap_or(0);
+                    let mut rows = (mappings::THEMES.iter().enumerate())
+                        .map(|(index, name)| {
+                            let mark = if index == picked { "●" } else { " " };
+                            let line = format!("{mark} {} ■■■■■■", crate::screen::fit(name, 21));
+                            (vec![line], Some(Open::Theme(index)))
+                        })
+                        .collect::<Vec<_>>();
+                    let note = crate::screen::THEME_NOTES[picked];
+                    let name = mappings::THEMES[picked];
+                    rows.push((
+                        vec![if note.is_empty() {
+                            format!("  {name}")
+                        } else {
+                            format!("  {name}: {note}")
+                        }],
+                        None,
+                    ));
+                    ("Theme · 14 themes · Enter picks one".into(), rows)
+                },
+            ],
             _ => vec![(
                 TABS[tab].0.split_once(' ').map_or("", |p| p.1).to_owned(),
                 TABS[tab].1.iter().map(|(name, _)| head(name)).collect(),
@@ -4696,6 +4734,8 @@ enum Open {
     Agent(usize),
     /// Switch the Agents pane between Table and Gallery.
     AgentsView,
+    /// Pick theme `n` of `mappings::THEMES` (v7.7 ticket 154).
+    Theme(usize),
 }
 /// A tab entry: its lines (one row, or an agent card) and what Enter does.
 type Entry = (Vec<String>, Option<Open>);
@@ -9525,6 +9565,11 @@ fn command_menu(ui: &mut Terminal) -> Result<Option<usize>> {
                             ui.notice = format!("config: {error}; nothing saved");
                         }
                     }
+                    Some(Open::Theme(index)) => {
+                        if let Err(error) = ui.pick_theme(index) {
+                            ui.notice = format!("config: {error}; nothing saved");
+                        }
+                    }
                     None => {}
                 }
                 continue;
@@ -10628,7 +10673,7 @@ mod tests {
             assert!(
                 ui.screen(&view)
                     .render(size.0, size.1, true)
-                    .contains("\x1b[1;38;2;158;206;106mBank B")
+                    .contains(";1;38;2;158;206;106mBank B")
             );
         }
         ui.context_verified = false;
@@ -11341,7 +11386,7 @@ mod tests {
         let frame = ui.screen("").render(100, 30, true);
         assert!(frame.contains("━━ Start over (asks first, keeps a backup)"));
         assert!(
-            frame.contains("\x1b[38;2;247;118;142m  ⚠ Reset settings"),
+            frame.contains(";38;2;247;118;142m  ⚠ Reset settings"),
             "the reset row is red:\n{frame}"
         );
 
@@ -11383,6 +11428,44 @@ mod tests {
             mappings::xbox_program_name(&mappings::load_config(&path).unwrap(), 1),
             "Browser"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 154: 8 System's Theme pane lists the 14 themes; Enter saves the pick
+    /// (config v33 `theme`) and the next frame is drawn in it.
+    #[test]
+    fn picking_a_theme_saves_it_and_draws_with_it() {
+        let (dir, mut ui, _ran, _) = configure_session("theme-pick");
+        let path = dir.join("mappings.tsv");
+        ui.at_menu = true;
+        ui.tab = 7;
+        ui.read_view(None);
+        // System's five rows, then the themes: the sixth is Catppuccin Latte.
+        let mut steps = vec![Step::Key(Key::Character(b'8'))];
+        steps.extend((0..10).map(|_| Step::Key(Key::Down)));
+        steps.extend([Step::Key(Key::Enter), Step::Key(Key::Escape)]);
+        ui.script = Some(Play {
+            steps: steps.into(),
+            ..Play::default()
+        });
+        assert_eq!(command_menu(&mut ui).unwrap(), None);
+        let saved = mappings::load_config(&path).unwrap();
+        assert_eq!(saved.look.theme, "Catppuccin Latte");
+        let frame = ui.screen("").render(100, 30, true);
+        crate::screen::set_theme("Tokyo Night");
+        assert!(
+            frame.contains("48;2;239;241;245"),
+            "drawn on Latte's ground"
+        );
+        let rows = (ui.tab_panes(7, 80, usize::MAX).into_iter())
+            .flat_map(|(_, entries)| entries.into_iter().flat_map(|(lines, _)| lines))
+            .collect::<Vec<_>>();
+        assert!(rows.iter().any(|r| r.contains("● Catppuccin Latte")));
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("Catppuccin Latte: light; accents darkened"))
+        );
+        assert_eq!(rows.iter().filter(|r| r.contains("■■■■■■")).count(), 14);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

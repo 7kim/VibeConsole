@@ -198,7 +198,7 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
                 assert re.search(rb"MIDI keyboard[^\n]*Saved assignments", wide)
                 assert b"Learn an Xbox button" in wide
                 # v7.7 ticket 150: focus is bold text on the selection background, never the accent fill.
-                assert b"\x1b[1;38;2;192;202;245;48;2;40;52;87m" in wide or ending == "narrow_resize" or "NO_COLOR" in os.environ
+                assert b";1;38;2;192;202;245;48;2;40;52;87m" in wide or ending == "narrow_resize" or "NO_COLOR" in os.environ
                 if ending == "narrow_resize":
                     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 18, 50, 0, 0))
                     narrow = read_until(master, b"Tab / Left / Right")

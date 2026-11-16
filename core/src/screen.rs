@@ -137,7 +137,7 @@ pub struct Palette {
     pub red: [u8; 3],
     pub selection: [u8; 3],
 }
-/// The default theme (v7.7 spec, Themes). The other 13 arrive with ticket 154.
+/// The default theme (v7.7 spec, Themes).
 pub const TOKYO_NIGHT: Palette = Palette {
     background: [0x1a, 0x1b, 0x26],
     border: [0x41, 0x48, 0x68],
@@ -151,6 +151,88 @@ pub const TOKYO_NIGHT: Palette = Palette {
     red: [0xf7, 0x76, 0x8e],
     selection: [0x28, 0x34, 0x57],
 };
+const fn rgb(hex: u32) -> [u8; 3] {
+    [(hex >> 16) as u8, (hex >> 8) as u8, hex as u8]
+}
+/// A palette from the spec's table order: background, text, muted, accent, heading, title,
+/// green, yellow, red, selection, border.
+const fn theme(c: [u32; 11]) -> Option<Palette> {
+    Some(Palette {
+        background: rgb(c[0]),
+        text: rgb(c[1]),
+        muted: rgb(c[2]),
+        accent: rgb(c[3]),
+        heading: rgb(c[4]),
+        title: rgb(c[5]),
+        green: rgb(c[6]),
+        yellow: rgb(c[7]),
+        red: rgb(c[8]),
+        selection: rgb(c[9]),
+        border: rgb(c[10]),
+    })
+}
+/// v7.7 ticket 154: the 14 themes in [`crate::mappings::THEMES`] order; `None` is Terminal
+/// colours (the terminal's own 16 ANSI colours, no RGB codes).
+#[rustfmt::skip]
+pub const PALETTES: [Option<Palette>; 14] = [
+    Some(TOKYO_NIGHT),
+    None,
+    theme([0x24283b, 0xc0caf5, 0x9aa2c8, 0x7aa2f7, 0xbb9af7, 0x7dcfff, 0x9ece6a, 0xe0af68, 0xf7768e, 0x2e3c64, 0x414868]),
+    theme([0x1e1e2e, 0xcdd6f4, 0xa6adc8, 0x89b4fa, 0xcba6f7, 0x89dceb, 0xa6e3a1, 0xf9e2af, 0xf38ba8, 0x313244, 0x45475a]),
+    theme([0x24273a, 0xcad3f5, 0xa5adcb, 0x8aadf4, 0xc6a0f6, 0x91d7e3, 0xa6da95, 0xeed49f, 0xed8796, 0x363a4f, 0x494d64]),
+    theme([0xeff1f5, 0x4c4f69, 0x5c5f77, 0x1e66f5, 0x8839ef, 0x1a6f7d, 0x2d7a1f, 0xa24f00, 0xd20f39, 0xccd0da, 0xbcc0cc]),
+    theme([0x282828, 0xebdbb2, 0xa89984, 0x83a598, 0xd3869b, 0x8ec07c, 0xb8bb26, 0xfabd2f, 0xfb4934, 0x3c3836, 0x504945]),
+    theme([0xfbf1c7, 0x3c3836, 0x665c54, 0x076678, 0x8f3f71, 0x427b58, 0x79740e, 0x8f5a0a, 0x9d0006, 0xebdbb2, 0xd5c4a1]),
+    theme([0x2e3440, 0xeceff4, 0xa7b1c2, 0x88c0d0, 0xb48ead, 0x8fbcbb, 0xa3be8c, 0xebcb8b, 0xe48890, 0x3b4252, 0x4c566a]),
+    theme([0x282a36, 0xf8f8f2, 0xa4a9c8, 0xbd93f9, 0xff79c6, 0x8be9fd, 0x50fa7b, 0xffb86c, 0xff5555, 0x44475a, 0x44475a]),
+    theme([0x282c34, 0xabb2bf, 0x959dab, 0x61afef, 0xc678dd, 0x56b6c2, 0x98c379, 0xe5c07b, 0xe06c75, 0x3e4451, 0x3e4451]),
+    theme([0x1f1f28, 0xdcd7ba, 0xa6a69c, 0x7e9cd8, 0x957fb8, 0x7fb4ca, 0x98bb6c, 0xe6c384, 0xe46876, 0x2d4f67, 0x54546d]),
+    theme([0x2d353b, 0xd3c6aa, 0x9da9a0, 0x7fbbb3, 0xd699b6, 0x83c092, 0xa7c080, 0xdbbc7f, 0xe67e80, 0x3d484d, 0x475258]),
+    theme([0x1f2430, 0xcccac2, 0x8a9199, 0x73d0ff, 0xdfbfff, 0x95e6cb, 0xd5ff80, 0xffcc66, 0xf28779, 0x2d3445, 0x3a4150]),
+];
+/// Each theme's note (v7.7 spec, Themes), in [`PALETTES`] order.
+pub const THEME_NOTES: [&str; 14] = [
+    "today's look",
+    "the terminal's own 16 colours; how they look depends on your terminal",
+    "lighter ground",
+    "soft pastels, darkest",
+    "medium",
+    "light; accents darkened",
+    "warm",
+    "light",
+    "red lightened",
+    "",
+    "",
+    "",
+    "",
+    "",
+];
+std::thread_local! {
+    /// The theme this thread draws with (v7.7 ticket 154), an index into [`PALETTES`]. Per
+    /// thread: the session draws on one, and tests drawing in parallel don't share it.
+    static THEME: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+/// Draw with the theme named `name` from now on; an unknown name draws Tokyo Night.
+pub fn set_theme(name: &str) {
+    let index = crate::mappings::THEMES.iter().position(|t| *t == name);
+    THEME.with(|t| t.set(index.unwrap_or(0)));
+}
+fn palette() -> Option<Palette> {
+    PALETTES[THEME.with(std::cell::Cell::get)]
+}
+/// What every painted text goes back to: the theme's background and text, or (Terminal
+/// colours) the terminal's own.
+fn base() -> String {
+    match palette() {
+        Some(p) => {
+            let [r, g, b] = p.background;
+            let [tr, tg, tb] = p.text;
+            format!("0;48;2;{r};{g};{b};38;2;{tr};{tg};{tb}")
+        }
+        None => "0".into(),
+    }
+}
+
 /// What a piece of text is; [`style`] turns it into the palette's colours.
 #[derive(Clone, Copy)]
 enum Role {
@@ -173,7 +255,25 @@ enum Role {
     Primary,
 }
 fn style(role: Role) -> String {
-    let p = TOKYO_NIGHT;
+    let Some(p) = palette() else {
+        // Terminal colours: the same roles in the 16 ANSI colours (bright black for muted,
+        // reverse video for the selection).
+        return match role {
+            Role::Border | Role::Muted => "90",
+            Role::Focus => "1;34",
+            Role::Selected => "1;7",
+            Role::Heading => "1;35",
+            Role::Title => "1;36",
+            Role::Running => "32",
+            Role::Paused => "33",
+            Role::Error => "31",
+            Role::BankA => "1;31",
+            Role::BankB => "1;32",
+            Role::ActiveTab => "1;4;30;44",
+            Role::Primary => "1;30;44",
+        }
+        .into();
+    };
     let fg = |[r, g, b]: [u8; 3]| format!("38;2;{r};{g};{b}");
     let bg = |[r, g, b]: [u8; 3]| format!("48;2;{r};{g};{b}");
     match role {
@@ -195,10 +295,54 @@ fn style(role: Role) -> String {
 
 fn paint(text: &str, role: Role, color: bool) -> String {
     if color {
-        format!("\x1b[{}m{text}\x1b[0m", style(role))
+        let base = base();
+        format!("\x1b[{base};{}m{text}\x1b[{base}m", style(role))
     } else {
         text.into()
     }
+}
+
+/// The frame's rows, each starting from the theme's background and text (v7.7 ticket 154),
+/// so unpainted text and padding are on the theme's ground, not the terminal's.
+fn finish(mut rows: Vec<String>, height: usize, color: bool) -> String {
+    rows.truncate(height);
+    if color {
+        let base = format!("\x1b[{}m", base());
+        for row in &mut rows {
+            row.insert_str(0, &base);
+        }
+    }
+    rows.join("\r\n")
+}
+
+/// A theme row's `■■■■■■` in that theme's accent, heading, title, green, yellow and red.
+fn paint_swatch(text: &str, color: bool) -> String {
+    const SWATCH: &str = "■■■■■■";
+    let theme = (crate::mappings::THEMES.iter().enumerate())
+        .filter(|(_, name)| text.contains(*name))
+        .max_by_key(|(_, name)| name.len());
+    let (Some((index, _)), true) = (theme, color && text.contains(SWATCH)) else {
+        return text.into();
+    };
+    // Terminal colours sends no RGB code, not even another theme's swatch.
+    if palette().is_none() && PALETTES[index].is_some() {
+        return text.into();
+    }
+    let base = base();
+    let codes: Vec<String> = match PALETTES[index] {
+        Some(p) => [p.accent, p.heading, p.title, p.green, p.yellow, p.red]
+            .iter()
+            .map(|[r, g, b]| format!("38;2;{r};{g};{b}"))
+            .collect(),
+        None => ["34", "35", "36", "32", "33", "31"]
+            .map(String::from)
+            .to_vec(),
+    };
+    let squares = codes
+        .iter()
+        .map(|code| format!("\x1b[{base};{code}m■"))
+        .collect::<String>();
+    text.replace(SWATCH, &format!("{squares}\x1b[{base}m"))
 }
 
 fn paint_bulbs(text: &str, color: bool) -> String {
@@ -356,7 +500,7 @@ fn pane(
         } else if line.starts_with("Error:") {
             paint(&text, Role::Error, color)
         } else {
-            paint_bulbs(&text, color)
+            paint_swatch(&paint_bulbs(&text, color), color)
         };
         let side = paint("│", border, color);
         rows.push(format!("{side} {text} {side}"));
@@ -584,8 +728,7 @@ impl Screen {
                     .iter()
                     .map(|row| paint(&fit(row, width), Role::Muted, color)),
             );
-            rows.truncate(height);
-            return rows.join("\r\n");
+            return finish(rows, height, color);
         }
         let (text_width, text_height) = self.details_size(columns, height);
         let mut text = wrap(&self.details, text_width);
@@ -623,8 +766,7 @@ impl Screen {
                 .iter()
                 .map(|row| paint(&fit(row, width), Role::Muted, color)),
         );
-        rows.truncate(height);
-        rows.join("\r\n")
+        finish(rows, height, color)
     }
 }
 
@@ -649,6 +791,88 @@ mod tests {
         );
         assert_eq!(wrap("abcdefgh", 3), ["abc", "def", "gh"]);
         assert_eq!(wrap("ab  cd", 3), ["ab", "cd"]);
+    }
+
+    /// v7.7 ticket 154: every RGB theme's text and muted text reach 4.5:1 on its background
+    /// (WCAG relative luminance); Terminal colours draws with no RGB code at all.
+    #[test]
+    fn themes_are_readable_and_terminal_colours_uses_no_rgb() {
+        fn luminance(c: [u8; 3]) -> f64 {
+            let channel = |v: u8| {
+                let v = f64::from(v) / 255.0;
+                if v <= 0.03928 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * channel(c[0]) + 0.7152 * channel(c[1]) + 0.0722 * channel(c[2])
+        }
+        let ratio = |a, b| {
+            let (a, b) = (luminance(a), luminance(b));
+            (a.max(b) + 0.05) / (a.min(b) + 0.05)
+        };
+        assert_eq!(PALETTES.len(), crate::mappings::THEMES.len());
+        for (name, palette) in crate::mappings::THEMES.iter().zip(PALETTES) {
+            let Some(p) = palette else {
+                assert_eq!(*name, "Terminal colours");
+                continue;
+            };
+            for (role, colour) in [("text", p.text), ("muted", p.muted)] {
+                let r = ratio(colour, p.background);
+                assert!(r >= 4.5, "{name} {role}: {r:.2}:1");
+            }
+        }
+        let screen = Screen {
+            tabs: vec!["1 Live".into(), "8 System".into()],
+            groups: vec![1],
+            active_tab: 1,
+            header: "VibeConsole\nProgram 1 | RUNNING".into(),
+            commands: Vec::new(),
+            anchor: 0,
+            focus_commands: false,
+            details: String::new(),
+            notice: String::new(),
+            live: Vec::new(),
+            hints: "Ctrl+C: quit".into(),
+            panes: vec![Pane {
+                title: "Theme".into(),
+                rows: vec![
+                    "> ● Tokyo Night           ■■■■■■".into(),
+                    "    Nord ■■■■■■".into(),
+                ],
+                anchor: 0,
+                focused: true,
+                primary: None,
+            }],
+        };
+        set_theme("Terminal colours");
+        let frame = screen.render(100, 24, true);
+        set_theme("Tokyo Night");
+        assert!(frame.contains('\x1b'), "still coloured");
+        assert!(
+            !frame.contains("38;2;") && !frame.contains("48;2;"),
+            "{frame:?}"
+        );
+        // RGB themes paint their own ground on every row, and the swatch in its colours.
+        set_theme("Catppuccin Latte");
+        let latte = screen.render(100, 24, true);
+        set_theme("Tokyo Night");
+        assert!(
+            latte
+                .lines()
+                .all(|l| l.starts_with("\x1b[0;48;2;239;241;245;38;2;76;79;105m"))
+        );
+        assert!(
+            latte.contains(";38;2;136;192;208m■"),
+            "Nord's accent in Nord's swatch"
+        );
+        set_theme("no such theme");
+        assert_eq!(
+            palette(),
+            Some(TOKYO_NIGHT),
+            "an unknown name draws Tokyo Night"
+        );
     }
 
     /// v7.7 ticket 151: a tab's panes stack full width, the selected row stays visible as
@@ -698,9 +922,9 @@ mod tests {
             }
         }
         let colored = screen.render(120, 30, true);
-        let lit = format!("\x1b[{}m◆ Pad 5", style(Role::Selected));
+        let lit = format!("{}m◆ Pad 5", style(Role::Selected));
         assert!(colored.contains(&lit), "the pressed line looks selected");
-        assert!(colored.contains(&format!("\x1b[{}mIDLE", style(Role::Muted))));
+        assert!(colored.contains(&format!("{}mIDLE", style(Role::Muted))));
     }
 
     #[test]
@@ -792,7 +1016,7 @@ mod tests {
             "{wide}"
         );
         let colored = bar(screen.render(170, 24, true));
-        assert!(colored.contains("\x1b[1;4;38;2;26;27;38;48;2;122;162;247m[3 Agents]"));
+        assert!(colored.contains("1;4;38;2;26;27;38;48;2;122;162;247m[3 Agents]"));
         // 80 columns: the tabs around the active one, scrolling behind ‹ ›.
         screen.active_tab = 8;
         let narrow = bar(screen.render(80, 24, false));
