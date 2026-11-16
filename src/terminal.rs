@@ -484,7 +484,7 @@ impl Terminal {
         let hints = match (self.at_menu, size.0 < 75) {
             (true, true) => "Tab 1–0 · ↑↓ · Enter · Esc · Ctrl+C: quit",
             (true, false) => {
-                "Tab ←→ 1–0: tabs | Up/Down: move | Enter: open | Esc: quit | Ctrl+C: quit"
+                "Tab ←→ 1–0: tabs | Up/Down: move | Enter: open | /: find | Esc: quit | Ctrl+C: quit"
             }
             (false, true) => "↑↓ · Enter · Space · Esc · Ctrl+C: quit",
             (false, false) => {
@@ -1110,6 +1110,92 @@ impl Terminal {
         self.notice = format!("Went to {}.", row.name);
         Ok(())
     }
+    /// v7.7 ticket 155: Find's matches for `query`: every row that opens something on every
+    /// tab, as `Tab › row`, and every old name, as `old → tab`; a match has every word of the
+    /// query (case ignored). Each is (label, tab, entry index in that tab).
+    fn find_matches(&self, query: &str) -> Vec<(String, usize, usize)> {
+        let words = query.to_lowercase();
+        let words = words.split_whitespace().collect::<Vec<_>>();
+        let mut found = Vec::new();
+        for (tab, (label, _)) in TABS.iter().enumerate() {
+            let name = label.split_once(' ').map_or(*label, |p| p.1);
+            let entries = (self.tab_panes(tab, 80, usize::MAX).into_iter())
+                .flat_map(|(_, entries)| entries)
+                .collect::<Vec<_>>();
+            for (index, (lines, open)) in entries.iter().enumerate() {
+                if open.is_none() {
+                    continue;
+                }
+                let row = lines[0].trim_matches(|c: char| " >┌╔─═┐╗".contains(c));
+                found.push((format!("{name} › {row}"), tab, index));
+            }
+            for (old, _, id) in MOVED.iter().filter(|(_, t, _)| *t == tab) {
+                let index = entries
+                    .iter()
+                    .position(|(_, open)| id.is_some() && *open == id.map(Open::Command))
+                    .or_else(|| entries.iter().position(|(_, open)| open.is_some()))
+                    .unwrap_or(0);
+                found.push((format!("{old} → {label}"), tab, index));
+            }
+        }
+        found.retain(|(label, _, _)| {
+            let label = label.to_lowercase();
+            words.iter().all(|word| label.contains(word))
+        });
+        found
+    }
+    /// v7.7 ticket 155: `/` Find: type (at most 64 characters), ↑↓ choose, Enter goes to
+    /// that tab and selects the row, Esc closes. Find opens nothing and fires nothing itself.
+    fn find(&mut self) -> Result<()> {
+        let mut query = String::new();
+        let mut at = 0;
+        self.at_menu = false;
+        let picked = loop {
+            let matches = self.find_matches(&query);
+            at = at.min(matches.len().saturating_sub(1));
+            let mut tabs = matches.iter().map(|m| m.1).collect::<Vec<_>>();
+            tabs.dedup();
+            let mut text = format!(
+                "/ {query}▌ · {} matches in {} tabs · Enter opens · Esc closes\n",
+                matches.len(),
+                tabs.len()
+            );
+            for (index, (label, _, _)) in matches.iter().enumerate().take(60) {
+                text += &format!("\n{}{label}", if index == at { "> " } else { "  " });
+            }
+            if let Err(error) = self.draw(&text) {
+                self.at_menu = true;
+                return Err(error);
+            }
+            match self.key() {
+                Err(error) => {
+                    self.at_menu = true;
+                    return Err(error);
+                }
+                Ok(Some(Key::Escape)) => break None,
+                Ok(Some(Key::Enter)) => break matches.get(at).map(|m| (m.1, m.2)),
+                Ok(Some(Key::Up)) => at = at.saturating_sub(1),
+                Ok(Some(Key::Down)) => at = (at + 1).min(matches.len().saturating_sub(1)),
+                Ok(Some(Key::Backspace)) => {
+                    query.pop();
+                    at = 0;
+                }
+                Ok(Some(Key::Character(c))) if query.len() < 64 => {
+                    query.push(char::from(c));
+                    at = 0;
+                }
+                Ok(Some(Key::Space)) if query.len() < 64 => query.push(' '),
+                _ => {}
+            }
+        };
+        self.at_menu = true;
+        if let Some((tab, entry)) = picked {
+            self.tab = tab;
+            self.menu = entry;
+            self.read_view(None);
+        }
+        Ok(())
+    }
     /// v7.7 ticket 154: theme `index`, saved (config v33 `theme`, an atomic save) and drawn at
     /// once; it only changes the terminal's colours, never the controller's lights.
     fn pick_theme(&mut self, index: usize) -> Result<()> {
@@ -1470,6 +1556,11 @@ impl Terminal {
                             format!("  {name}: {note}")
                         }],
                         None,
+                    ));
+                    rows.push((vec!["── About".into()], None));
+                    rows.push((
+                        vec!["What moved in 7.7 · where every old command went".into()],
+                        Some(Open::WhatMoved),
                     ));
                     ("Theme · 14 themes · Enter picks one".into(), rows)
                 },
@@ -4736,6 +4827,8 @@ enum Open {
     AgentsView,
     /// Pick theme `n` of `mappings::THEMES` (v7.7 ticket 154).
     Theme(usize),
+    /// Show "What moved in 7.7" again (v7.7 ticket 155).
+    WhatMoved,
 }
 /// A tab entry: its lines (one row, or an agent card) and what Enter does.
 type Entry = (Vec<String>, Option<Open>);
@@ -9491,6 +9584,57 @@ const TABS: [(&str, TabRows); 10] = [
         &[("Ask Claude for a profile: 6 Apps & profiles", None)],
     ),
 ];
+/// v7.7 ticket 155: where every old command and Settings row went: (old name, tab, the id
+/// its row there opens, or `None` for the tab's first row). Find indexes these names, and
+/// "What moved in 7.7" lists them.
+const MOVED: &[(&str, usize, Option<usize>)] = &[
+    ("/pause", 0, Some(1)),
+    ("/release-all", 0, Some(5)),
+    ("/quit", 0, Some(11)),
+    ("Status <pad>: <state> lines", 0, None),
+    ("Settings › Favourites", 1, Some(SETTING + 10)),
+    ("Settings › Presets", 1, Some(SETTING + 11)),
+    ("Agents (the list)", 2, None),
+    ("Settings › Default agent directory", 2, Some(SETTING)),
+    ("Settings › Status light sources", 2, Some(SETTING + 4)),
+    ("Settings › Status light patterns", 2, Some(SETTING + 5)),
+    ("Agents › Prompts", 3, None),
+    ("Settings › MIDI device", 4, Some(SETTING + 7)),
+    ("Settings › App profiles", 5, None),
+    ("Settings › Xbox tuning", 6, None),
+    ("Settings › Login service", 7, Some(SETTING + 6)),
+    (
+        "Start the service when this session closes",
+        7,
+        Some(SETTING + 6),
+    ),
+    ("Settings › Start Wispr Flow with VibeConsole", 7, Some(16)),
+    ("Settings › Startup variables", 7, Some(SETTING + 2)),
+    ("Settings › User variables", 7, Some(SETTING + 3)),
+];
+/// v7.7 ticket 155: "What moved in 7.7": one line per old name (`old → tab`), a list that
+/// scrolls; Enter on a line returns its tab, Esc closes.
+fn what_moved(ui: &mut impl Ui) -> Result<Option<usize>> {
+    let lines = MOVED
+        .iter()
+        .map(|(old, tab, _)| format!("{old} → {}", TABS[*tab].0))
+        .collect::<Vec<_>>();
+    let title = "What moved in 7.7: every command and setting is still here, on a tab. Enter goes there · Esc closes · Find (/) knows the old names · again from 8 System › About";
+    Ok(choose(ui, title, &lines)?.map(|index| MOVED[index].1))
+}
+/// v7.7 ticket 155: "What moved in 7.7" once: shown while the config hasn't seen it (a v32
+/// or older file, or `seen-7.7 off`); closing it saves `seen-7.7 on` (an atomic save; a
+/// failed save shows it again next time). Returns the tab picked in it, if any.
+fn what_moved_once(ui: &mut impl Ui, path: &Path) -> Result<Option<usize>> {
+    let mut config = mappings::load_config(path)?;
+    if config.look.seen_moved {
+        return Ok(None);
+    }
+    let picked = what_moved(ui)?;
+    config.look.seen_moved = true;
+    mappings::save_config(path, &config)?;
+    Ok(picked)
+}
 /// Tabs that start a group: `1 Live │ 2–4 │ 5–7 │ 8–0`.
 const TAB_GROUPS: [usize; 3] = [1, 4, 7];
 
@@ -9570,11 +9714,25 @@ fn command_menu(ui: &mut Terminal) -> Result<Option<usize>> {
                             ui.notice = format!("config: {error}; nothing saved");
                         }
                     }
+                    Some(Open::WhatMoved) => {
+                        ui.at_menu = false;
+                        let picked = what_moved(ui);
+                        ui.at_menu = true;
+                        if let Some(tab) = picked? {
+                            ui.tab = tab;
+                            ui.menu = 0;
+                            ui.read_view(None);
+                        }
+                    }
                     None => {}
                 }
                 continue;
             }
             Some(Key::Escape) => return Ok(None),
+            Some(Key::Character(b'/')) => {
+                ui.find()?;
+                continue;
+            }
             _ => continue,
         };
         ui.tab = tab;
@@ -9637,6 +9795,12 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
         } else {
             format!("{notice}. {}", ui.notice)
         };
+    }
+    // v7.7 ticket 155: after updating, where everything went, once.
+    match what_moved_once(&mut ui, path) {
+        Ok(Some(tab)) => ui.tab = tab,
+        Ok(None) => {}
+        Err(error) => ui.notice = format!("config: {error}; What moved shows again next time"),
     }
     loop {
         ui.run_mappings = ui.context_mappings(&current);
@@ -11314,12 +11478,13 @@ mod tests {
             for row in 0..opens {
                 let mut steps = vec![Step::Key(Key::Character(digit))];
                 steps.extend((0..row).map(|_| Step::Key(Key::Down)));
-                steps.extend([Step::Key(Key::Enter), Step::Key(Key::Escape)]);
+                // An Esc closes What moved (8 System › About), one more leaves.
+                steps.extend([Key::Enter, Key::Escape, Key::Escape].map(Step::Key));
                 ui.script = Some(Play {
                     steps: steps.into(),
                     ..Play::default()
                 });
-                // Live's view switch is handled in place; Esc then leaves.
+                // Live's view switch and the themes are handled in place; Esc then leaves.
                 if let Some(id) = command_menu(&mut ui).unwrap() {
                     ids.push(id);
                 }
@@ -11428,6 +11593,113 @@ mod tests {
             mappings::xbox_program_name(&mappings::load_config(&path).unwrap(), 1),
             "Browser"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 155: `/` Find goes to a row by its label ("presets" → 2 Mappings ›
+    /// Presets) and by its old name ("settings xbox tuning" → 7 Xbox); Esc closes; the query
+    /// stops at 64 characters. "What moved in 7.7" shows once for a v32 config and not again.
+    #[test]
+    fn find_by_label_and_old_name_and_what_moved_once() {
+        let (dir, mut ui, _ran, _) = configure_session("find");
+        let path = dir.join("mappings.tsv");
+        ui.at_menu = true;
+        ui.read_view(None);
+        let find = |query: &str| {
+            let mut steps = vec![Step::Key(Key::Character(b'/'))];
+            steps.extend(typed(query).into_iter().map(Step::Key));
+            steps.push(Step::Key(Key::Enter));
+            steps
+        };
+        let mut steps = find("presets");
+        steps.extend(find("settings xbox tuning"));
+        steps.push(Step::Key(Key::Character(b'/')));
+        steps.extend(typed(&"x".repeat(70)).into_iter().map(Step::Key));
+        steps.extend([Step::Key(Key::Escape), Step::Key(Key::Escape)]);
+        ui.script = Some(Play {
+            steps: steps.into(),
+            ..Play::default()
+        });
+        // The first Find runs from the menu; Enter returns to it on the found row.
+        let mut seen = Vec::new();
+        assert_eq!(command_menu(&mut ui).unwrap(), None);
+        let play = ui.script.take().unwrap();
+        for screen in &play.screens {
+            if screen.contains("matches in") {
+                seen.push(screen.clone());
+            }
+        }
+        assert!(
+            seen.iter().any(|s| s.contains("> Mappings › Presets")),
+            "{seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .any(|s| s.contains("> Settings › Xbox tuning → 7 Xbox")),
+            "the old name is found"
+        );
+        assert!(
+            seen.iter()
+                .any(|s| s.contains(&format!("/ {}▌", "x".repeat(64)))),
+            "the query stops at 64"
+        );
+        assert_eq!(ui.tab, 6, "Enter went to 7 Xbox");
+        // Ticket 153: the old login switch's name finds Start at login.
+        let login = ui.find_matches("when this session closes");
+        assert_eq!(login.len(), 1);
+        assert_eq!(
+            login[0].0,
+            "Start the service when this session closes → 8 System"
+        );
+
+        // What moved: a v32 file hasn't seen it.
+        let v33 = std::fs::read_to_string(&path).unwrap();
+        let v32 = v33
+            .replace("vibeconsole-mappings-v33", "vibeconsole-mappings-v32")
+            .lines()
+            .filter(|l| {
+                ![
+                    "theme\t",
+                    "ai-share-usage\t",
+                    "seen-7.7\t",
+                    "agents-view\t",
+                    "default-agent\t",
+                ]
+                .iter()
+                .any(|k| l.starts_with(k))
+            })
+            .map(|l| format!("{l}\n"))
+            .collect::<String>();
+        std::fs::write(&path, v32).unwrap();
+        let mut script = Script {
+            keys: [Key::Enter].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            what_moved_once(&mut script, &path).unwrap(),
+            Some(0),
+            "/pause → 1 Live"
+        );
+        assert!(
+            script
+                .screens
+                .iter()
+                .any(|s| s.contains("What moved in 7.7") && s.contains("> /pause → 1 Live")),
+            "{:?}",
+            script.screens
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("\nseen-7.7\ton\n")
+        );
+        let mut again = Script::default();
+        assert_eq!(
+            what_moved_once(&mut again, &path).unwrap(),
+            None,
+            "only once"
+        );
+        assert!(again.screens.is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

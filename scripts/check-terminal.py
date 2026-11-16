@@ -60,6 +60,27 @@ def signal_app(child, number):
         os.kill(pid, number)
 
 
+def read_until_any(master, tokens, seconds=3):
+    data = b""
+    deadline = time.monotonic() + seconds
+    while not any(t in data for t in tokens) and time.monotonic() < deadline:
+        if select.select([master], [], [], 0.1)[0]:
+            data += os.read(master, 65536)
+    assert any(t in data for t in tokens), (tokens, data)
+    return data
+
+
+def preserved(before, after):
+    """The file is as it was, or (v7.7 ticket 155) saved once as v33 to mark What moved seen,
+    with every mapping still there."""
+    if after == before:
+        return True
+    # An old line `device kind channel id behaviour keys …` keeps its control and its keys.
+    lines = [line.split(b"\t") for line in before.splitlines()[1:] if line.startswith(b"09e8:1049\t")]
+    kept = all(b"\t".join(f[:4]) in after and b"\t" + f[4] + b"\t" + f[5] + b"\t" in after for f in lines)
+    return after.startswith(b"vibeconsole-mappings-v33\n") and b"\nseen-7.7\ton\n" in after and kept
+
+
 def read_until(master, token, seconds=3):
     data = b""
     deadline = time.monotonic() + seconds
@@ -117,7 +138,12 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
             env=dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ["PATH"], XDG_CONFIG_HOME=directory, XDG_RUNTIME_DIR=directory, XDG_DATA_HOME=directory, XDG_DATA_DIRS=directory, TERM="xterm-256color", **({"NO_COLOR": "1"} if ending == "narrow_resize" else {})),
         )
         try:
-            initial_screen=read_until(master, b"Release all")
+            # v7.7 ticket 155: these configs are older than 7.7, so What moved shows first; Esc
+            # closes it and marks it seen.
+            initial_screen = read_until_any(master, [MENU, b"What moved in 7.7"])
+            if b"What moved in 7.7" in initial_screen:
+                os.write(master, b"\x1b")
+                initial_screen += read_until(master, MENU)
             if ending == "unverified_run":
                 go(master, "Run", "Run")
                 notice = read_until(master, b"Select /prog-select before running")
@@ -295,7 +321,7 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
             if ending == "flow_setting":
                 assert b"start-flow\toff\n" in path.read_bytes()
             else:
-                assert path.read_bytes() == contents
+                assert preserved(contents, path.read_bytes())
             calls = (bin_dir / "systemctl.log").read_text() if (bin_dir / "systemctl.log").exists() else ""
             assert " start " not in f" {calls} ", calls
             print(f"{ending}: PASS (terminal restored, saved mappings preserved)")
