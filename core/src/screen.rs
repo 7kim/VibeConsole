@@ -121,33 +121,88 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
-// Tokyo Night–like palette (24-bit foreground/background); plain text when colour is off.
-const BORDER: &str = "38;2;65;72;104";
-const FOCUS: &str = "1;38;2;122;162;247";
-const SELECTED: &str = "1;38;2;26;27;38;48;2;122;162;247";
-const HEADING: &str = "1;38;2;187;154;247";
-const TITLE: &str = "1;38;2;125;207;255";
-const RUNNING: &str = "38;2;158;206;106";
-const PAUSED: &str = "38;2;224;175;104";
-const ERROR: &str = "38;2;247;118;142";
-const DIM: &str = "38;2;86;95;137";
-const BANK_A: &str = "1;38;2;247;118;142";
-const BANK_B: &str = "1;38;2;158;206;106";
+/// The colours of one theme by role (v7.7 spec, Palette instead of constants). Drawing code
+/// names a [`Role`], never a colour.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Palette {
+    pub background: [u8; 3],
+    pub border: [u8; 3],
+    pub text: [u8; 3],
+    pub muted: [u8; 3],
+    pub accent: [u8; 3],
+    pub heading: [u8; 3],
+    pub title: [u8; 3],
+    pub green: [u8; 3],
+    pub yellow: [u8; 3],
+    pub red: [u8; 3],
+    pub selection: [u8; 3],
+}
+/// The default theme (v7.7 spec, Themes). The other 13 arrive with ticket 154.
+pub const TOKYO_NIGHT: Palette = Palette {
+    background: [0x1a, 0x1b, 0x26],
+    border: [0x41, 0x48, 0x68],
+    text: [0xc0, 0xca, 0xf5],
+    muted: [0x81, 0x89, 0xb0],
+    accent: [0x7a, 0xa2, 0xf7],
+    heading: [0xbb, 0x9a, 0xf7],
+    title: [0x7d, 0xcf, 0xff],
+    green: [0x9e, 0xce, 0x6a],
+    yellow: [0xe0, 0xaf, 0x68],
+    red: [0xf7, 0x76, 0x8e],
+    selection: [0x28, 0x34, 0x57],
+};
+/// What a piece of text is; [`style`] turns it into the palette's colours.
+#[derive(Clone, Copy)]
+enum Role {
+    Border,
+    Focus,
+    /// The selected row: `>` plus the selection background and bold, never the primary look.
+    Selected,
+    Heading,
+    Title,
+    Running,
+    Paused,
+    Error,
+    Muted,
+    BankA,
+    BankB,
+    /// The active tab: filled with the accent and underlined (and bracketed, so not colour only).
+    ActiveTab,
+}
+fn style(role: Role) -> String {
+    let p = TOKYO_NIGHT;
+    let fg = |[r, g, b]: [u8; 3]| format!("38;2;{r};{g};{b}");
+    let bg = |[r, g, b]: [u8; 3]| format!("48;2;{r};{g};{b}");
+    match role {
+        Role::Border => fg(p.border),
+        Role::Focus => format!("1;{}", fg(p.accent)),
+        Role::Selected => format!("1;{};{}", fg(p.text), bg(p.selection)),
+        Role::Heading => format!("1;{}", fg(p.heading)),
+        Role::Title => format!("1;{}", fg(p.title)),
+        Role::Running => fg(p.green),
+        Role::Paused => fg(p.yellow),
+        Role::Error => fg(p.red),
+        Role::Muted => fg(p.muted),
+        Role::BankA => format!("1;{}", fg(p.red)),
+        Role::BankB => format!("1;{}", fg(p.green)),
+        Role::ActiveTab => format!("1;4;{};{}", fg(p.background), bg(p.accent)),
+    }
+}
 
-fn paint(text: &str, style: &str, color: bool) -> String {
+fn paint(text: &str, role: Role, color: bool) -> String {
     if color {
-        format!("\x1b[{style}m{text}\x1b[0m")
+        format!("\x1b[{}m{text}\x1b[0m", style(role))
     } else {
         text.into()
     }
 }
 
 fn paint_bulbs(text: &str, color: bool) -> String {
-    text.replace(bulb(true), &paint(bulb(true), PAUSED, color))
-        .replace(bulb(false), &paint(bulb(false), DIM, color))
-        .replace("[●]", &paint("[●]", PAUSED, color))
-        .replace("Bank A", &paint("Bank A", BANK_A, color))
-        .replace("Bank B", &paint("Bank B", BANK_B, color))
+    text.replace(bulb(true), &paint(bulb(true), Role::Paused, color))
+        .replace(bulb(false), &paint(bulb(false), Role::Muted, color))
+        .replace("[●]", &paint("[●]", Role::Paused, color))
+        .replace("Bank A", &paint("Bank A", Role::BankA, color))
+        .replace("Bank B", &paint("Bank B", Role::BankB, color))
 }
 
 fn width_of(text: &str) -> usize {
@@ -237,7 +292,7 @@ fn pane(
         return vec![" ".repeat(width); height];
     }
     let inner = width - 4;
-    let border = if focused { FOCUS } else { BORDER };
+    let border = if focused { Role::Focus } else { Role::Border };
     let title = format!("{}{title} ", if focused { "▸ " } else { " " });
     let title = fit(&title, inner.min(width_of(&title)));
     let mut rows = vec![paint(
@@ -250,11 +305,11 @@ fn pane(
         let line = lines.get(index).map(String::as_str).unwrap_or("");
         let text = fit(line, inner);
         let text = if line.starts_with("> ") && focused {
-            paint(&text, SELECTED, color)
+            paint(&text, Role::Selected, color)
         } else if line.starts_with("── ") {
-            paint(&text, HEADING, color)
+            paint(&text, Role::Heading, color)
         } else if line.starts_with("Error:") {
-            paint(&text, ERROR, color)
+            paint(&text, Role::Error, color)
         } else {
             paint_bulbs(&text, color)
         };
@@ -269,8 +324,79 @@ fn pane(
     rows
 }
 
-/// One tiled screen: header, commands | details | live panes, and a key-hint status line.
+/// The tab bar (v7.7 ticket 150): `VibeConsole  1 Live │ 2 Mappings  3 Agents …`, a `│`
+/// before each tab that starts a group, the active tab in brackets (and, in colour, filled
+/// and underlined). When it doesn't fit, the tabs around the active one between `‹ ›`; below
+/// 60 columns only the active tab and its place (`‹ Agents 3/10 ›`).
+fn tab_bar(tabs: &[String], groups: &[usize], active: usize, width: usize, color: bool) -> String {
+    let slot = |index: usize| {
+        let label = &tabs[index];
+        if index == active {
+            format!("[{label}]")
+        } else {
+            format!(" {label} ")
+        }
+    };
+    let gap = |index: usize| if groups.contains(&index) { "│" } else { "" };
+    let draw = |range: std::ops::Range<usize>| {
+        range
+            .map(|index| {
+                let slot = slot(index);
+                let slot = if index == active {
+                    paint(&slot, Role::ActiveTab, color)
+                } else {
+                    slot
+                };
+                format!("{}{slot}", paint(gap(index), Role::Border, color))
+            })
+            .collect::<String>()
+    };
+    let span = |range: std::ops::Range<usize>| -> usize {
+        range
+            .map(|index| width_of(gap(index)) + width_of(&slot(index)))
+            .sum()
+    };
+    let title = "VibeConsole ";
+    if width_of(title) + span(0..tabs.len()) <= width {
+        return format!(
+            "{}{}",
+            paint(title, Role::Title, color),
+            draw(0..tabs.len())
+        );
+    }
+    let edges = |start: usize, end: usize| 2 + span(start..end); // ‹ and ›
+    let mut start = active;
+    while start > 0 && edges(start - 1, active + 1) <= width {
+        start -= 1;
+    }
+    let mut end = active + 1;
+    while end < tabs.len() && edges(start, end + 1) <= width {
+        end += 1;
+    }
+    if width < 60 || edges(start, end) > width {
+        let name = tabs[active]
+            .split_once(' ')
+            .map_or(tabs[active].as_str(), |p| p.1);
+        let place = format!("‹ {name} {}/{} ›", active + 1, tabs.len());
+        return paint(&place, Role::ActiveTab, color);
+    }
+    let more = |shown: bool| if shown { "‹" } else { " " };
+    format!(
+        "{}{}{}",
+        paint(more(start > 0), Role::Muted, color),
+        draw(start..end),
+        paint(if end < tabs.len() { "›" } else { " " }, Role::Muted, color)
+    )
+}
+
+/// One tiled screen: the tab bar, a header, the active tab's rows | details | live panes,
+/// and a key-hint status line.
 pub struct Screen {
+    /// Tab labels (`1 Live`); empty draws no tab bar.
+    pub tabs: Vec<String>,
+    /// Indexes of the tabs that start a group (a `│` before them).
+    pub groups: Vec<usize>,
+    pub active_tab: usize,
     pub header: String,
     pub commands: Vec<String>,
     pub anchor: usize,
@@ -290,7 +416,8 @@ impl Screen {
         let width = columns.saturating_sub(1).max(1);
         let header = pack(&self.header, width);
         let hints = pack(&self.hints, width);
-        let body = height.saturating_sub(header.len() + hints.len());
+        let bar = usize::from(!self.tabs.is_empty());
+        let body = height.saturating_sub(bar + header.len() + hints.len());
         let sizes = panes(
             columns,
             body,
@@ -321,7 +448,8 @@ impl Screen {
     /// Inner (width, height) available to the live pane at most.
     pub fn live_size(&self, columns: usize, height: usize) -> (usize, usize) {
         let (header, hints, _) = self.sizes(columns, height);
-        let body = height.saturating_sub(header.len() + hints.len());
+        let bar = usize::from(!self.tabs.is_empty());
+        let body = height.saturating_sub(bar + header.len() + hints.len());
         let [_, _, (width, height)] = panes(
             columns,
             body,
@@ -345,33 +473,32 @@ impl Screen {
                 .join("\r\n");
         }
         let (header, hints, [commands, details, live]) = self.sizes(columns, height);
-        let mut rows = header
-            .iter()
-            .enumerate()
-            .map(|(index, row)| {
-                let style = if index == 0 {
-                    TITLE
-                } else if row.contains("RUNNING") {
-                    RUNNING
-                } else {
-                    PAUSED
-                };
-                paint_bulbs(&paint(&fit(row, width), style, color), color)
-            })
-            .collect::<Vec<_>>();
+        let mut rows = Vec::new();
+        if !self.tabs.is_empty() {
+            let bar = |color| tab_bar(&self.tabs, &self.groups, self.active_tab, width, color);
+            // The bar is built to fit; padding keeps every row the same width.
+            let pad = width.saturating_sub(width_of(&bar(false)));
+            rows.push(format!("{}{}", bar(color), " ".repeat(pad)));
+        }
+        rows.extend(header.iter().enumerate().map(|(index, row)| {
+            let role = if index == 0 {
+                Role::Title
+            } else if row.contains("RUNNING") {
+                Role::Running
+            } else {
+                Role::Paused
+            };
+            paint_bulbs(&paint(&fit(row, width), role, color), color)
+        }));
         let (text_width, text_height) = self.details_size(columns, height);
         let mut text = wrap(&self.details, text_width);
         text.resize(text_height, String::new());
         text.extend(self.notice_rows(text_width));
         let focus = self.focus_commands;
-        let commands = pane(
-            "Commands",
-            &self.commands,
-            self.anchor,
-            commands,
-            focus,
-            color,
-        );
+        let title = self.tabs.get(self.active_tab).map_or("Commands", |label| {
+            label.split_once(' ').map_or(label.as_str(), |p| p.1)
+        });
+        let commands = pane(title, &self.commands, self.anchor, commands, focus, color);
         let details = pane("Details", &text, 0, details, !focus, color);
         let live = pane("Live", &self.live, 0, live, false, color);
         if columns >= 160 {
@@ -386,7 +513,11 @@ impl Screen {
         } else {
             rows.extend(commands.into_iter().chain(details).chain(live));
         }
-        rows.extend(hints.iter().map(|row| paint(&fit(row, width), DIM, color)));
+        rows.extend(
+            hints
+                .iter()
+                .map(|row| paint(&fit(row, width), Role::Muted, color)),
+        );
         rows.truncate(height);
         rows.join("\r\n")
     }
@@ -426,7 +557,24 @@ mod tests {
             "[●] Toggle 1: Bank A Pad 1 (Shift)"
         );
         assert!(toggle_line(2, "Knob 3", "Ctrl+K", false).starts_with("[○] Toggle 2"));
-        let screen = Screen {
+        let tabs = [
+            "1 Live",
+            "2 Mappings",
+            "3 Agents",
+            "4 Prompts",
+            "5 Devices",
+            "6 Apps & profiles",
+            "7 Xbox",
+            "8 System",
+            "9 Insights",
+            "0 AI",
+        ]
+        .map(String::from)
+        .to_vec();
+        let mut screen = Screen {
+            tabs: tabs.clone(),
+            groups: vec![1, 4, 7],
+            active_tab: 1,
             header: "VibeConsole | MIDI 💡 ON connected hw:1,0,0 | Input 💡 OFF\nProgram 2 — VSCode (hardware/RAM verified) | RUNNING".into(),
             commands: vec!["── Run".into(), "> /run".into(), "  /pause".into()],
             anchor: 1,
@@ -448,19 +596,17 @@ mod tests {
             assert_eq!(frame.lines().count(), height);
             assert!(!frame.contains('\x1b'));
             assert!(frame.lines().all(|line| width_of(line) < width));
-            for text in [
-                "RUNNING",
-                "── Run",
-                "> /run",
-                "Error: MIDI disconnected",
-                "Ctrl+C",
-            ] {
+            // Narrow and short, the rows pane scrolls with the selection (headings may go).
+            if width >= 80 {
+                row_of(&frame, "── Run");
+            }
+            for text in ["RUNNING", "> /run", "Error: MIDI disconnected", "Ctrl+C"] {
                 row_of(&frame, text); // nothing essential is cut off at any width
             }
             let (commands, details, live) = (
-                row_of(&frame, "▸ Commands"),
-                row_of(&frame, " Details "),
-                row_of(&frame, " Live "),
+                row_of(&frame, "▸ Mappings"),
+                row_of(&frame, "─ Details "),
+                row_of(&frame, "─ Live "),
             );
             if width >= 160 {
                 assert!(commands.0 == details.0 && details.0 == live.0);
@@ -472,7 +618,56 @@ mod tests {
             }
         }
         let colored = screen.render(120, 24, true);
-        assert!(colored.contains('\x1b') && colored.contains("▸ Commands"));
+        assert!(colored.contains('\x1b') && colored.contains("▸ Mappings"));
         assert!(screen.render(39, 24, false).contains("Resize terminal"));
+        assert!(screen.render(80, 15, false).contains("Resize terminal"));
+
+        // v7.7 ticket 150: the tab bar. Wide: every tab in four groups, the active one in
+        // brackets (and filled and underlined in colour).
+        screen.active_tab = 2;
+        let bar = |frame: String| frame.lines().next().unwrap().to_owned();
+        let wide = bar(screen.render(170, 24, false));
+        assert!(
+            wide.starts_with(
+                "VibeConsole  1 Live │ 2 Mappings [3 Agents] 4 Prompts │ 5 Devices  6 Apps & profiles  7 Xbox │ 8 System  9 Insights  0 AI "
+            ),
+            "{wide}"
+        );
+        let colored = bar(screen.render(170, 24, true));
+        assert!(colored.contains("\x1b[1;4;38;2;26;27;38;48;2;122;162;247m[3 Agents]"));
+        // 80 columns: the tabs around the active one, scrolling behind ‹ ›.
+        screen.active_tab = 8;
+        let narrow = bar(screen.render(80, 24, false));
+        assert!(
+            narrow.starts_with('‹') && narrow.contains("[9 Insights]"),
+            "{narrow}"
+        );
+        assert!(!narrow.contains("1 Live"), "{narrow}");
+        screen.active_tab = 0;
+        let start = bar(screen.render(80, 24, false));
+        assert!(
+            start.starts_with(" [1 Live]") && start.contains('›'),
+            "{start}"
+        );
+        // 40 columns: only the active tab and its place.
+        screen.active_tab = 5;
+        assert_eq!(
+            bar(screen.render(40, 16, false)).trim_end(),
+            "‹ Apps & profiles 6/10 ›"
+        );
+        for (width, height) in [(80, 24), (40, 16)] {
+            for active in 0..tabs.len() {
+                screen.active_tab = active;
+                let frame = screen.render(width, height, false);
+                assert_eq!(frame.lines().count(), height);
+                assert!(
+                    frame.lines().all(|line| width_of(line) < width),
+                    "{width}×{height}:\n{frame}"
+                );
+                for text in ["RUNNING", "> /run", "Ctrl+C"] {
+                    row_of(&frame, text);
+                }
+            }
+        }
     }
 }

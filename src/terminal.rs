@@ -18,6 +18,8 @@ enum Key {
     Up,
     Down,
     Tab,
+    /// Shift+Tab (`ESC [ Z`): the previous tab (v7.7 ticket 150).
+    BackTab,
     Left,
     Right,
     Enter,
@@ -31,6 +33,7 @@ enum Key {
 
 fn csi_key(sequence: &[u8]) -> Key {
     let (code, modifier) = match sequence {
+        [b'Z'] => return Key::BackTab,
         [code @ (b'A' | b'B' | b'C' | b'D')] => (*code, 1),
         [
             b'1',
@@ -348,6 +351,8 @@ struct Terminal {
     /// hardware check) is open: only the Xbox controller fires there.
     akai_owned: bool,
     menu: usize,
+    /// The active tab (v7.7 ticket 150); `menu` is the selected row inside it.
+    tab: usize,
     rendered: String,
     rendered_size: (usize, usize),
 }
@@ -473,12 +478,20 @@ impl Terminal {
                 .map(|c| format!("Feedback: {}", c.status))
                 .unwrap_or_default()
         };
-        let hints = if size.0 < 75 {
-            "↑↓ · Enter · Space · Esc · Ctrl+C: quit"
-        } else {
-            "Up/Down: move | Enter: confirm | Space: select | Esc: back | Ctrl+C: quit"
+        let hints = match (self.at_menu, size.0 < 75) {
+            (true, true) => "Tab 1–0 · ↑↓ · Enter · Esc · Ctrl+C: quit",
+            (true, false) => {
+                "Tab ←→ 1–0: tabs | Up/Down: move | Enter: open | Esc: quit | Ctrl+C: quit"
+            }
+            (false, true) => "↑↓ · Enter · Space · Esc · Ctrl+C: quit",
+            (false, false) => {
+                "Up/Down: move | Enter: confirm | Space: select | Esc: back | Ctrl+C: quit"
+            }
         };
         let mut screen = crate::screen::Screen {
+            tabs: TABS.iter().map(|(label, _)| (*label).to_owned()).collect(),
+            groups: TAB_GROUPS.to_vec(),
+            active_tab: self.tab,
             header,
             commands: Vec::new(),
             anchor: self.menu,
@@ -488,7 +501,7 @@ impl Terminal {
             live: Vec::new(),
             hints: hints.into(),
         };
-        for (index, (name, command)) in command_rows(self.wanted_run).iter().enumerate() {
+        for (index, (name, command)) in tab_rows(self.tab, self.wanted_run).iter().enumerate() {
             screen.commands.push(match command {
                 None => format!("── {name}"),
                 Some(_) if index == self.menu && self.at_menu => format!("> {name}"),
@@ -862,6 +875,7 @@ impl Terminal {
             at_menu: false,
             akai_owned: false,
             menu: 1,
+            tab: 0,
             rendered: String::new(),
             rendered_size: (0, 0),
         };
@@ -4298,10 +4312,12 @@ fn existing_directory(dir: &str, config: &mappings::Config) -> Result<String> {
     Ok(expanded)
 }
 
-/// Settings (Configure group): default agent directory, Flow at launch, variables.
+/// The old Settings list, kept for the tests that open a Settings row by its place in it;
+/// since v7.7 ticket 150 each row is a tab row that calls [`setting`].
+#[cfg(test)]
 fn settings_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
     loop {
-        let mut config = mappings::load_config(path)?;
+        let config = mappings::load_config(path)?;
         let rows = vec![
             format!(
                 "Default agent directory: {}",
@@ -4353,44 +4369,52 @@ fn settings_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
         let Some(choice) = choose(ui, "Settings", &rows)? else {
             return Ok(());
         };
-        let result = match choice {
-            0 => {
-                let Some(dir) = text_entry(
-                    ui,
-                    "Default agent directory (absolute path or ${NAME}; empty clears)",
-                    config.agent_dir.as_deref().unwrap_or(""),
-                )?
-                else {
-                    continue;
-                };
-                (|| {
-                    config.agent_dir = if dir.trim().is_empty() {
-                        None
-                    } else {
-                        existing_directory(&dir, &config)?;
-                        Some(dir)
-                    };
-                    mappings::save_config(path, &config)
-                })()
-            }
-            1 => {
-                config.start_flow = !config.start_flow;
-                mappings::save_config(path, &config)
-            }
-            2 | 3 => variables_menu(ui, path, choice == 3),
-            4 => light_sources_menu(ui, path),
-            5 => light_patterns_menu(ui, path),
-            6 => login_menu(ui),
-            7 => midi_device_menu(ui, path),
-            8 => tuning_menu(ui, path),
-            9 => profiles_menu(ui, path),
-            10 => favourites_menu(ui, path),
-            _ => presets_menu(ui, path),
-        };
-        if let Err(error) = result {
-            not_saved(ui, &error)?;
-        }
+        setting(ui, path, choice)?;
     }
+}
+
+/// Settings row `choice` (v7.7 ticket 150: also opened from its tab); a failure is shown as
+/// "Not saved" and leaves the file as it was.
+fn setting(ui: &mut impl Ui, path: &Path, choice: usize) -> Result<()> {
+    let mut config = mappings::load_config(path)?;
+    let result = match choice {
+        0 => {
+            let Some(dir) = text_entry(
+                ui,
+                "Default agent directory (absolute path or ${NAME}; empty clears)",
+                config.agent_dir.as_deref().unwrap_or(""),
+            )?
+            else {
+                return Ok(());
+            };
+            (|| {
+                config.agent_dir = if dir.trim().is_empty() {
+                    None
+                } else {
+                    existing_directory(&dir, &config)?;
+                    Some(dir)
+                };
+                mappings::save_config(path, &config)
+            })()
+        }
+        1 => {
+            config.start_flow = !config.start_flow;
+            mappings::save_config(path, &config)
+        }
+        2 | 3 => variables_menu(ui, path, choice == 3),
+        4 => light_sources_menu(ui, path),
+        5 => light_patterns_menu(ui, path),
+        6 => login_menu(ui),
+        7 => midi_device_menu(ui, path),
+        8 => tuning_menu(ui, path),
+        9 => profiles_menu(ui, path),
+        10 => favourites_menu(ui, path),
+        _ => presets_menu(ui, path),
+    };
+    if let Err(error) = result {
+        not_saved(ui, &error)?;
+    }
+    Ok(())
 }
 
 /// Settings -> App profiles (v7 ticket 12): while one of a profile's apps is focused, its
@@ -5284,6 +5308,7 @@ fn on_off(state: Result<bool>) -> &'static str {
     }
 }
 /// The real state, read from systemctl each time, never a saved copy (ticket 21).
+#[cfg(test)]
 fn login_row(ui: &mut impl Ui) -> String {
     use crate::runtime::Login;
     format!(
@@ -8463,171 +8488,294 @@ pub fn daemon(path: &Path, current: Vec<Mapping>) -> Result<()> {
 }
 
 // Command pane groups (SPEC-UI). Numbers are the command ids `start` dispatches on.
-const COMMANDS: &[(&str, &[(usize, &str, &str)])] = &[
+/// A tab row that opens a Settings row (v7.7 ticket 150): `SETTING + n` runs [`setting`]
+/// `n`, so the session's dispatch stays one match on a number.
+const SETTING: usize = 100;
+/// A tab's rows: a heading has no target; a row has (command id, what it does).
+type TabRows = &'static [(&'static str, Option<(usize, &'static str)>)];
+/// The ten tabs in the user's order (v7.7 spec, The frame). Every old command and every old
+/// Settings row has a row here; their screens are unchanged until ticket 152 fills the tabs.
+/// Settings' "Start Wispr Flow" row is the same switch as command 16.
+const TABS: [(&str, TabRows); 10] = [
     (
-        "Run",
+        "1 Live",
         &[
+            ("Run", None),
             (
-                1,
                 "Run",
-                "Enable the verified program's mappings; retain applicable safety confirmations.",
+                Some((
+                    1,
+                    "Enable the verified program's mappings; retain applicable safety confirmations.",
+                )),
             ),
             (
-                3,
                 "/pause",
-                "Release synthetic keys, cancel pending mapped actions, and remain paused.",
+                Some((
+                    3,
+                    "Release synthetic keys, cancel pending mapped actions, and remain paused.",
+                )),
             ),
             (
-                5,
                 "/release-all",
-                "Clear holds/toggles while retaining running mode.",
+                Some((5, "Clear holds/toggles while retaining running mode.")),
             ),
             (
-                11,
                 "/quit",
-                "Release keys, attempt owned-feedback restoration, and restore the terminal.",
+                Some((
+                    11,
+                    "Release keys, attempt owned-feedback restoration, and restore the terminal.",
+                )),
             ),
         ],
     ),
     (
-        "Configure",
+        "2 Mappings",
         &[
+            ("Assign", None),
             (
-                0,
                 "/configure",
-                "Learn controls; edit, save, or explicitly remove assignments.",
-            ),
-            (2, "/list", "Inspect saved mappings and toggle states."),
-            (
-                18,
-                "Settings",
-                "Default agent directory, Flow at launch, startup and user variables.",
+                Some((
+                    0,
+                    "Learn controls; edit, save, or explicitly remove assignments.",
+                )),
             ),
             (
-                17,
-                "Agents",
-                "Add, edit, or remove tmux agents; attach with tmux attach -t vibe.",
+                "/list",
+                Some((2, "Inspect saved mappings and toggle states.")),
+            ),
+            ("Keep", None),
+            (
+                "Favourites",
+                Some((SETTING + 10, "★ assignments and profiles, listed first.")),
             ),
             (
-                15,
+                "Presets",
+                Some((SETTING + 11, "Save the whole setup by name, load it later.")),
+            ),
+            ("Start over (asks first, keeps a backup)", None),
+            (
                 "Reset settings",
-                "Back up and clear every program's mappings and idle feedback.",
+                Some((
+                    15,
+                    "Back up and clear every program's mappings and idle feedback.",
+                )),
             ),
         ],
     ),
     (
-        "Programs",
+        "3 Agents",
         &[
+            ("Agents · tmux attach -t vibe", None),
             (
-                10,
+                "Agents",
+                Some((
+                    17,
+                    "Add, edit, or remove tmux agents; status lights; saved prompts.",
+                )),
+            ),
+            ("Lights", None),
+            (
+                "Status light sources",
+                Some((SETTING + 4, "Agents outside VibeConsole's tmux.")),
+            ),
+            (
+                "Status light patterns",
+                Some((SETTING + 5, "What each agent state shows.")),
+            ),
+            ("Reporting", None),
+            (
+                "Default agent directory",
+                Some((
+                    SETTING,
+                    "Where new agents start (absolute path or ${NAME}).",
+                )),
+            ),
+        ],
+    ),
+    (
+        "4 Prompts",
+        &[(
+            "Saved prompts and sequences: 3 Agents › Agents › Prompts",
+            None,
+        )],
+    ),
+    (
+        "5 Devices",
+        &[
+            ("Akai MPK mini 3", None),
+            (
                 "/prog-select",
-                "Select and verify an actual hardware program.",
+                Some((10, "Select and verify an actual hardware program.")),
             ),
             (
-                14,
                 "/program-name",
-                "Review, rename, and verify a stored program name.",
+                Some((14, "Review, rename, and verify a stored program name.")),
             ),
-        ],
-    ),
-    (
-        "Feedback",
-        &[
             (
-                9,
                 "/feedback-idle",
-                "Configure the selected program's idle musical settings.",
+                Some((9, "Configure the selected program's idle musical settings.")),
             ),
             (
-                8,
                 "/feedback-check",
-                "Run the bounded original-program feedback/restoration trial.",
+                Some((
+                    8,
+                    "Run the bounded original-program feedback/restoration trial.",
+                )),
             ),
-        ],
-    ),
-    (
-        "Wispr Flow",
-        &[
+            ("Inspect", None),
             (
-                16,
-                "Start Wispr Flow with VibeConsole",
-                "Toggle automatic Flow startup for interactive sessions and the login service.",
-            ),
-            (
-                12,
-                "Start or repair Wispr Flow",
-                "Starts Flow if it is not running, or quits and reopens it once if it is, then checks it opened VibeConsole's keyboard. Output pauses meanwhile and resumes on success.",
-            ),
-        ],
-    ),
-    (
-        "Inspect",
-        &[
-            (
-                7,
                 "/detect",
-                "Show paged Note activity, identities, and events without mapped effects.",
+                Some((
+                    7,
+                    "Show paged Note activity, identities, and events without mapped effects.",
+                )),
             ),
             (
-                6,
                 "/get",
-                "Inspect an observed Note control in the selected context.",
+                Some((
+                    6,
+                    "Inspect an observed Note control in the selected context.",
+                )),
+            ),
+            ("Choose", None),
+            (
+                "MIDI device",
+                Some((
+                    SETTING + 7,
+                    "The MIDI device to use (takes effect next launch).",
+                )),
             ),
         ],
+    ),
+    (
+        "6 Apps & profiles",
+        &[(
+            "App profiles",
+            Some((SETTING + 9, "Pads that change with the focused app.")),
+        )],
+    ),
+    (
+        "7 Xbox",
+        &[(
+            "Xbox tuning",
+            Some((
+                SETTING + 8,
+                "Sticks, triggers, mouse, rumble, button light, headset and driver.",
+            )),
+        )],
+    ),
+    (
+        "8 System",
+        &[
+            ("Login service", None),
+            (
+                "Start at login",
+                Some((SETTING + 6, "The login service and what Quit does.")),
+            ),
+            ("Wispr Flow", None),
+            (
+                "Start Wispr Flow with VibeConsole",
+                Some((
+                    16,
+                    "Toggle automatic Flow startup for interactive sessions and the login service.",
+                )),
+            ),
+            (
+                "Start or repair Wispr Flow",
+                Some((
+                    12,
+                    "Starts Flow if it is not running, or quits and reopens it once if it is, then checks it opened VibeConsole's keyboard. Output pauses meanwhile and resumes on success.",
+                )),
+            ),
+            ("Variables", None),
+            (
+                "Startup variables",
+                Some((SETTING + 2, "Exported into tmux sessions and commands.")),
+            ),
+            (
+                "User variables",
+                Some((SETTING + 3, "${NAME} in commands and directories.")),
+            ),
+        ],
+    ),
+    ("9 Insights", &[("Nothing here yet", None)]),
+    (
+        "0 AI",
+        &[("Ask Claude for a profile: 6 Apps & profiles", None)],
     ),
 ];
+/// Tabs that start a group: `1 Live │ 2–4 │ 5–7 │ 8–0`.
+const TAB_GROUPS: [usize; 3] = [1, 4, 7];
 
-/// Command pane rows: a heading has no command; others carry (id, description).
-fn command_rows(running: bool) -> Vec<(&'static str, Option<(usize, &'static str)>)> {
-    let mut rows = Vec::new();
-    for (heading, commands) in COMMANDS {
-        rows.push((*heading, None));
-        rows.extend(commands.iter().map(|(id, name, about)| {
-            if *id == 1 && running {
-                (
-                    "Pause",
-                    Some((*id, "Release synthetic keys and pause output.")),
-                )
-            } else {
-                (*name, Some((*id, *about)))
-            }
-        }));
-    }
-    rows
+/// The active tab's rows; Run reads Pause while running.
+fn tab_rows(tab: usize, running: bool) -> Vec<(&'static str, Option<(usize, &'static str)>)> {
+    TABS[tab]
+        .1
+        .iter()
+        .map(|&(name, target)| match target {
+            Some((1, _)) if running => (
+                "Pause",
+                Some((1, "Release synthetic keys and pause output.")),
+            ),
+            _ => (name, target),
+        })
+        .collect()
 }
 
-/// Highlighted command row; Up/Down skip headings and wrap. Esc quits as before.
+/// The next row after `from` that opens something, `step` 1 down or `len - 1` up, wrapping.
+fn next_row(rows: &[(&str, Option<(usize, &str)>)], from: usize, step: usize) -> Option<usize> {
+    (1..=rows.len())
+        .map(|k| (from + step * k) % rows.len())
+        .find(|&index| rows[index].1.is_some())
+}
+
+/// The tabbed command screen (v7.7 ticket 150). Tab / → next tab, Shift+Tab / ← previous,
+/// 1–9 and 0 jump; ↑↓ move through the tab's rows and wrap. Switching tabs is not a
+/// transition: nothing is released or drained, and controls keep firing. Esc quits as before.
 fn command_menu(ui: &mut Terminal) -> Result<Option<usize>> {
     loop {
         let running = ui.wanted_run;
-        let rows = command_rows(running);
-        let Some((command, about)) = rows[ui.menu].1 else {
-            ui.menu = (ui.menu + 1) % rows.len();
-            continue;
+        let rows = tab_rows(ui.tab, running);
+        ui.menu = ui.menu.min(rows.len() - 1);
+        if rows[ui.menu].1.is_none() {
+            ui.menu = next_row(&rows, ui.menu, 1).unwrap_or(ui.menu);
+        }
+        let selected = rows[ui.menu].1;
+        let text = match selected {
+            Some((16, _)) => format!(
+                "{}\n\n{}\n\nEnter: open",
+                rows[ui.menu].0,
+                if ui.start_flow_enabled {
+                    "On. Enter to turn off automatic Flow startup on the next launch."
+                } else {
+                    "Off. Enter to turn on automatic Flow startup on the next launch."
+                }
+            ),
+            Some((_, about)) => format!("{}\n\n{about}\n\nEnter: open", rows[ui.menu].0),
+            None => rows[ui.menu].0.to_owned(),
         };
-        let about = if command == 16 {
-            if ui.start_flow_enabled {
-                "On. Enter to turn off automatic Flow startup on the next launch."
-            } else {
-                "Off. Enter to turn on automatic Flow startup on the next launch."
+        ui.draw(&text)?;
+        let tab = match ui.key()? {
+            Some(Key::Tab | Key::Right) => (ui.tab + 1) % TABS.len(),
+            Some(Key::BackTab | Key::Left) => (ui.tab + TABS.len() - 1) % TABS.len(),
+            Some(Key::Character(digit @ b'0'..=b'9')) => (usize::from(digit - b'0') + 9) % 10,
+            Some(Key::Up) => {
+                ui.menu = next_row(&rows, ui.menu, rows.len() - 1).unwrap_or(ui.menu);
+                continue;
             }
-        } else {
-            about
-        };
-        ui.draw(&format!("{}\n\n{about}\n\nEnter: open", rows[ui.menu].0))?;
-        let step = match ui.key()? {
-            Some(Key::Up) => rows.len() - 1,
-            Some(Key::Down) => 1,
-            Some(Key::Enter) if ui.wanted_run == running => return Ok(Some(command)),
+            Some(Key::Down) => {
+                ui.menu = next_row(&rows, ui.menu, 1).unwrap_or(ui.menu);
+                continue;
+            }
+            Some(Key::Enter) if ui.wanted_run == running => match selected {
+                Some((command, _)) => return Ok(Some(command)),
+                None => continue,
+            },
             Some(Key::Escape) => return Ok(None),
             _ => continue,
         };
-        loop {
-            ui.menu = (ui.menu + step) % rows.len();
-            if rows[ui.menu].1.is_some() {
-                break;
-            }
-        }
+        ui.tab = tab;
+        ui.menu = 0;
     }
 }
 
@@ -8866,9 +9014,10 @@ Running/paused mode is retained; held keys and toggles start inactive.",
                 Ok(())
             })(),
             17 => ui.menu_fires(false, |ui| agents_menu(ui, path)),
-            18 => (|| {
-                // v7 ticket 144: mapped controls fire in Settings, as in /configure.
-                let shown = ui.menu_fires(false, |ui| settings_menu(ui, path));
+            SETTING.. => (|| {
+                // v7 ticket 144: mapped controls fire in Settings, as in /configure; v7.7
+                // ticket 150: each Settings row is a tab row of its own.
+                let shown = ui.menu_fires(false, |ui| setting(ui, path, command - SETTING));
                 // A preset (or anything else in Settings) may have replaced the mappings:
                 // pick them up, so resuming is a transition, never a stale set.
                 let config = mappings::load_config(path)?;
@@ -8881,7 +9030,7 @@ Running/paused mode is retained; held keys and toggles start inactive.",
         let result = result.and_then(|()| {
             if ui.context_verified
                 && was_running
-                && matches!(command, 0 | 6 | 7 | 8 | 9 | 10 | 14 | 17 | 18)
+                && matches!(command, 0 | 6 | 7 | 8 | 9 | 10 | 14 | 17 | SETTING..)
             {
                 ui.run_mode(&ui.context_mappings(&current), false)?;
             } else if refresh_idle_after_menu(command, was_running, ui.context_verified) {
@@ -10328,42 +10477,110 @@ mod tests {
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
+    /// v7.7 ticket 150: with the keyboard alone (a number key, Down, Enter) the ten tabs reach
+    /// every old command id once and every old Settings row (Settings' Flow switch, row 1, is
+    /// command 16); Settings itself (18) is gone because its rows are; Run reads Pause while
+    /// running.
     #[test]
-    fn grouped_commands_reach_every_command_once_and_headings_are_not_commands() {
-        let rows = command_rows(false);
-        let mut ids = rows
-            .iter()
-            .filter_map(|(_, command)| command.map(|(id, _)| id))
-            .collect::<Vec<_>>();
+    fn a_walk_of_the_tabs_opens_every_old_command_and_settings_row() {
+        let (dir, mut ui, _ran, _) = configure_session("tab-walk");
+        let mut ids = Vec::new();
+        for (tab, (label, rows)) in TABS.iter().enumerate() {
+            let digit = label.as_bytes()[0];
+            assert_eq!(usize::from(digit - b'0'), (tab + 1) % 10, "{label}");
+            for row in 0..rows.iter().filter(|r| r.1.is_some()).count() {
+                let mut steps = vec![Step::Key(Key::Character(digit))];
+                steps.extend((0..row).map(|_| Step::Key(Key::Down)));
+                steps.push(Step::Key(Key::Enter));
+                ui.script = Some(Play {
+                    steps: steps.into(),
+                    ..Play::default()
+                });
+                ids.push(command_menu(&mut ui).unwrap().unwrap());
+                assert!(ui.script.take().unwrap().steps.is_empty());
+            }
+        }
         ids.sort();
+        let commands = (0..=17).filter(|id| ![4, 13].contains(id));
+        let settings = (0..=11).filter(|row| *row != 1).map(|row| SETTING + row);
+        assert_eq!(ids, commands.chain(settings).collect::<Vec<_>>());
+        assert_eq!(tab_rows(0, true)[1].0, "Pause");
+        assert_eq!(tab_rows(0, false)[1].0, "Run");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 150: Tab and → go to the next tab, Shift+Tab and ← to the previous (both
+    /// wrap), 1–9 and 0 jump; a pad mapped to Tab switches tabs too. Switching releases
+    /// nothing: a held Shift stays down.
+    #[test]
+    fn tab_keys_and_a_pad_mapped_to_tab_switch_tabs() {
+        use Key::*;
+        let (dir, mut ui, _ran, [.., shift]) = configure_session("tab-keys");
+        let path = dir.join("mappings.tsv");
+        let tab_pad = Control::from_note(10, 40).unwrap();
+        let mut config = mappings::load_config(&path).unwrap();
+        config
+            .mappings
+            .push(Mapping::new(tab_pad, "Tab", "tap").unwrap());
+        mappings::save_config(&path, &config).unwrap();
+        ui.run_mappings = ui.context_mappings(&config.mappings);
+        let mut output = crate::keyboard::Output::recording(&ui.run_mappings).unwrap();
+        output.keyboard.resume();
+        ui.output = Some(output);
+        ui.handle_events(vec![Event::Press(shift)]).unwrap();
+        ui.script = Some(Play {
+            steps: VecDeque::from([
+                Step::Key(Tab),
+                Step::Key(Tab),
+                Step::Key(BackTab),
+                Step::Key(Right),
+                Step::Key(Left),
+                Step::Key(Left),
+                Step::Key(Left),
+                Step::Key(Character(b'5')),
+                Step::Key(Character(b'1')),
+                tap(tab_pad),
+                Step::Key(Escape),
+            ]),
+            ..Play::default()
+        });
+        assert_eq!(command_menu(&mut ui).unwrap(), None);
+        let play = ui.script.take().unwrap();
+        let active = play
+            .screens
+            .iter()
+            .map(|screen| {
+                TABS.iter()
+                    .map(|(label, _)| *label)
+                    .find(|label| screen.contains(&format!("[{label}]")))
+                    .unwrap_or_else(|| panic!("no active tab in:\n{screen}"))
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
-            ids,
-            (0..=18)
-                .filter(|id| ![4, 13].contains(id))
-                .collect::<Vec<_>>()
+            active,
+            [
+                "1 Live",
+                "2 Mappings",
+                "3 Agents",
+                "2 Mappings",
+                "3 Agents",
+                "2 Mappings",
+                "1 Live",
+                "0 AI",
+                "5 Devices",
+                "1 Live",
+                "1 Live", // the pad's press; its Tab is read next
+                "2 Mappings",
+            ]
         );
+        let recorded = &ui.output.as_ref().unwrap().recorded;
         assert!(
-            rows.iter()
-                .any(|(name, command)| *name == "Reset settings" && command.is_some())
-        );
-        let headings = rows.iter().filter(|(_, c)| c.is_none()).map(|(h, _)| *h);
-        assert!(headings.eq([
-            "Run",
-            "Configure",
-            "Programs",
-            "Feedback",
-            "Wispr Flow",
-            "Inspect"
-        ]));
-        assert!(rows[0].1.is_none() && rows[1].0 == "Run");
-        let running = command_rows(true);
-        assert_eq!(running[1].0, "Pause");
-        assert!(
-            running
+            !recorded
                 .iter()
-                .any(|(name, command)| *name == "/pause" && command.is_some())
+                .any(|(key, down)| *key == evdev::KeyCode::KEY_LEFTSHIFT && !down),
+            "switching tabs is not a transition: Shift is still held"
         );
-        assert!(!running.iter().any(|(name, _)| *name == "/resume"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -15098,6 +15315,7 @@ mod tests {
                     match (*key, *down) {
                         (KeyCode::KEY_DOWN, true) => play.typed.push_back(Key::Down),
                         (KeyCode::KEY_ENTER, true) => play.typed.push_back(Key::Enter),
+                        (KeyCode::KEY_TAB, true) => play.typed.push_back(Key::Tab),
                         _ => {}
                     }
                 }

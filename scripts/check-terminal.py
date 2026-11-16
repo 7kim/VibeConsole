@@ -7,6 +7,7 @@ from pathlib import Path
 import pty
 import re
 import select
+import shutil
 import signal
 import struct
 import subprocess
@@ -15,22 +16,45 @@ import termios
 import time
 
 binary = Path(__file__).resolve().parents[1] / "target/debug/vibeconsole"
-# Grouped command order (headings are skipped); the cursor starts on Run/Pause.
-ORDER = ["Run", "/pause", "/release-all", "/quit", "/configure", "/list", "Settings", "Agents", "Reset settings",
-         "/prog-select", "/program-name", "/feedback-idle", "/feedback-check",
-         "Start Wispr Flow with VibeConsole", "Start or repair Wispr Flow", "/detect", "/get"]
+# v7.7 ticket 150: each tab's rows that open something, by the tab's number key (headings
+# are skipped). The session starts on 1 Live with Run/Pause selected.
+TABS = {
+    b"1": ["Run", "/pause", "/release-all", "/quit"],
+    b"2": ["/configure", "/list", "Favourites", "Presets", "Reset settings"],
+    b"3": ["Agents", "Status light sources", "Status light patterns", "Default agent directory"],
+    b"5": ["/prog-select", "/program-name", "/feedback-idle", "/feedback-check", "/detect", "/get", "MIDI device"],
+    b"6": ["App profiles"],
+    b"7": ["Xbox tuning"],
+    b"8": ["Start at login", "Start Wispr Flow with VibeConsole", "Start or repair Wispr Flow", "Startup variables", "User variables"],
+}
+# A connected Xbox controller (or any input device) must not reach a scenario: it could run
+# the session and send real shortcuts. bwrap hides /dev/input from the app (v7.7 ticket 150).
+HIDE_INPUT = ["bwrap", "--dev-bind", "/", "/", "--tmpfs", "/dev/input"] if shutil.which("bwrap") else []
+if not HIDE_INPUT:
+    print("bwrap not found: a connected controller can reach these scenarios; unplug it first")
+# The command screen's hint line ("Tab ←→ 1–0: tabs" or "Tab 1–0 · …"): back at the tabs.
+MENU = "1–0".encode()
 
 
 def go(master, source, target):
-    """Move from the highlighted command to the target by name; Enter only once it is highlighted.
+    """Open the target row by name: its tab's number key (which selects the tab's first row),
+    then Down until it, Enter only once it is highlighted; `source` is the highlighted row.
     Flow commands would launch the real application, so no scenario may open them."""
     assert target != "Start or repair Wispr Flow", target
-    if source != target:  # otherwise the target is already highlighted
-        index = lambda name: 0 if name == "Pause" else ORDER.index(name)
-        os.write(master, b"\x1b[B" * ((index(target) - index(source)) % len(ORDER)))
+    if source != target:  # otherwise it is already highlighted, and an unchanged row isn't redrawn
+        name = "Run" if target == "Pause" else target
+        key, rows = next((key, rows) for key, rows in TABS.items() if name in rows)
+        os.write(master, key + b"\x1b[B" * rows.index(name))
         visible = "Start Wispr Flow with V" if target == "Start Wispr Flow with VibeConsole" else target
         read_until(master, b"> " + visible.encode())
     os.write(master, b"\r")
+
+
+def signal_app(child, number):
+    """Signal VibeConsole itself: under bwrap, `child` is bwrap and the app is its child."""
+    found = subprocess.run(["pgrep", "-P", str(child.pid)], capture_output=True, text=True).stdout.split()
+    for pid in [int(pid) for pid in found] if HIDE_INPUT else [child.pid]:
+        os.kill(pid, number)
 
 
 def read_until(master, token, seconds=3):
@@ -82,7 +106,7 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
         original = termios.tcgetattr(slave)
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
         child = subprocess.Popen(
-            [binary, *(["run"] if ending == "run_subcommand" else [] if ending in ("default_running", "toggle_run_pause", "pause_alias", "idle_no_device") else ["--paused"])], stdin=slave, stdout=slave, stderr=slave,
+            [*HIDE_INPUT, binary, *(["run"] if ending == "run_subcommand" else [] if ending in ("default_running", "toggle_run_pause", "pause_alias", "idle_no_device") else ["--paused"])], stdin=slave, stdout=slave, stderr=slave,
             env=dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ["PATH"], XDG_CONFIG_HOME=directory, XDG_RUNTIME_DIR=directory, XDG_DATA_HOME=directory, XDG_DATA_DIRS=directory, TERM="xterm-256color", **({"NO_COLOR": "1"} if ending == "narrow_resize" else {})),
         )
         try:
@@ -95,7 +119,7 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
                 assert b"RUNNING" not in notice
                 assert b"Registered VibeConsole keyboard" not in notice
                 os.write(master, b"\r")
-                read_until(master, b"/quit")
+                read_until(master, MENU)
                 go(master, "Run", "/quit")
             elif ending == "toggle_run_pause":
                 assert b"RUNNING (detecting program" in initial_screen
@@ -106,7 +130,7 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
                 go(master, "Run", "Run")
                 read_until(master, b"Select /prog-select before running")
                 os.write(master, b"\r")
-                read_until(master, b"/quit")
+                read_until(master, MENU)
                 go(master, "Run", "/quit")
             elif ending == "pause_alias":
                 go(master, "Pause", "/pause")
@@ -148,7 +172,7 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
                 if b"unavailable" not in failure:  # error notice, pinned below in the details pane
                     read_until(master, b"unavailable")
                 os.write(master, b"\r")
-                read_until(master, b"/quit")
+                read_until(master, MENU)
                 go(master, "/prog-select", "/quit")
             elif ending == "quit":
                 go(master, "Run", "/quit")
@@ -162,7 +186,7 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
                 read_until(master, b"Operation failed")
                 assert path.read_bytes() == contents
                 os.write(master, b"\r")
-                read_until(master, b"/quit")
+                read_until(master, MENU)
                 go(master, "/configure", "/quit")
             elif ending in ("panes", "narrow_resize"):
                 go(master, "Run", "/configure")
@@ -171,7 +195,8 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
                 # v7 ticket 109: a MIDI keyboard pane (with its Xbox controller part) beside the saved one.
                 assert re.search(rb"MIDI keyboard[^\n]*Saved assignments", wide)
                 assert b"Learn an Xbox button" in wide
-                assert b"\x1b[1;38;2;26;27;38;48;2;122;162;247m" in wide or ending == "narrow_resize" or "NO_COLOR" in os.environ
+                # v7.7 ticket 150: focus is bold text on the selection background, never the accent fill.
+                assert b"\x1b[1;38;2;192;202;245;48;2;40;52;87m" in wide or ending == "narrow_resize" or "NO_COLOR" in os.environ
                 if ending == "narrow_resize":
                     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 18, 50, 0, 0))
                     narrow = read_until(master, b"Tab / Left / Right")
@@ -186,7 +211,8 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
                     read_until(master, b"Resize terminal")
                     os.write(master, b"\t\t\r")  # Confirm is suppressed below the minimum size.
                     time.sleep(0.1)
-                    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 18, 100, 0, 0))
+                    # 19 rows: the tab bar (v7.7 ticket 150) takes one; at 18 Configure is short.
+                    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 19, 100, 0, 0))
                     restored = read_until(master, b"Tab / Left / Right")
                     assert b"> Learn a pad" in restored and b"Finish" in restored
                     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
@@ -194,12 +220,13 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
                     os.write(master, b"\t\x1b[B")
                     read_until(master, b"> Remove saved assignment")
                     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 16, 50, 0, 0))
-                    short = read_until(master, b"Tab / Left / Right")
-                    assert b"> Remove saved assignment" in short
+                    # 50×16 with the tab bar: the rows scroll with the selection; the pane
+                    # hint line is below them.
+                    read_until(master, b"> Remove saved assignment")
                     os.write(master, b"\x1b")
                     read_until(master, b"/configure")
                     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
-                    read_until(master, b"/quit")
+                    read_until(master, b"> /configure")
                     os.write(master, b"\r")
                     read_until(master, b"Tab / Left / Right")
                 os.write(master, b"\t\r")  # Saved pane -> Edit, without MIDI.
@@ -207,12 +234,12 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
                 os.write(master, b"\x1b")
                 read_until(master, b"Tab / Left / Right")
                 os.write(master, b"\t\t\r")  # Finish centered below both panes.
-                read_until(master, b"/quit")
+                read_until(master, MENU)
                 go(master, "/configure", "/quit")
             elif ending == "toggle_panel":
                 if b"Ctrl+K" not in initial_screen:  # the live pane renders after the command pane
                     initial_screen += read_until(master, b"Ctrl+K")
-                assert b"/prog-select" in initial_screen and b"Toggles 2/2" in initial_screen
+                assert b"/release-all" in initial_screen and b"Toggles 2/2" in initial_screen
                 assert b"Shift" in initial_screen and b"Ctrl+K" in initial_screen
                 assert "[○] Toggle 1:".encode() in initial_screen and "[○] Toggle 2:".encode() in initial_screen
                 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 18, 50, 0, 0))
@@ -220,7 +247,7 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
                 narrow = read_until(master, b"Toggles 1/2 \xc2\xb7 /list")
                 assert "[○] Toggle 1:".encode() in narrow and b"(Shift)" in narrow
                 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
-                read_until(master, b"/prog-select")
+                read_until(master, b"/release-all")
                 go(master, "Run", "/quit")
             elif ending == "contexts":
                 go(master, "Run", "/prog-select")
@@ -228,7 +255,7 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
                 if b"unavailable" not in failure:  # error notice, pinned below in the details pane
                     read_until(master, b"unavailable")
                 os.write(master, b"\r")
-                read_until(master, b"/quit")
+                read_until(master, MENU)
                 go(master, "/prog-select", "/quit")
             elif ending == "current_settings":
                 go(master, "Run", "/feedback-idle")
@@ -255,7 +282,7 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
             else:
                 go(master, "Run", "/configure")
                 read_until(master, b"Configure controls")
-                child.send_signal(signal.SIGINT if ending == "sigint" else signal.SIGTERM)
+                signal_app(child, signal.SIGINT if ending == "sigint" else signal.SIGTERM)
             # Drain full-screen frames while quitting; a PTY is a bounded output buffer.
             restored = read_until(master, b"\x1b[?1049l")
             assert b"\x1b[?25h" in restored
