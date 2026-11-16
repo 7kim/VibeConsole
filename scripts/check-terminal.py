@@ -19,7 +19,7 @@ binary = Path(__file__).resolve().parents[1] / "target/debug/vibeconsole"
 # v7.7 ticket 150: each tab's rows that open something, by the tab's number key (headings
 # are skipped). The session starts on 1 Live with Run/Pause selected.
 TABS = {
-    b"1": ["Run", "/pause", "/release-all", "/quit"],
+    b"1": ["▶ Resume", "Release all", "Quit"],
     b"2": ["/configure", "/list", "Favourites", "Presets", "Reset settings"],
     b"3": ["Agents", "Status light sources", "Status light patterns", "Default agent directory"],
     b"5": ["/prog-select", "/program-name", "/feedback-idle", "/feedback-check", "/detect", "/get", "MIDI device"],
@@ -32,6 +32,9 @@ TABS = {
 HIDE_INPUT = ["bwrap", "--dev-bind", "/", "/", "--tmpfs", "/dev/input"] if shutil.which("bwrap") else []
 if not HIDE_INPUT:
     print("bwrap not found: a connected controller can reach these scenarios; unplug it first")
+# The names scenarios use for Live's buttons (v7.7 ticket 151 relabelled them).
+LIVE = {"Run": "▶ Resume", "Pause": "❚❚ Pause", "/release-all": "Release all", "/quit": "Quit"}
+RESUME, PAUSE = "> ▶ Resume".encode(), "> ❚❚ Pause".encode()
 # The command screen's hint line ("Tab ←→ 1–0: tabs" or "Tab 1–0 · …"): back at the tabs.
 MENU = "1–0".encode()
 
@@ -42,10 +45,10 @@ def go(master, source, target):
     Flow commands would launch the real application, so no scenario may open them."""
     assert target != "Start or repair Wispr Flow", target
     if source != target:  # otherwise it is already highlighted, and an unchanged row isn't redrawn
-        name = "Run" if target == "Pause" else target
+        name = LIVE.get("Run" if target == "Pause" else target, target)
         key, rows = next((key, rows) for key, rows in TABS.items() if name in rows)
         os.write(master, key + b"\x1b[B" * rows.index(name))
-        visible = "Start Wispr Flow with V" if target == "Start Wispr Flow with VibeConsole" else target
+        visible = "Start Wispr Flow with V" if target == "Start Wispr Flow with VibeConsole" else LIVE.get(target, target)
         read_until(master, b"> " + visible.encode())
     os.write(master, b"\r")
 
@@ -82,7 +85,7 @@ def pick(master, label, limit=20):
     os.write(master, b"\r")
 
 
-for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_settings", "contexts", "default_running", "run_subcommand", "toggle_run_pause", "pause_alias", "modified_navigation", "flow_setting", "panes", "narrow_resize", "toggle_panel", "idle_no_device", "unverified_run"):
+for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_settings", "contexts", "default_running", "run_subcommand", "toggle_run_pause", "modified_navigation", "flow_setting", "panes", "narrow_resize", "toggle_panel", "idle_no_device", "unverified_run"):
     with tempfile.TemporaryDirectory(prefix="vibeconsole-pty-") as directory:
         config = Path(directory) / "vibeconsole"
         config.mkdir()
@@ -106,11 +109,11 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
         original = termios.tcgetattr(slave)
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
         child = subprocess.Popen(
-            [*HIDE_INPUT, binary, *(["run"] if ending == "run_subcommand" else [] if ending in ("default_running", "toggle_run_pause", "pause_alias", "idle_no_device") else ["--paused"])], stdin=slave, stdout=slave, stderr=slave,
+            [*HIDE_INPUT, binary, *(["run"] if ending == "run_subcommand" else [] if ending in ("default_running", "toggle_run_pause", "idle_no_device") else ["--paused"])], stdin=slave, stdout=slave, stderr=slave,
             env=dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ["PATH"], XDG_CONFIG_HOME=directory, XDG_RUNTIME_DIR=directory, XDG_DATA_HOME=directory, XDG_DATA_DIRS=directory, TERM="xterm-256color", **({"NO_COLOR": "1"} if ending == "narrow_resize" else {})),
         )
         try:
-            initial_screen=read_until(master, b"/quit")
+            initial_screen=read_until(master, b"Release all")
             if ending == "unverified_run":
                 go(master, "Run", "Run")
                 notice = read_until(master, b"Select /prog-select before running")
@@ -123,29 +126,24 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
                 go(master, "Run", "/quit")
             elif ending == "toggle_run_pause":
                 assert b"RUNNING (detecting program" in initial_screen
-                assert b"> Pause" in initial_screen
+                assert PAUSE in initial_screen
                 go(master, "Pause", "Pause")
-                paused = read_until(master, b"> Run")
+                paused = read_until(master, RESUME)
                 assert b"PAUSED" in paused
                 go(master, "Run", "Run")
                 read_until(master, b"Select /prog-select before running")
                 os.write(master, b"\r")
                 read_until(master, MENU)
                 go(master, "Run", "/quit")
-            elif ending == "pause_alias":
-                go(master, "Pause", "/pause")
-                paused = read_until(master, b"  Run")
-                assert b"PAUSED" in paused
-                go(master, "/pause", "/quit")
             elif ending == "modified_navigation":
                 os.write(master, b"\x1b[1;2B")  # Shift+Down
-                read_until(master, b"> /pause")
+                read_until(master, b"> Release all")
                 os.write(master, b"\x1b[1;3A")  # Alt+Up
-                read_until(master, b"> Run")
+                read_until(master, RESUME)
                 os.write(master, b"\x1b[13;5u")  # Ctrl+Enter
                 read_until(master, b"Select /prog-select before running")
                 os.write(master, b"\x1b[27;3u")  # Alt+Esc
-                read_until(master, b"> Run")
+                read_until(master, RESUME)
                 go(master, "Run", "Reset settings")
                 read_until(master, b"Type reset")
                 os.write(master, b"ReSeT\r")
@@ -237,17 +235,18 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
                 read_until(master, MENU)
                 go(master, "/configure", "/quit")
             elif ending == "toggle_panel":
-                if b"Ctrl+K" not in initial_screen:  # the live pane renders after the command pane
+                if b"Ctrl+K" not in initial_screen:  # Toggles is Live's last pane (v7.7 ticket 151)
                     initial_screen += read_until(master, b"Ctrl+K")
-                assert b"/release-all" in initial_screen and b"Toggles 2/2" in initial_screen
+                assert b"Release all" in initial_screen and "Toggles · 0 of 2 on".encode() in initial_screen
                 assert b"Shift" in initial_screen and b"Ctrl+K" in initial_screen
                 assert "[○] Toggle 1:".encode() in initial_screen and "[○] Toggle 2:".encode() in initial_screen
                 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 18, 50, 0, 0))
                 # Long raw names wrap rather than truncate; the pane shows what fits and points to /list.
-                narrow = read_until(master, b"Toggles 1/2 \xc2\xb7 /list")
-                assert "[○] Toggle 1:".encode() in narrow and b"(Shift)" in narrow
+                # 50 columns: the Toggles pane stays, its rows cut to fit.
+                narrow = read_until(master, "Toggles · 0 of 2 on".encode())
+                assert "[○] Toggle 1:".encode() in narrow
                 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
-                read_until(master, b"/release-all")
+                read_until(master, b"Release all")
                 go(master, "Run", "/quit")
             elif ending == "contexts":
                 go(master, "Run", "/prog-select")

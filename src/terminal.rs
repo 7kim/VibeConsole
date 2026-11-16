@@ -305,6 +305,15 @@ struct Terminal {
     flow_resume: bool,
     /// (agent, tmux window, state), refreshed every `STATUS_EVERY`.
     agent_states: Vec<(String, String, &'static str)>,
+    /// v7.7 ticket 151: each agent's host and folder, in `agent_states` order.
+    agent_places: Vec<(mappings::Host, Option<String>)>,
+    /// v7.7 ticket 151: folder → project (its git top-level folder's name), found in the
+    /// status refresh, never while drawing.
+    projects: BTreeMap<String, String>,
+    /// v7.7 ticket 151: the Live Agents pane shows cards (config `agents-view gallery`).
+    agent_cards: bool,
+    /// v7.7 ticket 151: the status control pressed last and when, for its lit line.
+    pressed: Option<(Control, Instant)>,
     /// v7 ticket 86: each device's switch and patterns; None while Status lights is off.
     device_lights: Option<crate::status::DevicePatterns>,
     /// Agents' status-light settings, in `agent_states` order; None while Status lights is Off.
@@ -373,18 +382,7 @@ impl Terminal {
             .output
             .as_ref()
             .map(|o| o.keyboard.status(|control| self.name(control)))
-            .unwrap_or_else(|| format!("PAUSED | {} saved assignments", self.run_mappings.len()))
-            + &agent_line(
-                &self
-                    .agent_states
-                    .iter()
-                    .cloned()
-                    .chain(self.light_sessions.iter().map(|(folder, state, _)| {
-                        let name = folder.rsplit('/').find(|p| !p.is_empty()).unwrap_or(folder);
-                        (name.to_owned(), String::new(), *state)
-                    }))
-                    .collect::<Vec<_>>(),
-            );
+            .unwrap_or_else(|| format!("PAUSED | {} saved assignments", self.run_mappings.len()));
         let state = if self.wanted_run {
             let label = if !self.context_verified {
                 "RUNNING (detecting program; actions inactive)"
@@ -500,7 +498,29 @@ impl Terminal {
             notice,
             live: Vec::new(),
             hints: hints.into(),
+            panes: Vec::new(),
         };
+        if self.at_menu && self.tab == 0 {
+            let mut number = 0;
+            for (title, entries) in self.live_panes(crate::screen::pane_width(size.0), self.menu) {
+                let mut pane = crate::screen::Pane {
+                    title,
+                    rows: Vec::new(),
+                    anchor: 0,
+                    focused: false,
+                };
+                for (lines, _) in entries {
+                    pane.rows.extend(lines);
+                    if number == self.menu {
+                        pane.anchor = pane.rows.len() - 1;
+                        pane.focused = true;
+                    }
+                    number += 1;
+                }
+                screen.panes.push(pane);
+            }
+            return screen;
+        }
         for (index, (name, command)) in tab_rows(self.tab, self.wanted_run).iter().enumerate() {
             screen.commands.push(match command {
                 None => format!("── {name}"),
@@ -840,6 +860,10 @@ impl Terminal {
             xbox_status: Vec::new(),
             probe: None,
             agent_states: Vec::new(),
+            agent_places: Vec::new(),
+            projects: BTreeMap::new(),
+            agent_cards: false,
+            pressed: None,
             device_lights: None,
             light_agents: None,
             light_sessions: Vec::new(),
@@ -874,7 +898,7 @@ impl Terminal {
             bend: None,
             at_menu: false,
             akai_owned: false,
-            menu: 1,
+            menu: 0, // Live's Pause / Resume (v7.7 ticket 151)
             tab: 0,
             rendered: String::new(),
             rendered_size: (0, 0),
@@ -964,15 +988,245 @@ impl Terminal {
             .map(|layout| layout.into_iter().filter(|m| m.status).collect())
             .unwrap_or_default();
     }
-    /// `Status <pad>: <word>` per status pad, for the live pane.
+    /// v7.7 ticket 151: `<control> · <what it does> · <state>` per status pad, in plain
+    /// words; the one pressed in the last second starts `◆ ` and ends `← pressed`.
     fn status_lines(&self) -> Vec<String> {
+        let now = Instant::now();
         self.status_mappings()
             .map(|m| {
                 let probed = self.probed.get(&m.control).copied().flatten();
                 let word = status_word(self.phases.get(&m.control).copied(), probed);
-                format!("Status {}: {word}", self.name(m.control))
+                let line = format!("{} · {} · {word}", self.name(m.control), m.action_label());
+                let lit = self.pressed.is_some_and(|(control, at)| {
+                    control == m.control && now.duration_since(at) < Duration::from_secs(1)
+                });
+                if lit {
+                    format!("◆ {line}  ← pressed")
+                } else {
+                    format!("  {line}")
+                }
             })
             .collect()
+    }
+    /// v7.7 ticket 151: every agent and outside session, most urgent first: needs input,
+    /// decision, working, idle, finished (stable within a state).
+    fn agent_rows(&self) -> Vec<AgentRow> {
+        let project = |folder: &Option<String>| {
+            folder
+                .as_ref()
+                .and_then(|f| self.projects.get(f).cloned())
+                .unwrap_or_else(|| "—".into())
+        };
+        let mut rows = self
+            .agent_states
+            .iter()
+            .enumerate()
+            .map(|(index, (name, window, state))| {
+                let (host, folder) = self
+                    .agent_places
+                    .get(index)
+                    .cloned()
+                    .unwrap_or((mappings::Host::Tmux, None));
+                AgentRow {
+                    name: name.clone(),
+                    project: project(&folder),
+                    window: window.clone(),
+                    folder,
+                    state,
+                    host: Some(host),
+                }
+            })
+            .chain(self.light_sessions.iter().map(|(folder, state, _)| {
+                let folder = Some(folder.clone());
+                AgentRow {
+                    name: folder_name(folder.as_deref().unwrap_or_default()).into(),
+                    project: project(&folder),
+                    window: String::new(),
+                    folder,
+                    state,
+                    host: None,
+                }
+            }))
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|row| match row.state {
+            "needs-input" => 0,
+            "needs-decision" => 1,
+            "thinking" => 2,
+            "finished" => 4,
+            _ => 3,
+        });
+        rows
+    }
+    /// v7.7 ticket 151: Enter on an agent: Orca jump or herdr focus through the dispatcher,
+    /// tmux `select-window` through the runner, identifiers as single arguments. Going to a
+    /// finished agent attends to it.
+    fn go_to_agent(&mut self, row: &AgentRow) -> Result<()> {
+        use crate::actions::Action;
+        match row.host {
+            Some(mappings::Host::Orca) => self.actions.submit(
+                Action::OrcaJump {
+                    agent: row.name.clone(),
+                    folder: row.folder.clone().ok_or("no folder to jump to")?,
+                },
+                None,
+            )?,
+            Some(mappings::Host::Herdr) => self
+                .actions
+                .submit(Action::HerdrFocus(row.name.clone()), None)?,
+            Some(mappings::Host::Tmux) => {
+                let target = format!("vibe:{}", row.window);
+                Ui::run(self, &["tmux", "select-window", "-t", &target])?;
+            }
+            None => return Err("a session VibeConsole didn't start; open it where it runs".into()),
+        }
+        self.clear_finished(std::slice::from_ref(&row.name));
+        self.notice = format!("Went to {}.", row.name);
+        Ok(())
+    }
+    /// v7.7 ticket 151: Table ↔ Gallery, saved as `agents-view` (an atomic save; a failure
+    /// keeps the file and the view).
+    fn switch_agents_view(&mut self) -> Result<()> {
+        let mut config = mappings::load_config(&self.path)?;
+        config.look.agent_cards = !self.agent_cards;
+        mappings::save_config(&self.path, &config)?;
+        self.agent_cards = config.look.agent_cards;
+        Ok(())
+    }
+    /// v7.7 ticket 151: Live's panes: its buttons, Agents, Pads and buttons, Toggles. Each
+    /// entry is its lines and what Enter does; entry `selected` (counted over every pane)
+    /// gets `> `, or a double border when it is an agent card.
+    fn live_panes(&self, width: usize, selected: usize) -> Vec<(String, Vec<Entry>)> {
+        use crate::screen::fit;
+        let one = |line: String, open: Option<Open>| (vec![line], open);
+        let buttons = tab_rows(0, self.wanted_run)
+            .into_iter()
+            .filter_map(|(name, target)| Some(one(name.into(), Some(Open::Command(target?.0)))))
+            .collect::<Vec<_>>();
+        let view = if self.agent_cards {
+            "View: Table  [Gallery]"
+        } else {
+            "View: [Table]  Gallery"
+        };
+        let mut agents = vec![one(view.into(), Some(Open::AgentsView))];
+        let rows = self.agent_rows();
+        if rows.is_empty() {
+            agents.push(one(
+                "No agents yet · Enter: Add agent".into(),
+                Some(Open::Command(17)),
+            ));
+            agents.push(one(
+                "  Agents in other terminals appear once Status light sources lists their folder."
+                    .into(),
+                None,
+            ));
+        } else if self.agent_cards {
+            for (number, row) in rows.iter().enumerate() {
+                let open = row.host.is_some().then_some(Open::Agent(number));
+                let chosen = buttons.len() + agents.len() == selected && open.is_some();
+                let lines = [
+                    format!("● {}", state_word(row.state)),
+                    format!("{} · {}", row.project, row.place()),
+                ];
+                let card = crate::screen::card(&row.name, &lines, width, chosen);
+                agents.push((card, open));
+            }
+        } else {
+            // Below 100 columns FOLDER goes, then PROJECT (v7.7 spec, Sizes).
+            let (project, folder) = (width >= 55, width >= 90);
+            let mut head = format!("── {}", fit("AGENT", 18));
+            let line = |row: &AgentRow| {
+                let mut text = format!("● {}", fit(&row.name, 18));
+                if project {
+                    text += &fit(&row.project, 16);
+                }
+                if folder {
+                    // A folder keeps its end, the part that names it: `…/VibeConsole/docs`.
+                    let place = row.place();
+                    let count = place.chars().count();
+                    let place = if count < 28 {
+                        place
+                    } else {
+                        format!(
+                            "…{}",
+                            place.chars().skip(count + 2 - 28).collect::<String>()
+                        )
+                    };
+                    text += &fit(&place, 28);
+                }
+                text + state_word(row.state)
+            };
+            if project {
+                head += &fit("PROJECT", 16);
+            }
+            if folder {
+                head += &fit("FOLDER", 28);
+            }
+            agents.push(one(head + "STATUS", None));
+            for (number, row) in rows.iter().enumerate() {
+                let open = row.host.is_some().then_some(Open::Agent(number));
+                let text = line(row);
+                agents.push(one(
+                    if open.is_some() {
+                        text
+                    } else {
+                        format!("  {text}")
+                    },
+                    open,
+                ));
+            }
+        }
+        let mut panes = vec![
+            ("Live".to_owned(), buttons),
+            (
+                "Agents · most urgent first · Enter: go to the agent".to_owned(),
+                agents,
+            ),
+        ];
+        let pads = self.status_lines();
+        if !pads.is_empty() {
+            panes.push((
+                "Pads and buttons · the one you just pressed lights up".into(),
+                pads.into_iter().map(|line| one(line, None)).collect(),
+            ));
+        }
+        let toggles = self
+            .run_mappings
+            .iter()
+            .filter(|m| m.behavior == mappings::Behavior::Toggle)
+            .map(|m| {
+                let on = (self.output.as_ref()).is_some_and(|o| o.keyboard.active(m.control));
+                (m, on)
+            })
+            .collect::<Vec<_>>();
+        if !toggles.is_empty() {
+            let on = toggles.iter().filter(|(_, on)| *on).count();
+            let lines = toggles
+                .iter()
+                .enumerate()
+                .map(|(number, (m, active))| {
+                    let line = crate::screen::toggle_line(
+                        number + 1,
+                        &self.name(m.control),
+                        &m.action_label(),
+                        *active,
+                    );
+                    one(format!("  {line}"), None)
+                })
+                .collect();
+            panes.push((format!("Toggles · {on} of {} on", toggles.len()), lines));
+        }
+        // One-line entries that open something get their mark.
+        let mut number = 0;
+        for (_, entries) in &mut panes {
+            for (lines, open) in entries {
+                if open.is_some() && lines.len() == 1 {
+                    let mark = if number == selected { "> " } else { "  " };
+                    lines[0] = format!("{mark}{}", lines[0]);
+                }
+                number += 1;
+            }
+        }
+        panes
     }
     fn refresh_agent_states(&mut self) {
         let Ok(config) = mappings::load_config(&self.path) else {
@@ -1032,6 +1286,20 @@ impl Terminal {
         } else {
             Vec::new()
         };
+        self.agent_cards = config.look.agent_cards;
+        self.agent_places = config
+            .agents
+            .iter()
+            .map(|a| (a.host, config.agent_directory(a).ok().flatten()))
+            .collect();
+        let folders = self.agent_places.iter().filter_map(|(_, f)| f.clone());
+        let outside = self.light_sessions.iter().map(|(f, _, _)| f.clone());
+        for folder in folders.chain(outside).collect::<Vec<_>>() {
+            if !self.projects.contains_key(&folder) {
+                let project = project_of(&folder);
+                self.projects.insert(folder, project);
+            }
+        }
         self.agent_states = config
             .agents
             .into_iter()
@@ -1548,6 +1816,7 @@ impl Terminal {
                             Phase::Failed
                         };
                         self.phases.insert(pad, phase);
+                        self.pressed = Some((pad, Instant::now()));
                     }
                     return submitted;
                 }
@@ -3486,6 +3755,12 @@ impl Ui for Terminal {
         (crate::gamepad::driver_in_use(&bound), cards)
     }
     fn run(&mut self, args: &[&str]) -> Result<String> {
+        // A scripted session never starts a real program: it records it (v7.7 ticket 151).
+        #[cfg(test)]
+        if let Some(play) = &mut self.script {
+            play.ran.push(args.join(" "));
+            return Ok(String::new());
+        }
         (crate::gamepad::run_program())(args)
     }
     fn light_rule(&self) -> bool {
@@ -4054,6 +4329,69 @@ enum Phase {
     Failed,
 }
 
+/// What Enter does on a tab row (v7.7 tickets 150, 151).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Open {
+    /// A session command id, or `SETTING + n`.
+    Command(usize),
+    /// Go to the agent at this place in `agent_rows`.
+    Agent(usize),
+    /// Switch the Agents pane between Table and Gallery.
+    AgentsView,
+}
+/// A tab entry: its lines (one row, or an agent card) and what Enter does.
+type Entry = (Vec<String>, Option<Open>);
+/// One row of the Live Agents pane (v7.7 ticket 151). `host` is None for a session found by
+/// Status light sources: VibeConsole can't go to it.
+#[derive(Clone, Debug)]
+struct AgentRow {
+    name: String,
+    project: String,
+    folder: Option<String>,
+    window: String,
+    state: &'static str,
+    host: Option<mappings::Host>,
+}
+impl AgentRow {
+    /// The folder with the home folder as `~`, or `—` (a herdr agent without one).
+    fn place(&self) -> String {
+        let Some(folder) = &self.folder else {
+            return "—".into();
+        };
+        match std::env::var("HOME") {
+            Ok(home) if !home.is_empty() && folder.starts_with(&home) => {
+                format!("~{}", &folder[home.len()..])
+            }
+            _ => folder.clone(),
+        }
+    }
+}
+/// A state as a word, never colour alone (v7.7 spec, 1 Live).
+fn state_word(state: &str) -> &'static str {
+    match state {
+        "needs-input" => "NEEDS INPUT",
+        "needs-decision" => "DECISION",
+        "thinking" => "WORKING",
+        "finished" => "FINISHED",
+        _ => "IDLE",
+    }
+}
+fn folder_name(folder: &str) -> &str {
+    folder.rsplit('/').find(|p| !p.is_empty()).unwrap_or(folder)
+}
+/// A folder's project: the name of the nearest folder above it holding `.git` (a folder, or
+/// a file in a worktree), else the folder's own name. No git process is started.
+fn project_of(folder: &str) -> String {
+    let path = Path::new(folder);
+    path.ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .and_then(|dir| dir.file_name())
+        .map_or_else(
+            || folder_name(folder).into(),
+            |n| n.to_string_lossy().into(),
+        )
+}
+
 /// A failed press stays failed until the next press; otherwise the derived state wins, so a
 /// stopped process or killed server never shows a stale "running".
 fn status_word(phase: Option<Phase>, running: Option<bool>) -> &'static str {
@@ -4064,25 +4402,6 @@ fn status_word(phase: Option<Phase>, running: Option<bool>) -> &'static str {
         (_, None) => "unavailable",
         _ => "stopped",
     }
-}
-
-/// "\nAgents: claude thinking · VibeConsole NEEDS INPUT", or nothing when every agent is idle.
-/// Idle (and exited) agents are left out; finished means it waits for you, so it reads as
-/// needs input like a permission question does.
-fn agent_line(states: &[(String, String, &'static str)]) -> String {
-    let parts = states
-        .iter()
-        .filter(|(_, _, state)| *state != "idle")
-        .map(|(name, _, state)| match *state {
-            "finished" | "needs-input" => format!("{name} NEEDS INPUT"),
-            "needs-decision" => format!("{name} DECISION"),
-            state => format!("{name} {state}"),
-        })
-        .collect::<Vec<_>>();
-    if parts.is_empty() {
-        return String::new();
-    }
-    format!("\nAgents: {}", parts.join(" · "))
 }
 
 fn agents_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
@@ -8497,30 +8816,23 @@ type TabRows = &'static [(&'static str, Option<(usize, &'static str)>)];
 /// Settings row has a row here; their screens are unchanged until ticket 152 fills the tabs.
 /// Settings' "Start Wispr Flow" row is the same switch as command 16.
 const TABS: [(&str, TabRows); 10] = [
+    // v7.7 ticket 151: Live's buttons; its other panes are built from the session.
     (
         "1 Live",
         &[
-            ("Run", None),
             (
-                "Run",
+                "▶ Resume",
                 Some((
                     1,
                     "Enable the verified program's mappings; retain applicable safety confirmations.",
                 )),
             ),
             (
-                "/pause",
-                Some((
-                    3,
-                    "Release synthetic keys, cancel pending mapped actions, and remain paused.",
-                )),
-            ),
-            (
-                "/release-all",
+                "Release all",
                 Some((5, "Clear holds/toggles while retaining running mode.")),
             ),
             (
-                "/quit",
+                "Quit",
                 Some((
                     11,
                     "Release keys, attempt owned-feedback restoration, and restore the terminal.",
@@ -8714,7 +9026,7 @@ fn tab_rows(tab: usize, running: bool) -> Vec<(&'static str, Option<(usize, &'st
         .iter()
         .map(|&(name, target)| match target {
             Some((1, _)) if running => (
-                "Pause",
+                "❚❚ Pause",
                 Some((1, "Release synthetic keys and pause output.")),
             ),
             _ => (name, target),
@@ -8723,36 +9035,46 @@ fn tab_rows(tab: usize, running: bool) -> Vec<(&'static str, Option<(usize, &'st
 }
 
 /// The next row after `from` that opens something, `step` 1 down or `len - 1` up, wrapping.
-fn next_row(rows: &[(&str, Option<(usize, &str)>)], from: usize, step: usize) -> Option<usize> {
-    (1..=rows.len())
-        .map(|k| (from + step * k) % rows.len())
-        .find(|&index| rows[index].1.is_some())
+fn next_row(opens: &[bool], from: usize, step: usize) -> Option<usize> {
+    (1..=opens.len())
+        .map(|k| (from + step * k) % opens.len())
+        .find(|&index| opens[index])
 }
 
 /// The tabbed command screen (v7.7 ticket 150). Tab / → next tab, Shift+Tab / ← previous,
 /// 1–9 and 0 jump; ↑↓ move through the tab's rows and wrap. Switching tabs is not a
 /// transition: nothing is released or drained, and controls keep firing. Esc quits as before.
+/// On Live (ticket 151) Enter on an agent goes to it and the view switch saves at once.
 fn command_menu(ui: &mut Terminal) -> Result<Option<usize>> {
     loop {
         let running = ui.wanted_run;
         let rows = tab_rows(ui.tab, running);
-        ui.menu = ui.menu.min(rows.len() - 1);
-        if rows[ui.menu].1.is_none() {
-            ui.menu = next_row(&rows, ui.menu, 1).unwrap_or(ui.menu);
+        let (targets, agents) = if ui.tab == 0 {
+            let targets = (ui.live_panes(80, usize::MAX).into_iter())
+                .flat_map(|(_, entries)| entries.into_iter().map(|(_, open)| open))
+                .collect::<Vec<_>>();
+            (targets, ui.agent_rows())
+        } else {
+            let targets = rows.iter().map(|(_, t)| t.map(|(id, _)| Open::Command(id)));
+            (targets.collect(), Vec::new())
+        };
+        let opens = targets.iter().map(Option::is_some).collect::<Vec<_>>();
+        ui.menu = ui.menu.min(targets.len() - 1);
+        if !opens[ui.menu] {
+            ui.menu = next_row(&opens, ui.menu, 1).unwrap_or(ui.menu);
         }
-        let selected = rows[ui.menu].1;
-        let text = match selected {
-            Some((16, _)) => format!(
-                "{}\n\n{}\n\nEnter: open",
-                rows[ui.menu].0,
+        let text = match rows.get(ui.menu).filter(|_| ui.tab != 0) {
+            Some((name, Some((16, _)))) => format!(
+                "{name}\n\n{}\n\nEnter: open",
                 if ui.start_flow_enabled {
                     "On. Enter to turn off automatic Flow startup on the next launch."
                 } else {
                     "Off. Enter to turn on automatic Flow startup on the next launch."
                 }
             ),
-            Some((_, about)) => format!("{}\n\n{about}\n\nEnter: open", rows[ui.menu].0),
-            None => rows[ui.menu].0.to_owned(),
+            Some((name, Some((_, about)))) => format!("{name}\n\n{about}\n\nEnter: open"),
+            Some((name, None)) => (*name).to_owned(),
+            None => String::new(),
         };
         ui.draw(&text)?;
         let tab = match ui.key()? {
@@ -8760,17 +9082,32 @@ fn command_menu(ui: &mut Terminal) -> Result<Option<usize>> {
             Some(Key::BackTab | Key::Left) => (ui.tab + TABS.len() - 1) % TABS.len(),
             Some(Key::Character(digit @ b'0'..=b'9')) => (usize::from(digit - b'0') + 9) % 10,
             Some(Key::Up) => {
-                ui.menu = next_row(&rows, ui.menu, rows.len() - 1).unwrap_or(ui.menu);
+                ui.menu = next_row(&opens, ui.menu, opens.len() - 1).unwrap_or(ui.menu);
                 continue;
             }
             Some(Key::Down) => {
-                ui.menu = next_row(&rows, ui.menu, 1).unwrap_or(ui.menu);
+                ui.menu = next_row(&opens, ui.menu, 1).unwrap_or(ui.menu);
                 continue;
             }
-            Some(Key::Enter) if ui.wanted_run == running => match selected {
-                Some((command, _)) => return Ok(Some(command)),
-                None => continue,
-            },
+            Some(Key::Enter) if ui.wanted_run == running => {
+                match targets[ui.menu] {
+                    Some(Open::Command(command)) => return Ok(Some(command)),
+                    Some(Open::Agent(number)) => {
+                        if let Some(row) = agents.get(number) {
+                            if let Err(error) = ui.go_to_agent(row) {
+                                ui.notice = format!("go to agent {}: {error}", row.name);
+                            }
+                        }
+                    }
+                    Some(Open::AgentsView) => {
+                        if let Err(error) = ui.switch_agents_view() {
+                            ui.notice = format!("config: {error}; nothing saved");
+                        }
+                    }
+                    None => {}
+                }
+                continue;
+            }
             Some(Key::Escape) => return Ok(None),
             _ => continue,
         };
@@ -9195,7 +9532,7 @@ mod tests {
         /// error a run gives (when set).
         driver: Option<&'static str>,
         cards: String,
-        ran: Vec<String>,
+        pub(super) ran: Vec<String>,
         run_error: Option<String>,
         xone_missing: bool,
         rule: bool,
@@ -10479,8 +10816,8 @@ mod tests {
     }
     /// v7.7 ticket 150: with the keyboard alone (a number key, Down, Enter) the ten tabs reach
     /// every old command id once and every old Settings row (Settings' Flow switch, row 1, is
-    /// command 16); Settings itself (18) is gone because its rows are; Run reads Pause while
-    /// running.
+    /// command 16); Settings itself (18) is gone because its rows are; Resume reads Pause
+    /// while running.
     #[test]
     fn a_walk_of_the_tabs_opens_every_old_command_and_settings_row() {
         let (dir, mut ui, _ran, _) = configure_session("tab-walk");
@@ -10501,11 +10838,12 @@ mod tests {
             }
         }
         ids.sort();
-        let commands = (0..=17).filter(|id| ![4, 13].contains(id));
+        // `/pause` (3) is Live's one Pause / Resume button since ticket 151.
+        let commands = (0..=17).filter(|id| ![3, 4, 13].contains(id));
         let settings = (0..=11).filter(|row| *row != 1).map(|row| SETTING + row);
         assert_eq!(ids, commands.chain(settings).collect::<Vec<_>>());
-        assert_eq!(tab_rows(0, true)[1].0, "Pause");
-        assert_eq!(tab_rows(0, false)[1].0, "Run");
+        assert_eq!(tab_rows(0, true)[0].0, "❚❚ Pause");
+        assert_eq!(tab_rows(0, false)[0].0, "▶ Resume");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -10579,6 +10917,160 @@ mod tests {
                 .iter()
                 .any(|(key, down)| *key == evdev::KeyCode::KEY_LEFTSHIFT && !down),
             "switching tabs is not a transition: Shift is still held"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 151: Live's Agents pane: agent, project, folder and status in that order,
+    /// sorted needs input → decision → working → idle → finished, a dot and a word each;
+    /// Enter on a tmux agent asks the runner for `select-window`, on an Orca or herdr agent
+    /// submits its jump; an outside session opens nothing; the Table | Gallery switch
+    /// draws cards and is saved as `agents-view`.
+    #[test]
+    fn live_agents_sort_go_to_the_agent_and_switch_to_cards() {
+        use crate::actions::Action;
+        let (dir, mut ui, ran, _) = configure_session("live-agents");
+        let path = dir.join("mappings.tsv");
+        let repo = dir.join("VibeConsole");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("docs")).unwrap();
+        let docs = repo.join("docs").to_string_lossy().into_owned();
+        ui.status_at = Instant::now() + Duration::from_secs(3600); // keep these fake agents
+        ui.agent_states = vec![
+            ("idler".into(), "w1".into(), "idle"),
+            ("done".into(), "w2".into(), "finished"),
+            ("busy".into(), "w3".into(), "thinking"),
+            ("orca-claude".into(), String::new(), "needs-decision"),
+            ("asker".into(), "w5".into(), "needs-input"),
+            ("herdr-one".into(), String::new(), "idle"),
+        ];
+        let tmux = (mappings::Host::Tmux, Some(docs.clone()));
+        ui.agent_places = vec![
+            tmux.clone(),
+            tmux.clone(),
+            tmux.clone(),
+            (mappings::Host::Orca, Some(docs.clone())),
+            tmux,
+            (mappings::Host::Herdr, None),
+        ];
+        ui.light_sessions = vec![("/srv/outside".into(), "thinking", 0)];
+        ui.projects.insert(docs.clone(), project_of(&docs));
+        ui.projects
+            .insert("/srv/outside".into(), project_of("/srv/outside"));
+        assert_eq!(
+            ui.projects[&docs], "VibeConsole",
+            "the git top-level's name"
+        );
+
+        let wide = ui.live_panes(120, usize::MAX);
+        let (title, agents) = &wide[1];
+        assert!(title.starts_with("Agents · most urgent first"));
+        let lines = agents.iter().map(|(l, _)| l[0].clone()).collect::<Vec<_>>();
+        let head = &lines[1];
+        let at = |word: &str| head.find(word).unwrap();
+        assert!(
+            at("AGENT") < at("PROJECT")
+                && at("PROJECT") < at("FOLDER")
+                && at("FOLDER") < at("STATUS")
+        );
+        let order = lines[2..]
+            .iter()
+            .map(|l| l.split_whitespace().nth(1).unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            order,
+            [
+                "asker",
+                "orca-claude",
+                "busy",
+                "outside",
+                "idler",
+                "herdr-one",
+                "done"
+            ]
+        );
+        for (line, word) in lines[2..].iter().zip([
+            "NEEDS INPUT",
+            "DECISION",
+            "WORKING",
+            "WORKING",
+            "IDLE",
+            "IDLE",
+            "FINISHED",
+        ]) {
+            assert!(line.contains('●') && line.ends_with(word), "{line}");
+        }
+        assert!(lines[2].contains("VibeConsole") && lines[2].contains("/VibeConsole/docs"));
+        assert!(
+            lines[7].contains("—"),
+            "herdr without a folder: {}",
+            lines[7]
+        );
+        assert!(agents[5].1.is_none(), "an outside session opens nothing");
+
+        // Entries: Resume, Release all, Quit, View, (heading), asker, orca-claude, busy,
+        // (outside), idler, herdr-one, done. "done" is never entered: it would clear a real
+        // status file.
+        ui.menu = 0;
+        ui.at_menu = true; // as the session does around `command_menu`
+        let down = |n| (0..n).map(|_| Step::Key(Key::Down)).collect::<Vec<_>>();
+        let mut steps = down(4); // asker (the heading is skipped)
+        steps.push(Step::Key(Key::Enter));
+        steps.extend(down(1)); // orca-claude
+        steps.push(Step::Key(Key::Enter));
+        steps.extend(down(3)); // busy, (outside skipped), idler, herdr-one
+        steps.push(Step::Key(Key::Enter));
+        steps.extend((0..5).map(|_| Step::Key(Key::Up))); // idler, busy, orca, asker, View
+        steps.push(Step::Key(Key::Enter));
+        steps.push(Step::Key(Key::Escape));
+        ui.script = Some(Play {
+            steps: steps.into(),
+            ..Play::default()
+        });
+        assert_eq!(command_menu(&mut ui).unwrap(), None);
+        let play = ui.script.take().unwrap();
+        assert_eq!(play.ran, ["tmux select-window -t vibe:w5"]);
+        let got = [
+            ran.recv_timeout(Duration::from_secs(2)).unwrap(),
+            ran.recv_timeout(Duration::from_secs(2)).unwrap(),
+        ];
+        assert_eq!(
+            got,
+            [
+                Action::OrcaJump {
+                    agent: "orca-claude".into(),
+                    folder: docs.clone()
+                },
+                Action::HerdrFocus("herdr-one".into())
+            ]
+        );
+        let first = &play.screens[0];
+        assert!(
+            first.contains("> ▶ Resume") || first.contains("> ❚❚ Pause"),
+            "{first}"
+        );
+        assert!(play.screens.iter().any(|s| s.contains("> ● asker")));
+        let last = play.screens.last().unwrap();
+        assert!(
+            last.contains("[Gallery]") && last.contains("┌─ asker "),
+            "{last}"
+        );
+        let cards = ui.live_panes(80, 4).remove(1).1; // entry 4 is asker's card now
+        assert!(
+            cards[1].0[0].starts_with("╔═ > asker "),
+            "selected: {:?}",
+            cards[1].0
+        );
+        assert!(
+            cards[2].0[0].starts_with("┌─ orca-claude "),
+            "{:?}",
+            cards[2].0
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("\nagents-view\tgallery\n"),
+            "the view is saved"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -14264,9 +14756,24 @@ mod tests {
         ui.refresh_xbox_status();
         let lines = ui.status_lines();
         assert_eq!(lines.len(), 1, "layer 1 only: {lines:?}");
-        assert!(lines[0].starts_with("Status Xbox X: "), "{lines:?}");
+        // v7.7 ticket 151: control, what it does and the state, in plain words.
+        assert!(
+            lines[0].starts_with("  Xbox X · Run `build` in /tmp"),
+            "{lines:?}"
+        );
         ui.transition(x, true).unwrap();
-        assert_eq!(ui.status_lines(), ["Status Xbox X: sent"]);
+        assert_eq!(
+            ui.status_lines(),
+            ["◆ Xbox X · Run `build` in /tmp (tmux window w) · sent  ← pressed"],
+            "the pressed line is lit"
+        );
+        ui.pressed = ui
+            .pressed
+            .map(|(c, at)| (c, at - Duration::from_millis(1100)));
+        assert!(
+            ui.status_lines()[0].starts_with("  Xbox X"),
+            "after a second it isn't"
+        );
         let deadline = Instant::now() + Duration::from_secs(2);
         while ui.phases.get(&x) == Some(&Phase::Sent) {
             ui.tick().unwrap();
@@ -14280,9 +14787,9 @@ mod tests {
         ui.set_layer(true).unwrap(); // LB held
         let lines = ui.status_lines();
         assert_eq!(lines.len(), 1, "layer 2 only: {lines:?}");
-        assert!(lines[0].starts_with("Status Xbox B: "), "{lines:?}");
+        assert!(lines[0].starts_with("  Xbox B · "), "{lines:?}");
         ui.set_layer(false).unwrap();
-        assert!(ui.status_lines()[0].starts_with("Status Xbox X: "));
+        assert!(ui.status_lines()[0].starts_with("  Xbox X · "));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -15198,26 +15705,6 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// The Agents line names outside sessions by their folder's last component, says NEEDS
-    /// INPUT for finished, and leaves idle or exited agents out.
-    #[test]
-    fn agent_line_shows_busy_agents_by_name_and_finished_as_needs_input() {
-        let row = |name: &str, state| (name.to_owned(), String::new(), state);
-        assert_eq!(
-            agent_line(&[
-                row("claude", "thinking"),
-                row("codex", "idle"),
-                row("VibeConsole", "finished")
-            ]),
-            "\nAgents: claude thinking · VibeConsole NEEDS INPUT"
-        );
-        assert_eq!(agent_line(&[row("claude", "idle")]), "");
-        assert_eq!(
-            agent_line(&[row("claude", "needs-decision")]),
-            "\nAgents: claude DECISION"
-        );
-    }
-
     /// Ticket 13: the Prompts list reads, creates, edits and deletes; deleting a used prompt
     /// names its users; names that would leave the directory and failed edits change nothing.
     #[test]
@@ -15304,6 +15791,8 @@ mod tests {
         typed: VecDeque<Key>,
         seen: usize,
         screens: Vec<String>,
+        /// Programs `Ui::run` was asked to start, never started.
+        pub(super) ran: Vec<String>,
     }
     impl Terminal {
         pub(super) fn scripted_key(&mut self) -> Result<Option<Key>> {

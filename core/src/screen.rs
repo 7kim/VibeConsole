@@ -203,6 +203,41 @@ fn paint_bulbs(text: &str, color: bool) -> String {
         .replace("[●]", &paint("[●]", Role::Paused, color))
         .replace("Bank A", &paint("Bank A", Role::BankA, color))
         .replace("Bank B", &paint("Bank B", Role::BankB, color))
+        // v7.7 ticket 151: agent states keep their word; the colour only adds to it.
+        .replace("NEEDS INPUT", &paint("NEEDS INPUT", Role::Error, color))
+        .replace("DECISION", &paint("DECISION", Role::Paused, color))
+        .replace("WORKING", &paint("WORKING", Role::Focus, color))
+        .replace("FINISHED", &paint("FINISHED", Role::Running, color))
+        .replace("IDLE", &paint("IDLE", Role::Muted, color))
+}
+
+/// One agent card (v7.7 ticket 151, Agents pane Gallery view): a box `width` wide with
+/// `title` on its top border; the selected card has a double border and `>`.
+pub fn card(title: &str, lines: &[String], width: usize, selected: bool) -> Vec<String> {
+    let [h, v, tl, tr, bl, br] = if selected {
+        ["═", "║", "╔", "╗", "╚", "╝"]
+    } else {
+        ["─", "│", "┌", "┐", "└", "┘"]
+    };
+    let inner = width.saturating_sub(4);
+    let title = format!(" {}{title} ", if selected { "> " } else { "" });
+    let title = fit(&title, inner.min(width_of(&title)));
+    let mut rows = vec![format!(
+        "{tl}{h}{title}{}{tr}",
+        h.repeat(width.saturating_sub(3 + width_of(&title)))
+    )];
+    rows.extend(
+        lines
+            .iter()
+            .map(|line| format!("{v} {} {v}", fit(line, inner))),
+    );
+    rows.push(format!("{bl}{}{br}", h.repeat(width.saturating_sub(2))));
+    rows
+}
+
+/// The inner width of a full-width pane in a `columns`-wide terminal.
+pub fn pane_width(columns: usize) -> usize {
+    columns.saturating_sub(5)
 }
 
 fn width_of(text: &str) -> usize {
@@ -304,7 +339,7 @@ fn pane(
     for index in first..first + height - 2 {
         let line = lines.get(index).map(String::as_str).unwrap_or("");
         let text = fit(line, inner);
-        let text = if line.starts_with("> ") && focused {
+        let text = if (line.starts_with("> ") && focused) || line.starts_with("◆ ") {
             paint(&text, Role::Selected, color)
         } else if line.starts_with("── ") {
             paint(&text, Role::Heading, color)
@@ -389,8 +424,17 @@ fn tab_bar(tabs: &[String], groups: &[usize], active: usize, width: usize, color
     )
 }
 
-/// One tiled screen: the tab bar, a header, the active tab's rows | details | live panes,
-/// and a key-hint status line.
+/// A titled box of a tab's body (v7.7 ticket 151). Rows starting `> ` are the selection,
+/// `── ` a heading and `◆ ` the control pressed in the last second; `anchor` stays visible.
+pub struct Pane {
+    pub title: String,
+    pub rows: Vec<String>,
+    pub anchor: usize,
+    pub focused: bool,
+}
+
+/// One tiled screen: the tab bar, a header, the active tab's rows | details | live panes
+/// (or, when `panes` is set, those panes stacked), and a key-hint status line.
 pub struct Screen {
     /// Tab labels (`1 Live`); empty draws no tab bar.
     pub tabs: Vec<String>,
@@ -405,6 +449,9 @@ pub struct Screen {
     pub notice: String,
     pub live: Vec<String>,
     pub hints: String,
+    /// The tab's own panes, drawn full width one under the other; empty keeps the
+    /// rows | details | live layout (the screens a command opens).
+    pub panes: Vec<Pane>,
 }
 
 impl Screen {
@@ -490,6 +537,43 @@ impl Screen {
             };
             paint_bulbs(&paint(&fit(row, width), role, color), color)
         }));
+        if !self.panes.is_empty() {
+            let notice = wrap(&self.notice, width.saturating_sub(1));
+            let notice = &notice[..notice.len().min(3) * usize::from(!self.notice.is_empty())];
+            let mut body = height.saturating_sub(rows.len() + hints.len() + notice.len());
+            for (index, p) in self.panes.iter().enumerate() {
+                // Each pane after this one keeps at least its borders and one row.
+                let reserve = 3 * (self.panes.len() - index - 1);
+                let size = (p.rows.len() + 2).min(body.saturating_sub(reserve));
+                if size >= 3 {
+                    rows.extend(pane(
+                        &p.title,
+                        &p.rows,
+                        p.anchor,
+                        (width, size),
+                        p.focused,
+                        color,
+                    ));
+                    body -= size;
+                }
+            }
+            rows.extend((0..body).map(|_| " ".repeat(width)));
+            rows.extend(notice.iter().map(|row| {
+                let role = if row.starts_with("Error:") {
+                    Role::Error
+                } else {
+                    Role::Paused
+                };
+                paint(&fit(row, width), role, color)
+            }));
+            rows.extend(
+                hints
+                    .iter()
+                    .map(|row| paint(&fit(row, width), Role::Muted, color)),
+            );
+            rows.truncate(height);
+            return rows.join("\r\n");
+        }
         let (text_width, text_height) = self.details_size(columns, height);
         let mut text = wrap(&self.details, text_width);
         text.resize(text_height, String::new());
@@ -546,6 +630,57 @@ mod tests {
         assert_eq!(wrap("ab  cd", 3), ["ab", "cd"]);
     }
 
+    /// v7.7 ticket 151: a tab's panes stack full width, the selected row stays visible as
+    /// panes shrink, the pressed line is drawn like the selection, and the notice keeps its
+    /// place above the hints at every size.
+    #[test]
+    fn panes_stack_keep_the_selection_and_the_notice() {
+        let pane = |title: &str, rows: Vec<String>, anchor, focused| Pane {
+            title: title.into(),
+            rows,
+            anchor,
+            focused,
+        };
+        let agents = (0..30)
+            .map(|n| format!("{}● agent-{n} IDLE", if n == 25 { "> " } else { "  " }))
+            .collect();
+        let screen = Screen {
+            tabs: vec!["1 Live".into(), "2 Mappings".into()],
+            groups: vec![1],
+            active_tab: 0,
+            header: "VibeConsole\nProgram 1 | RUNNING".into(),
+            commands: Vec::new(),
+            anchor: 0,
+            focus_commands: false,
+            details: String::new(),
+            notice: "Error: go to agent: tmux failed".into(),
+            live: Vec::new(),
+            hints: "Tab ←→ 1–0: tabs | Ctrl+C: quit".into(),
+            panes: vec![
+                pane("Live", vec!["  ❚❚ Pause".into(), "  Quit".into()], 0, false),
+                pane("Agents", agents, 25, true),
+                pane(
+                    "Pads and buttons",
+                    vec!["◆ Pad 5 · Orca · sent  ← pressed".into()],
+                    0,
+                    false,
+                ),
+            ],
+        };
+        for (width, height) in [(120, 30), (80, 24), (40, 16)] {
+            let frame = screen.render(width, height, false);
+            assert_eq!(frame.lines().count(), height);
+            assert!(frame.lines().all(|l| width_of(l) < width), "{frame}");
+            for text in ["> ● agent-25", "Error: go to agent", "Ctrl+C", "─ Live "] {
+                assert!(frame.contains(text), "{width}×{height} {text}:\n{frame}");
+            }
+        }
+        let colored = screen.render(120, 30, true);
+        let lit = format!("\x1b[{}m◆ Pad 5", style(Role::Selected));
+        assert!(colored.contains(&lit), "the pressed line looks selected");
+        assert!(colored.contains(&format!("\x1b[{}mIDLE", style(Role::Muted))));
+    }
+
     #[test]
     fn bounded_unicode_layout_and_plain_color_fallback() {
         assert_eq!(fit("界e\u{301}x", 4), "界e\u{301}x");
@@ -583,6 +718,7 @@ mod tests {
             notice: "Error: MIDI disconnected".into(),
             live: vec!["Active holds/toggles: none".into()],
             hints: "Up/Down: move | Enter: confirm | Space: select | Esc: back | Ctrl+C: quit".into(),
+            panes: Vec::new(),
         };
         let row_of = |frame: &str, text: &str| {
             frame
