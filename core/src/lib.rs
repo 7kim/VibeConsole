@@ -11,6 +11,7 @@ pub mod owner;
 pub mod recording;
 pub mod screen;
 pub mod status;
+pub mod usage;
 
 use std::{collections::HashSet, process::Command};
 

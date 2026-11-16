@@ -367,6 +367,13 @@ struct Terminal {
     /// v7.7 ticket 163: what Undo would undo (`14:02 · Bank A Pad 5 → Orca IDE`), read on
     /// 2 Mappings.
     undo_row: String,
+    /// v7.7 ticket 164: the usage log's folder (a temporary one in tests), the counts not
+    /// written yet, when they were last written, and Insights' panes (read on 9 Insights).
+    usage_dir: Option<PathBuf>,
+    usage_pending: crate::usage::Day,
+    usage_at: Instant,
+    insights: Vec<(String, Vec<String>)>,
+    insights_at: Option<Instant>,
     /// v7 ticket 86: each device's switch and patterns; None while Status lights is off.
     device_lights: Option<crate::status::DevicePatterns>,
     /// Agents' status-light settings, in `agent_states` order; None while Status lights is Off.
@@ -993,6 +1000,18 @@ impl Terminal {
             contexts: BTreeMap::new(),
             token_cache: BTreeMap::new(),
             undo_row: String::new(),
+            #[cfg(test)]
+            usage_dir: Some(std::env::temp_dir().join(format!(
+                "vibeconsole-test-usage-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ))),
+            #[cfg(not(test))]
+            usage_dir: crate::usage::dir().ok(),
+            usage_pending: crate::usage::Day::default(),
+            usage_at: Instant::now(),
+            insights: Vec::new(),
+            insights_at: None,
             device_lights: None,
             light_agents: None,
             light_sessions: Vec::new(),
@@ -1226,6 +1245,208 @@ impl Terminal {
         });
         rows
     }
+    /// v7.7 ticket 164: a press, and what it fired: its family, the keys a shortcut typed, the
+    /// prompt it sent. Counts and names only, never the text.
+    fn count_press(&mut self, control: Control, fired: Option<&Mapping>) {
+        let name = self.name(control);
+        let day = &mut self.usage_pending;
+        day.add("press", &name, 1);
+        let Some(mapping) = fired else {
+            return;
+        };
+        day.add("family", mapping.action.family(), 1);
+        if mapping.action == crate::actions::Action::Shortcut {
+            let keys = mapping.keys.iter().map(|k| k.split('+').count() as u64);
+            day.add("keys", "-", keys.sum());
+        }
+        for prompt in mapping.action.prompt_files() {
+            day.add("prompt", prompt, 1);
+        }
+    }
+    /// v7.7 ticket 164: write the counts gathered since the last write into today's file.
+    fn flush_usage(&mut self) {
+        self.usage_at = Instant::now();
+        let Some(dir) = &self.usage_dir else {
+            return;
+        };
+        match crate::usage::flush(dir, crate::usage::today(), &self.usage_pending) {
+            Ok(()) => self.usage_pending = crate::usage::Day::default(),
+            Err(error) => self.notice = format!("usage: {error}; counts kept for the next try"),
+        }
+    }
+    /// v7.7 ticket 164: Insights' panes from the last 40 weeks of day files.
+    fn read_insights(&mut self) {
+        use crate::usage::{band, civil, load, streaks, weekday};
+        self.insights_at = Some(Instant::now());
+        let Some(dir) = self.usage_dir.clone() else {
+            return;
+        };
+        let today = crate::usage::today();
+        let (days, notices) = load(&dir, today, 280);
+        if let Some(notice) = notices.first() {
+            self.notice = notice.clone();
+        }
+        let presses = days
+            .iter()
+            .map(|(_, d)| d.total("press"))
+            .collect::<Vec<_>>();
+        let mut all = crate::usage::Day::default();
+        for (_, day) in &days {
+            all.merge(day);
+        }
+        let name = |day: i64| {
+            const DAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+            const MONTHS: [&str; 12] = [
+                "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+            ];
+            let (_, m, d) = civil(day);
+            format!(
+                "{} {d} {}",
+                DAYS[weekday(day) as usize],
+                MONTHS[m as usize - 1]
+            )
+        };
+        let top = |day: &crate::usage::Day, kind: &str| {
+            day.of(kind)
+                .max_by_key(|(_, n)| *n)
+                .map(|(k, n)| (k.to_owned(), n))
+        };
+        let mut panes = Vec::new();
+        // Weekly recap: last Monday–Sunday, once a whole week has been counted.
+        let monday = today - weekday(today) - 7;
+        let first = days.iter().position(|(_, d)| !d.0.is_empty());
+        if first.is_some_and(|at| days[at].0 <= monday) {
+            let mut week = crate::usage::Day::default();
+            let mut daily = Vec::new();
+            for (day, counts) in days
+                .iter()
+                .filter(|(d, _)| (monday..monday + 7).contains(d))
+            {
+                let _ = day;
+                week.merge(counts);
+                daily.push(counts.total("press"));
+            }
+            let pad = top(&week, "press").map_or("none".into(), |(k, _)| k);
+            panes.push((
+                "Weekly recap".into(),
+                vec![format!(
+                    "  Last week · {} – {} · {} presses · top control {pad} · {} prompts · longest streak {} days · {} agents answered",
+                    name(monday),
+                    name(monday + 6),
+                    week.total("press"),
+                    week.total("prompt"),
+                    streaks(&daily).1,
+                    week.total("answered")
+                )],
+            ));
+        }
+        // Tiles.
+        let today_presses = presses.last().copied().unwrap_or(0);
+        let total = all.total("press");
+        let xbox = all
+            .of("press")
+            .filter(|(k, _)| k.starts_with("Xbox"))
+            .map(|(_, n)| n)
+            .sum::<u64>();
+        let percent = |n: u64| if total == 0 { 0 } else { n * 100 / total };
+        let mut waits = all
+            .of("answered")
+            .flat_map(|(k, n)| std::iter::repeat_n(k.parse::<u64>().unwrap_or(0), n as usize))
+            .collect::<Vec<_>>();
+        waits.sort();
+        let median = waits
+            .get(waits.len() / 2)
+            .map_or("—".into(), |s| format!("{s} s"));
+        let prompt = top(&all, "prompt").map_or("none yet".into(), |(k, n)| format!("{k} ×{n}"));
+        panes.push((
+            "What you use · counts only, kept on this computer; never the text you send".into(),
+            vec![
+                format!(
+                    "  Presses {total} · today {today_presses} · Akai {}% · Xbox {}%",
+                    percent(total - xbox),
+                    percent(xbox)
+                ),
+                format!("  Keys typed for you {}", all.total("keys")),
+                format!(
+                    "  Prompts sent to agents {} · top {prompt}",
+                    all.total("prompt")
+                ),
+                format!(
+                    "  Agents answered {} · median wait {median}",
+                    all.total("answered")
+                ),
+            ],
+        ));
+        // Activity: 40 weeks × 7 days.
+        const SHADES: [char; 5] = ['·', '░', '▒', '▓', '█'];
+        let start = today - weekday(today) - 39 * 7;
+        let mut grid = Vec::new();
+        for (row, label) in ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
+            .iter()
+            .enumerate()
+        {
+            let cells = (0..40)
+                .map(|week| {
+                    let day = start + week * 7 + row as i64;
+                    match days.iter().position(|(d, _)| *d == day) {
+                        Some(at) if day <= today => SHADES[band(presses[at])],
+                        _ => ' ',
+                    }
+                })
+                .collect::<String>();
+            grid.push(format!("  {label} {cells}"));
+        }
+        let (current, longest) = streaks(&presses);
+        grid.push(format!(
+            "  Today · {} · {today_presses} presses",
+            name(today)
+        ));
+        grid.push("  · 0  ░ 1–49  ▒ 50–149  ▓ 150–299  █ 300+ a day".into());
+        grid.push(format!(
+            "  Current streak {current} days · longest {longest}"
+        ));
+        panes.push(("Activity · presses per day, last 40 weeks".into(), grid));
+        // Actions by family and most-used controls (30 days).
+        let families = all.total("family");
+        let mut by_family = all.of("family").collect::<Vec<_>>();
+        by_family.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        let bars = by_family
+            .iter()
+            .take(8)
+            .map(|(family, n)| {
+                let share = n * 100 / families.max(1);
+                let bar = "█".repeat((share as usize).div_ceil(10));
+                format!("  {:<16}{bar:<11}{share}%", family)
+            })
+            .collect::<Vec<_>>();
+        panes.push((
+            "Actions by family".into(),
+            if bars.is_empty() {
+                vec!["  Nothing fired yet".into()]
+            } else {
+                bars
+            },
+        ));
+        let mut month = crate::usage::Day::default();
+        for (_, day) in days.iter().rev().take(30) {
+            month.merge(day);
+        }
+        let mut controls = month.of("press").collect::<Vec<_>>();
+        controls.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        panes.push((
+            "Most-used controls · 30 days · AI Recommendations use these".into(),
+            if controls.is_empty() {
+                vec!["  No presses yet".into()]
+            } else {
+                controls
+                    .iter()
+                    .take(8)
+                    .map(|(k, n)| format!("  {k} · {n}"))
+                    .collect()
+            },
+        ));
+        self.insights = panes;
+    }
     /// v7.7 ticket 162: each agent's context file and transcript tokens (new lines only).
     fn read_contexts(&mut self) {
         let Ok(dir) = crate::status::state_dir() else {
@@ -1263,6 +1484,11 @@ impl Terminal {
         for (name, state) in states {
             let since = self.agent_since.entry(name.clone()).or_insert((state, now));
             if since.0 != state {
+                // v7.7 ticket 164: needs you → anything else is an answer, with its wait.
+                if matches!(since.0, "needs-input" | "needs-decision") {
+                    let wait = now.saturating_duration_since(since.1).as_secs();
+                    self.usage_pending.add("answered", &wait.to_string(), 1);
+                }
                 *since = (state, now);
             }
             if state != "idle" {
@@ -1504,6 +1730,13 @@ impl Terminal {
         }
         if self.tab == 7 {
             self.read_problems();
+        }
+        if self.tab == 8
+            && self
+                .insights_at
+                .is_none_or(|at| at.elapsed() >= Duration::from_secs(10))
+        {
+            self.read_insights();
         }
         if self.tab == 1 {
             self.undo_row = match last_change(&self.path, &config) {
@@ -1900,6 +2133,12 @@ impl Terminal {
                     ("Theme · 14 themes · Enter picks one".into(), rows)
                 },
             ],
+            8 if !self.insights.is_empty() => (self.insights.iter())
+                .map(|(title, rows)| {
+                    let rows = rows.iter().map(|row| (vec![row.clone()], None)).collect();
+                    (title.clone(), rows)
+                })
+                .collect(),
             _ => vec![(
                 TABS[tab].0.split_once(' ').map_or("", |p| p.1).to_owned(),
                 TABS[tab].1.iter().map(|(name, _)| head(name)).collect(),
@@ -2282,6 +2521,9 @@ impl Terminal {
             }
         }
         self.track_agents(Instant::now()); // v7.7 ticket 161
+        if self.usage_at.elapsed() >= Duration::from_secs(30) {
+            self.flush_usage(); // v7.7 ticket 164
+        }
         self.read_contexts();
         // v7 tickets 11 and 86: rumble as a source newly enters a state whose Xbox pattern
         // rumbles, under the Status lights and Xbox switches.
@@ -3295,7 +3537,14 @@ impl Terminal {
             }
             // v7 ticket 21: hold-to-quit pads decide on release (tap) or at one second (quit).
             if let Event::Press(pad) | Event::Release(pad, _) = &event {
-                let quit = self.fired(*pad)?.and_then(|m| match m.action {
+                let fired = self.fired(*pad)?;
+                if let (Event::Press(_), Some(mapping)) = (&event, &fired) {
+                    let firing = self.output.is_some() && self.wanted_run && !self.suspended;
+                    self.count_press(*pad, firing.then_some(mapping));
+                } else if matches!(event, Event::Press(_)) {
+                    self.count_press(*pad, None);
+                }
+                let quit = fired.and_then(|m| match m.action {
                     crate::actions::Action::AppToggleQuit(path) => Some(path),
                     _ => None,
                 });
@@ -4824,6 +5073,7 @@ Changing musical settings while running is unsupported.",
 
 impl Drop for Terminal {
     fn drop(&mut self) {
+        self.flush_usage(); // v7.7 ticket 164: the last counts
         // Release before restoring terminal settings or waiting for MIDI shutdown.
         self.output = None;
         self.actions.cancel();
@@ -12484,6 +12734,72 @@ mod tests {
             mappings::xbox_program_name(&mappings::load_config(&path).unwrap(), 1),
             "Browser"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 164: a fired pad adds a press, its family and the keys it typed, and the
+    /// day file holds names and numbers only; Insights builds the recap, tiles, heatmap and
+    /// streaks from fixture day files.
+    #[test]
+    fn usage_counts_fired_actions_and_insights_read_the_days() {
+        use crate::usage::{Day, file, flush, today};
+        let (dir, mut ui, ran, [mute, down, ..]) = configure_session("usage");
+        let usage = dir.join("usage");
+        ui.usage_dir = Some(usage.clone());
+        ui.handle_events(vec![
+            Event::Press(mute),
+            Event::Release(mute, crate::ReleaseType::NoteOff),
+            Event::Press(down),
+            Event::Release(down, crate::ReleaseType::NoteOff),
+        ])
+        .unwrap();
+        let _ = ran.recv_timeout(Duration::from_secs(2));
+        ui.flush_usage();
+        let text = std::fs::read_to_string(file(&usage, today())).unwrap();
+        assert!(
+            text.contains(&format!("press\t{}\t1\n", ui.name(mute))),
+            "{text}"
+        );
+        assert!(
+            text.contains("family\tshortcut\t1\n") && text.contains("keys\t-\t1\n"),
+            "{text}"
+        );
+        for line in text.lines() {
+            let [kind, _, count] = line.split('\t').collect::<Vec<_>>()[..] else {
+                panic!("{line}")
+            };
+            assert!(crate::usage::KINDS.contains(&kind) && count.parse::<u64>().is_ok());
+        }
+        // Fixture days: fourteen busy days up to yesterday (today has the two presses above).
+        let day = today();
+        for back in 1..=14 {
+            let mut counts = Day::default();
+            counts.add("press", "Bank A Pad 5", if back <= 10 { 60 } else { 400 });
+            counts.add("prompt", "review", 2);
+            flush(&usage, day - back, &counts).unwrap();
+        }
+        ui.read_insights();
+        let all = ui
+            .insights
+            .iter()
+            .flat_map(|(title, rows)| std::iter::once(title.clone()).chain(rows.clone()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all.contains("Weekly recap") && all.contains("Last week ·"),
+            "{all}"
+        );
+        assert!(all.contains("top control Bank A Pad 5"), "{all}");
+        assert!(all.contains("Current streak 15 days · longest 15"), "{all}");
+        assert!(
+            all.contains('▒') && all.contains('█'),
+            "50–149 and 300+ bands drawn"
+        );
+        assert!(
+            all.contains("Prompts sent to agents 28 · top review ×28"),
+            "{all}"
+        );
+        assert!(all.contains("· 0  ░ 1–49  ▒ 50–149  ▓ 150–299  █ 300+ a day"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
