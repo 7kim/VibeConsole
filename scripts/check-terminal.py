@@ -315,6 +315,9 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
             # Drain full-screen frames while quitting; a PTY is a bounded output buffer.
             restored = read_until(master, b"\x1b[?1049l")
             assert b"\x1b[?25h" in restored
+            # v7.7 ticket 159: mouse reporting was on while drawn and is off on every exit.
+            assert b"\x1b[?1000h" in initial_screen or ending in ("sigint", "sigterm")
+            assert b"\x1b[?1000l" in restored, restored[-200:]
             child.wait(timeout=3)
             assert child.returncode == (1 if ending in ("sigint", "sigterm") else 0)
             assert termios.tcgetattr(slave) == original

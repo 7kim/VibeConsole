@@ -20,6 +20,9 @@ enum Key {
     Tab,
     /// Shift+Tab (`ESC [ Z`): the previous tab (v7.7 ticket 150).
     BackTab,
+    /// A left click at (column, row), both from 1 (v7.7 ticket 159, SGR mouse reporting).
+    /// A click is a key, never a mapped control.
+    Click(u16, u16),
     Left,
     Right,
     Enter,
@@ -34,6 +37,23 @@ enum Key {
 fn csi_key(sequence: &[u8]) -> Key {
     let (code, modifier) = match sequence {
         [b'Z'] => return Key::BackTab,
+        // v7.7 ticket 159: `ESC [ < button ; column ; row M` (press) or `m` (release).
+        [b'<', rest @ ..] => {
+            let Some((&end, params)) = rest.split_last() else {
+                return Key::Other;
+            };
+            let fields = std::str::from_utf8(params)
+                .unwrap_or_default()
+                .split(';')
+                .map(|f| f.parse::<u16>().ok())
+                .collect::<Vec<_>>();
+            return match (end, fields.as_slice()) {
+                (b'M', [Some(0), Some(x), Some(y)]) => Key::Click(*x, *y),
+                (b'M', [Some(64), _, _]) => Key::Up, // wheel up
+                (b'M', [Some(65), _, _]) => Key::Down,
+                _ => Key::Other,
+            };
+        }
         [code @ (b'A' | b'B' | b'C' | b'D')] => (*code, 1),
         [
             b'1',
@@ -998,7 +1018,7 @@ impl Terminal {
         if unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw) } != 0 {
             return Err(io::Error::last_os_error().into());
         }
-        write!(io::stdout(), "\x1b[?1049h\x1b[?25l")?;
+        write!(io::stdout(), "\x1b[?1049h\x1b[?25l{MOUSE_ON}")?;
         io::stdout().flush()?;
         Ok(terminal)
     }
@@ -1193,6 +1213,48 @@ impl Terminal {
             }
         }
         Ok(())
+    }
+    /// v7.7 ticket 159: what the click at (column, row) lands on in the frame on screen: a
+    /// tab in the tab bar, or a row of the tab's panes (the longest row text it shows).
+    fn clicked(&self, column: u16, row: u16) -> Option<Clicked> {
+        let rows = plain_rows(&self.rendered);
+        let line = rows.get(usize::from(row).checked_sub(1)?)?;
+        let column = usize::from(column).checked_sub(1)?;
+        if row == 1 {
+            let chars = line.chars().collect::<Vec<_>>();
+            let text = |from: usize| chars[from..].iter().collect::<String>();
+            return (0..TABS.len()).find_map(|tab| {
+                let label = TABS[tab].0;
+                let start = (0..chars.len()).find(|&at| text(at).starts_with(label))?;
+                (start <= column && column < start + label.chars().count())
+                    .then_some(Clicked::Tab(tab))
+            });
+        }
+        let size = self.size();
+        let entries = (self.tab_panes(self.tab, crate::screen::pane_width(size.0), usize::MAX))
+            .into_iter()
+            .flat_map(|(_, entries)| entries)
+            .collect::<Vec<_>>();
+        let shown = line.trim_matches(|c: char| " │║".contains(c));
+        let shown = shown
+            .strip_prefix("> ")
+            .unwrap_or(shown)
+            .trim_end_matches('…');
+        let mut best: Option<(usize, usize)> = None;
+        for (index, (lines, open)) in entries.iter().enumerate() {
+            if open.is_none() {
+                continue;
+            }
+            for text in lines {
+                let text = text.trim_start_matches("  ").trim();
+                let hit = !shown.is_empty()
+                    && (line.contains(text) || (shown.len() >= 4 && text.starts_with(shown)));
+                if hit && best.is_none_or(|(_, len)| text.len() > len) {
+                    best = Some((index, text.len()));
+                }
+            }
+        }
+        best.map(|(index, _)| Clicked::Entry(index))
     }
     /// v7.7 ticket 155: Find's matches for `query`: every row that opens something on every
     /// tab, as `Tab › row`, and every old name, as `old → tab`; a match has every word of the
@@ -4411,7 +4473,7 @@ impl Drop for Terminal {
             signal_hook::low_level::unregister(signal);
         }
         if self.original.is_some() {
-            let _ = write!(io::stdout(), "\x1b[0m\x1b[?25h\x1b[?1049l");
+            let _ = write!(io::stdout(), "{MOUSE_OFF}\x1b[0m\x1b[?25h\x1b[?1049l");
         }
         let _ = io::stdout().flush();
     }
@@ -4459,7 +4521,7 @@ impl Ui for Terminal {
         if unsafe { libc::tcsetattr(0, libc::TCSANOW, &original) } != 0 {
             return Err(io::Error::last_os_error().into());
         }
-        write!(io::stdout(), "\x1b[0m\x1b[?25h\x1b[?1049l")?;
+        write!(io::stdout(), "{MOUSE_OFF}\x1b[0m\x1b[?25h\x1b[?1049l")?;
         io::stdout().flush()?;
         let editor = std::env::var_os("VISUAL")
             .filter(|v| !v.is_empty())
@@ -4481,7 +4543,7 @@ impl Ui for Terminal {
         if unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw) } != 0 {
             return Err(io::Error::last_os_error().into());
         }
-        write!(io::stdout(), "\x1b[?1049h\x1b[?25l\x1b[2J")?;
+        write!(io::stdout(), "\x1b[?1049h\x1b[?25l\x1b[2J{MOUSE_ON}")?;
         io::stdout().flush()?;
         self.rendered.clear();
         if !result?.success() {
@@ -5016,6 +5078,34 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
+}
+/// v7.7 ticket 159: SGR mouse reporting, on while VibeConsole draws and off whenever the
+/// terminal is handed back (quit, error, signal, `$EDITOR`).
+const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1006h";
+const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1000l";
+/// A frame without its colour codes, as rows of what is on screen.
+fn plain_rows(frame: &str) -> Vec<String> {
+    let mut out = String::new();
+    let mut chars = frame.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else if c != '\r' {
+            out.push(c);
+        }
+    }
+    out.split('\n').map(String::from).collect()
+}
+/// What a click lands on (v7.7 ticket 159).
+#[derive(Debug, PartialEq)]
+enum Clicked {
+    Tab(usize),
+    Entry(usize),
 }
 /// What Enter does on a tab row (v7.7 tickets 150, 151).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -9887,7 +9977,19 @@ fn command_menu(ui: &mut Terminal) -> Result<Option<usize>> {
         }
         let text = String::new();
         ui.draw(&text)?;
-        let tab = match ui.key()? {
+        // v7.7 ticket 159: a click on a tab switches to it; on a row it does what Enter does.
+        let key = match ui.key()? {
+            Some(Key::Click(column, row)) => match ui.clicked(column, row) {
+                Some(Clicked::Tab(tab)) => Some(Key::Character(b"1234567890"[tab])),
+                Some(Clicked::Entry(entry)) => {
+                    ui.menu = entry;
+                    Some(Key::Enter)
+                }
+                None => None,
+            },
+            key => key,
+        };
+        let tab = match key {
             Some(Key::Tab | Key::Right) => (ui.tab + 1) % TABS.len(),
             Some(Key::BackTab | Key::Left) => (ui.tab + TABS.len() - 1) % TABS.len(),
             Some(Key::Character(digit @ b'0'..=b'9')) => (usize::from(digit - b'0') + 9) % 10,
@@ -11817,6 +11919,58 @@ mod tests {
             mappings::xbox_program_name(&mappings::load_config(&path).unwrap(), 1),
             "Browser"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 159: SGR mouse: a click on a tab switches to it, a click on a row does
+    /// what Enter does there; the wheel moves; a release or another button does nothing.
+    #[test]
+    fn a_click_switches_tabs_and_opens_rows() {
+        assert_eq!(csi_key(b"<0;12;1M"), Key::Click(12, 1));
+        assert_eq!(csi_key(b"<0;12;1m"), Key::Other, "a release");
+        assert_eq!(csi_key(b"<64;3;3M"), Key::Up);
+        assert_eq!(csi_key(b"<65;3;3M"), Key::Down);
+        assert_eq!(csi_key(b"<2;3;3M"), Key::Other, "the right button");
+        let (dir, mut ui, _ran, _) = configure_session("mouse");
+        ui.at_menu = true;
+        let at = |frame: &str, text: &str| {
+            let rows = plain_rows(frame);
+            let (row, line) = (rows.iter().enumerate())
+                .find(|(_, l)| l.contains(text))
+                .unwrap_or_else(|| panic!("{text} not in:\n{}", rows.join("\n")));
+            let column = line[..line.find(text).unwrap()].chars().count() + 2;
+            (column as u16, row as u16 + 1)
+        };
+        // Draw 2 Mappings once to know where /list is.
+        ui.script = Some(Play {
+            steps: [Key::Character(b'2'), Key::Escape].map(Step::Key).into(),
+            ..Play::default()
+        });
+        command_menu(&mut ui).unwrap();
+        let list = at(&ui.rendered, "/list");
+        ui.tab = 0;
+        ui.menu = 0;
+        ui.script = Some(Play {
+            steps: [Key::Escape].map(Step::Key).into(),
+            ..Play::default()
+        });
+        command_menu(&mut ui).unwrap();
+        let mappings_tab = at(&ui.rendered, "2 Mappings");
+        ui.script = Some(Play {
+            steps: [
+                Key::Click(mappings_tab.0, mappings_tab.1),
+                Key::Click(list.0, list.1),
+            ]
+            .map(Step::Key)
+            .into(),
+            ..Play::default()
+        });
+        assert_eq!(
+            command_menu(&mut ui).unwrap(),
+            Some(2),
+            "the click opened /list"
+        );
+        assert_eq!(ui.tab, 1);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
