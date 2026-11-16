@@ -189,6 +189,132 @@ pub fn login(request: Login) -> Result<bool> {
         }
     }
 }
+/// v7.7 ticket 158: the ten VibeConsole skills, embedded at build time: (path under
+/// `~/.claude/skills`, text). A test keeps this list equal to the repo's `.claude/skills`.
+pub const SKILLS: [(&str, &str); 17] = [
+    (
+        "vibeconsole-agents/SKILL.md",
+        include_str!("../.claude/skills/vibeconsole-agents/SKILL.md"),
+    ),
+    (
+        "vibeconsole-doctor/SKILL.md",
+        include_str!("../.claude/skills/vibeconsole-doctor/SKILL.md"),
+    ),
+    (
+        "vibeconsole-hardware-test/SKILL.md",
+        include_str!("../.claude/skills/vibeconsole-hardware-test/SKILL.md"),
+    ),
+    (
+        "vibeconsole-lights/SKILL.md",
+        include_str!("../.claude/skills/vibeconsole-lights/SKILL.md"),
+    ),
+    (
+        "vibeconsole-profiles/SKILL.md",
+        include_str!("../.claude/skills/vibeconsole-profiles/SKILL.md"),
+    ),
+    (
+        "vibeconsole-recipes/SKILL.md",
+        include_str!("../.claude/skills/vibeconsole-recipes/SKILL.md"),
+    ),
+    (
+        "vibeconsole-release/SKILL.md",
+        include_str!("../.claude/skills/vibeconsole-release/SKILL.md"),
+    ),
+    (
+        "vibeconsole-safety-review/SKILL.md",
+        include_str!("../.claude/skills/vibeconsole-safety-review/SKILL.md"),
+    ),
+    (
+        "vibeconsole-why-silent/SKILL.md",
+        include_str!("../.claude/skills/vibeconsole-why-silent/SKILL.md"),
+    ),
+    (
+        "vibeconsole/SKILL.md",
+        include_str!("../.claude/skills/vibeconsole/SKILL.md"),
+    ),
+    (
+        "vibeconsole/examples/browser-tabs.profile",
+        include_str!("../.claude/skills/vibeconsole/examples/browser-tabs.profile"),
+    ),
+    (
+        "vibeconsole/examples/editor.profile",
+        include_str!("../.claude/skills/vibeconsole/examples/editor.profile"),
+    ),
+    (
+        "vibeconsole/examples/orca.profile",
+        include_str!("../.claude/skills/vibeconsole/examples/orca.profile"),
+    ),
+    (
+        "vibeconsole/reference/actions.md",
+        include_str!("../.claude/skills/vibeconsole/reference/actions.md"),
+    ),
+    (
+        "vibeconsole/reference/controls.md",
+        include_str!("../.claude/skills/vibeconsole/reference/controls.md"),
+    ),
+    (
+        "vibeconsole/reference/formats.md",
+        include_str!("../.claude/skills/vibeconsole/reference/formats.md"),
+    ),
+    (
+        "vibeconsole/reference/safety-rules.md",
+        include_str!("../.claude/skills/vibeconsole/reference/safety-rules.md"),
+    ),
+];
+/// v7.7 ticket 158: Install /skills into `home`'s `.claude/skills`: missing files are
+/// written, a file that differs is backed up first (`<file>.bak-vibeconsole-<time>`) and
+/// replaced, an equal one is left; nothing is ever deleted. Each write is atomic. Returns
+/// what was done.
+pub fn install_skills(home: &Path) -> Result<String> {
+    let root = home.join(".claude/skills");
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let (mut written, mut backups) = (0, Vec::new());
+    for (path, text) in SKILLS {
+        let target = root.join(path);
+        match fs::read(&target) {
+            Ok(old) if old == text.as_bytes() => continue,
+            Ok(_) => {
+                let backup = PathBuf::from(format!("{}.bak-vibeconsole-{stamp}", target.display()));
+                fs::copy(&target, &backup)?;
+                backups.push(backup.display().to_string());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("install skills: {}: {e}", target.display()).into()),
+        }
+        let folder = target.parent().ok_or("install skills: no folder")?;
+        fs::create_dir_all(folder)?;
+        let temporary = folder.join(format!(
+            ".{}.vibeconsole-tmp",
+            target.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        fs::write(&temporary, text)?;
+        fs::rename(&temporary, &target).inspect_err(|_| {
+            let _ = fs::remove_file(&temporary);
+        })?;
+        written += 1;
+    }
+    Ok(match (written, backups.is_empty()) {
+        (0, _) => "Install /skills: already installed; nothing changed.".into(),
+        (n, true) => format!(
+            "Install /skills: {n} files written into {}.",
+            root.display()
+        ),
+        (n, false) => format!(
+            "Install /skills: {n} files written into {}; backed up first: {}",
+            root.display(),
+            backups.join(", ")
+        ),
+    })
+}
+/// v7.7 ticket 158: installed means every skill file is there and equal.
+pub fn skills_installed(home: &Path) -> bool {
+    SKILLS.iter().all(|(path, text)| {
+        fs::read(home.join(".claude/skills").join(path)).is_ok_and(|old| old == text.as_bytes())
+    })
+}
+
 /// v7.7 ticket 157: a problem `doctor` reports, with its fix.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Problem {
@@ -568,6 +694,77 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// v7.7 ticket 158: Install /skills writes the missing files into a home, backs up a
+    /// differing one before replacing it, deletes nothing, and reports installed only when
+    /// every file is there and equal; the embedded list is the repo's `.claude/skills`.
+    #[test]
+    fn install_skills_writes_missing_backs_up_differing_and_deletes_nothing() {
+        let home = std::env::temp_dir().join(format!("vibeconsole-skills-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        let skills = home.join(".claude/skills");
+        fs::create_dir_all(skills.join("vibeconsole")).unwrap();
+        fs::write(skills.join("vibeconsole/SKILL.md"), "my own edit").unwrap();
+        fs::create_dir_all(skills.join("mine")).unwrap();
+        fs::write(skills.join("mine/SKILL.md"), "someone else's skill").unwrap();
+        assert!(!skills_installed(&home));
+        let note = install_skills(&home).unwrap();
+        assert!(
+            note.contains("17 files written") && note.contains("backed up first"),
+            "{note}"
+        );
+        assert!(skills_installed(&home));
+        let backups = fs::read_dir(skills.join("vibeconsole"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains(".bak-vibeconsole-")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            fs::read_to_string(backups[0].path()).unwrap(),
+            "my own edit"
+        );
+        assert_eq!(
+            fs::read_to_string(skills.join("mine/SKILL.md")).unwrap(),
+            "someone else's skill",
+            "nothing else touched"
+        );
+        assert!(install_skills(&home).unwrap().contains("already installed"));
+        fs::remove_dir_all(&home).unwrap();
+
+        // The embedded list is every vibeconsole* file in the repo's .claude/skills.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(".claude/skills");
+        let mut on_disk = Vec::new();
+        let mut folders = vec![root.clone()];
+        while let Some(folder) = folders.pop() {
+            for entry in fs::read_dir(folder).unwrap().filter_map(|e| e.ok()) {
+                let path = entry.path();
+                let rel = path
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                if !rel.starts_with("vibeconsole") {
+                    continue;
+                }
+                if path.is_dir() {
+                    folders.push(path);
+                } else {
+                    on_disk.push(rel);
+                }
+            }
+        }
+        on_disk.sort();
+        let mut embedded = SKILLS
+            .iter()
+            .map(|(p, _)| p.to_string())
+            .collect::<Vec<_>>();
+        embedded.sort();
+        assert_eq!(embedded, on_disk);
+    }
     /// Ticket 20: a running service is paused for the session and started again on quit.
     #[test]
     fn session_takes_over_a_running_service_and_restarts_it() {

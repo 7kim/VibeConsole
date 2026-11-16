@@ -327,6 +327,8 @@ struct Terminal {
     /// v7.7 ticket 157: doctor's problems with a fix, read on 8 System and every 30 s.
     problems: Vec<crate::runtime::Problem>,
     problems_at: Option<Instant>,
+    /// v7.7 ticket 158: every VibeConsole skill is in `~/.claude/skills` (read on 3 Agents).
+    skills_installed: bool,
     /// v7 ticket 86: each device's switch and patterns; None while Status lights is off.
     device_lights: Option<crate::status::DevicePatterns>,
     /// Agents' status-light settings, in `agent_states` order; None while Status lights is Off.
@@ -932,6 +934,7 @@ impl Terminal {
             hint_line: String::new(),
             problems: Vec::new(),
             problems_at: None,
+            skills_installed: false,
             device_lights: None,
             light_agents: None,
             light_sessions: Vec::new(),
@@ -1311,6 +1314,10 @@ impl Terminal {
         if self.tab == 7 {
             self.read_problems();
         }
+        if self.tab == 2 {
+            self.skills_installed =
+                home_dir().is_some_and(|h| crate::runtime::skills_installed(&h));
+        }
         self.agent_cards = config.look.agent_cards;
         crate::screen::set_theme(&config.look.theme); // v7.7 ticket 154
         self.view = Some(config);
@@ -1422,6 +1429,21 @@ impl Terminal {
                     head("Reporting"),
                     one("Claude Code status hooks".into(), Some(AGENT + n + 1)),
                     one("Codex status hooks".into(), Some(AGENT + n + 2)),
+                    (
+                        vec![format!(
+                            "Install /skills · {} VibeConsole skills → ~/.claude/skills · {}",
+                            crate::runtime::SKILLS
+                                .iter()
+                                .filter(|(path, _)| path.ends_with("/SKILL.md"))
+                                .count(),
+                            if self.skills_installed {
+                                "installed"
+                            } else {
+                                "not installed"
+                            }
+                        )],
+                        Some(Open::InstallSkills),
+                    ),
                     one(
                         format!(
                             "Default agent directory · {}",
@@ -4983,6 +5005,18 @@ enum Phase {
     Failed,
 }
 
+/// The home folder, when HOME is an absolute path. In tests a temporary folder: no test may
+/// write into the real home (v7.7 ticket 158).
+fn home_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    return Some(
+        std::env::temp_dir().join(format!("vibeconsole-test-home-{}", std::process::id())),
+    );
+    #[cfg(not(test))]
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+}
 /// What Enter does on a tab row (v7.7 tickets 150, 151).
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Open {
@@ -4996,6 +5030,8 @@ enum Open {
     Theme(usize),
     /// Fix doctor problem `n` (v7.7 ticket 157).
     Problem(usize),
+    /// Install the VibeConsole skills (v7.7 ticket 158).
+    InstallSkills,
     /// Show "What moved in 7.7" again (v7.7 ticket 155).
     WhatMoved,
 }
@@ -9882,6 +9918,17 @@ fn command_menu(ui: &mut Terminal) -> Result<Option<usize>> {
                         if let Err(error) = ui.pick_theme(index) {
                             ui.notice = format!("config: {error}; nothing saved");
                         }
+                    }
+                    Some(Open::InstallSkills) => {
+                        ui.notice = match home_dir() {
+                            Some(home) => {
+                                crate::runtime::install_skills(&home).unwrap_or_else(|e| {
+                                    format!("install skills: {e}; nothing deleted")
+                                })
+                            }
+                            None => "install skills: HOME is not set; nothing written".into(),
+                        };
+                        ui.read_view(None);
                     }
                     Some(Open::Problem(index)) => {
                         ui.at_menu = false;
