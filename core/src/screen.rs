@@ -168,6 +168,9 @@ enum Role {
     BankB,
     /// The active tab: filled with the accent and underlined (and bracketed, so not colour only).
     ActiveTab,
+    /// A tab's one primary row (v7.7 ticket 152): filled with the accent, unlike the
+    /// selection.
+    Primary,
 }
 fn style(role: Role) -> String {
     let p = TOKYO_NIGHT;
@@ -186,6 +189,7 @@ fn style(role: Role) -> String {
         Role::BankA => format!("1;{}", fg(p.red)),
         Role::BankB => format!("1;{}", fg(p.green)),
         Role::ActiveTab => format!("1;4;{};{}", fg(p.background), bg(p.accent)),
+        Role::Primary => format!("1;{};{}", fg(p.background), bg(p.accent)),
     }
 }
 
@@ -321,6 +325,7 @@ fn pane(
     anchor: usize,
     (width, height): (usize, usize),
     focused: bool,
+    primary: Option<usize>,
     color: bool,
 ) -> Vec<String> {
     if height < 3 || width < 8 {
@@ -341,6 +346,11 @@ fn pane(
         let text = fit(line, inner);
         let text = if (line.starts_with("> ") && focused) || line.starts_with("◆ ") {
             paint(&text, Role::Selected, color)
+        } else if primary == Some(index) {
+            paint(&text, Role::Primary, color)
+        } else if line.starts_with("━━ ") || line.trim_start().starts_with("⚠ ") {
+            // Danger: a red rule and red rows (skill `destructive-emphasis`).
+            paint(&text, Role::Error, color)
         } else if line.starts_with("── ") {
             paint(&text, Role::Heading, color)
         } else if line.starts_with("Error:") {
@@ -431,6 +441,8 @@ pub struct Pane {
     pub rows: Vec<String>,
     pub anchor: usize,
     pub focused: bool,
+    /// The tab's primary row, drawn filled unless it is the selection.
+    pub primary: Option<usize>,
 }
 
 /// One tiled screen: the tab bar, a header, the active tab's rows | details | live panes
@@ -552,6 +564,7 @@ impl Screen {
                         p.anchor,
                         (width, size),
                         p.focused,
+                        p.primary,
                         color,
                     ));
                     body -= size;
@@ -582,9 +595,17 @@ impl Screen {
         let title = self.tabs.get(self.active_tab).map_or("Commands", |label| {
             label.split_once(' ').map_or(label.as_str(), |p| p.1)
         });
-        let commands = pane(title, &self.commands, self.anchor, commands, focus, color);
-        let details = pane("Details", &text, 0, details, !focus, color);
-        let live = pane("Live", &self.live, 0, live, false, color);
+        let commands = pane(
+            title,
+            &self.commands,
+            self.anchor,
+            commands,
+            focus,
+            None,
+            color,
+        );
+        let details = pane("Details", &text, 0, details, !focus, None, color);
+        let live = pane("Live", &self.live, 0, live, false, None, color);
         if columns >= 160 {
             for ((a, b), c) in commands.iter().zip(&details).zip(&live) {
                 rows.push(format!("{a}{b}{c}"));
@@ -640,6 +661,7 @@ mod tests {
             rows,
             anchor,
             focused,
+            primary: None,
         };
         let agents = (0..30)
             .map(|n| format!("{}● agent-{n} IDLE", if n == 25 { "> " } else { "  " }))

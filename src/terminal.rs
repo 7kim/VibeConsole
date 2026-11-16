@@ -314,6 +314,11 @@ struct Terminal {
     agent_cards: bool,
     /// v7.7 ticket 151: the status control pressed last and when, for its lit line.
     pressed: Option<(Control, Instant)>,
+    /// v7.7 ticket 152: what the tabs list, read after each command and with the status
+    /// refresh, never while drawing: the config, the prompt files, Xbox tuning's rows.
+    view: Option<mappings::Config>,
+    prompt_names: Vec<String>,
+    tuning_rows: Vec<String>,
     /// v7 ticket 86: each device's switch and patterns; None while Status lights is off.
     device_lights: Option<crate::status::DevicePatterns>,
     /// Agents' status-light settings, in `agent_states` order; None while Status lights is Off.
@@ -500,17 +505,30 @@ impl Terminal {
             hints: hints.into(),
             panes: Vec::new(),
         };
-        if self.at_menu && self.tab == 0 {
+        let primary = self.primary_target();
+        // `> ` marks the selection only on the menu; a command's screen shows it as `• `.
+        let selected = if self.at_menu { self.menu } else { usize::MAX };
+        let panes = self.tab_panes(self.tab, crate::screen::pane_width(size.0), selected);
+        if self.at_menu {
+            let primary = (panes.iter().flat_map(|(_, entries)| entries))
+                .enumerate()
+                .filter(|(_, (_, open))| open.is_some() && *open == primary)
+                .last()
+                .map(|(number, _)| number);
             let mut number = 0;
-            for (title, entries) in self.live_panes(crate::screen::pane_width(size.0), self.menu) {
+            for (title, entries) in panes {
                 let mut pane = crate::screen::Pane {
                     title,
                     rows: Vec::new(),
                     anchor: 0,
                     focused: false,
+                    primary: None,
                 };
-                for (lines, _) in entries {
+                for (lines, open) in entries {
                     pane.rows.extend(lines);
+                    if primary == Some(number) {
+                        pane.primary = Some(pane.rows.len() - 1);
+                    }
                     if number == self.menu {
                         pane.anchor = pane.rows.len() - 1;
                         pane.focused = true;
@@ -521,13 +539,19 @@ impl Terminal {
             }
             return screen;
         }
-        for (index, (name, command)) in tab_rows(self.tab, self.wanted_run).iter().enumerate() {
-            screen.commands.push(match command {
-                None => format!("── {name}"),
-                Some(_) if index == self.menu && self.at_menu => format!("> {name}"),
-                Some(_) if index == self.menu => format!("• {name}"),
-                Some(_) => format!("  {name}"),
-            });
+        // A command's own screen: the tab's rows on the left, the one that opened it marked.
+        let rows = panes
+            .into_iter()
+            .flat_map(|(_, entries)| entries)
+            .enumerate();
+        for (index, (lines, open)) in rows {
+            for line in lines {
+                let line = match line.strip_prefix("  ") {
+                    Some(rest) if index == self.menu && open.is_some() => format!("• {rest}"),
+                    _ => line,
+                };
+                screen.commands.push(line);
+            }
         }
         let (width, height) = screen.live_size(size.0, size.1);
         live.extend(self.status_lines());
@@ -864,6 +888,9 @@ impl Terminal {
             projects: BTreeMap::new(),
             agent_cards: false,
             pressed: None,
+            view: None,
+            prompt_names: Vec::new(),
+            tuning_rows: Vec::new(),
             device_lights: None,
             light_agents: None,
             light_sessions: Vec::new(),
@@ -1092,6 +1119,340 @@ impl Terminal {
         self.agent_cards = config.look.agent_cards;
         Ok(())
     }
+    /// v7.7 ticket 152: what the tabs list, from `config` (or the file). Xbox tuning's rows
+    /// read the driver and the light rule, so only while 7 Xbox is open.
+    fn read_view(&mut self, config: Option<mappings::Config>) {
+        let Some(config) = config.or_else(|| mappings::load_config(&self.path).ok()) else {
+            return;
+        };
+        self.prompt_names = crate::actions::prompts_dir_for(&self.path)
+            .and_then(|dir| prompt_files(&dir))
+            .unwrap_or_default();
+        if self.tab == 6 {
+            self.tuning_rows = tuning_items(self, &config.tuning);
+        }
+        self.agent_cards = config.look.agent_cards;
+        self.view = Some(config);
+    }
+    /// v7.7 ticket 152: the tab's one primary row (skill `primary-action`), by what it opens;
+    /// the last row opening it is the one drawn. 7 Xbox, 8 System, 9 and 0 have none.
+    fn primary_target(&self) -> Option<Open> {
+        let config = self.view.as_ref();
+        let count = |f: fn(&mappings::Config) -> usize| config.map_or(0, f);
+        let id = match self.tab {
+            0 => 1,
+            1 => 0,
+            2 => AGENT + count(|c| c.agents.len()).min(ROWS - 3),
+            3 => PROMPT + self.prompt_names.len().min(ROWS - 3),
+            4 => 10,
+            5 => PROFILE + count(|c| c.profiles.len()).min(ROWS - 3),
+            _ => return None,
+        };
+        Some(Open::Command(id))
+    }
+    /// v7.7 ticket 152: a tab's panes (Live's from [`Self::live_panes`]); one-line entries
+    /// that open something get `> ` when `selected`, else two spaces.
+    fn tab_panes(&self, tab: usize, width: usize, selected: usize) -> Vec<(String, Vec<Entry>)> {
+        if tab == 0 {
+            return self.live_panes(width, selected);
+        }
+        let default = mappings::Config::default();
+        let config = self.view.as_ref().unwrap_or(&default);
+        let one = |line: String, open: Option<usize>| (vec![line], open.map(Open::Command));
+        let head = |text: &str| (vec![format!("── {text}")], None);
+        let on = |b: bool| if b { "On" } else { "Off" };
+        let cap = |n: usize| n.min(ROWS - 3);
+        let mut panes: Vec<(String, Vec<Entry>)> = match tab {
+            1 => vec![(
+                "Mappings · Learn controls and keep what you assigned.".into(),
+                vec![
+                    head("Assign"),
+                    one("/configure".into(), Some(0)),
+                    one("/list".into(), Some(2)),
+                    head("Keep"),
+                    one(
+                        format!("Favourites ({})", config.favourites.len()),
+                        Some(SETTING + 10),
+                    ),
+                    one("Presets".into(), Some(SETTING + 11)),
+                    (vec![String::new()], None),
+                    (
+                        vec!["━━ Start over (asks first, keeps a backup)".into()],
+                        None,
+                    ),
+                    one("⚠ Reset settings".into(), Some(15)),
+                ],
+            )],
+            2 => {
+                let n = cap(config.agents.len());
+                let mut rows = vec![head("Agents · tmux attach -t vibe")];
+                for (index, agent) in config.agents.iter().take(n).enumerate() {
+                    let host = match agent.host {
+                        mappings::Host::Tmux => format!("tmux {}", agent.launch),
+                        mappings::Host::Orca => format!("Orca {}", agent.launch),
+                        mappings::Host::Herdr => "herdr".into(),
+                    };
+                    let state = (self.agent_states.iter())
+                        .find(|(name, _, _)| *name == agent.name)
+                        .map_or("idle", |(_, _, state)| state);
+                    let folder = AgentRow {
+                        name: String::new(),
+                        project: String::new(),
+                        folder: config.agent_directory(agent).ok().flatten(),
+                        window: String::new(),
+                        state,
+                        host: None,
+                    }
+                    .place();
+                    rows.push(one(
+                        format!("{} · {host} · {folder} · {}", agent.name, state_word(state)),
+                        Some(AGENT + index),
+                    ));
+                }
+                rows.push(one(
+                    if n == 0 {
+                        "No agents yet · Enter: Add agent".into()
+                    } else {
+                        "Add agent".into()
+                    },
+                    Some(AGENT + n),
+                ));
+                rows.extend([
+                    head("Lights"),
+                    one(
+                        format!("Status lights · {}", on(config.status_lights)),
+                        Some(AGENT + n + 3),
+                    ),
+                    one(
+                        format!(
+                            "Status light sources · {} folders · every other session {}",
+                            config.light_folders.len(),
+                            on(config.light_other_on)
+                        ),
+                        Some(SETTING + 4),
+                    ),
+                    one(
+                        format!(
+                            "Status light patterns · slow {} · fast {} BPM",
+                            config.light_patterns.slow, config.light_patterns.fast
+                        ),
+                        Some(SETTING + 5),
+                    ),
+                    head("Reporting"),
+                    one("Claude Code status hooks".into(), Some(AGENT + n + 1)),
+                    one("Codex status hooks".into(), Some(AGENT + n + 2)),
+                    one(
+                        format!(
+                            "Default agent directory · {}",
+                            config
+                                .agent_dir
+                                .as_deref()
+                                .unwrap_or("not set (tmux default)")
+                        ),
+                        Some(SETTING),
+                    ),
+                ]);
+                vec![(
+                    "Agents · who runs where, what the lights show, how agents report".into(),
+                    rows,
+                )]
+            }
+            3 => {
+                let users = |test: &dyn Fn(&crate::actions::Action) -> bool| {
+                    let names = (config.mappings.iter())
+                        .chain(config.profiles.iter().flat_map(|p| p.mappings.iter()))
+                        .filter(|m| test(&m.action))
+                        .map(|m| m.name(None))
+                        .collect::<Vec<_>>();
+                    match names.as_slice() {
+                        [] => "not used".to_owned(),
+                        [one] => one.clone(),
+                        [first, rest @ ..] => format!("{first} and {} more", rest.len()),
+                    }
+                };
+                let n = cap(self.prompt_names.len());
+                let mut prompts = (self.prompt_names.iter().take(n).enumerate())
+                    .map(|(index, name)| {
+                        let used = users(&|a| a.prompt_files().contains(&name.as_str()));
+                        one(format!("{name} · {used}"), Some(PROMPT + index))
+                    })
+                    .collect::<Vec<_>>();
+                if n == 0 {
+                    prompts.push(one(
+                        "No prompts yet · Enter: New prompt".into(),
+                        Some(PROMPT),
+                    ));
+                }
+                let m = cap(config.sequences.len());
+                let mut sequences = (config.sequences.iter().take(m).enumerate())
+                    .map(|(index, (name, steps))| {
+                        let used =
+                            users(&|a| *a == crate::actions::Action::SavedSequence(name.clone()));
+                        let line = format!("{name} · {} steps · {used}", steps.len());
+                        one(line, Some(SEQUENCE + index))
+                    })
+                    .collect::<Vec<_>>();
+                if m == 0 {
+                    sequences.push(one(
+                        "No sequences yet · Enter: New sequence".into(),
+                        Some(SEQUENCE),
+                    ));
+                }
+                vec![
+                    (format!("Saved prompts ({n})"), prompts),
+                    (format!("Saved prompt sequences ({m})"), sequences),
+                    (
+                        "Commands".into(),
+                        vec![
+                            one("New prompt · write it in $EDITOR".into(), Some(PROMPT + n)),
+                            one(
+                                "New sequence · pick prompts in order".into(),
+                                Some(SEQUENCE + m),
+                            ),
+                        ],
+                    ),
+                ]
+            }
+            4 => vec![(
+                "Devices · each connected device and its own checks".into(),
+                vec![
+                    head("Akai MPK mini 3"),
+                    one("/prog-select".into(), Some(10)),
+                    one("/program-name".into(), Some(14)),
+                    one("/feedback-idle".into(), Some(9)),
+                    one("/feedback-check".into(), Some(8)),
+                    head("Xbox Wireless Controller"),
+                    one("/prog-select (Xbox)".into(), Some(19)),
+                    one("/program-name (Xbox)".into(), Some(20)),
+                    head("Inspect"),
+                    one("/detect".into(), Some(7)),
+                    one("/get".into(), Some(6)),
+                    head("Choose"),
+                    one(
+                        format!(
+                            "MIDI device · {} (takes effect next launch)",
+                            config.midi_active.as_deref().unwrap_or("Akai MPK mini 3")
+                        ),
+                        Some(SETTING + 7),
+                    ),
+                ],
+            )],
+            5 => {
+                let n = cap(config.profiles.len());
+                let mut set = (config.profiles.iter().take(n).enumerate())
+                    .map(|(index, p)| {
+                        let apps = if p.apps.is_empty() {
+                            "no apps".to_owned()
+                        } else {
+                            p.apps.join(", ")
+                        };
+                        let line = format!("{} · {apps} · {} overrides", p.name, p.mappings.len());
+                        one(line, Some(PROFILE + index))
+                    })
+                    .collect::<Vec<_>>();
+                if n == 0 {
+                    set.push(one(
+                        "No profiles yet · Enter: New profile".into(),
+                        Some(PROFILE),
+                    ));
+                }
+                set.push(head("Every other app"));
+                set.push(one(
+                    "Default · the base mappings (/configure)".into(),
+                    Some(0),
+                ));
+                vec![
+                    (format!("Profiles set ({n})"), set),
+                    (
+                        "Add a profile".into(),
+                        vec![
+                            one(
+                                "New profile · pick the app, then its pads".into(),
+                                Some(PROFILE + n),
+                            ),
+                            one("Import a profile file".into(), Some(PROFILE + n + 1)),
+                            one("Ask Claude for a profile…".into(), Some(PROFILE + n + 2)),
+                        ],
+                    ),
+                ]
+            }
+            6 => {
+                let row = |index: usize| {
+                    let text = self.tuning_rows.get(index).cloned().unwrap_or_default();
+                    one(text, Some(TUNING + index))
+                };
+                vec![(
+                    "Xbox · sticks, feedback, headset and driver".into(),
+                    vec![
+                        head("Sticks and triggers"),
+                        row(0),
+                        row(1),
+                        row(3),
+                        row(4),
+                        row(5),
+                        row(6),
+                        head("Feedback"),
+                        row(2),
+                        row(11),
+                        head("Headset and driver"),
+                        row(7),
+                        row(8),
+                        row(9),
+                        row(10),
+                    ],
+                )]
+            }
+            7 => vec![(
+                "System · VibeConsole itself: login, Wispr Flow, variables".into(),
+                vec![
+                    head("Login service"),
+                    one("Start at login".into(), Some(SETTING + 6)),
+                    head("Wispr Flow"),
+                    one(
+                        format!(
+                            "Start Wispr Flow with VibeConsole · {} (next launch)",
+                            on(self.start_flow_enabled)
+                        ),
+                        Some(16),
+                    ),
+                    one(
+                        "Start or repair Wispr Flow · output pauses meanwhile".into(),
+                        Some(12),
+                    ),
+                    head("Variables"),
+                    one(
+                        format!(
+                            "Startup variables ({}) · exported into tmux",
+                            config.env.len()
+                        ),
+                        Some(SETTING + 2),
+                    ),
+                    one(
+                        format!(
+                            "User variables ({}) · ${{NAME}} in commands",
+                            config.vars.len()
+                        ),
+                        Some(SETTING + 3),
+                    ),
+                ],
+            )],
+            _ => vec![(
+                TABS[tab].0.split_once(' ').map_or("", |p| p.1).to_owned(),
+                TABS[tab].1.iter().map(|(name, _)| head(name)).collect(),
+            )],
+        };
+        let mut number = 0;
+        for (_, entries) in &mut panes {
+            for (lines, open) in entries {
+                if open.is_some() && lines.len() == 1 {
+                    let mark = if number == selected { "> " } else { "  " };
+                    lines[0] = format!("{mark}{}", lines[0]);
+                }
+                number += 1;
+            }
+        }
+        panes
+    }
     /// v7.7 ticket 151: Live's panes: its buttons, Agents, Pads and buttons, Toggles. Each
     /// entry is its lines and what Enter does; entry `selected` (counted over every pane)
     /// gets `> `, or a double border when it is an agent card.
@@ -1112,7 +1473,7 @@ impl Terminal {
         if rows.is_empty() {
             agents.push(one(
                 "No agents yet · Enter: Add agent".into(),
-                Some(Open::Command(17)),
+                Some(Open::Command(AGENT)),
             ));
             agents.push(one(
                 "  Agents in other terminals appear once Status light sources lists their folder."
@@ -1287,6 +1648,7 @@ impl Terminal {
             Vec::new()
         };
         self.agent_cards = config.look.agent_cards;
+        self.read_view(Some(config.clone()));
         self.agent_places = config
             .agents
             .iter()
@@ -2266,6 +2628,22 @@ impl Terminal {
         self.notice = format!("Xbox · {}", self.xbox_program_label());
         Ok(())
     }
+    /// v7.7 ticket 152: Devices' `/prog-select (Xbox)`: the 8 programs by name; picking one
+    /// switches through [`Self::set_xbox_program`] (a transition: held keys released).
+    fn pick_xbox_program(&mut self) -> Result<()> {
+        let config = mappings::load_config(&self.path)?;
+        let names = (1..=mappings::XBOX_PROGRAMS)
+            .map(|p| mappings::xbox_program_name(&config, p))
+            .collect::<Vec<_>>();
+        let at = usize::from(self.xbox_program.saturating_sub(1));
+        let picked = self.menu_fires(false, |ui| {
+            choose_at(ui, "/prog-select (Xbox): which Xbox program?", &names, at)
+        })?;
+        match picked {
+            Some(at) => self.set_xbox_program(u8::try_from(at + 1)?),
+            None => Ok(()),
+        }
+    }
     /// "Program N — name" (or "Program N") for the Xbox program in use.
     fn xbox_program_label(&self) -> String {
         let name = mappings::load_config(&self.path)
@@ -2447,29 +2825,9 @@ impl Terminal {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
+    /// The Akai's program names. v7.7 ticket 152: the Xbox has its own row
+    /// (`/program-name (Xbox)`), so no device question.
     fn rename_program(&mut self) -> Result<()> {
-        // v7 ticket 115: the Xbox programs' names live in VibeConsole's config only.
-        if self
-            .gamepad
-            .as_ref()
-            .is_some_and(|p| !p.connected().is_empty())
-        {
-            let devices = options(&[
-                "MPK (stored on the controller)",
-                "Xbox controller (saved in VibeConsole)",
-            ]);
-            let device = self.menu_fires(true, |ui| {
-                choose(ui, "Rename a program on which device?", &devices)
-            })?;
-            match device {
-                Some(1) => {
-                    let path = self.path.clone();
-                    return self.menu_fires(false, |ui| rename_xbox_program(ui, &path));
-                }
-                Some(_) => {}
-                None => return Ok(()),
-            }
-        }
         self.program_connection()?;
         let names = crate::feedback::names(self.input.as_mut().ok_or("MIDI disconnected")?)?;
         self.program_names = names.clone();
@@ -4406,7 +4764,7 @@ fn status_word(phase: Option<Phase>, running: Option<bool>) -> &'static str {
 
 fn agents_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
     loop {
-        let mut config = mappings::load_config(path)?;
+        let config = mappings::load_config(path)?;
         let mut choices = config
             .agents
             .iter()
@@ -4436,184 +4794,192 @@ fn agents_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
         let Some(index) = choose(ui, "Agents | tmux attach -t vibe", &choices)? else {
             return Ok(());
         };
-        if index == config.agents.len() + 4 {
-            prompts_menu(ui, path)?;
-            continue;
+        agent_choice(ui, path, index)?;
+    }
+}
+/// One row of the Agents list (v7.7 ticket 152: also a row of 3 Agents): agent `index`,
+/// then Add agent, Claude Code hooks, Codex hooks, Status lights, Prompts.
+fn agent_choice(ui: &mut impl Ui, path: &Path, index: usize) -> Result<()> {
+    let mut config = mappings::load_config(path)?;
+
+    if index == config.agents.len() + 4 {
+        prompts_menu(ui, path)?;
+        return Ok(());
+    }
+    if index == config.agents.len() + 3 {
+        config.status_lights = !config.status_lights;
+        if let Err(error) = mappings::save_config(path, &config) {
+            not_saved(ui, &error)?;
         }
-        if index == config.agents.len() + 3 {
-            config.status_lights = !config.status_lights;
+        return Ok(());
+    }
+    if let Some(which @ (1 | 2)) = index.checked_sub(config.agents.len()) {
+        let codex = which == 2;
+        let hooks = if codex {
+            crate::status::codex_hooks()
+        } else {
+            crate::status::claude_hooks()
+        };
+        let text = format!(
+            "{}\nInstall merges only the missing entries, after a backup. Hooks report only for agents VibeConsole started in tmux; `vibeconsole` must be on PATH.\n\n{hooks}",
+            crate::status::hooks_status(codex)
+        );
+        match choose(
+            ui,
+            &text,
+            &options(&["Install (merge, with backup)", "Copy with wl-copy", "Back"]),
+        )? {
+            Some(0) => match crate::status::install_hooks(codex) {
+                Ok(note) => {
+                    choose(ui, &note, &options(&["Back"]))?;
+                }
+                Err(error) => not_saved(ui, &error)?,
+            },
+            Some(1) => crate::actions::copy_text(&hooks)?,
+            _ => {}
+        }
+        return Ok(());
+    }
+    let existing = config.agents.get(index).cloned();
+    let operation = if existing.is_some() {
+        choose(ui, "Agent", &options(&["Edit", "Remove", "Back"]))?
+    } else {
+        Some(0)
+    };
+    if operation == Some(1) {
+        if choose(
+            ui,
+            "Remove this agent? Its prompt mappings become invalid.",
+            &options(&["Cancel", "Remove"]),
+        )? == Some(1)
+        {
+            config.agents.remove(index);
             if let Err(error) = mappings::save_config(path, &config) {
                 not_saved(ui, &error)?;
             }
-            continue;
         }
-        if let Some(which @ (1 | 2)) = index.checked_sub(config.agents.len()) {
-            let codex = which == 2;
-            let hooks = if codex {
-                crate::status::codex_hooks()
-            } else {
-                crate::status::claude_hooks()
-            };
-            let text = format!(
-                "{}\nInstall merges only the missing entries, after a backup. Hooks report only for agents VibeConsole started in tmux; `vibeconsole` must be on PATH.\n\n{hooks}",
-                crate::status::hooks_status(codex)
-            );
-            match choose(
-                ui,
-                &text,
-                &options(&["Install (merge, with backup)", "Copy with wl-copy", "Back"]),
-            )? {
-                Some(0) => match crate::status::install_hooks(codex) {
-                    Ok(note) => {
-                        choose(ui, &note, &options(&["Back"]))?;
-                    }
-                    Err(error) => not_saved(ui, &error)?,
-                },
-                Some(1) => crate::actions::copy_text(&hooks)?,
-                _ => {}
-            }
-            continue;
-        }
-        let existing = config.agents.get(index).cloned();
-        let operation = if existing.is_some() {
-            choose(ui, "Agent", &options(&["Edit", "Remove", "Back"]))?
-        } else {
-            Some(0)
-        };
-        if operation == Some(1) {
-            if choose(
-                ui,
-                "Remove this agent? Its prompt mappings become invalid.",
-                &options(&["Cancel", "Remove"]),
-            )? == Some(1)
-            {
-                config.agents.remove(index);
-                if let Err(error) = mappings::save_config(path, &config) {
-                    not_saved(ui, &error)?;
-                }
-            }
-            continue;
-        }
-        if operation != Some(0) {
-            continue;
-        }
-        let Some(name) = text_entry(ui, "Agent name", existing.as_ref().map_or("", |a| &a.name))?
-        else {
-            continue;
-        };
-        // v7 ticket 49: where the agent lives. T3 Code has no supported way to send a prompt.
-        let hosts = [
-            mappings::Host::Tmux,
-            mappings::Host::Orca,
-            mappings::Host::Herdr,
-        ];
-        let Some(host) = choose_saved(
-            ui,
-            "Where does this agent live?",
-            options(&[
-                "tmux (VibeConsole starts it in its own tmux window)",
-                "Orca (a terminal in an Orca workspace; started with orca agent launch)",
-                "herdr (an agent herdr runs, by its herdr name; start it in herdr)",
-                "T3 Code",
-            ]),
-            existing
-                .as_ref()
-                .and_then(|a| hosts.iter().position(|h| *h == a.host)),
-        )?
-        else {
-            continue;
-        };
-        let Some(&host) = hosts.get(host) else {
-            not_saved(
-                ui,
-                &"validation: T3 Code can't host an agent: it has no supported way to send a prompt (no CLI); use tmux, Orca or herdr",
-            )?;
-            continue;
-        };
-        let (launch, window, dir) = match host {
-            mappings::Host::Herdr => (name.clone(), name.clone(), String::new()),
-            _ => {
-                let orca = host == mappings::Host::Orca;
-                let Some(launch) = text_entry(
-                    ui,
-                    if orca {
-                        "Orca agent kind (e.g. claude, codex)"
-                    } else {
-                        "Launch command"
-                    },
-                    existing.as_ref().map_or("", |a| &a.launch),
-                )?
-                else {
-                    continue;
-                };
-                let window = if orca {
-                    name.clone()
-                } else {
-                    let Some(window) = text_entry(
-                        ui,
-                        "tmux window name",
-                        existing.as_ref().map_or("", |a| &a.window),
-                    )?
-                    else {
-                        continue;
-                    };
-                    window
-                };
-                let Some(dir) = text_entry(
-                    ui,
-                    if orca {
-                        "Orca workspace folder (absolute path or ${NAME}; empty uses the Settings default)"
-                    } else {
-                        "Working directory (absolute path or ${NAME}; empty uses the Settings default)"
-                    },
-                    existing
-                        .as_ref()
-                        .and_then(|a| a.dir.as_deref())
-                        .unwrap_or(""),
-                )?
-                else {
-                    continue;
-                };
-                (launch, window, dir)
-            }
-        };
-        let defaults = mappings::Agent::new(&name, &launch, &window).ok();
-        let light = existing.as_ref().or(defaults.as_ref());
-        let Some(octave) = number(
-            ui,
-            "Status light octave (−4..−1 or +1..+4; Claude +1, Codex −1; tempo is set per state in Status light patterns)",
-            light.map_or(1, |a| a.octave.into()),
-            -4,
-            4,
-        )?
-        else {
-            continue;
-        };
-        let saved = (|| -> Result<()> {
-            let mut agent = mappings::Agent::new(&name, &launch, &window)?;
-            agent.octave = crate::status::valid_octave(octave.try_into()?)?;
-            agent.host = host;
-            if !dir.trim().is_empty() {
-                existing_directory(&dir, &config)?;
-                agent.dir = Some(dir.clone());
-            }
-            if host == mappings::Host::Orca && config.agent_directory(&agent)?.is_none() {
-                return Err(format!(
-                    "validation: Orca agent {name} needs a folder (its Orca workspace)"
-                )
-                .into());
-            }
-            if existing.is_some() {
-                config.agents[index] = agent;
-            } else {
-                config.agents.push(agent);
-            }
-            mappings::save_config(path, &config)
-        })();
-        if let Err(error) = saved {
-            not_saved(ui, &error)?;
-        }
+        return Ok(());
     }
+    if operation != Some(0) {
+        return Ok(());
+    }
+    let Some(name) = text_entry(ui, "Agent name", existing.as_ref().map_or("", |a| &a.name))?
+    else {
+        return Ok(());
+    };
+    // v7 ticket 49: where the agent lives. T3 Code has no supported way to send a prompt.
+    let hosts = [
+        mappings::Host::Tmux,
+        mappings::Host::Orca,
+        mappings::Host::Herdr,
+    ];
+    let Some(host) = choose_saved(
+        ui,
+        "Where does this agent live?",
+        options(&[
+            "tmux (VibeConsole starts it in its own tmux window)",
+            "Orca (a terminal in an Orca workspace; started with orca agent launch)",
+            "herdr (an agent herdr runs, by its herdr name; start it in herdr)",
+            "T3 Code",
+        ]),
+        existing
+            .as_ref()
+            .and_then(|a| hosts.iter().position(|h| *h == a.host)),
+    )?
+    else {
+        return Ok(());
+    };
+    let Some(&host) = hosts.get(host) else {
+        not_saved(
+            ui,
+            &"validation: T3 Code can't host an agent: it has no supported way to send a prompt (no CLI); use tmux, Orca or herdr",
+        )?;
+        return Ok(());
+    };
+    let (launch, window, dir) = match host {
+        mappings::Host::Herdr => (name.clone(), name.clone(), String::new()),
+        _ => {
+            let orca = host == mappings::Host::Orca;
+            let Some(launch) = text_entry(
+                ui,
+                if orca {
+                    "Orca agent kind (e.g. claude, codex)"
+                } else {
+                    "Launch command"
+                },
+                existing.as_ref().map_or("", |a| &a.launch),
+            )?
+            else {
+                return Ok(());
+            };
+            let window = if orca {
+                name.clone()
+            } else {
+                let Some(window) = text_entry(
+                    ui,
+                    "tmux window name",
+                    existing.as_ref().map_or("", |a| &a.window),
+                )?
+                else {
+                    return Ok(());
+                };
+                window
+            };
+            let Some(dir) = text_entry(
+                ui,
+                if orca {
+                    "Orca workspace folder (absolute path or ${NAME}; empty uses the Settings default)"
+                } else {
+                    "Working directory (absolute path or ${NAME}; empty uses the Settings default)"
+                },
+                existing
+                    .as_ref()
+                    .and_then(|a| a.dir.as_deref())
+                    .unwrap_or(""),
+            )?
+            else {
+                return Ok(());
+            };
+            (launch, window, dir)
+        }
+    };
+    let defaults = mappings::Agent::new(&name, &launch, &window).ok();
+    let light = existing.as_ref().or(defaults.as_ref());
+    let Some(octave) = number(
+        ui,
+        "Status light octave (−4..−1 or +1..+4; Claude +1, Codex −1; tempo is set per state in Status light patterns)",
+        light.map_or(1, |a| a.octave.into()),
+        -4,
+        4,
+    )?
+    else {
+        return Ok(());
+    };
+    let saved = (|| -> Result<()> {
+        let mut agent = mappings::Agent::new(&name, &launch, &window)?;
+        agent.octave = crate::status::valid_octave(octave.try_into()?)?;
+        agent.host = host;
+        if !dir.trim().is_empty() {
+            existing_directory(&dir, &config)?;
+            agent.dir = Some(dir.clone());
+        }
+        if host == mappings::Host::Orca && config.agent_directory(&agent)?.is_none() {
+            return Err(format!(
+                "validation: Orca agent {name} needs a folder (its Orca workspace)"
+            )
+            .into());
+        }
+        if existing.is_some() {
+            config.agents[index] = agent;
+        } else {
+            config.agents.push(agent);
+        }
+        mappings::save_config(path, &config)
+    })();
+    if let Err(error) = saved {
+        not_saved(ui, &error)?;
+    }
+    Ok(())
 }
 
 /// A rejected Settings/Agents/Prompts entry: nothing changed, so a note, not a failure that pauses.
@@ -4771,16 +5137,23 @@ fn profiles_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
         else {
             return Ok(());
         };
-        let result = match config.profiles.get(choice) {
-            Some(profile) => profile_menu(ui, path, &profile.name),
-            None if choice == config.profiles.len() => new_profile(ui, path),
-            None if choice == config.profiles.len() + 1 => import_profile_file(ui, path),
-            None => ai_profile(ui, path),
-        };
-        if let Err(error) = result {
-            not_saved(ui, &error)?;
-        }
+        profile_choice(ui, path, choice)?;
     }
+}
+/// One row of App profiles (v7.7 ticket 152: also a row of 6 Apps & profiles): profile
+/// `choice`, then New profile, Import a profile file, Ask Claude for a profile.
+fn profile_choice(ui: &mut impl Ui, path: &Path, choice: usize) -> Result<()> {
+    let config = mappings::load_config(path)?;
+    let result = match config.profiles.get(choice) {
+        Some(profile) => profile_menu(ui, path, &profile.name),
+        None if choice == config.profiles.len() => new_profile(ui, path),
+        None if choice == config.profiles.len() + 1 => import_profile_file(ui, path),
+        None => ai_profile(ui, path),
+    };
+    if let Err(error) = result {
+        not_saved(ui, &error)?;
+    }
+    Ok(())
 }
 /// An installed app's desktop ID, picked from the app list.
 fn pick_app(ui: &mut impl Ui) -> Result<Option<String>> {
@@ -5417,9 +5790,23 @@ fn keyboard_leds_menu(ui: &mut impl Ui, chosen: &mut [bool; 4]) -> Result<()> {
 /// Settings -> Xbox tuning (v7 ticket 08): the stick dead zone (drift inside it never
 /// fires) and how far a trigger is pulled before it fires.
 fn tuning_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
-    let mut config = mappings::load_config(path)?;
-    let tuning = config.tuning.clone();
-    let items = vec![
+    let config = mappings::load_config(path)?;
+    let mut items = tuning_items(ui, &config.tuning);
+    items.push("Back".to_string());
+    let title = format!(
+        "Xbox tuning\n{}\n{}",
+        crate::gamepad::headset(),
+        crate::gamepad::ButtonLight::status()
+    );
+    match choose(ui, &title, &items)? {
+        Some(choice) => tuning_choice(ui, path, choice),
+        None => Ok(()),
+    }
+}
+/// Xbox tuning's rows with their values (v7.7 ticket 152: also the rows of 7 Xbox); the
+/// driver and the light rule are read from the system, never a saved copy.
+fn tuning_items(ui: &impl Ui, tuning: &mappings::Tuning) -> Vec<String> {
+    vec![
         format!("Stick dead zone: {}%", tuning.dead_zone),
         format!("Triggers fire at: {}% of travel", tuning.trigger),
         format!(
@@ -5456,14 +5843,13 @@ fn tuning_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 "not installed (Install…)"
             }
         ),
-        "Back".to_string(),
-    ];
-    let title = format!(
-        "Xbox tuning\n{}\n{}",
-        crate::gamepad::headset(),
-        crate::gamepad::ButtonLight::status()
-    );
-    match choose(ui, &title, &items)? {
+    ]
+}
+/// Xbox tuning row `choice` ([`tuning_items`] order); a change is saved atomically.
+fn tuning_choice(ui: &mut impl Ui, path: &Path, choice: usize) -> Result<()> {
+    let mut config = mappings::load_config(path)?;
+    let tuning = config.tuning.clone();
+    match Some(choice) {
         Some(0) => {
             let Some(value) = number(
                 ui,
@@ -6196,65 +6582,74 @@ fn prompts_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
         let Some(index) = choose(ui, &format!("Prompts in {}", dir.display()), &rows)? else {
             return Ok(());
         };
-        if index == files.len() + 1 {
-            saved_sequences_menu(ui, path)?;
-            continue;
-        }
-        let result = if index == files.len() {
-            match text_entry(ui, "New prompt name", "")? {
-                Some(name) if files.contains(&name) => {
-                    Err(format!("prompt {name} already exists").into())
-                }
-                Some(name) => edit_prompt(ui, &dir, &name),
-                None => Ok(()),
-            }
-        } else {
-            let name = &files[index];
-            match choose(
-                ui,
-                &format!("Prompt {name}"),
-                &options(&["Read", "Edit", "Delete", "Back"]),
-            )? {
-                Some(0) => {
-                    let text = std::fs::read_to_string(dir.join(name))
-                        .unwrap_or_else(|e| format!("(unreadable: {e})"));
-                    choose(ui, &format!("{name}\n\n{text}"), &options(&["Back"])).map(drop)
-                }
-                Some(1) => edit_prompt(ui, &dir, name),
-                Some(2) => {
-                    let config = mappings::load_config(path)?;
-                    let users = config
-                        .mappings
-                        .iter()
-                        .filter(|m| m.action.prompt_files().contains(&name.as_str()))
-                        .map(|m| format!("{} {}", mappings::program_label(m.context), m.name(None)))
-                        .collect::<Vec<_>>();
-                    let warning = if users.is_empty() {
-                        "No mapping uses it.".to_string()
-                    } else {
-                        format!(
-                            "Used by: {}. Those pads will report a missing prompt.",
-                            users.join(", ")
-                        )
-                    };
-                    if choose(
-                        ui,
-                        &format!("Delete prompt {name}?\n{warning}"),
-                        &options(&["Cancel", "Delete"]),
-                    )? == Some(1)
-                    {
-                        std::fs::remove_file(dir.join(name)).map_err(stage("file I/O"))
-                    } else {
-                        Ok(())
-                    }
-                }
-                _ => Ok(()),
-            }
-        };
-        if let Err(error) = result {
-            not_saved(ui, &error)?;
-        }
+        prompt_choice(ui, path, index)?;
     }
+}
+/// One row of the Prompts list (v7.7 ticket 152: also a row of 4 Prompts): prompt `index`,
+/// then New prompt, Saved prompt sequences.
+fn prompt_choice(ui: &mut impl Ui, path: &Path, index: usize) -> Result<()> {
+    let dir = crate::actions::prompts_dir_for(path)?;
+    let files = prompt_files(&dir)?;
+
+    if index == files.len() + 1 {
+        saved_sequences_menu(ui, path)?;
+        return Ok(());
+    }
+    let result = if index == files.len() {
+        match text_entry(ui, "New prompt name", "")? {
+            Some(name) if files.contains(&name) => {
+                Err(format!("prompt {name} already exists").into())
+            }
+            Some(name) => edit_prompt(ui, &dir, &name),
+            None => Ok(()),
+        }
+    } else {
+        let name = &files[index];
+        match choose(
+            ui,
+            &format!("Prompt {name}"),
+            &options(&["Read", "Edit", "Delete", "Back"]),
+        )? {
+            Some(0) => {
+                let text = std::fs::read_to_string(dir.join(name))
+                    .unwrap_or_else(|e| format!("(unreadable: {e})"));
+                choose(ui, &format!("{name}\n\n{text}"), &options(&["Back"])).map(drop)
+            }
+            Some(1) => edit_prompt(ui, &dir, name),
+            Some(2) => {
+                let config = mappings::load_config(path)?;
+                let users = config
+                    .mappings
+                    .iter()
+                    .filter(|m| m.action.prompt_files().contains(&name.as_str()))
+                    .map(|m| format!("{} {}", mappings::program_label(m.context), m.name(None)))
+                    .collect::<Vec<_>>();
+                let warning = if users.is_empty() {
+                    "No mapping uses it.".to_string()
+                } else {
+                    format!(
+                        "Used by: {}. Those pads will report a missing prompt.",
+                        users.join(", ")
+                    )
+                };
+                if choose(
+                    ui,
+                    &format!("Delete prompt {name}?\n{warning}"),
+                    &options(&["Cancel", "Delete"]),
+                )? == Some(1)
+                {
+                    std::fs::remove_file(dir.join(name)).map_err(stage("file I/O"))
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Ok(()),
+        }
+    };
+    if let Err(error) = result {
+        not_saved(ui, &error)?;
+    }
+    Ok(())
 }
 
 fn prompt_action(
@@ -7460,9 +7855,8 @@ fn sequence_for_pad(
 /// Edit use the sequence editor; a rename follows every pad using it; a sequence a pad uses
 /// can't be deleted (the pads are named).
 fn saved_sequences_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
-    use crate::actions::Action;
     loop {
-        let mut config = mappings::load_config(path).map_err(stage("file I/O"))?;
+        let config = mappings::load_config(path).map_err(stage("file I/O"))?;
         let mut rows = config
             .sequences
             .iter()
@@ -7472,102 +7866,107 @@ fn saved_sequences_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
         let Some(index) = choose(ui, "Saved prompt sequences", &rows)? else {
             return Ok(());
         };
-        let users = |config: &mappings::Config, name: &str| {
-            config
-                .mappings
-                .iter()
-                .chain(config.profiles.iter().flat_map(|p| p.mappings.iter()))
-                .filter(|m| m.action == Action::SavedSequence(name.into()))
-                .map(|m| format!("{} {}", mappings::program_label(m.context), m.name(None)))
-                .collect::<Vec<_>>()
-        };
-        let result: Result<()> = (|| {
-            if index == config.sequences.len() {
-                let Some(name) =
-                    text_entry(ui, "New sequence name (letters, digits, - and _)", "")?
-                else {
+        sequence_choice(ui, path, index)?;
+    }
+}
+/// One row of Saved prompt sequences (v7.7 ticket 152: also a row of 4 Prompts): sequence
+/// `index`, then New sequence.
+fn sequence_choice(ui: &mut impl Ui, path: &Path, index: usize) -> Result<()> {
+    use crate::actions::Action;
+    let mut config = mappings::load_config(path).map_err(stage("file I/O"))?;
+
+    let users = |config: &mappings::Config, name: &str| {
+        config
+            .mappings
+            .iter()
+            .chain(config.profiles.iter().flat_map(|p| p.mappings.iter()))
+            .filter(|m| m.action == Action::SavedSequence(name.into()))
+            .map(|m| format!("{} {}", mappings::program_label(m.context), m.name(None)))
+            .collect::<Vec<_>>()
+    };
+    let result: Result<()> = (|| {
+        if index == config.sequences.len() {
+            let Some(name) = text_entry(ui, "New sequence name (letters, digits, - and _)", "")?
+            else {
+                return Ok(());
+            };
+            if !mappings::simple_name(&name) || mappings::saved_sequence(&config, &name).is_some() {
+                return Err(format!(
+                    "validation: {name:?} is taken or not letters, digits, - and _"
+                )
+                .into());
+            }
+            let Some(Action::PromptSequence(steps)) = prompt_sequence_action(ui, path, None)?
+            else {
+                return Ok(());
+            };
+            config.sequences.push((name, steps));
+            return mappings::save_config(path, &config).map_err(stage("file I/O"));
+        }
+        let name = config.sequences[index].0.clone();
+        match choose(
+            ui,
+            &format!("Saved sequence {name}"),
+            &options(&["Edit", "Rename", "Delete", "Back"]),
+        )? {
+            Some(0) => {
+                let steps = Action::PromptSequence(config.sequences[index].1.clone());
+                if let Some(Action::PromptSequence(steps)) =
+                    prompt_sequence_action(ui, path, Some(&steps))?
+                {
+                    config.sequences[index].1 = steps;
+                    mappings::save_config(path, &config).map_err(stage("file I/O"))?;
+                }
+                Ok(())
+            }
+            Some(1) => {
+                let Some(new) = text_entry(ui, "New name", &name)? else {
                     return Ok(());
                 };
-                if !mappings::simple_name(&name)
-                    || mappings::saved_sequence(&config, &name).is_some()
+                if !mappings::simple_name(&new) || mappings::saved_sequence(&config, &new).is_some()
                 {
                     return Err(format!(
-                        "validation: {name:?} is taken or not letters, digits, - and _"
+                        "validation: {new:?} is taken or not letters, digits, - and _"
                     )
                     .into());
                 }
-                let Some(Action::PromptSequence(steps)) = prompt_sequence_action(ui, path, None)?
-                else {
-                    return Ok(());
+                config.sequences[index].0 = new.clone();
+                let rename = |m: &mut Mapping| {
+                    if m.action == Action::SavedSequence(name.clone()) {
+                        m.action = Action::SavedSequence(new.clone());
+                    }
                 };
-                config.sequences.push((name, steps));
-                return mappings::save_config(path, &config).map_err(stage("file I/O"));
+                config.mappings.iter_mut().for_each(rename);
+                config
+                    .profiles
+                    .iter_mut()
+                    .flat_map(|p| p.mappings.iter_mut())
+                    .for_each(rename);
+                mappings::save_config(path, &config).map_err(stage("file I/O"))
             }
-            let name = config.sequences[index].0.clone();
-            match choose(
-                ui,
-                &format!("Saved sequence {name}"),
-                &options(&["Edit", "Rename", "Delete", "Back"]),
-            )? {
-                Some(0) => {
-                    let steps = Action::PromptSequence(config.sequences[index].1.clone());
-                    if let Some(Action::PromptSequence(steps)) =
-                        prompt_sequence_action(ui, path, Some(&steps))?
-                    {
-                        config.sequences[index].1 = steps;
-                        mappings::save_config(path, &config).map_err(stage("file I/O"))?;
-                    }
-                    Ok(())
+            Some(2) => {
+                let used = users(&config, &name);
+                if !used.is_empty() {
+                    return Err(format!("validation: sequence {name} is used by {}; map those to something else first", used.join(", ")).into());
                 }
-                Some(1) => {
-                    let Some(new) = text_entry(ui, "New name", &name)? else {
-                        return Ok(());
-                    };
-                    if !mappings::simple_name(&new)
-                        || mappings::saved_sequence(&config, &new).is_some()
-                    {
-                        return Err(format!(
-                            "validation: {new:?} is taken or not letters, digits, - and _"
-                        )
-                        .into());
-                    }
-                    config.sequences[index].0 = new.clone();
-                    let rename = |m: &mut Mapping| {
-                        if m.action == Action::SavedSequence(name.clone()) {
-                            m.action = Action::SavedSequence(new.clone());
-                        }
-                    };
-                    config.mappings.iter_mut().for_each(rename);
-                    config
-                        .profiles
-                        .iter_mut()
-                        .flat_map(|p| p.mappings.iter_mut())
-                        .for_each(rename);
-                    mappings::save_config(path, &config).map_err(stage("file I/O"))
+                if choose(
+                    ui,
+                    &format!("Delete sequence {name}? No pad uses it."),
+                    &options(&["Cancel", "Delete"]),
+                )? == Some(1)
+                {
+                    config.sequences.remove(index);
+                    mappings::save_config(path, &config).map_err(stage("file I/O"))?;
                 }
-                Some(2) => {
-                    let used = users(&config, &name);
-                    if !used.is_empty() {
-                        return Err(format!("validation: sequence {name} is used by {}; map those to something else first", used.join(", ")).into());
-                    }
-                    if choose(
-                        ui,
-                        &format!("Delete sequence {name}? No pad uses it."),
-                        &options(&["Cancel", "Delete"]),
-                    )? == Some(1)
-                    {
-                        config.sequences.remove(index);
-                        mappings::save_config(path, &config).map_err(stage("file I/O"))?;
-                    }
-                    Ok(())
-                }
-                _ => Ok(()),
+                Ok(())
             }
-        })();
-        if let Err(error) = result {
-            not_saved(ui, &error)?;
+            _ => Ok(()),
         }
+    })();
+    if let Err(error) = result {
+        not_saved(ui, &error)?;
     }
+    Ok(())
 }
 
 /// The prompt-sequence editor (v7 ticket 20): add step n+1 (a saved prompt or a new one),
@@ -8810,6 +9209,30 @@ pub fn daemon(path: &Path, current: Vec<Mapping>) -> Result<()> {
 /// A tab row that opens a Settings row (v7.7 ticket 150): `SETTING + n` runs [`setting`]
 /// `n`, so the session's dispatch stays one match on a number.
 const SETTING: usize = 100;
+/// v7.7 ticket 152: tab rows that open one row of an old list, `BASE + n` each; see
+/// [`tab_row`]. A list shows at most `ROWS - 3` items as rows.
+const ROWS: usize = 1000;
+const AGENT: usize = ROWS;
+const PROMPT: usize = 2 * ROWS;
+const SEQUENCE: usize = 3 * ROWS;
+const PROFILE: usize = 4 * ROWS;
+const TUNING: usize = 5 * ROWS;
+/// Opens tab row `id` (`SETTING..`): one Settings row, or one row of the Agents, Prompts,
+/// Saved prompt sequences, App profiles or Xbox tuning lists, as those lists do.
+fn tab_row(ui: &mut impl Ui, path: &Path, id: usize) -> Result<()> {
+    let row = id % ROWS;
+    match id / ROWS * ROWS {
+        0 => setting(ui, path, id - SETTING),
+        AGENT => agent_choice(ui, path, row),
+        PROMPT => prompt_choice(ui, path, row),
+        SEQUENCE => sequence_choice(ui, path, row),
+        PROFILE => profile_choice(ui, path, row),
+        _ => match tuning_choice(ui, path, row) {
+            Err(error) => not_saved(ui, &error),
+            ok => ok,
+        },
+    }
+}
 /// A tab's rows: a heading has no target; a row has (command id, what it does).
 type TabRows = &'static [(&'static str, Option<(usize, &'static str)>)];
 /// The ten tabs in the user's order (v7.7 spec, The frame). Every old command and every old
@@ -9048,34 +9471,20 @@ fn next_row(opens: &[bool], from: usize, step: usize) -> Option<usize> {
 fn command_menu(ui: &mut Terminal) -> Result<Option<usize>> {
     loop {
         let running = ui.wanted_run;
-        let rows = tab_rows(ui.tab, running);
-        let (targets, agents) = if ui.tab == 0 {
-            let targets = (ui.live_panes(80, usize::MAX).into_iter())
-                .flat_map(|(_, entries)| entries.into_iter().map(|(_, open)| open))
-                .collect::<Vec<_>>();
-            (targets, ui.agent_rows())
+        let targets = (ui.tab_panes(ui.tab, 80, usize::MAX).into_iter())
+            .flat_map(|(_, entries)| entries.into_iter().map(|(_, open)| open))
+            .collect::<Vec<_>>();
+        let agents = if ui.tab == 0 {
+            ui.agent_rows()
         } else {
-            let targets = rows.iter().map(|(_, t)| t.map(|(id, _)| Open::Command(id)));
-            (targets.collect(), Vec::new())
+            Vec::new()
         };
         let opens = targets.iter().map(Option::is_some).collect::<Vec<_>>();
         ui.menu = ui.menu.min(targets.len() - 1);
         if !opens[ui.menu] {
             ui.menu = next_row(&opens, ui.menu, 1).unwrap_or(ui.menu);
         }
-        let text = match rows.get(ui.menu).filter(|_| ui.tab != 0) {
-            Some((name, Some((16, _)))) => format!(
-                "{name}\n\n{}\n\nEnter: open",
-                if ui.start_flow_enabled {
-                    "On. Enter to turn off automatic Flow startup on the next launch."
-                } else {
-                    "Off. Enter to turn on automatic Flow startup on the next launch."
-                }
-            ),
-            Some((name, Some((_, about)))) => format!("{name}\n\n{about}\n\nEnter: open"),
-            Some((name, None)) => (*name).to_owned(),
-            None => String::new(),
-        };
+        let text = String::new();
         ui.draw(&text)?;
         let tab = match ui.key()? {
             Some(Key::Tab | Key::Right) => (ui.tab + 1) % TABS.len(),
@@ -9113,6 +9522,7 @@ fn command_menu(ui: &mut Terminal) -> Result<Option<usize>> {
         };
         ui.tab = tab;
         ui.menu = 0;
+        ui.read_view(None); // 7 Xbox reads its rows when opened
     }
 }
 
@@ -9173,6 +9583,7 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
     }
     loop {
         ui.run_mappings = ui.context_mappings(&current);
+        ui.read_view(None); // what a command changed shows at once (v7.7 ticket 152)
         ui.at_menu = true;
         let Some(command) = command_menu(&mut ui)? else {
             return Ok(());
@@ -9330,6 +9741,10 @@ Running/paused mode is retained; held keys and toggles start inactive.",
             })(),
             12 => ui.start_flow(),
             14 => ui.rename_program(),
+            // v7.7 ticket 152: Devices' Xbox rows. Picking a program is a transition (held
+            // keys released); nothing is written to the controller.
+            19 => ui.pick_xbox_program(),
+            20 => ui.menu_fires(false, |ui| rename_xbox_program(ui, path)),
             15 => (|| {
                 if !reset_confirmation(&mut ui)? {
                     return Ok(());
@@ -9354,7 +9769,7 @@ Running/paused mode is retained; held keys and toggles start inactive.",
             SETTING.. => (|| {
                 // v7 ticket 144: mapped controls fire in Settings, as in /configure; v7.7
                 // ticket 150: each Settings row is a tab row of its own.
-                let shown = ui.menu_fires(false, |ui| setting(ui, path, command - SETTING));
+                let shown = ui.menu_fires(false, |ui| tab_row(ui, path, command));
                 // A preset (or anything else in Settings) may have replaced the mappings:
                 // pick them up, so resuming is a transition, never a stale set.
                 let config = mappings::load_config(path)?;
@@ -9367,7 +9782,10 @@ Running/paused mode is retained; held keys and toggles start inactive.",
         let result = result.and_then(|()| {
             if ui.context_verified
                 && was_running
-                && matches!(command, 0 | 6 | 7 | 8 | 9 | 10 | 14 | 17 | SETTING..)
+                && matches!(
+                    command,
+                    0 | 6 | 7 | 8 | 9 | 10 | 14 | 17 | 19 | 20 | SETTING..
+                )
             {
                 ui.run_mode(&ui.context_mappings(&current), false)?;
             } else if refresh_idle_after_menu(command, was_running, ui.context_verified) {
@@ -10814,36 +11232,142 @@ mod tests {
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
-    /// v7.7 ticket 150: with the keyboard alone (a number key, Down, Enter) the ten tabs reach
-    /// every old command id once and every old Settings row (Settings' Flow switch, row 1, is
-    /// command 16); Settings itself (18) is gone because its rows are; Resume reads Pause
-    /// while running.
+    /// v7.7 tickets 150 and 152: with the keyboard alone (a number key, Down, Enter) the tabs
+    /// reach every old command and every old Settings row: Settings' Flow switch is command
+    /// 16; Xbox tuning and App profiles are rows of 7 Xbox and 6 Apps & profiles; the Agents
+    /// list (17) is 3 Agents' rows; `/pause` is Live's one Pause / Resume button. Devices
+    /// adds the Xbox's own program rows (19, 20). Resume reads Pause while running.
     #[test]
     fn a_walk_of_the_tabs_opens_every_old_command_and_settings_row() {
         let (dir, mut ui, _ran, _) = configure_session("tab-walk");
+        ui.at_menu = true;
         let mut ids = Vec::new();
-        for (tab, (label, rows)) in TABS.iter().enumerate() {
+        for (tab, (label, _)) in TABS.iter().enumerate() {
             let digit = label.as_bytes()[0];
             assert_eq!(usize::from(digit - b'0'), (tab + 1) % 10, "{label}");
-            for row in 0..rows.iter().filter(|r| r.1.is_some()).count() {
+            ui.tab = tab;
+            ui.read_view(None);
+            let opens = (ui.tab_panes(tab, 80, usize::MAX).into_iter())
+                .flat_map(|(_, entries)| entries)
+                .filter(|(_, open)| open.is_some())
+                .count();
+            for row in 0..opens {
                 let mut steps = vec![Step::Key(Key::Character(digit))];
                 steps.extend((0..row).map(|_| Step::Key(Key::Down)));
-                steps.push(Step::Key(Key::Enter));
+                steps.extend([Step::Key(Key::Enter), Step::Key(Key::Escape)]);
                 ui.script = Some(Play {
                     steps: steps.into(),
                     ..Play::default()
                 });
-                ids.push(command_menu(&mut ui).unwrap().unwrap());
-                assert!(ui.script.take().unwrap().steps.is_empty());
+                // Live's view switch is handled in place; Esc then leaves.
+                if let Some(id) = command_menu(&mut ui).unwrap() {
+                    ids.push(id);
+                }
+                ui.script = None;
             }
         }
         ids.sort();
-        // `/pause` (3) is Live's one Pause / Resume button since ticket 151.
-        let commands = (0..=17).filter(|id| ![3, 4, 13].contains(id));
-        let settings = (0..=11).filter(|row| *row != 1).map(|row| SETTING + row);
-        assert_eq!(ids, commands.chain(settings).collect::<Vec<_>>());
+        ids.dedup();
+        let commands = [0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 19, 20];
+        let settings = [0, 2, 3, 4, 5, 6, 7, 10, 11].map(|row| SETTING + row);
+        // Each agent, then Add agent, the two hooks rows and Status lights; no prompts,
+        // sequences or profiles, so each of those lists is its "New …" row.
+        let agents = mappings::load_config(&dir.join("mappings.tsv"))
+            .unwrap()
+            .agents
+            .len();
+        let lists = (0..agents + 4)
+            .map(|n| AGENT + n)
+            .chain([PROMPT, SEQUENCE])
+            .chain((0..3).map(|n| PROFILE + n))
+            .chain((0..12).map(|n| TUNING + n));
+        let mut expected = commands
+            .into_iter()
+            .chain(settings)
+            .chain(lists)
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(ids, expected);
         assert_eq!(tab_rows(0, true)[0].0, "❚❚ Pause");
         assert_eq!(tab_rows(0, false)[0].0, "▶ Resume");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 152: empty lists say what to do; each tab has at most one primary row and
+    /// tabs 1–6 exactly one; the reset row is red under a red rule; `/prog-select (Xbox)`
+    /// switches the program and releases a held key; `/program-name (Xbox)` renames with no
+    /// device question.
+    #[test]
+    fn tab_contents_empty_rows_primary_danger_and_xbox_programs() {
+        let (dir, mut ui, _ran, [.., shift]) = configure_session("tab-contents");
+        let path = dir.join("mappings.tsv");
+        let mut config = mappings::load_config(&path).unwrap();
+        config.agents.clear();
+        mappings::save_config(&path, &config).unwrap();
+        ui.at_menu = true;
+        ui.read_view(None);
+        let rows = |ui: &Terminal, tab| {
+            (ui.tab_panes(tab, 80, usize::MAX).into_iter())
+                .flat_map(|(_, entries)| entries.into_iter().flat_map(|(lines, _)| lines))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(rows(&ui, 2).contains("No agents yet · Enter: Add agent"));
+        assert!(rows(&ui, 3).contains("No prompts yet · Enter: New prompt"));
+        assert!(rows(&ui, 3).contains("No sequences yet · Enter: New sequence"));
+        assert!(rows(&ui, 5).contains("No profiles yet · Enter: New profile"));
+        for tab in 0..TABS.len() {
+            ui.tab = tab;
+            let screen = ui.screen("");
+            let primaries = screen.panes.iter().filter(|p| p.primary.is_some()).count();
+            assert_eq!(primaries, usize::from(tab <= 5), "tab {tab}");
+        }
+        ui.tab = 1;
+        let frame = ui.screen("").render(100, 30, true);
+        assert!(frame.contains("━━ Start over (asks first, keeps a backup)"));
+        assert!(
+            frame.contains("\x1b[38;2;247;118;142m  ⚠ Reset settings"),
+            "the reset row is red:\n{frame}"
+        );
+
+        // `/prog-select (Xbox)`: Program 2, with Shift held before. A command's screen is
+        // drawn with the menu closed, as the session does.
+        ui.at_menu = false;
+        ui.handle_events(vec![Event::Press(shift)]).unwrap();
+        ui.script = Some(Play {
+            steps: VecDeque::from([Step::Key(Key::Down), Step::Key(Key::Enter)]),
+            ..Play::default()
+        });
+        ui.pick_xbox_program().unwrap();
+        assert_eq!(ui.xbox_program, 2);
+        let recorded = &ui.output.as_ref().unwrap().recorded;
+        assert!(
+            recorded
+                .iter()
+                .any(|(key, down)| *key == evdev::KeyCode::KEY_LEFTSHIFT && !down),
+            "the switch released the held key"
+        );
+        let play = ui.script.take().unwrap();
+        assert!(
+            play.screens
+                .iter()
+                .any(|s| s.contains("/prog-select (Xbox)"))
+        );
+
+        // `/program-name (Xbox)`: straight to the program list.
+        let mut keys = vec![Key::Enter];
+        keys.extend(typed("Browser"));
+        keys.push(Key::Enter);
+        let mut script = Script {
+            keys: keys.into(),
+            ..Default::default()
+        };
+        rename_xbox_program(&mut script, &path).unwrap();
+        assert!(!script.screens.iter().any(|s| s.contains("which device")));
+        assert_eq!(
+            mappings::xbox_program_name(&mappings::load_config(&path).unwrap(), 1),
+            "Browser"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

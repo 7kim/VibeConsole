@@ -20,11 +20,10 @@ binary = Path(__file__).resolve().parents[1] / "target/debug/vibeconsole"
 # are skipped). The session starts on 1 Live with Run/Pause selected.
 TABS = {
     b"1": ["▶ Resume", "Release all", "Quit"],
-    b"2": ["/configure", "/list", "Favourites", "Presets", "Reset settings"],
-    b"3": ["Agents", "Status light sources", "Status light patterns", "Default agent directory"],
-    b"5": ["/prog-select", "/program-name", "/feedback-idle", "/feedback-check", "/detect", "/get", "MIDI device"],
-    b"6": ["App profiles"],
-    b"7": ["Xbox tuning"],
+    b"2": ["/configure", "/list", "Favourites", "Presets", "⚠ Reset settings"],
+    # v7.7 ticket 152: 3 Agents, 4 Prompts, 6 and 7 list the config's own items; no scenario opens them.
+    b"5": ["/prog-select", "/program-name", "/feedback-idle", "/feedback-check", "/prog-select (Xbox)",
+           "/program-name (Xbox)", "/detect", "/get", "MIDI device"],
     b"8": ["Start at login", "Start Wispr Flow with VibeConsole", "Start or repair Wispr Flow", "Startup variables", "User variables"],
 }
 # A connected Xbox controller (or any input device) must not reach a scenario: it could run
@@ -33,7 +32,8 @@ HIDE_INPUT = ["bwrap", "--dev-bind", "/", "/", "--tmpfs", "/dev/input"] if shuti
 if not HIDE_INPUT:
     print("bwrap not found: a connected controller can reach these scenarios; unplug it first")
 # The names scenarios use for Live's buttons (v7.7 ticket 151 relabelled them).
-LIVE = {"Run": "▶ Resume", "Pause": "❚❚ Pause", "/release-all": "Release all", "/quit": "Quit"}
+LIVE = {"Run": "▶ Resume", "Pause": "❚❚ Pause", "/release-all": "Release all", "/quit": "Quit",
+        "Reset settings": "⚠ Reset settings"}
 RESUME, PAUSE = "> ▶ Resume".encode(), "> ❚❚ Pause".encode()
 # The command screen's hint line ("Tab ←→ 1–0: tabs" or "Tab 1–0 · …"): back at the tabs.
 MENU = "1–0".encode()
@@ -147,13 +147,13 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
                 go(master, "Run", "Reset settings")
                 read_until(master, b"Type reset")
                 os.write(master, b"ReSeT\r")
-                read_until(master, b"> Reset settings")
+                read_until(master, "> ⚠ Reset settings".encode())
                 assert not list(config.glob("mappings.tsv.bak-*"))
                 go(master, "Reset settings", "/quit")
             elif ending == "flow_setting":
                 assert b"Wispr Flow not installed" in initial_screen
                 go(master, "Run", "Start Wispr Flow with VibeConsole")
-                read_until(master, b"Off. Enter to turn on")
+                read_until(master, "Start Wispr Flow with VibeConsole · Off".encode())
                 assert b"start-flow\toff\n" in path.read_bytes()
                 go(master, "Start Wispr Flow with VibeConsole", "/quit")
             elif ending == "idle_no_device":
