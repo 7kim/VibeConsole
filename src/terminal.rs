@@ -364,6 +364,9 @@ struct Terminal {
     /// context file and transcript; read in the status refresh; transcripts by bytes read.
     contexts: BTreeMap<String, (Option<u8>, Option<u64>, Option<u64>)>,
     token_cache: BTreeMap<PathBuf, (u64, u64)>,
+    /// v7.7 ticket 163: what Undo would undo (`14:02 · Bank A Pad 5 → Orca IDE`), read on
+    /// 2 Mappings.
+    undo_row: String,
     /// v7 ticket 86: each device's switch and patterns; None while Status lights is off.
     device_lights: Option<crate::status::DevicePatterns>,
     /// Agents' status-light settings, in `agent_states` order; None while Status lights is Off.
@@ -989,6 +992,7 @@ impl Terminal {
             focus: false,
             contexts: BTreeMap::new(),
             token_cache: BTreeMap::new(),
+            undo_row: String::new(),
             device_lights: None,
             light_agents: None,
             light_sessions: Vec::new(),
@@ -1501,6 +1505,12 @@ impl Terminal {
         if self.tab == 7 {
             self.read_problems();
         }
+        if self.tab == 1 {
+            self.undo_row = match last_change(&self.path, &config) {
+                Some(change) => change,
+                None => "nothing to undo yet".into(),
+            };
+        }
         if self.tab == 2 {
             self.skills_installed =
                 home_dir().is_some_and(|h| crate::runtime::skills_installed(&h));
@@ -1553,6 +1563,12 @@ impl Terminal {
                         Some(SETTING + 10),
                     ),
                     one("Presets".into(), Some(SETTING + 11)),
+                    head("History · your last 10 saves"),
+                    one(format!("Undo last change · {}", self.undo_row), Some(23)),
+                    one(
+                        "History… · put back one of the last 10 saves".into(),
+                        Some(24),
+                    ),
                     (vec![String::new()], None),
                     (
                         vec!["━━ Start over (asks first, keeps a backup)".into()],
@@ -5417,6 +5433,66 @@ enum Phase {
     Failed,
 }
 
+/// `HH:MM` local time for seconds since 1970 (v7.7 ticket 163).
+fn clock(secs: u64) -> String {
+    // SAFETY: localtime_r fills the zeroed struct from a valid time_t.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let time = secs as libc::time_t;
+    unsafe { libc::localtime_r(&time, &mut tm) };
+    format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
+}
+/// v7.7 ticket 163: the newest history entry against `current`: `14:02 · <what changed>`.
+fn last_change(path: &Path, current: &mappings::Config) -> Option<String> {
+    let (file, secs) = mappings::history(path).into_iter().next()?;
+    let older = mappings::load_config(&file).ok()?;
+    Some(format!(
+        "{} · {}",
+        clock(secs),
+        mappings::change_summary(&older, current)
+    ))
+}
+/// v7.7 ticket 163: Undo: put back the file the last save replaced (atomically; the undo
+/// itself lands in history, so Undo again redoes it).
+fn undo_last(path: &Path) -> Result<String> {
+    let current = mappings::load_config(path)?;
+    let change = last_change(path, &current).ok_or("history: nothing to undo yet")?;
+    let (file, _) = mappings::history(path).remove(0);
+    mappings::restore(path, &file)?;
+    Ok(format!("Undone: {change}. Undo again to redo it."))
+}
+/// v7.7 ticket 163: History: the last ten saves, each `HH:MM · what that save changed`;
+/// Enter puts one back (which can be undone too).
+fn history_menu(ui: &mut impl Ui, path: &Path) -> Result<Option<String>> {
+    let entries = mappings::history(path);
+    if entries.is_empty() {
+        choose(ui, "History: no saves yet.", &options(&["Back"]))?;
+        return Ok(None);
+    }
+    let mut newer = mappings::load_config(path)?;
+    let mut rows = Vec::new();
+    for (file, secs) in &entries {
+        let older = mappings::load_config(file).unwrap_or_default();
+        rows.push(format!(
+            "{} · {}",
+            clock(*secs),
+            mappings::change_summary(&older, &newer)
+        ));
+        newer = older;
+    }
+    let Some(index) = choose(
+        ui,
+        "History · your last 10 saves, newest first · Enter puts the setup back to before that save",
+        &rows,
+    )?
+    else {
+        return Ok(None);
+    };
+    mappings::restore(path, &entries[index].0)?;
+    Ok(Some(format!(
+        "Put back: before {}. Undo to go forward again.",
+        rows[index]
+    )))
+}
 /// The home folder, when HOME is an absolute path. In tests a temporary folder: no test may
 /// write into the real home (v7.7 ticket 158).
 fn home_dir() -> Option<PathBuf> {
@@ -10764,6 +10840,23 @@ Running/paused mode is retained; held keys and toggles start inactive.",
             // v7.7 ticket 152: Devices' Xbox rows. Picking a program is a transition (held
             // keys released); nothing is written to the controller.
             19 => ui.pick_xbox_program(),
+            // v7.7 ticket 163: a restore is a mapping change: reapplied at once below, held
+            // keys released by that transition.
+            23 | 24 => (|| {
+                let note = ui.menu_fires(false, |ui| match command {
+                    23 => undo_last(path).map(Some),
+                    _ => history_menu(ui, path),
+                });
+                let config = mappings::load_config(path)?;
+                current = config.mappings;
+                ui.start_flow_enabled = config.start_flow;
+                match note {
+                    Ok(Some(note)) => ui.notice = note,
+                    Ok(None) => {}
+                    Err(error) => ui.notice = error.to_string(),
+                }
+                Ok(())
+            })(),
             20 => ui.menu_fires(false, |ui| rename_xbox_program(ui, path)),
             15 => (|| {
                 if !reset_confirmation(&mut ui)? {
@@ -10804,7 +10897,7 @@ Running/paused mode is retained; held keys and toggles start inactive.",
                 && was_running
                 && matches!(
                     command,
-                    0 | 6 | 7 | 8 | 9 | 10 | 14 | 17 | 19 | 20 | SETTING..
+                    0 | 6 | 7 | 8 | 9 | 10 | 14 | 17 | 19 | 20 | 23 | 24 | SETTING..
                 )
             {
                 ui.run_mode(&ui.context_mappings(&current), false)?;
@@ -12289,7 +12382,9 @@ mod tests {
         }
         ids.sort();
         ids.dedup();
-        let commands = [0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 19, 20, 21];
+        let commands = [
+            0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 19, 20, 21, 23, 24,
+        ];
         let settings = [0, 2, 3, 4, 5, 6, 7, 10, 11].map(|row| SETTING + row);
         // Each agent, then Add agent, the two hooks rows and Status lights; no prompts,
         // sequences or profiles, so each of those lists is its "New …" row.

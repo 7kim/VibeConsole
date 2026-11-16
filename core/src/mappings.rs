@@ -2961,6 +2961,81 @@ pub fn serialize_config(config: &Config) -> Result<String> {
     Ok(contents)
 }
 
+/// v7.7 ticket 163: `history/` beside the config: the files saves replaced, at most ten.
+pub fn history_dir(path: &Path) -> PathBuf {
+    path.with_file_name("history")
+}
+/// How many replaced files history keeps.
+pub const HISTORY: usize = 10;
+fn keep_history(path: &Path, new: &[u8]) -> Result<()> {
+    let old = fs::read(path)?;
+    if old == new {
+        return Ok(());
+    }
+    let dir = history_dir(path);
+    fs::create_dir_all(&dir)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dir.join(format!("{stamp:020}.tsv")))?
+        .write_all(&old)?;
+    let entries = history(path);
+    for (old, _) in entries.iter().skip(HISTORY) {
+        fs::remove_file(old)?;
+    }
+    Ok(())
+}
+/// v7.7 ticket 163: history, newest first: (file, seconds since 1970 when it was replaced).
+pub fn history(path: &Path) -> Vec<(PathBuf, u64)> {
+    let mut entries = fs::read_dir(history_dir(path))
+        .map(|dir| {
+            dir.filter_map(|e| e.ok())
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    let nanos = name.strip_suffix(".tsv")?.parse::<u128>().ok()?;
+                    Some((e.path(), (nanos / 1_000_000_000) as u64))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    entries
+}
+/// v7.7 ticket 163: put a history file back: validated in full like a load, then saved
+/// atomically (so the restore lands in history and can itself be undone).
+pub fn restore(path: &Path, from: &Path) -> Result<()> {
+    let text = fs::read_to_string(from).map_err(|e| format!("history: {e}"))?;
+    let config = parse_config(&text).map_err(|e| format!("history: {e}; nothing restored"))?;
+    save_config(path, &config)
+}
+/// v7.7 ticket 163: what changed from `older` to `newer`, in control names:
+/// `Bank A Pad 5 → Orca IDE`, `+2 more`, or `settings` when no mapping changed.
+pub fn change_summary(older: &Config, newer: &Config) -> String {
+    let key = |m: &Mapping| (m.context, m.control);
+    let mut changes = newer
+        .mappings
+        .iter()
+        .filter(|m| !older.mappings.contains(m))
+        .map(|m| format!("{} → {}", m.name(None), m.action_label()))
+        .collect::<Vec<_>>();
+    changes.extend(
+        older
+            .mappings
+            .iter()
+            .filter(|m| !newer.mappings.iter().any(|n| key(n) == key(m)))
+            .map(|m| format!("{} → removed", m.name(None))),
+    );
+    match changes.len() {
+        0 => "settings".into(),
+        1 => changes.remove(0),
+        n => format!("{} +{} more", changes[0], n - 1),
+    }
+}
+
 pub fn save_config(path: &Path, config: &Config) -> Result<()> {
     let contents = serialize_config(config)?;
     fs::create_dir_all(path.parent().ok_or("configuration path has no parent")?)?;
@@ -2981,6 +3056,9 @@ pub fn save_config(path: &Path, config: &Config) -> Result<()> {
         file.write_all(contents.as_bytes())?;
         file.sync_all()?;
         drop(file);
+        // v7.7 ticket 163: the file this save replaces goes to history first; history is
+        // best effort and never blocks a save.
+        let _ = keep_history(path, contents.as_bytes());
         fs::rename(&temporary, path)?;
         Ok(())
     })();
@@ -2992,6 +3070,66 @@ pub fn save_config(path: &Path, config: &Config) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// v7.7 ticket 163: every save keeps the file it replaced; restoring the newest puts the
+    /// previous save back byte for byte and is itself in history (undo the undo); a file
+    /// that doesn't load is refused and changes nothing; ten are kept; the summary names the
+    /// control and its new action.
+    #[test]
+    fn history_undo_restores_byte_for_byte_and_keeps_ten() {
+        use super::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-history-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let pad = Control::from_note(10, 40).unwrap();
+        let mut config = Config::default();
+        save_config(&path, &config).unwrap();
+        assert!(history(&path).is_empty(), "nothing replaced yet");
+        let before = fs::read(&path).unwrap();
+        let mut mapping = Mapping::new(pad, "Ctrl+T", "tap").unwrap();
+        mapping.label = "Bank A Pad 5".into();
+        config.mappings.push(mapping);
+        save_config(&path, &config).unwrap();
+        let after = fs::read(&path).unwrap();
+        let (newest, _) = history(&path).remove(0);
+        assert_eq!(fs::read(&newest).unwrap(), before);
+        let older = load_config(&newest).unwrap();
+        assert_eq!(
+            change_summary(&older, &config),
+            format!("{} → Ctrl+T", config.mappings[0].name(None))
+        );
+        assert_eq!(
+            change_summary(&config, &older),
+            format!("{} → removed", config.mappings[0].name(None))
+        );
+
+        restore(&path, &newest).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), before, "undo: byte for byte");
+        let (redo, _) = history(&path).remove(0);
+        restore(&path, &redo).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            after,
+            "the undo was itself undoable"
+        );
+
+        let bad = dir.join("history/00000000000000000001.tsv");
+        fs::write(&bad, "not a config").unwrap();
+        assert!(
+            restore(&path, &bad)
+                .unwrap_err()
+                .to_string()
+                .contains("nothing restored")
+        );
+        assert_eq!(fs::read(&path).unwrap(), after);
+        for n in 0..12 {
+            config.tuning.dead_zone = n;
+            save_config(&path, &config).unwrap();
+        }
+        assert_eq!(history(&path).len(), HISTORY);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn agents_and_prompt_mapping_round_trip_while_old_config_migrates() {
         use super::*;
