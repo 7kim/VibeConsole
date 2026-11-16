@@ -189,6 +189,128 @@ pub fn login(request: Login) -> Result<bool> {
         }
     }
 }
+/// v7.7 ticket 157: a problem `doctor` reports, with its fix.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Problem {
+    /// What it is about (`uinput`, `prerequisite`, `window extension`).
+    pub stage: &'static str,
+    pub message: String,
+    pub fix: Fix,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub enum Fix {
+    /// A fixed program with fixed arguments (never a shell line), run after `ask` is
+    /// answered yes.
+    Run { args: Vec<String>, ask: String },
+    /// What to run yourself.
+    Show(String),
+}
+/// What a missing prerequisite's Fedora package is called.
+const PACKAGES: [(&str, &str); 5] = [
+    ("gio", "glib2"),
+    ("wpctl", "wireplumber"),
+    ("systemctl", "systemd"),
+    ("tmux", "tmux"),
+    ("wl-copy", "wl-clipboard"),
+];
+/// v7.7 ticket 157: doctor's problems that have a fix, from what was probed: `/dev/uinput`
+/// (`None` writable, else whether it exists), the prerequisites on PATH, the window
+/// extension answering, and the user's name (an identifier, never a shell word).
+pub fn problems(
+    uinput: Option<bool>,
+    on_path: impl Fn(&str) -> bool,
+    extension: bool,
+    user: &str,
+) -> Vec<Problem> {
+    let mut found = Vec::new();
+    let named = !user.is_empty()
+        && user
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
+    match uinput {
+        None => {}
+        Some(false) => found.push(Problem {
+            stage: "uinput",
+            message: "uinput missing: no /dev/uinput, so no keys can be sent".into(),
+            fix: Fix::Run {
+                args: ["pkexec", "modprobe", "uinput"].map(String::from).to_vec(),
+                ask: "Load the uinput module? It asks for your password (pkexec modprobe uinput).".into(),
+            },
+        }),
+        Some(true) if named => found.push(Problem {
+            stage: "uinput",
+            message: "uinput not writable: VibeConsole can't send keys".into(),
+            fix: Fix::Run {
+                args: ["pkexec", "setfacl", "-m", &format!("u:{user}:rw"), "/dev/uinput"]
+                    .map(String::from)
+                    .to_vec(),
+                ask: format!(
+                    "Let {user} write /dev/uinput? It asks for your password (pkexec setfacl) and lasts until the next reboot; the README has the permanent rule."
+                ),
+            },
+        }),
+        Some(true) => found.push(Problem {
+            stage: "uinput",
+            message: "uinput not writable: VibeConsole can't send keys".into(),
+            fix: Fix::Show("See the README's permission commands for /dev/uinput.".into()),
+        }),
+    }
+    for (program, package) in PACKAGES {
+        if !on_path(program) {
+            found.push(Problem {
+                stage: "prerequisite",
+                message: format!("{program} missing"),
+                fix: Fix::Show(format!("Install it: sudo dnf install {package}")),
+            });
+        }
+    }
+    if !extension {
+        found.push(Problem {
+            stage: "window extension",
+            message: "Window extension off: launcher pads can't minimize or close windows".into(),
+            fix: Fix::Run {
+                args: ["gnome-extensions", "enable", EXTENSION_UUID]
+                    .map(String::from)
+                    .to_vec(),
+                ask: format!(
+                    "Turn on the window extension? (gnome-extensions enable {EXTENSION_UUID}; after vibeconsole install it needs one logout and login first)"
+                ),
+            },
+        });
+    }
+    found
+}
+/// `/dev/uinput` for [`problems`]: `None` when it opens for writing, else whether it exists.
+pub fn uinput_state() -> Option<bool> {
+    match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open("/dev/uinput")
+    {
+        Ok(_) => None,
+        Err(e) => Some(e.kind() != std::io::ErrorKind::NotFound),
+    }
+}
+/// Whether `program` is a file in a PATH folder (looked up, never run).
+pub fn on_path(program: &str) -> bool {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .any(|p| p.join(program).is_file())
+}
+/// The gdbus call that asks whether the window extension answers (run through a runner).
+pub const EXTENSION_PROBE: [&str; 10] = [
+    "gdbus",
+    "call",
+    "--session",
+    "--dest",
+    "org.freedesktop.DBus",
+    "--object-path",
+    "/org/freedesktop/DBus",
+    "--method",
+    "org.freedesktop.DBus.NameHasOwner",
+    "org.vibeconsole.Windows",
+];
+
 /// `doctor`'s login-service line (v7 ticket 01). Nothing in VibeConsole disables the unit
 /// on its own; `startup-disable` (e.g. a test guide's cleanup) does, so doctor says so.
 fn login_doctor(installed: bool, mut systemctl: impl FnMut(&[&str]) -> Result<()>) -> String {

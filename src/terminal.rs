@@ -324,6 +324,9 @@ struct Terminal {
     midi_used: bool,
     xbox_seen: bool,
     hint_line: String,
+    /// v7.7 ticket 157: doctor's problems with a fix, read on 8 System and every 30 s.
+    problems: Vec<crate::runtime::Problem>,
+    problems_at: Option<Instant>,
     /// v7 ticket 86: each device's switch and patterns; None while Status lights is off.
     device_lights: Option<crate::status::DevicePatterns>,
     /// Agents' status-light settings, in `agent_states` order; None while Status lights is Off.
@@ -520,6 +523,9 @@ impl Terminal {
         }
         if unplugged {
             tabs[4] += " !";
+        }
+        if !self.problems.is_empty() {
+            tabs[7] += &format!(" !{}", self.problems.len());
         }
         let mut screen = crate::screen::Screen {
             tabs,
@@ -924,6 +930,8 @@ impl Terminal {
             midi_used: false,
             xbox_seen: false,
             hint_line: String::new(),
+            problems: Vec::new(),
+            problems_at: None,
             device_lights: None,
             light_agents: None,
             light_sessions: Vec::new(),
@@ -1143,6 +1151,46 @@ impl Terminal {
         self.notice = format!("Went to {}.", row.name);
         Ok(())
     }
+    /// v7.7 ticket 157: doctor's problems, probed now (the extension through the runner).
+    fn read_problems(&mut self) {
+        let extension =
+            Ui::run(self, &crate::runtime::EXTENSION_PROBE).is_ok_and(|out| out.contains("true"));
+        let user = std::env::var("USER").unwrap_or_default();
+        self.problems = crate::runtime::problems(
+            crate::runtime::uinput_state(),
+            crate::runtime::on_path,
+            extension,
+            &user,
+        );
+        self.problems_at = Some(Instant::now());
+    }
+    /// v7.7 ticket 157: Enter on a problem: a fixed command asks first and runs through the
+    /// runner (one argument each, never a shell); a shown fix says what to run.
+    fn fix_problem(&mut self, index: usize) -> Result<()> {
+        use crate::runtime::Fix;
+        let Some(problem) = self.problems.get(index).cloned() else {
+            return Ok(());
+        };
+        match &problem.fix {
+            Fix::Run { args, ask } => {
+                let text = format!("{}\n\n{ask}", problem.message);
+                if choose(self, &text, &options(&["Cancel", "Fix"]))? == Some(1) {
+                    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+                    Ui::run(self, &args).map_err(|e| format!("{}: {e}", problem.stage))?;
+                    self.notice = format!("{}: fix run", problem.stage);
+                    self.read_problems();
+                }
+            }
+            Fix::Show(text) => {
+                choose(
+                    self,
+                    &format!("{}\n\n{text}", problem.message),
+                    &options(&["Back"]),
+                )?;
+            }
+        }
+        Ok(())
+    }
     /// v7.7 ticket 155: Find's matches for `query`: every row that opens something on every
     /// tab, as `Tab › row`, and every old name, as `old → tab`; a match has every word of the
     /// query (case ignored). Each is (label, tab, entry index in that tab).
@@ -1259,6 +1307,9 @@ impl Terminal {
             .unwrap_or_default();
         if self.tab == 6 {
             self.tuning_rows = tuning_items(self, &config.tuning);
+        }
+        if self.tab == 7 {
+            self.read_problems();
         }
         self.agent_cards = config.look.agent_cards;
         crate::screen::set_theme(&config.look.theme); // v7.7 ticket 154
@@ -1533,6 +1584,26 @@ impl Terminal {
                 )]
             }
             7 => vec![
+                (
+                    format!("Problems (from doctor) · {}", self.problems.len()),
+                    if self.problems.is_empty() {
+                        vec![(
+                            vec!["  No problems: doctor found nothing to fix".into()],
+                            None,
+                        )]
+                    } else {
+                        (self.problems.iter().enumerate())
+                            .map(|(index, problem)| {
+                                let fix = match problem.fix {
+                                    crate::runtime::Fix::Run { .. } => "Enter: fix (asks first)",
+                                    crate::runtime::Fix::Show(_) => "Enter: what to run",
+                                };
+                                let line = format!("! {} · {fix}", problem.message);
+                                (vec![line], Some(Open::Problem(index)))
+                            })
+                            .collect()
+                    },
+                ),
                 (
                     "System · VibeConsole itself: login, Wispr Flow, variables".into(),
                     vec![
@@ -1815,6 +1886,12 @@ impl Terminal {
             .as_ref()
             .is_some_and(|p| !p.connected().is_empty());
         self.hint_line = self.hints_for(&config);
+        if self
+            .problems_at
+            .is_none_or(|at| at.elapsed() >= Duration::from_secs(30))
+        {
+            self.read_problems();
+        }
         self.read_view(Some(config.clone()));
         self.agent_places = config
             .agents
@@ -4330,10 +4407,14 @@ impl Ui for Terminal {
     fn run(&mut self, args: &[&str]) -> Result<String> {
         // A scripted session never starts a real program: it records it (v7.7 ticket 151).
         #[cfg(test)]
-        if let Some(play) = &mut self.script {
+        {
+            let Some(play) = &mut self.script else {
+                return Err(format!("{}: not started in tests", args[0]).into());
+            };
             play.ran.push(args.join(" "));
             return Ok(String::new());
         }
+        #[cfg(not(test))]
         (crate::gamepad::run_program())(args)
     }
     fn light_rule(&self) -> bool {
@@ -4913,6 +4994,8 @@ enum Open {
     AgentsView,
     /// Pick theme `n` of `mappings::THEMES` (v7.7 ticket 154).
     Theme(usize),
+    /// Fix doctor problem `n` (v7.7 ticket 157).
+    Problem(usize),
     /// Show "What moved in 7.7" again (v7.7 ticket 155).
     WhatMoved,
 }
@@ -9800,6 +9883,14 @@ fn command_menu(ui: &mut Terminal) -> Result<Option<usize>> {
                             ui.notice = format!("config: {error}; nothing saved");
                         }
                     }
+                    Some(Open::Problem(index)) => {
+                        ui.at_menu = false;
+                        let fixed = ui.fix_problem(index);
+                        ui.at_menu = true;
+                        if let Err(error) = fixed {
+                            ui.notice = error.to_string();
+                        }
+                    }
                     Some(Open::WhatMoved) => {
                         ui.at_menu = false;
                         let picked = what_moved(ui);
@@ -11682,6 +11773,51 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7.7 ticket 157: two doctor problems show in System with the badge !2; Enter on one
+    /// asks first, then runs its fixed command through the runner, one argument each; a user
+    /// name that isn't an identifier is never put in a command.
+    #[test]
+    fn doctor_problems_show_in_system_and_fix_through_the_runner() {
+        use crate::runtime::{Fix, problems};
+        let found = problems(Some(true), |_| true, false, "tester");
+        assert_eq!(found.len(), 2, "{found:?}");
+        let Fix::Run { args, .. } = &found[0].fix else {
+            panic!("uinput is fixed by a command")
+        };
+        assert_eq!(
+            args,
+            &["pkexec", "setfacl", "-m", "u:tester:rw", "/dev/uinput"]
+        );
+        let odd = problems(Some(true), |p| p != "tmux", true, "x; rm -rf ~");
+        assert!(matches!(odd[0].fix, Fix::Show(_)), "never in a command");
+        assert_eq!(odd[1].message, "tmux missing");
+        assert!(problems(None, |_| true, true, "tester").is_empty());
+
+        let (dir, mut ui, _ran, _) = configure_session("problems");
+        ui.status_at = Instant::now() + Duration::from_secs(3600);
+        ui.problems = found;
+        ui.problems_at = Some(Instant::now());
+        assert_eq!(ui.screen("").tabs[7], "8 System !2");
+        ui.script = Some(Play {
+            steps: VecDeque::from([Step::Key(Key::Down), Step::Key(Key::Enter)]),
+            ..Play::default()
+        });
+        ui.fix_problem(0).unwrap();
+        let play = ui.script.take().unwrap();
+        assert!(
+            play.ran
+                .contains(&"pkexec setfacl -m u:tester:rw /dev/uinput".to_string()),
+            "{:?}",
+            play.ran
+        );
+        assert!(
+            play.screens
+                .iter()
+                .any(|s| s.contains("asks for your password"))
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// v7.7 ticket 156: the hint line names the controls mapped to each screen key on the
     /// device used last (Xbox A for open, Right stick press for select; Akai pads), and the
     /// keyboard key with "(keyboard)" when that device has none; badges come and go with
@@ -11853,9 +11989,14 @@ mod tests {
         ui.at_menu = true;
         ui.tab = 7;
         ui.read_view(None);
-        // System's five rows, then the themes: the sixth is Catppuccin Latte.
+        // The rows above the themes (problems, System's own), then the sixth theme: Latte.
+        let above = (ui.tab_panes(7, 80, usize::MAX).into_iter())
+            .flat_map(|(_, entries)| entries)
+            .filter(|(_, open)| open.is_some())
+            .take_while(|(_, open)| !matches!(open, Some(Open::Theme(_))))
+            .count();
         let mut steps = vec![Step::Key(Key::Character(b'8'))];
-        steps.extend((0..10).map(|_| Step::Key(Key::Down)));
+        steps.extend((0..above + 5).map(|_| Step::Key(Key::Down)));
         steps.extend([Step::Key(Key::Enter), Step::Key(Key::Escape)]);
         ui.script = Some(Play {
             steps: steps.into(),
