@@ -524,7 +524,7 @@ impl Terminal {
                     focused: false,
                     primary: None,
                 };
-                for (lines, open) in entries {
+                for (lines, _) in entries {
                     pane.rows.extend(lines);
                     if primary == Some(number) {
                         pane.primary = Some(pane.rows.len() - 1);
