@@ -6017,28 +6017,22 @@ fn on_off(state: Result<bool>) -> &'static str {
 fn login_row(ui: &mut impl Ui) -> String {
     use crate::runtime::Login;
     format!(
-        "Login service: start at login {}; start when this session closes {}",
-        on_off(ui.login(Login::Enabled)),
-        on_off(ui.login(Login::RunOnQuit))
+        "Login service: start at login {} (also back after you quit)",
+        on_off(ui.login(Login::Enabled))
     )
 }
 /// Settings -> Login service: start at login (startup-enable/disable), and start the service
 /// when this session closes (the session holds the controller until then).
+/// v7.7 ticket 153: one switch. Start at login On also brings VibeConsole back after Quit
+/// (see [`quit_login`]); the old "start when this session closes" switch is gone.
 fn login_menu(ui: &mut impl Ui) -> Result<()> {
     use crate::runtime::Login;
     let enabled = ui.login(Login::Enabled)?;
-    let on_quit = ui.login(Login::RunOnQuit)?;
-    let turn = |on: bool| if on { "Turn Off" } else { "Turn On" };
     let items = vec![
         format!(
-            "Start at login: {} ({})",
+            "Start at login: {} ({}) · also back after you quit; Quit until next login skips that",
             on_off(Ok(enabled)),
-            turn(enabled)
-        ),
-        format!(
-            "Start the service when this session closes: {} ({})",
-            on_off(Ok(on_quit)),
-            turn(on_quit)
+            if enabled { "Turn Off" } else { "Turn On" }
         ),
         "Back".to_string(),
     ];
@@ -6050,9 +6044,20 @@ fn login_menu(ui: &mut impl Ui) -> Result<()> {
                 Login::Enable
             })
             .map(drop),
-        Some(1) => ui.login(Login::SetRunOnQuit(!on_quit)).map(drop),
         _ => Ok(()),
     }
+}
+/// v7.7 ticket 153: what the login service does once this session has quit (held keys are
+/// already released and owned feedback restored by then). Quit starts it again when Start
+/// at login is On, or when this session paused it on opening (ticket 20); Quit until next
+/// login never does. A login service that can't be asked counts as Off: nothing is started
+/// on a guess.
+fn quit_login(ui: &mut impl Ui, until_next_login: bool) -> Result<()> {
+    use crate::runtime::Login;
+    let start = !until_next_login
+        && (ui.login(Login::Enabled).unwrap_or(false)
+            || ui.login(Login::RunOnQuit).unwrap_or(false));
+    ui.login(Login::SetRunOnQuit(start)).map(drop)
 }
 
 /// Ticket 16/17: a source's octave light, which says which agent or folder it is.
@@ -9261,6 +9266,13 @@ const TABS: [(&str, TabRows); 10] = [
                     "Release keys, attempt owned-feedback restoration, and restore the terminal.",
                 )),
             ),
+            (
+                "Quit until next login",
+                Some((
+                    21,
+                    "Quit; the login service stays stopped until you log in again.",
+                )),
+            ),
         ],
     ),
     (
@@ -9586,8 +9598,11 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
         ui.read_view(None); // what a command changed shows at once (v7.7 ticket 152)
         ui.at_menu = true;
         let Some(command) = command_menu(&mut ui)? else {
-            return Ok(());
+            return quit_login(&mut ui, false); // Esc quits like Quit
         };
+        if matches!(command, 11 | 21) {
+            return quit_login(&mut ui, command == 21);
+        }
         ui.at_menu = false;
         let was_running = ui.wanted_run;
         let result = match command {
@@ -11268,7 +11283,7 @@ mod tests {
         }
         ids.sort();
         ids.dedup();
-        let commands = [0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 19, 20];
+        let commands = [0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 19, 20, 21];
         let settings = [0, 2, 3, 4, 5, 6, 7, 10, 11].map(|row| SETTING + row);
         // Each agent, then Add agent, the two hooks rows and Status lights; no prompts,
         // sequences or profiles, so each of those lists is its "New …" row.
@@ -11532,13 +11547,14 @@ mod tests {
         );
         assert!(agents[5].1.is_none(), "an outside session opens nothing");
 
-        // Entries: Resume, Release all, Quit, View, (heading), asker, orca-claude, busy,
+        // Entries: Resume, Release all, Quit, Quit until next login, View, (heading), asker,
+        // orca-claude, busy,
         // (outside), idler, herdr-one, done. "done" is never entered: it would clear a real
         // status file.
         ui.menu = 0;
         ui.at_menu = true; // as the session does around `command_menu`
         let down = |n| (0..n).map(|_| Step::Key(Key::Down)).collect::<Vec<_>>();
-        let mut steps = down(4); // asker (the heading is skipped)
+        let mut steps = down(5); // asker (the heading is skipped)
         steps.push(Step::Key(Key::Enter));
         steps.extend(down(1)); // orca-claude
         steps.push(Step::Key(Key::Enter));
@@ -11579,7 +11595,7 @@ mod tests {
             last.contains("[Gallery]") && last.contains("┌─ asker "),
             "{last}"
         );
-        let cards = ui.live_panes(80, 4).remove(1).1; // entry 4 is asker's card now
+        let cards = ui.live_panes(80, 5).remove(1).1; // entry 5 is asker's card now
         assert!(
             cards[1].0[0].starts_with("╔═ > asker "),
             "selected: {:?}",
@@ -15785,8 +15801,10 @@ mod tests {
         assert!(quiet_stop(Err("Flow capture failed".into())).is_err());
     }
 
-    /// Ticket 21: Settings -> Login service toggles start-at-login and start-on-quit through
-    /// the injected runner; a failure is shown and nothing changes.
+    /// Ticket 21, v7.7 ticket 153: Settings -> Login service has one switch, Start at login,
+    /// through the injected runner; a failure is shown and nothing changes. Quit starts the
+    /// service again when it is On (or when this session paused it); Quit until next login
+    /// doesn't.
     #[test]
     fn settings_login_service_toggles_and_shows_failures() {
         use crate::runtime::Login;
@@ -15800,7 +15818,7 @@ mod tests {
         let mut keys = to_login.clone();
         keys.push(Enter); // Start at login: Turn On
         keys.extend(to_login.clone());
-        keys.extend([Down, Enter]); // Start when this session closes: Turn On
+        keys.push(Escape); // one switch: Back
         keys.push(Escape);
         let mut ui = Script {
             keys: keys.into(),
@@ -15808,14 +15826,32 @@ mod tests {
         };
         settings_menu(&mut ui, &path).unwrap();
         assert!(ui.keys.is_empty());
-        assert_eq!(ui.login, (true, true));
+        assert_eq!(ui.login, (true, false));
         assert!(ui.login_calls.contains(&Login::Enable));
-        assert!(ui.login_calls.contains(&Login::SetRunOnQuit(true)));
+        assert!(
+            !ui.screens
+                .iter()
+                .any(|s| s.contains("when this session closes"))
+        );
         assert!(
             ui.screens
                 .iter()
-                .any(|s| s.contains("start at login On; start when this session closes On"))
+                .any(|s| s.contains("start at login On (also back after you quit)"))
         );
+        // Quit with Start at login On starts the service again; until next login doesn't.
+        quit_login(&mut ui, false).unwrap();
+        assert_eq!(ui.login, (true, true));
+        quit_login(&mut ui, true).unwrap();
+        assert_eq!(ui.login, (true, false));
+        // Off: Quit starts nothing, unless this session paused a running service.
+        ui.login = (false, false);
+        quit_login(&mut ui, false).unwrap();
+        assert_eq!(ui.login, (false, false));
+        ui.login = (false, true);
+        quit_login(&mut ui, false).unwrap();
+        assert_eq!(ui.login, (false, true), "handed over: back after Quit");
+        quit_login(&mut ui, true).unwrap();
+        assert_eq!(ui.login, (false, false), "until next login: not even then");
         let mut keys = to_login;
         keys.extend([Enter, Enter, Escape]); // Turn On fails -> Not saved -> Back
         let mut ui = Script {

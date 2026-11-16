@@ -103,6 +103,10 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
         bin_dir.mkdir()
         (bin_dir / "lsusb").write_text("#!/bin/sh\nexit 1\n")
         (bin_dir / "lsusb").chmod(0o755)
+        # Nor the real login service: Quit asks whether it starts at login (v7.7 ticket 153).
+        # The fake says no and logs every call.
+        (bin_dir / "systemctl").write_text('#!/bin/sh\necho "$@" >> "$(dirname "$0")/systemctl.log"\nexit 1\n')
+        (bin_dir / "systemctl").chmod(0o755)
         if ending == "configuration_error":
             (config / "mappings.tmp").write_text("occupied")
         master, slave = pty.openpty()
@@ -292,6 +296,8 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
                 assert b"start-flow\toff\n" in path.read_bytes()
             else:
                 assert path.read_bytes() == contents
+            calls = (bin_dir / "systemctl.log").read_text() if (bin_dir / "systemctl.log").exists() else ""
+            assert " start " not in f" {calls} ", calls
             print(f"{ending}: PASS (terminal restored, saved mappings preserved)")
         finally:
             if child.poll() is None:
