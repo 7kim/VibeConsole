@@ -18,4 +18,4 @@ Read the diff, then ask each question. A "no" is a finding; name the file and li
 9. Is a hardware or desktop effect claimed that nobody saw? Reports say "built" or "tested in simulation" until seen.
 10. Was input validation, config integrity or held-key cleanup simplified away?
 
-The rules in full: [Safety Rules](../vibeconsole/reference/safety-rules.md). Run `cargo fmt --check`, `cargo check --locked` and `cargo test --locked` before calling it reviewed.
+The rules in full: [Safety Rules](../vibeconsole/reference/safety-rules.md). Run `cargo-gate` (where it isn't installed: `cargo fmt --check`, `cargo check --locked` and `cargo test --locked`) before calling it reviewed.

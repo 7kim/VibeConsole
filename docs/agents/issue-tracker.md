@@ -27,7 +27,7 @@ Tests: `docs/<version>/agent-tests/NN-<slug>.md`, `docs/<version>/developer-test
 - <edge cases and rules>
 
 - [ ] <one acceptance check per line; `(user)` marks one only the user can see>
-- [ ] `cargo fmt --check`, `cargo check --locked` and `cargo test --locked` pass.
+- [ ] `cargo-gate` passes.
 
 ## Comments
 ```
