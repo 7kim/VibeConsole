@@ -191,6 +191,9 @@ pub enum Action {
     },
     /// v7 ticket 18: bring herdr's agent `name` to the front (`herdr agent focus`).
     HerdrFocus(String),
+    /// v7.7 ticket 182: bring tmux agent window `0` of session `vibe` to the front, and show
+    /// the session when no terminal is attached.
+    TmuxJump(String),
     /// v7 ticket 17: a T3 Code command (`chat.new`), pressed with whatever key the user's
     /// own T3 key file binds it to, read at press time.
     T3(String),
@@ -353,6 +356,9 @@ impl Action {
                 Err("a prompt sequence needs 1–999 prompt steps".into())
             }
             Self::PromptSequence(steps) => steps.iter().try_for_each(Self::validate),
+            Self::TmuxJump(window) if !crate::mappings::simple_name(window) => {
+                Err("a tmux agent's window is a simple name (letters, digits, -, _ and .)".into())
+            }
             // herdr's own rule for agent names: [a-z][a-z0-9_-]{0,31}.
             Self::HerdrFocus(name)
                 if !name.starts_with(|c: char| c.is_ascii_lowercase())
@@ -477,6 +483,7 @@ impl Action {
                     .join(&STEP_SEPARATOR.to_string())
             ),
             Self::HerdrFocus(name) => format!("herdr-focus:{name}"),
+            Self::TmuxJump(window) => format!("tmux-jump:{window}"),
             Self::Flow => "flow".into(),
         }
     }
@@ -609,6 +616,9 @@ impl Action {
             _ if value.starts_with("herdr-focus:") => {
                 Self::HerdrFocus(value["herdr-focus:".len()..].into())
             }
+            _ if value.starts_with("tmux-jump:") => {
+                Self::TmuxJump(value["tmux-jump:".len()..].into())
+            }
             _ if value.starts_with("orca-jump:") => {
                 let (agent, folder) = value["orca-jump:".len()..]
                     .split_once(':')
@@ -733,6 +743,7 @@ impl Action {
                 steps.first().map(Action::description).unwrap_or_default()
             ),
             Self::HerdrFocus(name) => format!("herdr: focus agent {name}"),
+            Self::TmuxJump(window) => format!("tmux: go to agent {window}"),
             Self::Flow => "Start or repair Wispr Flow".into(),
             Self::Shortcut => "Keyboard shortcut".into(),
         }
@@ -1839,20 +1850,47 @@ pub fn show_program(window: &str, dir: &str, argv: &[&str]) -> Result<String> {
         dir,
         argv,
         &startup_env(&config),
-        &mut |args| {
-            let output = tmux(args)?;
-            let text = if output.status.success() {
-                &output.stdout
-            } else {
-                &output.stderr
-            };
-            Ok((
-                output.status.success(),
-                String::from_utf8_lossy(text).trim().to_string(),
-            ))
-        },
+        &mut tmux_status,
         &mut open_terminal,
     )
+}
+/// tmux's answer: success, then its stdout (or stderr on failure, for the error message).
+fn tmux_status(args: &[&str]) -> Result<(bool, String)> {
+    let output = tmux(args)?;
+    let text = if output.status.success() {
+        &output.stdout
+    } else {
+        &output.stderr
+    };
+    Ok((
+        output.status.success(),
+        String::from_utf8_lossy(text).trim().to_string(),
+    ))
+}
+/// v7.7 ticket 182: go to a tmux agent's window (`select-window`, the window one argument),
+/// then show session `vibe` unless a terminal is already attached. An agent whose window
+/// isn't there is named; nothing else runs.
+fn tmux_jump(
+    window: &str,
+    tmux: &mut dyn FnMut(&[&str]) -> Result<(bool, String)>,
+    open: &mut dyn FnMut() -> Result<()>,
+) -> Result<String> {
+    if !tmux(&["has-session", "-t", "=vibe"])?.0 {
+        return Err(format!("tmux: agent {window} isn't running (no session vibe)").into());
+    }
+    let target = format!("=vibe:{window}");
+    if !tmux(&["select-window", "-t", &target])?.0 {
+        return Err(format!("tmux: agent {window} isn't running").into());
+    }
+    let (listed, clients) = tmux(&["list-clients", "-t", "=vibe", "-F", "#{client_name}"])?;
+    if listed && !clients.trim().is_empty() {
+        return Ok(format!("tmux: went to {window}"));
+    }
+    open()
+        .map_err(|e| format!("tmux: went to {window}, not shown: {e}. Run: tmux attach -t vibe"))?;
+    Ok(format!(
+        "tmux: went to {window}; terminal opened on session vibe"
+    ))
 }
 /// Send the command to tmux, then show the session: open a terminal attached to it unless a
 /// client already is. Only a successful open is reported as shown.
@@ -2500,6 +2538,7 @@ fn perform(
         Action::OrcaJump { agent, folder } => orca_jump(agent, folder, |args| {
             command(&orca_program()?, args, &cancelled)
         }),
+        Action::TmuxJump(window) => tmux_jump(window, &mut tmux_status, &mut open_terminal),
         Action::Shortcut => Err("shortcut belongs to keyboard output".into()),
         Action::Nothing => Ok(String::new()), // v7 ticket 111: a silenced default
         Action::Choice(_) | Action::Value { .. } => Err("knob actions run in the session".into()),
@@ -2712,7 +2751,7 @@ fn flow(node: &Path, cancelled: &impl Fn() -> bool) -> Result<String> {
 /// v7 ticket 141: every action as it is saved, with one example and what it does, for
 /// `vibeconsole describe` and the VibeConsole skills. `<US>` stands for the unit separator
 /// that joins steps. A test parses every example and checks the skills list each family.
-pub const ACTION_FORMS: [(&str, &str); 24] = [
+pub const ACTION_FORMS: [(&str, &str); 25] = [
     (
         "shortcut",
         "Press the keys in the keys field (a pad's default)",
@@ -2788,6 +2827,10 @@ pub const ACTION_FORMS: [(&str, &str); 24] = [
     ),
     ("t3:chat.new", "Run a T3 Code command"),
     ("herdr-focus:claude", "Focus a herdr agent"),
+    (
+        "tmux-jump:claude",
+        "Bring a tmux agent's window to the front",
+    ),
 ];
 impl Action {
     /// The action's family name, as the skills and `describe` list it. The match has no
@@ -2815,6 +2858,7 @@ impl Action {
             Self::PromptSequence(_) => "prompts",
             Self::PromptOwn { .. } => "prompt-own",
             Self::HerdrFocus(_) => "herdr-focus",
+            Self::TmuxJump(_) => "tmux-jump",
             Self::T3(_) => "t3",
         }
     }
@@ -2823,6 +2867,54 @@ impl Action {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v7.7 ticket 182: a tmux jump round-trips, refuses a window that isn't a simple name,
+    /// selects the window as one argument, opens a terminal only when none is attached, and
+    /// names an agent that isn't running.
+    #[test]
+    fn tmux_jump_selects_the_window_and_names_a_missing_agent() {
+        let action = Action::TmuxJump("claude".into());
+        assert_eq!(Action::parse(&action.encode()).unwrap(), action);
+        for bad in [
+            "tmux-jump:",
+            "tmux-jump:a b",
+            "tmux-jump:../x",
+            "tmux-jump:a;b",
+        ] {
+            assert!(Action::parse(bad).is_err(), "{bad}");
+        }
+        let run = |session: bool, window: bool, clients: &str| {
+            let mut calls = Vec::new();
+            let mut opened = 0;
+            let result = tmux_jump(
+                "api",
+                &mut |args| {
+                    calls.push(args.join(" "));
+                    Ok(match args[0] {
+                        "has-session" => (session, String::new()),
+                        "select-window" => (window, String::new()),
+                        _ => (true, clients.to_string()),
+                    })
+                },
+                &mut || {
+                    opened += 1;
+                    Ok(())
+                },
+            );
+            (result.map_err(|e| e.to_string()), calls, opened)
+        };
+        let (result, calls, opened) = run(true, true, "");
+        assert_eq!(calls[1], "select-window -t =vibe:api");
+        assert!(result.unwrap().contains("terminal opened") && opened == 1);
+        let (result, _, opened) = run(true, true, "/dev/pts/3");
+        assert_eq!((result.unwrap(), opened), ("tmux: went to api".into(), 0));
+        assert_eq!(
+            run(true, false, "").0.unwrap_err(),
+            "tmux: agent api isn't running"
+        );
+        let (result, calls, _) = run(false, true, "");
+        assert!(result.unwrap_err().contains("isn't running") && calls.len() == 1);
+    }
 
     #[test]
     fn herdr_focus_keeps_to_herdrs_agent_names() {
@@ -4203,7 +4295,7 @@ mod forms_tests {
             assert_eq!(action.encode(), saved, "{example}");
             families.insert(action.family());
         }
-        // ponytail: 22 families; a new Action breaks `family()`, then this count.
-        assert_eq!(families.len(), 22, "{families:?}");
+        // ponytail: 23 families (v7.7 ticket 182 added tmux-jump); a new Action breaks `family()`, then this count.
+        assert_eq!(families.len(), 23, "{families:?}");
     }
 }

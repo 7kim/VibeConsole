@@ -26,3 +26,4 @@ Generated from the code (`UPDATE_SKILLS=1 cargo test vibeconsole_skills`). `<US>
 - `orca-jump:claude:/tmp`: Jump to an agent in Orca IDE for a folder
 - `t3:chat.new`: Run a T3 Code command
 - `herdr-focus:claude`: Focus a herdr agent
+- `tmux-jump:claude`: Bring a tmux agent's window to the front

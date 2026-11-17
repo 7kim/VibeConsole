@@ -10209,6 +10209,7 @@ fn families(input: mappings::Input) -> Vec<usize> {
     // v7.7 ticket 169: the families made in 0 AI hold press actions.
     if matches!(input, mappings::Input::Pad | mappings::Input::Piano) {
         offered.push(14);
+        offered.push(15); // v7.7 ticket 182
     }
     offered
 }
@@ -10230,6 +10231,7 @@ fn action_family(mapping: &Mapping) -> usize {
         Action::OrcaJump { .. } => 8,
         Action::T3(_) => 9,
         Action::HerdrFocus(_) => 10,
+        Action::TmuxJump(_) => 15,
         Action::PromptSequence(_) | Action::SavedSequence(_) => 11,
         action if action.audio() => 2,
         _ => 1, // launchers, hold to quit, Wispr Flow
@@ -10285,7 +10287,7 @@ fn favourite_mapping(
     Ok(Some(copy))
 }
 
-const FAMILIES: [&str; 15] = [
+const FAMILIES: [&str; 16] = [
     "Keyboard shortcut",
     "Launch application",
     "Fedora system action",
@@ -10301,6 +10303,7 @@ const FAMILIES: [&str; 15] = [
     "Terminal command, e.g. sudo dnf update (visible terminal, hold 1 second)",
     "Favourites (the same action as a starred assignment)",
     "Your families (named groups made in 0 AI)",
+    "tmux agent (go to its window)",
 ];
 
 fn configure(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) -> Result<()> {
@@ -11432,6 +11435,27 @@ fn configure_steps(
                 continue;
             };
             Mapping::new_action(pad, input, action).map_err(stage("validation"))?
+        } else if family == 15 {
+            // v7.7 ticket 182: one of 3 Agents' tmux agents, by its window.
+            let windows = mappings::load_config(path)
+                .map_err(stage("file I/O"))?
+                .agents
+                .into_iter()
+                .filter(|a| a.host == mappings::Host::Tmux)
+                .map(|a| a.window)
+                .collect::<Vec<_>>();
+            if windows.is_empty() {
+                return Err("validation: no tmux agents in 3 Agents; add one first".into());
+            }
+            let Some(index) = choose(ui, "Go to which tmux agent?", &windows)? else {
+                continue;
+            };
+            Mapping::new_action(
+                pad,
+                input,
+                crate::actions::Action::TmuxJump(windows[index].clone()),
+            )
+            .map_err(stage("validation"))?
         } else if family == 10 {
             let agents = ui.herdr_agents()?;
             if agents.is_empty() {
@@ -12658,6 +12682,8 @@ mod tests {
         asked: Vec<String>,
         /// v7.7 ticket 175: each ask's whole command, argument by argument.
         agent_argv: Vec<Vec<String>>,
+        /// v7.7 ticket 182: a taller screen than the default 24 rows, when set.
+        rows: Option<usize>,
         /// The verified program, when a test needs its pad and knob table (v7 ticket 45).
         program: Option<(u8, crate::feedback::Payload)>,
         /// An Xbox controller is connected (v7 ticket 111).
@@ -12676,6 +12702,9 @@ mod tests {
         rule: bool,
     }
     impl Ui for Script {
+        fn height(&self) -> usize {
+            self.rows.unwrap_or(24)
+        }
         fn light_rule(&self) -> bool {
             self.rule
         }
@@ -16635,6 +16664,7 @@ mod tests {
                 ],
                 12 => [command("sudo dnf update"), vec![Enter]].concat(),
                 14 => vec![Enter, Enter], // v7.7 ticket 169: the family, its one action
+                15 => vec![Enter, Enter], // v7.7 ticket 182: the first tmux agent, fire when
                 _ if kind == "knob" => vec![Enter, Enter], // 13: the favourite, knob step
                 _ => vec![Enter],         // 13: the starred favourite
             }
@@ -16658,7 +16688,7 @@ mod tests {
             deadzone: 1024,
             hysteresis: 128,
         };
-        let pressed = vec![0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13, 14];
+        let pressed = vec![0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15];
         // (kind, learn page, control, motion, families offered)
         let kinds: Vec<(&str, usize, Control, Option<Input>, Vec<usize>)> = vec![
             (
@@ -16737,6 +16767,7 @@ mod tests {
                     orca: vec![("claude".into(), "/work/a".into())],
                     t3: r#"[{"key":"mod+]","command":"thread.next"}]"#.into(),
                     herdr: vec!["api".into()],
+                    rows: Some(40), // every family on one screen (ticket 182)
                     ..Default::default()
                 };
                 let mut current = config.mappings.clone();

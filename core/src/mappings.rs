@@ -1244,7 +1244,8 @@ pub fn map_agents_request(
                 folder: config.agent_directory(agent)?.unwrap_or_else(|| "/".into()),
             },
             Host::Herdr => crate::actions::Action::HerdrFocus(agent.name.clone()),
-            Host::Tmux => continue,
+            // v7.7 ticket 182
+            Host::Tmux => crate::actions::Action::TmuxJump(agent.window.clone()),
         };
         actions += &format!("- jump to {}: {}\n", agent.name, action.encode());
     }
@@ -1309,6 +1310,10 @@ pub fn check_agent_mappings(
                 .agents
                 .iter()
                 .any(|a| a.host == Host::Herdr && &a.name == name),
+            crate::actions::Action::TmuxJump(window) => config
+                .agents
+                .iter()
+                .any(|a| a.host == Host::Tmux && &a.window == window),
             _ => false,
         };
         if !known {
@@ -5401,6 +5406,30 @@ mod tests {
 
     /// v7 ticket 25: a preset brings back mappings, profiles and their devices; settings
     /// stay; a lock on a profile the preset lacks is dropped.
+    /// v7.7 ticket 182: Map agents offers a jump to each tmux agent and accepts only those.
+    #[test]
+    fn map_agents_offers_and_checks_tmux_jumps() {
+        let config = Config::default(); // claude and codex, in tmux
+        let pad = Control::button(1);
+        let devices = profile_devices(&config, 0, None);
+        let request = map_agents_request("", &devices, &config).unwrap();
+        assert!(
+            request.contains("- jump to claude: tmux-jump:claude\n"),
+            "{request}"
+        );
+        let jump = |window: &str| {
+            vec![
+                Mapping::new_action(
+                    pad,
+                    Input::Pad,
+                    crate::actions::Action::TmuxJump(window.into()),
+                )
+                .unwrap(),
+            ]
+        };
+        assert!(check_agent_mappings("", &jump("codex"), &config).is_ok());
+        assert!(check_agent_mappings("", &jump("ghost"), &config).is_err());
+    }
     /// v7.7 ticket 175: the one-shot command is the binary, its fixed arguments (and
     /// Ollama's model), then the request as one argument; cycling skips agents that aren't
     /// installed or have no checked one-shot command (Oh My Pi).
