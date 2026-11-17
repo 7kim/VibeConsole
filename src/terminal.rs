@@ -197,11 +197,12 @@ trait Ui {
         None
     }
     /// v7.7 ticket 168: where Set up agents looks: `PATH` and the home folder (read; nothing
-    /// found there is run).
-    fn lookup_env(&self) -> (String, Option<PathBuf>) {
+    /// found there is run). v7.7 ticket 169: and the working folder (its `.claude/skills`).
+    fn lookup_env(&self) -> (String, Option<PathBuf>, Option<PathBuf>) {
         (
             std::env::var("PATH").unwrap_or_default(),
             std::env::var_os("HOME").map(PathBuf::from),
+            std::env::current_dir().ok(),
         )
     }
     fn ask_claude(&mut self, request: &str) -> Result<String> {
@@ -2270,11 +2271,32 @@ impl Terminal {
                         ),
                         Some(ASK_MAP_AGENTS),
                     ),
-                    later("a prompt… · asks what you need, then writes it (not yet)"),
-                    later("a prompt sequence… · from your skills and prompts (not yet)"),
-                    later("a preset… · a named whole setup (not yet)"),
-                    later("a whole setup… · \"I stream\", \"I code with Claude\" (not yet)"),
-                    later("an action family… · a named family of actions (not yet)"),
+                    one(
+                        format!("Ask {agent} for a prompt… · asks what you need, then writes it"),
+                        Some(ASK_PROMPT),
+                    ),
+                    one(
+                        format!(
+                            "Ask {agent} for a prompt sequence… · from your skills and prompts"
+                        ),
+                        Some(ASK_SEQUENCE),
+                    ),
+                    one(
+                        format!("Ask {agent} for a preset… · a named whole setup, saved for later"),
+                        Some(ASK_PRESET),
+                    ),
+                    one(
+                        format!(
+                            "Ask {agent} for a whole setup… · \"I stream\", \"I code with Claude\""
+                        ),
+                        Some(ASK_SETUP),
+                    ),
+                    one(
+                        format!(
+                            "Ask {agent} for an action family… · a named group of your actions"
+                        ),
+                        Some(ASK_FAMILY),
+                    ),
                     one(
                         format!(
                             "Ask {agent} about my setup… · \"Why didn't Pad 6 fire?\" · read-only"
@@ -6823,13 +6845,23 @@ enum AskKind {
     Mappings,
     SetupAgents,
     MapAgents,
+    Prompt,
+    Sequence,
+    Preset,
+    Setup,
+    Family,
     About,
     Recommendations,
 }
 fn ask_for(ui: &mut impl Ui, path: &Path, kind: AskKind) -> Result<()> {
     match kind {
         AskKind::Profile => ai_profile(ui, path),
-        AskKind::Mappings | AskKind::MapAgents => ask_mappings(ui, path, kind),
+        AskKind::Mappings | AskKind::MapAgents | AskKind::Preset | AskKind::Setup => {
+            ask_mappings(ui, path, kind)
+        }
+        AskKind::Prompt => ask_prompt(ui, path),
+        AskKind::Sequence => ask_sequence(ui, path),
+        AskKind::Family => ask_family(ui, path),
         AskKind::SetupAgents => ask_setup_agents(ui, path),
         AskKind::About => ask_about(ui, path),
         AskKind::Recommendations => ask_recommendations(ui, path),
@@ -6983,19 +7015,51 @@ fn ai_profile(ui: &mut impl Ui, path: &Path) -> Result<()> {
 /// v7.7 ticket 168: Ask for mappings (fills empty Default controls) and Ask to map agents
 /// (jump buttons, needs-me, octave lights). The reply is checked in full like an import;
 /// each replacement is shown old → new and needs its own yes; saved only on Save.
+/// v7.7 ticket 169: a whole setup is the same ask for a goal (replacements still need their
+/// yes); a preset is saved to Presets under its name with the changes, not applied.
 fn ask_mappings(ui: &mut impl Ui, path: &Path, kind: AskKind) -> Result<()> {
     let agents = kind == AskKind::MapAgents;
+    let preset = match kind {
+        AskKind::Preset => {
+            let Some(name) = text_entry(ui, "Preset name (1–32 characters)", "")? else {
+                return Ok(());
+            };
+            let name = name.trim().to_owned();
+            if !mappings::valid_profile_name(&name) {
+                return Err("a preset name is 1–32 printable characters; nothing saved".into());
+            }
+            let file = presets_dir(path).join(mappings::preset_file_name(&name));
+            if file.exists() {
+                return Err(format!("preset {name} exists; nothing saved").into());
+            }
+            Some(file)
+        }
+        _ => None,
+    };
     let Some(wish) = text_entry(
         ui,
-        if agents {
-            "What should the agent buttons do? (optional)"
-        } else {
-            "What should your empty buttons do? (optional)"
+        match kind {
+            AskKind::MapAgents => "What should the agent buttons do? (optional)",
+            AskKind::Setup => "What is the setup for? (e.g. I stream, I code with Claude)",
+            AskKind::Preset => "What should the preset do?",
+            _ => "What should your empty buttons do? (optional)",
         },
         "",
     )?
     else {
         return Ok(());
+    };
+    let wish = match kind {
+        AskKind::Setup | AskKind::Preset if wish.trim().is_empty() => return Ok(()),
+        AskKind::Setup => format!(
+            "A whole setup for: {}. Controls in use may be replaced where the goal needs them.",
+            wish.trim()
+        ),
+        AskKind::Preset => format!(
+            "A whole setup saved as a preset for later: {}. Controls in use may be replaced.",
+            wish.trim()
+        ),
+        _ => wish,
     };
     let mut config = mappings::load_config(path)?;
     let all = mappings::profile_devices(&config, ui.context(), ui.program().as_ref());
@@ -7028,11 +7092,12 @@ fn ask_mappings(ui: &mut impl Ui, path: &Path, kind: AskKind) -> Result<()> {
             None => words.push(format!("{}: {} (was empty)", m.label, m.action_label())),
             Some(old) => {
                 let change = format!("{}: {} → {}", m.label, old.action_label(), m.action_label());
-                if choose(
-                    ui,
-                    &format!("Replace?\n{change}"),
-                    &options(&["Keep what it does now", "Replace it"]),
-                )? != Some(1)
+                if preset.is_none()
+                    && choose(
+                        ui,
+                        &format!("Replace?\n{change}"),
+                        &options(&["Keep what it does now", "Replace it"]),
+                    )? != Some(1)
                 {
                     continue;
                 }
@@ -7070,10 +7135,13 @@ fn ask_mappings(ui: &mut impl Ui, path: &Path, kind: AskKind) -> Result<()> {
             "{} suggests:\n{}\n\nSent: the controls of the {sent} and what each does now{}.",
             config.look.default_agent,
             words.join("\n"),
-            if agents {
-                ", and your agents' names, hosts and folders"
-            } else {
-                ""
+            match &preset {
+                _ if agents => ", and your agents' names, hosts and folders".to_owned(),
+                Some(file) => format!(
+                    "\nSaved to Presets as {}, not applied: load it from 2 Mappings › Presets.",
+                    file.display()
+                ),
+                None => String::new(),
             }
         ),
         &options(&["Cancel", "Save"]),
@@ -7081,7 +7149,13 @@ fn ask_mappings(ui: &mut impl Ui, path: &Path, kind: AskKind) -> Result<()> {
     {
         return Ok(());
     }
-    mappings::save_config(path, &config)
+    match preset {
+        Some(file) => {
+            std::fs::create_dir_all(presets_dir(path))?;
+            mappings::save_config(&file, &config)
+        }
+        None => mappings::save_config(path, &config),
+    }
 }
 /// v7.7 ticket 168: Ask to set up agents. Agent CLIs are looked up on PATH (never run) and
 /// git folders found under home; only their names and paths are sent. Each proposed agent
@@ -7090,7 +7164,7 @@ fn ask_setup_agents(ui: &mut impl Ui, path: &Path) -> Result<()> {
     let Some(wish) = text_entry(ui, "Anything about your agents? (optional)", "")? else {
         return Ok(());
     };
-    let (path_var, home) = ui.lookup_env();
+    let (path_var, home, _) = ui.lookup_env();
     let clis = mappings::clis_on_path(&path_var);
     let folders = home
         .as_deref()
@@ -7121,6 +7195,338 @@ fn ask_setup_agents(ui: &mut impl Ui, path: &Path) -> Result<()> {
         return Ok(());
     }
     mappings::save_config(path, &new)
+}
+/// v7.7 ticket 169: Ask for a prompt: what it's for, up to three questions from the agent
+/// (each answered in a text entry), then the prompt it writes; Name it opens it in $EDITOR
+/// and saves it under a checked name. Esc at any step saves nothing.
+fn ask_prompt(ui: &mut impl Ui, path: &Path) -> Result<()> {
+    let Some(wish) = text_entry(ui, "What should the prompt do?", "")? else {
+        return Ok(());
+    };
+    let wish = wish.trim().chars().take(500).collect::<String>();
+    if wish.is_empty() {
+        return Ok(());
+    }
+    ui.draw("Asking your agent… this can take a minute.")?;
+    let reply = ui.ask_claude(&format!(
+        "You help write a prompt for a coding agent; VibeConsole sends it from a controller pad. The user wants: {wish}\n\nBefore writing it, ask up to three short questions whose answers you need, one per line, each starting with `Q:`. Reply with only the questions."
+    ))?;
+    let mut answers = String::new();
+    for question in mappings::questions_from_reply(&reply) {
+        let Some(answer) = text_entry(ui, &question, "")? else {
+            return Ok(());
+        };
+        answers += &format!(
+            "Q: {question}\nA: {}\n",
+            answer.trim().chars().take(500).collect::<String>()
+        );
+    }
+    ui.draw("Asking your agent… this can take a minute.")?;
+    let reply = ui.ask_claude(&format!(
+        "Write the prompt. The user wants: {wish}\n{answers}\nReply with only the prompt text: no code fences, nothing before or after it."
+    ))?;
+    let body = reply
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("```"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_owned();
+    if body.is_empty() {
+        return Err("the reply has no prompt; nothing saved".into());
+    }
+    if choose(
+        ui,
+        &format!(
+            "{} wrote this prompt:\n\n{body}",
+            mappings::load_config(path)?.look.default_agent
+        ),
+        &options(&["Cancel", "Name it, then open it in $EDITOR"]),
+    )? != Some(1)
+    {
+        return Ok(());
+    }
+    let Some(name) = text_entry(ui, "Prompt name", "")? else {
+        return Ok(());
+    };
+    let dir = crate::actions::prompts_dir_for(path)?;
+    if prompt_files(&dir)?.iter().any(|f| f == name.trim()) {
+        return Err(format!("prompt {} already exists; nothing saved", name.trim()).into());
+    }
+    edit_prompt_from(ui, &dir, name.trim(), Some(&body))
+}
+/// v7.7 ticket 169: Ask for a prompt sequence. Only the installed skills' names and
+/// one-line descriptions (`~/.claude/skills`, the working folder's `.claude/skills`) and the
+/// saved prompts' names with how often each was sent (30 days) go; never prompt text. The
+/// steps are reviewed, a target picked, and the sequence and its new prompts saved on Save.
+fn ask_sequence(ui: &mut impl Ui, path: &Path) -> Result<()> {
+    let Some(wish) = text_entry(ui, "What should the sequence do? (optional)", "")? else {
+        return Ok(());
+    };
+    let wish = wish.trim().chars().take(500).collect::<String>();
+    let (_, home, here) = ui.lookup_env();
+    let skills = [home, here]
+        .into_iter()
+        .flatten()
+        .flat_map(|d| mappings::skills_in(&d.join(".claude/skills")))
+        .map(|(name, what)| format!("- {name}: {what}\n"))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<String>();
+    let dir = crate::actions::prompts_dir_for(path)?;
+    let saved = prompt_files(&dir)?;
+    let mut sent = std::collections::HashMap::new();
+    if let Some(usage) = ui.usage_dir() {
+        let (days, _) = crate::usage::load(&usage, crate::usage::today(), 30);
+        for (_, day) in &days {
+            for (name, n) in day.of("prompt") {
+                *sent.entry(name.to_owned()).or_insert(0) += n;
+            }
+        }
+    }
+    let mut prompts = saved
+        .iter()
+        .map(|p| (sent.get(p).copied().unwrap_or(0), p))
+        .collect::<Vec<_>>();
+    prompts.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+    let prompts = prompts
+        .iter()
+        .take(20)
+        .map(|(n, p)| format!("- {p} (sent {n} times)\n"))
+        .collect::<String>();
+    let request = format!(
+        "Build a VibeConsole prompt sequence: one pad sends step 1 on the first tap, step 2 on the next, and so on. {wish}\n\nInstalled skills:\n{}\nSaved prompts (most sent first):\n{}\n\
+         Reply with tab-separated lines only:\nsequence<TAB><name>  (letters, digits, - and _)\nstep<TAB><prompt>  (1-16 steps, in order: a saved prompt, or one you make below)\nnew<TAB><prompt><TAB><one line of text>  (a new prompt; a new name)\n\
+         A skill is used by writing its name as /<skill> in a new prompt's text.",
+        if skills.is_empty() {
+            "none\n".into()
+        } else {
+            skills
+        },
+        if prompts.is_empty() {
+            "none\n".into()
+        } else {
+            prompts
+        },
+    );
+    ui.draw("Asking your agent… this can take a minute.")?;
+    let reply = ui.ask_claude(&request)?;
+    let (name, steps, new) = mappings::sequence_from_reply(&reply, &saved)
+        .map_err(|e| format!("the reply: {e}; nothing saved"))?;
+    let mut config = mappings::load_config(path)?;
+    if mappings::saved_sequence(&config, &name).is_some() {
+        return Err(format!("a sequence named {name} exists; nothing saved").into());
+    }
+    let words = steps
+        .iter()
+        .enumerate()
+        .map(|(i, step)| match new.iter().find(|(n, _)| n == step) {
+            Some((_, text)) => format!("{}. {step} (new): {text}", i + 1),
+            None => format!("{}. {step} (saved)", i + 1),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if choose(
+        ui,
+        &format!(
+            "{} suggests sequence {name}:\n{words}\n\nSent: your skills' names and descriptions and your saved prompts' names with how often each was sent; never their text.",
+            config.look.default_agent
+        ),
+        &options(&["Cancel", "Pick where it sends, then Save"]),
+    )? != Some(1)
+    {
+        return Ok(());
+    }
+    let Some((target, enter)) = prompt_target(ui, path, None)? else {
+        return Ok(());
+    };
+    config.sequences.push((
+        name,
+        steps
+            .into_iter()
+            .map(|file| crate::actions::Action::Prompt {
+                file,
+                target: target.clone(),
+                enter,
+            })
+            .collect(),
+    ));
+    mappings::serialize_config(&config)?;
+    // The new prompts first; if the config can't be saved they are taken back.
+    let mut written = Vec::new();
+    let result = (|| -> Result<()> {
+        std::fs::create_dir_all(&dir)?;
+        for (name, text) in &new {
+            let file = dir.join(name);
+            if file.exists() {
+                return Err(format!("prompt {name} exists").into());
+            }
+            crate::actions::write_atomic(&file, &format!("{text}\n"))?;
+            written.push(file);
+        }
+        mappings::save_config(path, &config)
+    })();
+    if result.is_err() {
+        for file in written {
+            let _ = std::fs::remove_file(file);
+        }
+    }
+    result
+}
+/// v7.7 ticket 169: the action families made with 0 AI, beside the config.
+fn families_dir(path: &Path) -> PathBuf {
+    path.parent().unwrap_or(Path::new(".")).join("families")
+}
+/// v7.7 ticket 169: a family file's actions, checked in full like an import.
+fn read_family(path: &Path, file: &Path) -> Result<mappings::Profile> {
+    let mut bare = mappings::load_config(path)?;
+    bare.profiles.clear();
+    let profile = mappings::import_profile(&std::fs::read_to_string(file)?, &bare)?;
+    mappings::refuse_risky(&profile.mappings)?;
+    Ok(profile)
+}
+/// v7.7 ticket 169: Ask for an action family: a named group of existing actions (no new
+/// kinds), saved under `families/` and listed in /configure; never a command or risky action.
+fn ask_family(ui: &mut impl Ui, path: &Path) -> Result<()> {
+    let Some(wish) = text_entry(
+        ui,
+        "What should the family group? (e.g. my browser keys)",
+        "",
+    )?
+    else {
+        return Ok(());
+    };
+    let wish = wish.trim().chars().take(500).collect::<String>();
+    if wish.is_empty() {
+        return Ok(());
+    }
+    let config = mappings::load_config(path)?;
+    let pad = Control::from_note(10, 36).ok_or("no placeholder pad")?;
+    let example = mappings::export_profile(&mappings::Profile {
+        name: "Example".into(),
+        apps: Vec::new(),
+        mappings: vec![Mapping::new(pad, "Ctrl+T", "hold")?],
+    })?;
+    let forms = crate::actions::ACTION_FORMS
+        .iter()
+        .filter(|(form, _)| !form.starts_with("command"))
+        .map(|(form, what)| format!("- {form}: {what}\n"))
+        .collect::<String>();
+    let mine = config
+        .mappings
+        .iter()
+        .filter(|m| mappings::refuse_risky(std::slice::from_ref(*m)).is_ok())
+        .map(|m| format!("- {}: {}\n", m.action_label(), m.action.encode()))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .take(60)
+        .collect::<String>();
+    let request = format!(
+        "Group existing VibeConsole actions into one named action family. {wish}\n\n\
+         Reply with only a file in exactly this tab-separated format: the header, one profile line with the family's name (1-32 characters) and the app field -, and whose last field is the number of lines; then one line per action (16 at most), each on the next Bank A pad (note 36, 37, … in the 7th field) as in the example, with the action's name in the 2nd field, the action in the 14th and, for a shortcut, the keys in the 9th:\n\n{example}\n\
+         The action forms there are:\n{forms}\nThe user's own actions:\n{}\n\
+         Terminal commands (`command:`) and risky actions are not available to you: VibeConsole refuses a reply that has one.",
+        if mine.is_empty() {
+            "none\n".into()
+        } else {
+            mine
+        },
+    );
+    ui.draw("Asking your agent… this can take a minute.")?;
+    let reply = ui.ask_claude(&request)?;
+    let refused = |e: Box<dyn std::error::Error>| format!("the reply: {e}; nothing saved");
+    let text = mappings::profile_text_from_reply(&reply)
+        .ok_or("the reply has no family in VibeConsole's format; nothing saved")?;
+    let mut bare = config.clone();
+    bare.profiles.clear();
+    let family = mappings::import_profile(&text, &bare).map_err(refused)?;
+    mappings::refuse_risky(&family.mappings).map_err(refused)?;
+    let file = families_dir(path).join(mappings::family_file_name(&family.name));
+    if file.exists() {
+        return Err(format!("a family named {} exists; nothing saved", family.name).into());
+    }
+    let words = family
+        .mappings
+        .iter()
+        .map(|m| format!("  {}: {}", m.label, m.action_label()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if choose(
+        ui,
+        &format!(
+            "{} suggests family {}:\n{words}\n\nSaved under {}; pick it in /configure › Action family.",
+            config.look.default_agent,
+            family.name,
+            file.display()
+        ),
+        &options(&["Cancel", "Save"]),
+    )? != Some(1)
+    {
+        return Ok(());
+    }
+    std::fs::create_dir_all(families_dir(path))?;
+    crate::actions::write_atomic(&file, &mappings::export_profile(&family)?)
+}
+/// v7.7 ticket 169: /configure's "Your families": one action of a family made with 0 AI,
+/// copied onto the learned control like a favourite.
+fn family_mapping(
+    ui: &mut impl Ui,
+    path: &Path,
+    pad: Control,
+    input: mappings::Input,
+) -> Result<Option<Mapping>> {
+    let dir = families_dir(path);
+    let mut files = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "family"))
+        .collect::<Vec<_>>();
+    files.sort();
+    if files.is_empty() {
+        return Err("validation: no families yet; ask for one in 0 AI".into());
+    }
+    let names = files
+        .iter()
+        .map(|f| {
+            f.file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    let Some(index) = choose(ui, "Your families", &names)? else {
+        return Ok(None);
+    };
+    let family = read_family(path, &files[index])
+        .map_err(|e| format!("validation: {}: {e}", names[index]))?;
+    let Some(entry) = choose(
+        ui,
+        &format!("Family {}", family.name),
+        &family
+            .mappings
+            .iter()
+            .map(|m| format!("{}: {}", m.label, m.action_label()))
+            .collect::<Vec<_>>(),
+    )?
+    else {
+        return Ok(None);
+    };
+    let chosen = &family.mappings[entry];
+    if !families(input).contains(&action_family(chosen)) {
+        return Err(format!(
+            "validation: {} is a \"{}\" action, which this control can't take",
+            chosen.label,
+            FAMILIES[action_family(chosen)]
+        )
+        .into());
+    }
+    let mut copy = chosen.clone();
+    copy.control = pad;
+    copy.input = input;
+    copy.label = pad.label();
+    Ok(Some(copy))
 }
 /// The one review every AI profile goes through (v7.7 tickets 147, 148, 167): checked in full
 /// like an import, against the devices' controls, never a command or a risky action, shown
@@ -8265,6 +8671,10 @@ const PROMPT_NAME_RULE: &str =
 /// Edit (or create) prompt `name` on a hidden copy, then rename it into place: a failed or
 /// empty edit keeps the old prompt.
 fn edit_prompt(ui: &mut impl Ui, dir: &Path, name: &str) -> Result<()> {
+    edit_prompt_from(ui, dir, name, None)
+}
+/// `start` (v7.7 ticket 169): the text a new prompt opens with, e.g. one an agent wrote.
+fn edit_prompt_from(ui: &mut impl Ui, dir: &Path, name: &str, start: Option<&str>) -> Result<()> {
     if !mappings::simple_name(name) {
         return Err(PROMPT_NAME_RULE.into());
     }
@@ -8273,7 +8683,9 @@ fn edit_prompt(ui: &mut impl Ui, dir: &Path, name: &str) -> Result<()> {
     let result = (|| -> Result<()> {
         // A new prompt starts empty; an existing one that cannot be read is never replaced.
         let old = match std::fs::read(&target) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => start
+                .map(|t| format!("{t}\n").into_bytes())
+                .unwrap_or_default(),
             other => other?,
         };
         std::fs::write(&scratch, old)?;
@@ -9433,6 +9845,10 @@ fn families(input: mappings::Input) -> Vec<usize> {
         mappings::Input::Joystick { .. } => vec![0],
     };
     offered.push(13); // v7 ticket 46: Favourites, for every control
+    // v7.7 ticket 169: the families made in 0 AI hold press actions.
+    if matches!(input, mappings::Input::Pad | mappings::Input::Piano) {
+        offered.push(14);
+    }
     offered
 }
 
@@ -9508,7 +9924,7 @@ fn favourite_mapping(
     Ok(Some(copy))
 }
 
-const FAMILIES: [&str; 14] = [
+const FAMILIES: [&str; 15] = [
     "Keyboard shortcut",
     "Launch application",
     "Fedora system action",
@@ -9523,6 +9939,7 @@ const FAMILIES: [&str; 14] = [
     "Prompt sequence (tap 1 sends prompt 1, tap 2 prompt 2, …)",
     "Terminal command, e.g. sudo dnf update (visible terminal, hold 1 second)",
     "Favourites (the same action as a starred assignment)",
+    "Your families (named groups made in 0 AI)",
 ];
 
 fn configure(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) -> Result<()> {
@@ -10604,9 +11021,14 @@ fn configure_steps(
         .map(|i| offered[i]) else {
             continue;
         };
-        let copied = family == 13;
+        let copied = family == 13 || family == 14;
         let mut mapping = if copied {
-            let Some(copy) = favourite_mapping(ui, path, pad, input)? else {
+            let copy = if family == 13 {
+                favourite_mapping(ui, path, pad, input)?
+            } else {
+                family_mapping(ui, path, pad, input)?
+            };
+            let Some(copy) = copy else {
                 continue;
             };
             copy
@@ -10943,6 +11365,12 @@ const SHARE_SWITCH: usize = 8 * ROWS;
 const ASK_MAPPINGS: usize = 9 * ROWS;
 const ASK_SETUP_AGENTS: usize = 10 * ROWS;
 const ASK_MAP_AGENTS: usize = 11 * ROWS;
+/// v7.7 ticket 169: prompt, sequence, preset, setup and family.
+const ASK_PROMPT: usize = 12 * ROWS;
+const ASK_SEQUENCE: usize = 13 * ROWS;
+const ASK_PRESET: usize = 14 * ROWS;
+const ASK_SETUP: usize = 15 * ROWS;
+const ASK_FAMILY: usize = 16 * ROWS;
 /// Opens tab row `id` (`SETTING..`): one Settings row, or one row of the Agents, Prompts,
 /// Saved prompt sequences, App profiles or Xbox tuning lists, as those lists do.
 fn tab_row(ui: &mut impl Ui, path: &Path, id: usize) -> Result<()> {
@@ -10961,11 +11389,17 @@ fn tab_row(ui: &mut impl Ui, path: &Path, id: usize) -> Result<()> {
             Err(error) => not_saved(ui, &error),
             ok => ok,
         },
-        ASK_MAPPINGS | ASK_SETUP_AGENTS | ASK_MAP_AGENTS => {
+        ASK_MAPPINGS | ASK_SETUP_AGENTS | ASK_MAP_AGENTS | ASK_PROMPT | ASK_SEQUENCE
+        | ASK_PRESET | ASK_SETUP | ASK_FAMILY => {
             let kind = match id / ROWS * ROWS {
                 ASK_MAPPINGS => AskKind::Mappings,
                 ASK_SETUP_AGENTS => AskKind::SetupAgents,
-                _ => AskKind::MapAgents,
+                ASK_MAP_AGENTS => AskKind::MapAgents,
+                ASK_PROMPT => AskKind::Prompt,
+                ASK_SEQUENCE => AskKind::Sequence,
+                ASK_PRESET => AskKind::Preset,
+                ASK_SETUP => AskKind::Setup,
+                _ => AskKind::Family,
             };
             match ask_for(ui, path, kind) {
                 Err(error) => not_saved(ui, &error),
@@ -11813,7 +12247,7 @@ mod tests {
         /// v7.7 ticket 146: the usage log a recommendations ask reads.
         usage: Option<PathBuf>,
         /// v7.7 ticket 168: the PATH and home folder Set up agents looks in.
-        lookup: (String, Option<PathBuf>),
+        lookup: (String, Option<PathBuf>, Option<PathBuf>),
         keys: VecDeque<Key>,
         pads: VecDeque<Control>,
         recordings: VecDeque<Result<Vec<String>>>,
@@ -11839,6 +12273,8 @@ mod tests {
         herdr: Vec<String>,
         /// Claude's reply (v7 ticket 26).
         claude: String,
+        /// v7.7 ticket 169: replies for asks of more than one call, in order; then `claude`.
+        replies: VecDeque<String>,
         /// Every request sent to Claude (v7 ticket 141).
         asked: Vec<String>,
         /// The verified program, when a test needs its pad and knob table (v7 ticket 45).
@@ -11889,12 +12325,15 @@ mod tests {
         fn usage_dir(&self) -> Option<PathBuf> {
             self.usage.clone()
         }
-        fn lookup_env(&self) -> (String, Option<PathBuf>) {
+        fn lookup_env(&self) -> (String, Option<PathBuf>, Option<PathBuf>) {
             self.lookup.clone()
         }
         fn ask_claude(&mut self, request: &str) -> Result<String> {
             self.asked.push(request.to_owned());
-            Ok(self.claude.clone())
+            Ok(self
+                .replies
+                .pop_front()
+                .unwrap_or_else(|| self.claude.clone()))
         }
         fn write_t3_key_file(&mut self, text: &str) -> Result<String> {
             self.t3 = text.to_owned();
@@ -13194,6 +13633,11 @@ mod tests {
                 ASK_MAPPINGS,
                 ASK_SETUP_AGENTS,
                 ASK_MAP_AGENTS,
+                ASK_PROMPT,
+                ASK_SEQUENCE,
+                ASK_PRESET,
+                ASK_SETUP,
+                ASK_FAMILY,
             ])
             .chain((0..3).map(|n| PROFILE + n))
             .chain((0..12).map(|n| TUNING + n));
@@ -13481,7 +13925,7 @@ mod tests {
             let mut ui = Script {
                 keys: keys.into(),
                 claude,
-                lookup: (bin.display().to_string(), Some(home.clone())),
+                lookup: (bin.display().to_string(), Some(home.clone()), None),
                 ..Default::default()
             };
             let result = ask_for(&mut ui, &path, AskKind::SetupAgents);
@@ -13595,6 +14039,258 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), saved);
         std::fs::remove_dir_all(dir).unwrap();
     }
+    /// v7.7 ticket 169: Ask for a prompt makes two calls: the questions, answered in text
+    /// entries, then the prompt; Name it saves it through $EDITOR. Esc at a question or Cancel
+    /// saves nothing.
+    #[test]
+    fn ask_for_a_prompt_asks_its_questions_then_writes_it() {
+        use Key::*;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-ai-prompt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let prompts = crate::actions::prompts_dir_for(&path).unwrap();
+        let run = |keys: Vec<Key>| {
+            let mut ui = Script {
+                keys: keys.into(),
+                replies: [
+                    "Sure.\nQ: Which language?\nQ: Tests too?\n".to_string(),
+                    "```\nReview the Rust diff and its tests.\n```".to_string(),
+                ]
+                .into(),
+                ..Default::default()
+            };
+            let result = ask_for(&mut ui, &path, AskKind::Prompt);
+            assert!(ui.keys.is_empty());
+            (result, ui.screens, ui.asked)
+        };
+        let mut keys = typed("review my diff");
+        keys.push(Enter);
+        // Esc at the first question: one call, nothing saved.
+        let mut esc = keys.clone();
+        esc.push(Escape);
+        let (result, _, asked) = run(esc);
+        result.unwrap();
+        assert_eq!(asked.len(), 1);
+        assert!(asked[0].contains("The user wants: review my diff") && asked[0].contains("`Q:`"));
+        assert!(prompt_files(&prompts).unwrap().is_empty());
+        keys.extend(typed("rust"));
+        keys.extend([Enter, Enter]); // answers
+        // Cancel at the review: two calls, nothing saved.
+        let mut cancel = keys.clone();
+        cancel.push(Enter);
+        let (result, screens, asked) = run(cancel);
+        result.unwrap();
+        assert!(asked[1].contains("Q: Which language?\nA: rust\nQ: Tests too?\nA: \n"));
+        assert!(
+            screens
+                .iter()
+                .any(|s| s.contains("wrote this prompt:\n\nReview the Rust diff and its tests."))
+        );
+        assert!(prompt_files(&prompts).unwrap().is_empty());
+        // Name it: saved through the editor under the checked name.
+        keys.extend([Down, Enter]);
+        keys.extend(typed("review-diff"));
+        keys.push(Enter);
+        run(keys.clone()).0.unwrap();
+        assert_eq!(prompt_files(&prompts).unwrap(), ["review-diff"]);
+        // A name that leaves the folder is refused.
+        let mut bad = keys[..keys.len() - 12].to_vec();
+        bad.extend(typed("../x"));
+        bad.push(Enter);
+        assert!(run(bad).0.is_err());
+        assert_eq!(prompt_files(&prompts).unwrap(), ["review-diff"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    /// v7.7 ticket 169: a sequence request holds only skill names and descriptions and the
+    /// saved prompts' names by how often each was sent; the sequence and its new prompts are
+    /// saved only on Save.
+    #[test]
+    fn ask_for_a_sequence_sends_only_skill_names_and_top_prompts() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-ai-seq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        std::fs::create_dir_all(home.join(".claude/skills/review")).unwrap();
+        std::fs::write(
+            home.join(".claude/skills/review/SKILL.md"),
+            "---\nname: review\ndescription: Reviews a diff\n---\nSECRET SKILL BODY\n",
+        )
+        .unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let prompts = crate::actions::prompts_dir_for(&path).unwrap();
+        std::fs::create_dir_all(&prompts).unwrap();
+        for name in ["fix", "plan"] {
+            std::fs::write(prompts.join(name), "SECRET PROMPT TEXT\n").unwrap();
+        }
+        let usage = dir.join("usage");
+        let mut day = crate::usage::Day::default();
+        day.add("prompt", "plan", 7);
+        crate::usage::flush(&usage, crate::usage::today(), &day).unwrap();
+        let reply =
+            "sequence\tship\nstep\tplan\nnew\tship-it\tRun /review then commit\nstep\tship-it\n";
+        let run = |then: Vec<Key>| {
+            let mut keys = vec![Enter];
+            keys.extend(then);
+            let mut ui = Script {
+                keys: keys.into(),
+                claude: reply.into(),
+                usage: Some(usage.clone()),
+                lookup: (String::new(), Some(home.clone()), None),
+                ..Default::default()
+            };
+            let result = ask_for(&mut ui, &path, AskKind::Sequence);
+            assert!(ui.keys.is_empty());
+            (result, ui.screens, ui.asked)
+        };
+        let (result, screens, asked) = run(vec![Enter]); // Cancel
+        result.unwrap();
+        let request = &asked[0];
+        assert!(request.contains("- review: Reviews a diff\n"), "{request}");
+        assert!(
+            request.contains("- plan (sent 7 times)\n- fix (sent 0 times)\n"),
+            "{request}"
+        );
+        assert!(
+            !request.contains("SECRET"),
+            "never skill bodies or prompt text"
+        );
+        assert!(
+            screens
+                .iter()
+                .any(|s| s.contains("1. plan (saved)\n2. ship-it (new): Run /review then commit"))
+        );
+        assert!(mappings::load_config(&path).unwrap().sequences.is_empty());
+        assert!(!prompts.join("ship-it").exists());
+        run(vec![Down, Enter, Enter, Enter]).0.unwrap(); // Save: the first agent, as it is
+        let config = mappings::load_config(&path).unwrap();
+        let steps = mappings::saved_sequence(&config, "ship").unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(prompts.join("ship-it")).unwrap(),
+            "Run /review then commit\n"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    /// v7.7 ticket 169: a preset is saved to Presets and not applied; a whole setup and an
+    /// action family save only on Save; a family's action is offered in /configure; a family
+    /// with a command is refused.
+    #[test]
+    fn ask_for_a_preset_a_setup_and_a_family_save_only_on_save() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-ai-more-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let file = |list: Vec<Mapping>, name: &str| {
+            format!(
+                "```\n{}```\n",
+                mappings::export_profile(&mappings::Profile {
+                    name: name.into(),
+                    apps: vec![],
+                    mappings: list,
+                })
+                .unwrap()
+            )
+        };
+        let xbox = file(
+            vec![Mapping::new(Control::button(0), "Ctrl+N", "hold").unwrap()],
+            "AI",
+        );
+        let ask = |kind, keys: Vec<Key>, claude: String| {
+            let mut ui = Script {
+                keys: keys.into(),
+                claude,
+                ..Default::default()
+            };
+            let result = ask_for(&mut ui, &path, kind);
+            assert!(ui.keys.is_empty());
+            (result, ui.screens, ui.asked)
+        };
+        // Preset: named, saved to Presets, the config itself unchanged.
+        let mut keys = typed("Stream");
+        keys.push(Enter);
+        keys.extend(typed("streaming"));
+        keys.extend([Enter, Down, Space, Enter, Down, Enter]);
+        let (result, screens, asked) = ask(AskKind::Preset, keys, xbox.clone());
+        result.unwrap();
+        assert!(asked[0].contains("A whole setup saved as a preset for later: streaming"));
+        assert!(screens.iter().any(|s| s.contains("not applied")));
+        let preset = mappings::load_config(&presets_dir(&path).join("Stream.preset")).unwrap();
+        assert_eq!(preset.mappings[0].keys, ["Ctrl", "N"]);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        // Whole setup: Cancel saves nothing; Save fills the button.
+        let mut keys = typed("I stream");
+        keys.extend([Enter, Down, Space, Enter]);
+        let mut cancel = keys.clone();
+        cancel.push(Enter);
+        let (result, _, asked) = ask(AskKind::Setup, cancel, xbox.clone());
+        result.unwrap();
+        assert!(asked[0].contains("A whole setup for: I stream."));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        keys.extend([Down, Enter]);
+        ask(AskKind::Setup, keys, xbox).0.unwrap();
+        let config = mappings::load_config(&path).unwrap();
+        assert!(
+            mappings::default_on(&config, mappings::GAMEPAD_CONTEXT, Control::button(0)).is_some()
+        );
+        // Family: saved under families/, then one of its actions copied in /configure.
+        let pad = |n| Control::from_note(10, n).unwrap();
+        let mut close = Mapping::new(pad(37), "Ctrl+W", "hold").unwrap();
+        close.label = "Close tab".into();
+        let family = file(
+            vec![Mapping::new(pad(36), "Ctrl+T", "hold").unwrap(), close],
+            "Browser",
+        );
+        let mut keys = typed("browser tabs");
+        keys.extend([Enter, Enter]);
+        assert!(ask(AskKind::Family, keys.clone(), family.clone()).0.is_ok()); // Cancel
+        assert!(!families_dir(&path).join("Browser.family").exists());
+        keys.pop();
+        keys.extend([Down, Enter]);
+        let (result, _, asked) = ask(AskKind::Family, keys.clone(), family.clone());
+        result.unwrap();
+        assert!(asked[0].contains("browser tabs") && asked[0].contains("- app:"));
+        assert!(families_dir(&path).join("Browser.family").exists());
+        let mut ui = Script {
+            keys: vec![Enter, Down, Enter].into(),
+            ..Default::default()
+        };
+        let copy = family_mapping(&mut ui, &path, Control::button(3), mappings::Input::Pad)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (copy.control, copy.keys.join("+")),
+            (Control::button(3), "Ctrl+W".into())
+        );
+        // A family with a command is refused naming the control; nothing saved.
+        let command = Mapping::new_action(
+            pad(36),
+            mappings::Input::Pad,
+            crate::actions::Action::Command {
+                window: "command".into(),
+                dir: "/tmp".into(),
+                line: "rm -rf ~".into(),
+            },
+        )
+        .unwrap();
+        let error = ask(
+            AskKind::Family,
+            keys[..keys.len() - 2].to_vec(),
+            file(vec![command], "Bad"),
+        )
+        .0
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("would run a terminal command"), "{error}");
+        assert!(!families_dir(&path).join("Bad.family").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     /// v7.7 ticket 148: a question goes to the agent with what `describe` says; the answer is
     /// shown and nothing is saved; a proposed profile goes through the review and Cancel
     /// saves nothing.
@@ -13691,7 +14387,11 @@ mod tests {
             opens(&ui, 9, "to map agents…"),
             Some(Open::Command(ASK_MAP_AGENTS))
         );
-        assert_eq!(opens(&ui, 9, "for a prompt…"), None, "not built yet");
+        assert_eq!(
+            opens(&ui, 9, "for a prompt…"),
+            Some(Open::Command(ASK_PROMPT))
+        );
+        assert_eq!(opens(&ui, 9, "how to improve"), None, "not built yet");
         let titles = ui
             .tab_panes(9, 100, usize::MAX)
             .into_iter()
@@ -15132,8 +15832,9 @@ mod tests {
                     Enter, Enter, Enter, Enter, Down, Enter, Down, Down, Enter, Enter,
                 ],
                 12 => [command("sudo dnf update"), vec![Enter]].concat(),
+                14 => vec![Enter, Enter], // v7.7 ticket 169: the family, its one action
                 _ if kind == "knob" => vec![Enter, Enter], // 13: the favourite, knob step
-                _ => vec![Enter],                          // 13: the starred favourite
+                _ => vec![Enter],         // 13: the starred favourite
             }
         };
         let knob = Control {
@@ -15155,7 +15856,7 @@ mod tests {
             deadzone: 1024,
             hysteresis: 128,
         };
-        let pressed = vec![0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13];
+        let pressed = vec![0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13, 14];
         // (kind, learn page, control, motion, families offered)
         let kinds: Vec<(&str, usize, Control, Option<Input>, Vec<usize>)> = vec![
             (
@@ -15195,6 +15896,20 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&dir);
                 std::fs::create_dir_all(dir.join("prompts")).unwrap();
                 std::fs::write(dir.join("prompts/review"), "Review this change.\n").unwrap();
+                std::fs::create_dir_all(dir.join("families")).unwrap();
+                let keys_family = mappings::Profile {
+                    name: "Keys".into(),
+                    apps: vec![],
+                    mappings: vec![
+                        Mapping::new(Control::from_note(10, 36).unwrap(), "Ctrl+T", "hold")
+                            .unwrap(),
+                    ],
+                };
+                std::fs::write(
+                    dir.join("families/Keys.family"),
+                    mappings::export_profile(&keys_family).unwrap(),
+                )
+                .unwrap();
                 let path = dir.join("mappings.tsv");
                 let mut config = mappings::Config::default();
                 config.mappings = vec![starred.clone()];
@@ -15239,7 +15954,11 @@ mod tests {
                 });
                 let saved = mappings::load_config(&path).unwrap().mappings;
                 let copy = saved.iter().find(|m| m.control == control);
-                let want = if family == 13 { 2 } else { family };
+                let want = match family {
+                    13 => 2,
+                    14 => 0,
+                    f => f,
+                };
                 // v7 ticket 55: editing the saved copy opens the family menu on its family
                 // (pads and Xbox buttons; the starred favourite is listed first).
                 let edit_ok = !matches!(kind, "pad" | "Xbox button") || copy.is_none() || {

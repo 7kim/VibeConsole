@@ -1236,6 +1236,100 @@ pub fn check_agent_mappings(
     }
     Ok(octaves)
 }
+/// v7.7 ticket 169: an action family's file name (`families/<name>.family`, a profile file
+/// whose overrides sit on placeholder pads), kept inside its folder.
+pub fn family_file_name(name: &str) -> String {
+    safe_file_name(name, "family")
+}
+/// v7.7 ticket 169: the skills in a skills folder (`<dir>/<skill>/SKILL.md`): each name and
+/// the first line of its `description:`, cut to 200 characters; 100 at most, sorted.
+pub fn skills_in(dir: &Path) -> Vec<(String, String)> {
+    let mut skills = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let text = fs::read_to_string(e.path().join("SKILL.md")).ok()?;
+            let name = e.file_name().to_string_lossy().into_owned();
+            let description = text
+                .lines()
+                .find_map(|l| l.strip_prefix("description:"))
+                .unwrap_or_default()
+                .trim()
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(200)
+                .collect();
+            simple_name(&name).then_some((name, description))
+        })
+        .collect::<Vec<_>>();
+    skills.sort();
+    skills.truncate(100);
+    skills
+}
+/// v7.7 ticket 169: the questions in an AI reply: lines starting `Q:`, three at most, each
+/// one printable line of up to 200 characters.
+pub fn questions_from_reply(reply: &str) -> Vec<String> {
+    reply
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("Q:"))
+        .map(|q| {
+            q.trim()
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(200)
+                .collect::<String>()
+        })
+        .filter(|q| !q.is_empty())
+        .take(3)
+        .collect()
+}
+/// v7.7 ticket 169: a sequence an AI reply proposes: `sequence<TAB><name>`, then up to 16
+/// `step<TAB><prompt>` (a saved prompt, or one this reply makes) and `new<TAB><prompt><TAB>
+/// <text>` lines (a new prompt of one line). Names are simple names (they can't leave the
+/// prompts folder); a new prompt never replaces a saved one. Returns the name, the steps in
+/// order and the new prompts.
+pub fn sequence_from_reply(
+    reply: &str,
+    saved: &[String],
+) -> Result<(String, Vec<String>, Vec<(String, String)>)> {
+    let (mut name, mut steps, mut new) = (None, Vec::new(), Vec::<(String, String)>::new());
+    for line in reply.lines().map(str::trim_end) {
+        match line.split('\t').collect::<Vec<_>>()[..] {
+            ["sequence", n] => name = Some(n.to_owned()),
+            ["step", prompt] => steps.push(prompt.to_owned()),
+            ["new", prompt, text] => {
+                if !simple_name(prompt) || saved.iter().any(|s| s == prompt) {
+                    return Err(format!(
+                        "new prompt {prompt:?}: a new simple name (letters, digits, -, _ and .)"
+                    )
+                    .into());
+                }
+                if text.trim().is_empty() || text.len() > 2000 || text.chars().any(char::is_control)
+                {
+                    return Err(
+                        format!("new prompt {prompt}: one line of up to 2000 characters").into(),
+                    );
+                }
+                new.push((prompt.to_owned(), text.trim().to_owned()));
+            }
+            _ => {}
+        }
+    }
+    let name = name.ok_or("the reply names no sequence")?;
+    if !simple_name(&name) {
+        return Err(format!("sequence name {name:?}: letters, digits, - and _").into());
+    }
+    if steps.is_empty() || steps.len() > 16 {
+        return Err("a sequence has 1–16 steps".into());
+    }
+    for step in &steps {
+        if !saved.contains(step) && !new.iter().any(|(n, _)| n == step) {
+            return Err(format!("step {step:?} is neither a saved prompt nor a new one").into());
+        }
+    }
+    Ok((name, steps, new))
+}
 /// v7.7 ticket 168: the agent CLIs Set up agents looks for on PATH (looked up, never run).
 pub const AGENT_CLIS: [&str; 10] = [
     "claude", "codex", "opencode", "ollama", "gemini", "aider", "goose", "qwen", "copilot", "omp",
