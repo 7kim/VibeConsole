@@ -1060,6 +1060,21 @@ pub fn refuse_risky(mappings: &[Mapping]) -> Result<()> {
     Ok(())
 }
 pub fn profile_request(app: &str, wish: &str, devices: &[ProfileDevice]) -> Result<String> {
+    let (names, lines, controls) = request_parts(app, devices, |_, _| String::new())?;
+    Ok(format!(
+        "Write one VibeConsole app profile for the app `{app}`, for the {names}. {wish}\n\n\
+         Reply with only the profile file, in exactly this tab-separated format (the first line is the header, then one profile line whose last field is the number of override lines, then the override lines, each with exactly the same 16 fields as this example):\n\n{lines}\n\
+         Rules: a profile name of 1-32 characters (not Default); overrides only for the controls listed below, behaviour hold or toggle, keyboard shortcuts as Key+Key names in the keys field (the 9th field), the action field always the word `shortcut` as in the example, no feedback. {NO_RISKY} To give the same function on more than one device, write one override line per device. Copy a control's line below as it is and change only the keys (and behaviour if needed); never invent a control. The controls:\n{controls}"
+    ))
+}
+const NO_RISKY: &str = "Terminal commands (`command:`) and risky actions are not available to you: VibeConsole refuses a reply that has one.";
+/// The parts every mappings request shares: the devices' names, the format by example, and
+/// each control by name with a ready line (plus `note`, e.g. what it does now).
+fn request_parts(
+    app: &str,
+    devices: &[ProfileDevice],
+    note: impl Fn(&ProfileDevice, Control) -> String,
+) -> Result<(String, String, String)> {
     let first = devices
         .iter()
         .find_map(|d| d.controls.first().map(|(c, n)| (d, *c, n)))
@@ -1075,14 +1090,302 @@ pub fn profile_request(app: &str, wish: &str, devices: &[ProfileDevice]) -> Resu
     for device in devices {
         controls += &format!("\n{}:\n", device.name);
         for (control, name) in &device.controls {
-            controls += &format!("- {name}: {}", override_line(device, *control, name)?);
+            controls += &format!(
+                "- {name}{}: {}",
+                note(device, *control),
+                override_line(device, *control, name)?
+            );
         }
     }
+    Ok((names, lines, controls))
+}
+/// v7.7 ticket 168: the Default mapping on a device's control, if any.
+pub fn default_on(config: &Config, context: u8, control: Control) -> Option<&Mapping> {
+    config
+        .mappings
+        .iter()
+        .find(|m| m.context == context && m.control == control)
+}
+/// v7.7 ticket 168: Ask for mappings: fill the picked devices' empty Default controls; a
+/// control in use says what it does now, and is replaced only when the wish asks for it.
+pub fn mappings_request(wish: &str, devices: &[ProfileDevice], config: &Config) -> Result<String> {
+    let (names, lines, controls) = request_parts("-", devices, |d, c| {
+        match default_on(config, d.context, c) {
+            Some(m) => format!(" (now: {})", m.action_label()),
+            None => " (empty)".into(),
+        }
+    })?;
     Ok(format!(
-        "Write one VibeConsole app profile for the app `{app}`, for the {names}. {wish}\n\n\
-         Reply with only the profile file, in exactly this tab-separated format (the first line is the header, then one profile line whose last field is the number of override lines, then the override lines, each with exactly the same 16 fields as this example):\n\n{lines}\n\
-         Rules: a profile name of 1-32 characters (not Default); overrides only for the controls listed below, behaviour hold or toggle, keyboard shortcuts as Key+Key names in the keys field (the 9th field), the action field always the word `shortcut` as in the example, no feedback. Terminal commands (`command:`) and risky actions are not available to you: VibeConsole refuses a reply that has one. To give the same function on more than one device, write one override line per device. Copy a control's line below as it is and change only the keys (and behaviour if needed); never invent a control. The controls:\n{controls}"
+        "Suggest VibeConsole Default mappings for the {names}. {wish}\n\n\
+         Fill the controls marked (empty). Change a control that is in use only when the wish above asks for it; the user confirms each replacement.\n\n\
+         Reply with the mappings in exactly this tab-separated format (the header, one profile line whose last field is the number of lines, then the lines, each with exactly the same 16 fields as this example; keep the profile name and the app field -):\n\n{lines}\n\
+         Rules: only the controls listed below, behaviour hold or toggle, keyboard shortcuts as Key+Key names in the keys field (the 9th field), the action field always the word `shortcut`, no feedback. {NO_RISKY} Copy a control's line as it is and change only the keys (and behaviour if needed); never invent a control. The controls:\n{controls}"
     ))
+}
+/// v7.7 ticket 168: Ask to map agents: jump buttons for the agents (Orca `orca-jump`, herdr
+/// `herdr-focus`), a needs-me button, and an octave light per agent.
+pub fn map_agents_request(
+    wish: &str,
+    devices: &[ProfileDevice],
+    config: &Config,
+) -> Result<String> {
+    let (names, lines, controls) = request_parts("-", devices, |d, c| {
+        match default_on(config, d.context, c) {
+            Some(m) => format!(" (now: {})", m.action_label()),
+            None => " (empty)".into(),
+        }
+    })?;
+    let needs_me = crate::actions::Action::OrcaKeys(orca_needs_me_steps()).encode();
+    let mut actions = format!("- needs-me (Orca's agent waiting on you): {needs_me}\n");
+    for agent in &config.agents {
+        let action = match agent.host {
+            Host::Orca => crate::actions::Action::OrcaJump {
+                agent: agent.launch.clone(),
+                folder: config.agent_directory(agent)?.unwrap_or_else(|| "/".into()),
+            },
+            Host::Herdr => crate::actions::Action::HerdrFocus(agent.name.clone()),
+            Host::Tmux => continue,
+        };
+        actions += &format!("- jump to {}: {}\n", agent.name, action.encode());
+    }
+    let agents = config
+        .agents
+        .iter()
+        .map(|a| {
+            format!(
+                "- {} ({}, octave light {})\n",
+                a.name,
+                a.host.text(),
+                a.octave
+            )
+        })
+        .collect::<String>();
+    Ok(format!(
+        "Map the VibeConsole agents to the {names}. {wish}\n\n\
+         The agents:\n{agents}\n\
+         First, one line per agent for its octave light, `agent-octave<TAB><name><TAB><octave>` with octave -4..-1 or 1..4, each agent a different one. Then the mappings in exactly this tab-separated format (the header, one profile line whose last field is the number of lines, then the lines with the same 16 fields; keep the profile name and the app field -):\n\n{lines}\n\
+         Rules: the action field (the 14th) is one of these, as written:\n{actions}\
+         Prefer empty controls; the user confirms each replacement. Behaviour hold, keys -, no feedback. {NO_RISKY} Copy a control's line and change only the action; never invent a control. The controls:\n{controls}"
+    ))
+}
+/// v7.7 ticket 168: the Default mappings in an AI reply (the profile format; its name and
+/// apps are not used), checked in full like an import, against the devices' controls, and
+/// never a command or a risky action.
+pub fn mappings_from_reply(
+    reply: &str,
+    config: &Config,
+    devices: &[ProfileDevice],
+) -> Result<Vec<Mapping>> {
+    let reply = reply
+        .lines()
+        .filter(|l| !l.starts_with("agent-octave\t"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let text = profile_text_from_reply(&reply)
+        .ok_or("the reply has no mappings in VibeConsole's format")?;
+    let mut bare = config.clone();
+    bare.profiles.clear();
+    let mut profile = import_profile(&text, &bare)?;
+    check_profile_controls(&mut profile, devices)?;
+    refuse_risky(&profile.mappings)?;
+    Ok(profile.mappings)
+}
+/// v7.7 ticket 168: Map agents may only jump to the agents there are, or press needs-me; the
+/// octave lines name an agent there is. Returns each agent's new octave.
+pub fn check_agent_mappings(
+    reply: &str,
+    mappings: &[Mapping],
+    config: &Config,
+) -> Result<Vec<(String, i8)>> {
+    for m in mappings {
+        let known = match &m.action {
+            crate::actions::Action::OrcaKeys(steps) => is_orca_needs_me(steps),
+            crate::actions::Action::OrcaJump { agent, folder } => config.agents.iter().any(|a| {
+                a.host == Host::Orca
+                    && &a.launch == agent
+                    && config.agent_directory(a).ok().flatten().as_ref() == Some(folder)
+            }),
+            crate::actions::Action::HerdrFocus(name) => config
+                .agents
+                .iter()
+                .any(|a| a.host == Host::Herdr && &a.name == name),
+            _ => false,
+        };
+        if !known {
+            return Err(format!(
+                "{}: {} isn't a jump to one of your agents or needs-me",
+                m.label,
+                m.action_label()
+            )
+            .into());
+        }
+    }
+    let mut octaves = Vec::new();
+    for line in reply.lines().filter(|l| l.starts_with("agent-octave\t")) {
+        let ["agent-octave", name, octave] = line.trim_end().split('\t').collect::<Vec<_>>()[..]
+        else {
+            return Err("invalid agent-octave line".into());
+        };
+        if !config.agents.iter().any(|a| a.name == name) {
+            return Err(format!("agent-octave: no agent named {name:?}").into());
+        }
+        octaves.push((
+            name.to_owned(),
+            crate::status::valid_octave(octave.parse()?)?,
+        ));
+    }
+    Ok(octaves)
+}
+/// v7.7 ticket 168: the agent CLIs Set up agents looks for on PATH (looked up, never run).
+pub const AGENT_CLIS: [&str; 10] = [
+    "claude", "codex", "opencode", "ollama", "gemini", "aider", "goose", "qwen", "copilot", "omp",
+];
+/// v7.7 ticket 168: which of [`AGENT_CLIS`] are executable files in a `PATH` directory.
+pub fn clis_on_path(path_var: &str) -> Vec<String> {
+    use std::os::unix::fs::PermissionsExt;
+    AGENT_CLIS
+        .iter()
+        .filter(|name| {
+            std::env::split_paths(path_var).any(|dir| {
+                fs::metadata(dir.join(name))
+                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            })
+        })
+        .map(|name| name.to_string())
+        .collect()
+}
+/// v7.7 ticket 168: git repositories under `home` (3 folders deep at most, hidden folders
+/// skipped, not inside a repository, 40 at most), sorted.
+pub fn git_folders(home: &Path) -> Vec<String> {
+    // ponytail: fixed depth 3 and 40 results; a setting if a deeper tree needs it.
+    fn walk(dir: &Path, depth: u8, found: &mut Vec<String>) {
+        if found.len() >= 40 {
+            return;
+        }
+        if dir.join(".git").exists() {
+            found.push(dir.display().to_string());
+            return;
+        }
+        if depth == 0 {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        let mut dirs = entries
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+            .map(|e| e.path())
+            .collect::<Vec<_>>();
+        dirs.sort();
+        for d in dirs {
+            walk(&d, depth - 1, found);
+        }
+    }
+    let mut found = Vec::new();
+    walk(home, 3, &mut found);
+    found.truncate(40);
+    found
+}
+/// v7.7 ticket 168: Ask to set up agents: only the CLI names found and the folder paths go.
+pub fn setup_agents_request(
+    wish: &str,
+    clis: &[String],
+    folders: &[String],
+    config: &Config,
+) -> String {
+    let have = config
+        .agents
+        .iter()
+        .map(|a| a.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Set up VibeConsole agents. {wish}\n\n\
+         Agent CLIs found on PATH: {}\nProject folders (git repositories):\n{}\nAgents already set up: {}\n\n\
+         Reply with tab-separated lines only:\n\
+         agent<TAB><name><TAB><cli><TAB><folder><TAB><octave>  (a new agent run in tmux; name: letters, digits, - and _; cli: one of the CLIs found, as a bare name, or `ollama run <model>`; folder: one of the folders above; octave -4..-1 or 1..4)\n\
+         agent-dir<TAB><folder>  (at most one: the default folder for agents)\n\
+         light-folder<TAB><folder><TAB><octave>  (status lights for sessions working there)\n\
+         No other commands or options: VibeConsole refuses them.",
+        if clis.is_empty() {
+            "none".into()
+        } else {
+            clis.join(", ")
+        },
+        folders
+            .iter()
+            .map(|f| format!("- {f}\n"))
+            .collect::<String>(),
+        if have.is_empty() { "none" } else { &have },
+    )
+}
+/// v7.7 ticket 168: the agents, default folder and light folders an AI reply proposes,
+/// applied to a copy of `config` and checked like Add agent: a launch is one of the CLIs
+/// found (bare) or `ollama run <model>`, every folder one that was sent. Returns the new
+/// config and each change in words.
+pub fn agent_setup_from_reply(
+    reply: &str,
+    clis: &[String],
+    folders: &[String],
+    config: &Config,
+) -> Result<(Config, Vec<String>)> {
+    let folder = |f: &str| -> Result<String> {
+        folders
+            .iter()
+            .find(|x| *x == f)
+            .cloned()
+            .ok_or_else(|| format!("{f:?} isn't one of the folders that were sent").into())
+    };
+    let mut new = config.clone();
+    let mut words = Vec::new();
+    for line in reply.lines().map(str::trim_end) {
+        match line.split('\t').collect::<Vec<_>>()[..] {
+            ["agent", name, launch, dir, octave] => {
+                let ok = match launch.split(' ').collect::<Vec<_>>()[..] {
+                    [cli] => clis.iter().any(|c| c == cli),
+                    ["ollama", "run", model] => {
+                        clis.iter().any(|c| c == "ollama")
+                            && !model.is_empty()
+                            && model.len() <= 64
+                            && model
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || b"._:-/".contains(&b))
+                    }
+                    _ => false,
+                };
+                if !ok {
+                    return Err(format!(
+                        "agent {name}: {launch:?} isn't one of the CLIs found (no options or commands)"
+                    )
+                    .into());
+                }
+                let mut agent = Agent::new(name, launch, name)?;
+                agent.dir = Some(folder(dir)?);
+                agent.octave = crate::status::valid_octave(octave.parse()?)?;
+                words.push(format!(
+                    "Agent {name} runs {launch} in tmux in {dir}; octave light {octave}."
+                ));
+                new.agents.push(agent);
+            }
+            ["agent-dir", dir] => {
+                new.agent_dir = Some(folder(dir)?);
+                words.push(format!("Agents start in {dir} unless they say otherwise."));
+            }
+            ["light-folder", dir, octave] => {
+                let octave = crate::status::valid_octave(octave.parse()?)?;
+                new.light_folders.push((folder(dir)?, octave));
+                words.push(format!("Sessions working in {dir} light octave {octave}."));
+            }
+            _ => {}
+        }
+    }
+    if words.is_empty() {
+        return Err("the reply proposes no agents or folders".into());
+    }
+    serialize_config(&new)?;
+    Ok((new, words))
 }
 /// v7 ticket 141: every override is a control of a chosen device, named as the user sees
 /// it; anything else is refused, naming the override.

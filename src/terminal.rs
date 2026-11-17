@@ -196,6 +196,14 @@ trait Ui {
     fn usage_dir(&self) -> Option<PathBuf> {
         None
     }
+    /// v7.7 ticket 168: where Set up agents looks: `PATH` and the home folder (read; nothing
+    /// found there is run).
+    fn lookup_env(&self) -> (String, Option<PathBuf>) {
+        (
+            std::env::var("PATH").unwrap_or_default(),
+            std::env::var_os("HOME").map(PathBuf::from),
+        )
+    }
     fn ask_claude(&mut self, request: &str) -> Result<String> {
         let output = std::process::Command::new("timeout")
             .args(["180", "claude", "-p", request])
@@ -2246,9 +2254,22 @@ impl Terminal {
                         ),
                         Some(profile),
                     ),
-                    later("mappings… · fills your empty Default buttons (not yet)"),
-                    later("setting up agents… · finds agent CLIs and project folders (not yet)"),
-                    later("mapping agents… · jump buttons, octave lights (not yet)"),
+                    one(
+                        format!("Ask {agent} for mappings… · fills your empty Default buttons"),
+                        Some(ASK_MAPPINGS),
+                    ),
+                    one(
+                        format!(
+                            "Ask {agent} to set up agents… · finds agent CLIs and project folders"
+                        ),
+                        Some(ASK_SETUP_AGENTS),
+                    ),
+                    one(
+                        format!(
+                            "Ask {agent} to map agents… · jump buttons, octave lights, needs-me"
+                        ),
+                        Some(ASK_MAP_AGENTS),
+                    ),
                     later("a prompt… · asks what you need, then writes it (not yet)"),
                     later("a prompt sequence… · from your skills and prompts (not yet)"),
                     later("a preset… · a named whole setup (not yet)"),
@@ -6799,12 +6820,17 @@ fn pick_devices(
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum AskKind {
     Profile,
+    Mappings,
+    SetupAgents,
+    MapAgents,
     About,
     Recommendations,
 }
 fn ask_for(ui: &mut impl Ui, path: &Path, kind: AskKind) -> Result<()> {
     match kind {
         AskKind::Profile => ai_profile(ui, path),
+        AskKind::Mappings | AskKind::MapAgents => ask_mappings(ui, path, kind),
+        AskKind::SetupAgents => ask_setup_agents(ui, path),
         AskKind::About => ask_about(ui, path),
         AskKind::Recommendations => ask_recommendations(ui, path),
     }
@@ -6953,6 +6979,148 @@ fn ai_profile(ui: &mut impl Ui, path: &Path) -> Result<()> {
     let text = mappings::profile_text_from_reply(&reply)
         .ok_or("Claude's reply has no profile in VibeConsole's format; nothing saved")?;
     review_profile(ui, path, config, &text, &devices)
+}
+/// v7.7 ticket 168: Ask for mappings (fills empty Default controls) and Ask to map agents
+/// (jump buttons, needs-me, octave lights). The reply is checked in full like an import;
+/// each replacement is shown old → new and needs its own yes; saved only on Save.
+fn ask_mappings(ui: &mut impl Ui, path: &Path, kind: AskKind) -> Result<()> {
+    let agents = kind == AskKind::MapAgents;
+    let Some(wish) = text_entry(
+        ui,
+        if agents {
+            "What should the agent buttons do? (optional)"
+        } else {
+            "What should your empty buttons do? (optional)"
+        },
+        "",
+    )?
+    else {
+        return Ok(());
+    };
+    let mut config = mappings::load_config(path)?;
+    let all = mappings::profile_devices(&config, ui.context(), ui.program().as_ref());
+    let Some(picked) = pick_devices(ui, &all)? else {
+        return Ok(());
+    };
+    let devices = all
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| picked.contains(i))
+        .map(|(_, d)| d)
+        .collect::<Vec<_>>();
+    let request = if agents {
+        mappings::map_agents_request(&wish, &devices, &config)?
+    } else {
+        mappings::mappings_request(&wish, &devices, &config)?
+    };
+    ui.draw("Asking your agent… this can take a minute.")?;
+    let reply = ui.ask_claude(&request)?;
+    let refused = |e: Box<dyn std::error::Error>| format!("the reply: {e}; nothing saved");
+    let new = mappings::mappings_from_reply(&reply, &config, &devices).map_err(refused)?;
+    let octaves = if agents {
+        mappings::check_agent_mappings(&reply, &new, &config).map_err(refused)?
+    } else {
+        Vec::new()
+    };
+    let mut words = Vec::new();
+    for m in new {
+        match mappings::default_on(&config, m.context, m.control).cloned() {
+            None => words.push(format!("{}: {} (was empty)", m.label, m.action_label())),
+            Some(old) => {
+                let change = format!("{}: {} → {}", m.label, old.action_label(), m.action_label());
+                if choose(
+                    ui,
+                    &format!("Replace?\n{change}"),
+                    &options(&["Keep what it does now", "Replace it"]),
+                )? != Some(1)
+                {
+                    continue;
+                }
+                config
+                    .mappings
+                    .retain(|x| !(x.context == m.context && x.control == m.control));
+                words.push(change);
+            }
+        }
+        config.mappings.push(m);
+    }
+    for (name, octave) in octaves {
+        if let Some(agent) = config.agents.iter_mut().find(|a| a.name == name) {
+            if agent.octave != octave {
+                words.push(format!(
+                    "Agent {name}: octave light {} → {octave}",
+                    agent.octave
+                ));
+                agent.octave = octave;
+            }
+        }
+    }
+    if words.is_empty() {
+        choose(ui, "Nothing to change; nothing saved.", &options(&["Back"]))?;
+        return Ok(());
+    }
+    let sent = devices
+        .iter()
+        .map(|d| d.name)
+        .collect::<Vec<_>>()
+        .join(" and ");
+    if choose(
+        ui,
+        &format!(
+            "{} suggests:\n{}\n\nSent: the controls of the {sent} and what each does now{}.",
+            config.look.default_agent,
+            words.join("\n"),
+            if agents {
+                ", and your agents' names, hosts and folders"
+            } else {
+                ""
+            }
+        ),
+        &options(&["Cancel", "Save"]),
+    )? != Some(1)
+    {
+        return Ok(());
+    }
+    mappings::save_config(path, &config)
+}
+/// v7.7 ticket 168: Ask to set up agents. Agent CLIs are looked up on PATH (never run) and
+/// git folders found under home; only their names and paths are sent. Each proposed agent
+/// is checked like Add agent; saved only on Save.
+fn ask_setup_agents(ui: &mut impl Ui, path: &Path) -> Result<()> {
+    let Some(wish) = text_entry(ui, "Anything about your agents? (optional)", "")? else {
+        return Ok(());
+    };
+    let (path_var, home) = ui.lookup_env();
+    let clis = mappings::clis_on_path(&path_var);
+    let folders = home
+        .as_deref()
+        .map(mappings::git_folders)
+        .unwrap_or_default();
+    let config = mappings::load_config(path)?;
+    let request = mappings::setup_agents_request(&wish, &clis, &folders, &config);
+    ui.draw("Asking your agent… this can take a minute.")?;
+    let reply = ui.ask_claude(&request)?;
+    let (new, words) = mappings::agent_setup_from_reply(&reply, &clis, &folders, &config)
+        .map_err(|e| format!("the reply: {e}; nothing saved"))?;
+    if choose(
+        ui,
+        &format!(
+            "{} suggests:\n{}\n\nSent: the names of the agent CLIs found on PATH ({}) and the paths of {} project folders under your home folder. Nothing was run.",
+            config.look.default_agent,
+            words.join("\n"),
+            if clis.is_empty() {
+                "none".into()
+            } else {
+                clis.join(", ")
+            },
+            folders.len()
+        ),
+        &options(&["Cancel", "Save"]),
+    )? != Some(1)
+    {
+        return Ok(());
+    }
+    mappings::save_config(path, &new)
 }
 /// The one review every AI profile goes through (v7.7 tickets 147, 148, 167): checked in full
 /// like an import, against the devices' controls, never a command or a risky action, shown
@@ -10771,6 +10939,10 @@ const ASK_ABOUT: usize = 6 * ROWS;
 /// v7.7 ticket 146: AI Recommendations and the sharing switch.
 const ASK_RECOMMENDATIONS: usize = 7 * ROWS;
 const SHARE_SWITCH: usize = 8 * ROWS;
+/// v7.7 ticket 168: the AI tab's mappings and agents rows.
+const ASK_MAPPINGS: usize = 9 * ROWS;
+const ASK_SETUP_AGENTS: usize = 10 * ROWS;
+const ASK_MAP_AGENTS: usize = 11 * ROWS;
 /// Opens tab row `id` (`SETTING..`): one Settings row, or one row of the Agents, Prompts,
 /// Saved prompt sequences, App profiles or Xbox tuning lists, as those lists do.
 fn tab_row(ui: &mut impl Ui, path: &Path, id: usize) -> Result<()> {
@@ -10789,6 +10961,17 @@ fn tab_row(ui: &mut impl Ui, path: &Path, id: usize) -> Result<()> {
             Err(error) => not_saved(ui, &error),
             ok => ok,
         },
+        ASK_MAPPINGS | ASK_SETUP_AGENTS | ASK_MAP_AGENTS => {
+            let kind = match id / ROWS * ROWS {
+                ASK_MAPPINGS => AskKind::Mappings,
+                ASK_SETUP_AGENTS => AskKind::SetupAgents,
+                _ => AskKind::MapAgents,
+            };
+            match ask_for(ui, path, kind) {
+                Err(error) => not_saved(ui, &error),
+                ok => ok,
+            }
+        }
         SHARE_SWITCH => match switch_share(path) {
             Err(error) => not_saved(ui, &error),
             ok => ok,
@@ -11629,6 +11812,8 @@ mod tests {
     struct Script {
         /// v7.7 ticket 146: the usage log a recommendations ask reads.
         usage: Option<PathBuf>,
+        /// v7.7 ticket 168: the PATH and home folder Set up agents looks in.
+        lookup: (String, Option<PathBuf>),
         keys: VecDeque<Key>,
         pads: VecDeque<Control>,
         recordings: VecDeque<Result<Vec<String>>>,
@@ -11703,6 +11888,9 @@ mod tests {
         }
         fn usage_dir(&self) -> Option<PathBuf> {
             self.usage.clone()
+        }
+        fn lookup_env(&self) -> (String, Option<PathBuf>) {
+            self.lookup.clone()
         }
         fn ask_claude(&mut self, request: &str) -> Result<String> {
             self.asked.push(request.to_owned());
@@ -13003,6 +13191,9 @@ mod tests {
                 ASK_ABOUT,
                 ASK_RECOMMENDATIONS,
                 SHARE_SWITCH,
+                ASK_MAPPINGS,
+                ASK_SETUP_AGENTS,
+                ASK_MAP_AGENTS,
             ])
             .chain((0..3).map(|n| PROFILE + n))
             .chain((0..12).map(|n| TUNING + n));
@@ -13153,6 +13344,257 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7.7 ticket 168: Ask for mappings fills empty controls, asks before each replacement,
+    /// and saves only on Save; a reply with a command saves nothing.
+    #[test]
+    fn ask_for_mappings_fills_empty_buttons_and_asks_before_replacing() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-ai-map-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let pad = Control::from_note(10, 36).unwrap();
+        mappings::save(&path, &[Mapping::new(pad, "Ctrl+A", "hold").unwrap()]).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let reply = |list: Vec<Mapping>| {
+            format!(
+                "Here you go:\n```\n{}```\n",
+                mappings::export_profile(&mappings::Profile {
+                    name: "AI".into(),
+                    apps: vec![],
+                    mappings: list,
+                })
+                .unwrap()
+            )
+        };
+        let good = reply(vec![
+            Mapping::new(pad, "Ctrl+T", "hold").unwrap(),
+            Mapping::new(Control::button(0), "Ctrl+N", "hold").unwrap(),
+        ]);
+        let run = |claude: &str, then: Vec<Key>| {
+            let mut keys = vec![Enter, Space, Down, Space, Enter]; // no wish; both devices
+            keys.extend(then);
+            let mut ui = Script {
+                keys: keys.into(),
+                claude: claude.into(),
+                ..Default::default()
+            };
+            let result = ask_for(&mut ui, &path, AskKind::Mappings);
+            assert!(ui.keys.is_empty());
+            (result, ui.screens, ui.asked)
+        };
+        // Replace, then Cancel: nothing saved.
+        let (result, screens, asked) = run(&good, vec![Down, Enter, Enter]);
+        result.unwrap();
+        assert!(asked[0].contains("(now: Ctrl+A)") && asked[0].contains("- Xbox A (empty): "));
+        assert!(
+            screens
+                .iter()
+                .any(|s| s.contains("Replace?\nBank A Pad 1: Ctrl+A → Ctrl+T"))
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        // Keep the old one, then Save: only the empty button is filled.
+        run(&good, vec![Enter, Down, Enter]).0.unwrap();
+        let config = mappings::load_config(&path).unwrap();
+        let on = |c: Control| {
+            let context = if c.message == crate::Message::Button {
+                mappings::GAMEPAD_CONTEXT
+            } else {
+                0
+            };
+            mappings::default_on(&config, context, c).map(|m| m.keys.join("+"))
+        };
+        assert_eq!(on(pad).as_deref(), Some("Ctrl+A"));
+        assert_eq!(on(Control::button(0)).as_deref(), Some("Ctrl+N"));
+        // Replace, then Save.
+        mappings::save(&path, &[Mapping::new(pad, "Ctrl+A", "hold").unwrap()]).unwrap();
+        let (_, screens, _) = run(&good, vec![Down, Enter, Down, Enter]);
+        assert!(
+            screens
+                .iter()
+                .any(|s| s.contains("Xbox A: Ctrl+N (was empty)"))
+        );
+        let config = mappings::load_config(&path).unwrap();
+        let on = |c: Control| {
+            let context = if c.message == crate::Message::Button {
+                mappings::GAMEPAD_CONTEXT
+            } else {
+                0
+            };
+            mappings::default_on(&config, context, c).map(|m| m.keys.join("+"))
+        };
+        assert_eq!(on(pad).as_deref(), Some("Ctrl+T"));
+        // A command is refused naming the control; nothing saved.
+        let saved = std::fs::read(&path).unwrap();
+        let command = Mapping::new_action(
+            Control::button(1),
+            mappings::Input::Pad,
+            crate::actions::Action::Command {
+                window: "command".into(),
+                dir: "/tmp".into(),
+                line: "rm -rf ~".into(),
+            },
+        )
+        .unwrap();
+        let (result, _, _) = run(&reply(vec![command]), vec![]);
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("refused: Xbox B would run a terminal command"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    /// v7.7 ticket 168: Set up agents sends only CLI names found on a fake PATH and git folder
+    /// paths under a fake home; nothing is run; a launch with options or an unsent folder is
+    /// refused; saved only on Save.
+    #[test]
+    fn ask_to_set_up_agents_sends_only_names_and_paths() {
+        use Key::*;
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-ai-agents-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (bin, home) = (dir.join("bin"), dir.join("home"));
+        for d in [
+            "proj/.git",
+            ".hidden/x/.git",
+            "a/b/c/.git",
+            "a/b/c/d/e/.git",
+            "notes",
+        ] {
+            std::fs::create_dir_all(home.join(d)).unwrap();
+        }
+        std::fs::create_dir_all(&bin).unwrap();
+        for (name, mode) in [("claude", 0o755), ("codex", 0o644)] {
+            std::fs::write(bin.join(name), "").unwrap();
+            std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+        }
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let proj = home.join("proj").display().to_string();
+        let run = |claude: String, then: Vec<Key>| {
+            let mut keys = vec![Enter];
+            keys.extend(then);
+            let mut ui = Script {
+                keys: keys.into(),
+                claude,
+                lookup: (bin.display().to_string(), Some(home.clone())),
+                ..Default::default()
+            };
+            let result = ask_for(&mut ui, &path, AskKind::SetupAgents);
+            (result, ui.screens, ui.asked)
+        };
+        let good = format!("agent\tapi\tclaude\t{proj}\t2\nagent-dir\t{proj}\n");
+        let (result, screens, asked) = run(good.clone(), vec![Enter]); // Cancel
+        result.unwrap();
+        let request = &asked[0];
+        assert!(
+            request.contains("Agent CLIs found on PATH: claude\n"),
+            "{request}"
+        );
+        assert!(
+            !request.contains(&bin.display().to_string()),
+            "no CLI path is sent"
+        );
+        assert!(request.contains(&format!("- {proj}\n")));
+        assert!(request.contains(&format!("- {}\n", home.join("a/b/c").display())));
+        assert!(!request.contains(".hidden") && !request.contains("/d/e"));
+        assert!(screens.iter().any(|s| s.contains("Agent api runs claude in tmux")
+            && s.contains("Sent: the names of the agent CLIs found on PATH (claude) and the paths of 2 project folders")));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        run(good, vec![Down, Enter]).0.unwrap(); // Save
+        let config = mappings::load_config(&path).unwrap();
+        let api = config.agents.iter().find(|a| a.name == "api").unwrap();
+        assert_eq!(
+            (api.launch.as_str(), api.dir.as_deref(), api.octave),
+            ("claude", Some(proj.as_str()), 2)
+        );
+        assert_eq!(config.agent_dir.as_deref(), Some(proj.as_str()));
+        // Options, a CLI that wasn't found and a folder that wasn't sent are refused.
+        let saved = std::fs::read(&path).unwrap();
+        for bad in [
+            format!("agent\tx\tclaude --dangerously-skip-permissions\t{proj}\t3\n"),
+            format!("agent\tx\tcodex\t{proj}\t3\n"),
+            "agent\tx\tclaude\t/etc\t3\n".to_string(),
+        ] {
+            assert!(run(bad, vec![]).0.is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), saved);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    /// v7.7 ticket 168: Map agents saves jump buttons to the agents there are and octave
+    /// lights; a jump to an agent that isn't set up is refused.
+    #[test]
+    fn ask_to_map_agents_jumps_only_to_your_agents() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-ai-mapag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let mut config = mappings::Config::default();
+        let mut orca = mappings::Agent::new("orca-claude", "claude", "orca-claude").unwrap();
+        orca.host = mappings::Host::Orca;
+        orca.dir = Some("/work/api".into());
+        config.agents.push(orca);
+        mappings::save_config(&path, &config).unwrap();
+        let reply = |folder: &str| {
+            let jump = Mapping::new_action(
+                Control::button(1),
+                mappings::Input::Pad,
+                crate::actions::Action::OrcaJump {
+                    agent: "claude".into(),
+                    folder: folder.into(),
+                },
+            )
+            .unwrap();
+            format!(
+                "agent-octave\torca-claude\t3\n```\n{}```\n",
+                mappings::export_profile(&mappings::Profile {
+                    name: "AI".into(),
+                    apps: vec![],
+                    mappings: vec![jump],
+                })
+                .unwrap()
+            )
+        };
+        let run = |claude: String| {
+            let mut ui = Script {
+                keys: vec![Enter, Down, Space, Enter, Down, Enter].into(), // Xbox only; Save
+                claude,
+                ..Default::default()
+            };
+            let result = ask_for(&mut ui, &path, AskKind::MapAgents);
+            (result, ui.asked)
+        };
+        let (result, asked) = run(reply("/work/api"));
+        result.unwrap();
+        assert!(asked[0].contains("- jump to orca-claude: orca-jump:claude:/work/api"));
+        assert!(asked[0].contains("- needs-me"));
+        let config = mappings::load_config(&path).unwrap();
+        let jump =
+            mappings::default_on(&config, mappings::GAMEPAD_CONTEXT, Control::button(1)).unwrap();
+        assert_eq!(jump.action.family(), "orca-jump");
+        assert_eq!(
+            config
+                .agents
+                .iter()
+                .find(|a| a.name == "orca-claude")
+                .unwrap()
+                .octave,
+            3
+        );
+        let saved = std::fs::read(&path).unwrap();
+        let error = run(reply("/work/other")).0.unwrap_err().to_string();
+        assert!(
+            error.contains("isn't a jump to one of your agents"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     /// v7.7 ticket 148: a question goes to the agent with what `describe` says; the answer is
     /// shown and nothing is saved; a proposed profile goes through the review and Cancel
     /// saves nothing.
@@ -13240,7 +13682,16 @@ mod tests {
         let ai = opens(&ui, 9, "Ask Claude Code for a profile…");
         assert!(ai.is_some());
         assert_eq!(ai, opens(&ui, 5, "Ask Claude for a profile…"));
-        assert_eq!(opens(&ui, 9, "for mappings…"), None, "not built yet");
+        // v7.7 ticket 168: mappings and agents open their own asks.
+        assert_eq!(
+            opens(&ui, 9, "for mappings…"),
+            Some(Open::Command(ASK_MAPPINGS))
+        );
+        assert_eq!(
+            opens(&ui, 9, "to map agents…"),
+            Some(Open::Command(ASK_MAP_AGENTS))
+        );
+        assert_eq!(opens(&ui, 9, "for a prompt…"), None, "not built yet");
         let titles = ui
             .tab_panes(9, 100, usize::MAX)
             .into_iter()
