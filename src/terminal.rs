@@ -2866,12 +2866,13 @@ impl Terminal {
     }
     /// Ticket 14: what the status lights should show now. None gives the controller back to the
     /// program's own feedback: Status lights Off, every agent idle, output not running on a
-    /// verified program, a piano program (octave/arpeggiator change the notes), or the login
-    /// service (`interactive` false).
-    fn wanted_lights(&self, interactive: bool) -> Option<crate::feedback::Settings> {
+    /// verified program, or a piano program (octave/arpeggiator change the notes).
+    /// v7.7 ticket 186: the login service lights them too, as the v7 spec decided ("agent
+    /// lights work outside tmux after boot"); ticket 14's terminal-only rule kept the Akai dark
+    /// whenever VibeConsole ran in the background. Every other gate stays.
+    fn wanted_lights(&self) -> Option<crate::feedback::Settings> {
         let agents = self.light_agents.as_ref()?;
         if !self.device_lights.as_ref().is_some_and(|p| p.on[0]) // the MPK's own switch
-            || !interactive
             || !self.wanted_run
             || self.suspended
             || !self.context_verified
@@ -2902,7 +2903,7 @@ impl Terminal {
         )
     }
     fn status_lights(&mut self) -> Result<()> {
-        let wanted = self.wanted_lights(self.original.is_some());
+        let wanted = self.wanted_lights();
         match &mut self.controller {
             // No writes before the controller's snapshot is validated.
             Some(controller) if controller.baseline.is_some() => controller.light(wanted),
@@ -20900,28 +20901,33 @@ mod tests {
         ];
         (ui.wanted_run, ui.suspended) = (true, false);
         (ui.context_verified, ui.feedback_allowed) = (true, true);
-        let shown = ui.wanted_lights(true).unwrap();
+        let shown = ui.wanted_lights().unwrap();
         assert_eq!((shown.octave, shown.tempo), (Some(1), Some(240)));
         // v7 ticket 86: the MPK's own switch off gives the program its feedback back.
         ui.device_lights.as_mut().unwrap().on[0] = false;
-        assert_eq!(ui.wanted_lights(true), None);
+        assert_eq!(ui.wanted_lights(), None);
         ui.device_lights.as_mut().unwrap().on[0] = true;
-        assert_eq!(ui.wanted_lights(false), None); // the login service never lights them
+        // v7.7 ticket 186: the login service (no terminal) lights them the same way.
+        ui.original = None;
+        assert_eq!(
+            ui.wanted_lights().map(|s| (s.octave, s.tempo)),
+            Some((Some(1), Some(240)))
+        );
         ui.suspended = true; // paused
-        assert_eq!(ui.wanted_lights(true), None);
+        assert_eq!(ui.wanted_lights(), None);
         ui.suspended = false;
         ui.feedback_allowed = false; // unverified program
-        assert_eq!(ui.wanted_lights(true), None);
+        assert_eq!(ui.wanted_lights(), None);
         ui.feedback_allowed = true;
         let mut piano = Mapping::new(Control::note(1, 60).unwrap(), "Shift", "hold").unwrap();
         piano.input = mappings::Input::Piano;
         ui.run_mappings = vec![piano];
-        assert_eq!(ui.wanted_lights(true), None); // octave/arpeggiator would change the notes
+        assert_eq!(ui.wanted_lights(), None); // octave/arpeggiator would change the notes
         ui.run_mappings.clear();
         ui.agent_states[0].2 = "idle";
-        assert_eq!(ui.wanted_lights(true), None); // all idle: program feedback
+        assert_eq!(ui.wanted_lights(), None); // all idle: program feedback
         ui.agent_states[0].2 = "thinking";
-        assert!(ui.wanted_lights(true).is_some());
+        assert!(ui.wanted_lights().is_some());
         // Agents -> Status lights (just above Prompts, the last row) toggles and saves Off.
         let mut menu = Script {
             keys: [Key::Up, Key::Up, Key::Enter, Key::Escape].into(),
@@ -20931,13 +20937,13 @@ mod tests {
         assert!(menu.screens.iter().any(|s| s.contains("Status lights: On")));
         assert!(!mappings::load_config(&path).unwrap().status_lights);
         ui.light_agents = None; // what refresh_agent_states sets for Off
-        assert_eq!(ui.wanted_lights(true), None);
+        assert_eq!(ui.wanted_lights(), None);
         // Ticket 16: a busy folder source lights the controller next to idle agents.
         ui.light_agents = Some(mappings::Config::default().agents);
         ui.agent_states[0].2 = "idle";
         let folder = -3;
         ui.light_sessions = vec![("/work/app".into(), "needs-input", folder)];
-        let shown = ui.wanted_lights(true).unwrap();
+        let shown = ui.wanted_lights().unwrap();
         assert_eq!((shown.octave, shown.tempo), (Some(-3), Some(240)));
         // Folders, Every other session and edited patterns survive a save in config v15.
         let mut config = mappings::load_config(&path).unwrap();
