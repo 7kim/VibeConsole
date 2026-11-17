@@ -47,6 +47,27 @@ Common setup in `docs/README.md`, then <exact commands, program, pads>.
 - Failures / notes:
 ```
 
+For a check that isn't hardware (a terminal, Claude Code, a file), use the short template. `tickets file` writes this one unless given `--hardware`:
+
+```markdown
+# Test NN: <Title> (<where: in a terminal, in Claude Code, your docs>)
+
+Ticket: `docs/<version>/tickets/<version>-<feature>/issues/NN-<slug>.md`
+Status: ready-for-human
+Blocked by: <other tests that set up what this one needs>, or none
+How: by the user, <one line: where and what state>.
+
+## Checks
+
+- <one observable pass criterion per line>
+
+## How to do
+
+<the exact commands and what the user should see, in one paragraph>
+
+## Result
+```
+
 Rules for the content:
 
 - Exact commands to copy, exact menu paths, and the expected effect for each step. One `- [ ]` per observation.
