@@ -1034,6 +1034,31 @@ fn override_line(device: &ProfileDevice, control: Control, name: &str) -> Result
 /// The request sent to Claude for a profile: the format by example, then for each chosen
 /// device every control by its name with a ready override line (v7 ticket 141), so
 /// Claude copies a line and changes only the keys.
+/// v7.7 ticket 147: an AI reply may hold no terminal command (`command:`, also inside a
+/// sequence) and no risky action (one that needs a one-second hold, or quits an app); the
+/// refusal names the control. The user can still add these by hand in /configure.
+pub fn refuse_risky(mappings: &[Mapping]) -> Result<()> {
+    for m in mappings {
+        let encoded = m.action.encode();
+        let what = if encoded.contains("command:") {
+            "a terminal command"
+        } else if m.risky || matches!(m.action.family(), "app-quit" | "app-toggle-quit") {
+            "a risky action"
+        } else {
+            continue;
+        };
+        let name = if m.label.is_empty() {
+            m.name(None)
+        } else {
+            m.label.clone()
+        };
+        return Err(format!(
+            "refused: {name} would run {what}; Claude never writes those (add them yourself in /configure)"
+        )
+        .into());
+    }
+    Ok(())
+}
 pub fn profile_request(app: &str, wish: &str, devices: &[ProfileDevice]) -> Result<String> {
     let first = devices
         .iter()
@@ -1056,7 +1081,7 @@ pub fn profile_request(app: &str, wish: &str, devices: &[ProfileDevice]) -> Resu
     Ok(format!(
         "Write one VibeConsole app profile for the app `{app}`, for the {names}. {wish}\n\n\
          Reply with only the profile file, in exactly this tab-separated format (the first line is the header, then one profile line whose last field is the number of override lines, then the override lines, each with exactly the same 16 fields as this example):\n\n{lines}\n\
-         Rules: a profile name of 1-32 characters (not Default); overrides only for the controls listed below, behaviour hold or toggle, keyboard shortcuts as Key+Key names in the keys field (the 9th field), the action field always the word `shortcut` as in the example, no feedback. To give the same function on more than one device, write one override line per device. Copy a control's line below as it is and change only the keys (and behaviour if needed); never invent a control. The controls:\n{controls}"
+         Rules: a profile name of 1-32 characters (not Default); overrides only for the controls listed below, behaviour hold or toggle, keyboard shortcuts as Key+Key names in the keys field (the 9th field), the action field always the word `shortcut` as in the example, no feedback. Terminal commands (`command:`) and risky actions are not available to you: VibeConsole refuses a reply that has one. To give the same function on more than one device, write one override line per device. Copy a control's line below as it is and change only the keys (and behaviour if needed); never invent a control. The controls:\n{controls}"
     ))
 }
 /// v7 ticket 141: every override is a control of a chosen device, named as the user sees
@@ -3070,6 +3095,38 @@ pub fn save_config(path: &Path, config: &Config) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// v7.7 ticket 147: no AI reply may hold a terminal command (also inside a sequence) or
+    /// a risky action; plain shortcuts pass; the request says so.
+    #[test]
+    fn ai_replies_never_carry_commands_or_risky_actions() {
+        use super::*;
+        use crate::actions::Action;
+        let pad = Control::from_note(10, 36).unwrap();
+        let plain = Mapping::new(pad, "Ctrl+T", "tap").unwrap();
+        assert!(refuse_risky(std::slice::from_ref(&plain)).is_ok());
+        let mut risky = plain.clone();
+        risky.risky = true;
+        assert!(
+            refuse_risky(&[risky])
+                .unwrap_err()
+                .to_string()
+                .contains("a risky action")
+        );
+        let action = Action::parse("command:dev:/tmp:sudo dnf update").unwrap();
+        let mut command = Mapping::new_action(pad, Input::Pad, action).unwrap();
+        command.label = "Bank A Pad 1".into();
+        let error = refuse_risky(&[command]).unwrap_err().to_string();
+        assert!(
+            error.contains("Bank A Pad 1 would run a terminal command"),
+            "{error}"
+        );
+        let devices = profile_devices(&Config::default(), 0, None);
+        let request = profile_request("firefox", "", &devices).unwrap();
+        assert!(
+            request.contains("Terminal commands (`command:`) and risky actions are not available")
+        );
+    }
+
     /// v7.7 ticket 163: every save keeps the file it replaced; restoring the newest puts the
     /// previous save back byte for byte and is itself in history (undo the undo); a file
     /// that doesn't load is refused and changes nothing; ten are kept; the summary names the

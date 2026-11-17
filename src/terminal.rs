@@ -6816,6 +6816,9 @@ fn ai_profile(ui: &mut impl Ui, path: &Path) -> Result<()> {
         .map_err(|e| format!("Claude's profile: {e}; nothing saved"))?;
     mappings::check_profile_controls(&mut profile, &devices)
         .map_err(|e| format!("Claude's profile: {e}; nothing saved"))?;
+    // v7.7 ticket 147: never a terminal command or a risky action from Claude.
+    mappings::refuse_risky(&profile.mappings)
+        .map_err(|e| format!("Claude's profile: {e}; nothing saved"))?;
     // By device, every control by its name, then the whole thing in plain words.
     let mut summary = String::new();
     for device in &devices {
@@ -16186,6 +16189,26 @@ mod tests {
             screens
                 .iter()
                 .any(|s| s.starts_with("Claude suggests profile Firefox"))
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        // v7.7 ticket 147: a terminal command from Claude is refused by name; nothing saved.
+        let mut command = profile.clone();
+        command.mappings = vec![
+            Mapping::new_action(
+                pad,
+                mappings::Input::Pad,
+                crate::actions::Action::parse("command:dev:/tmp:sudo dnf update").unwrap(),
+            )
+            .unwrap(),
+        ];
+        command.mappings[0].label = "Bank A Pad 1".into();
+        let sudo = format!("```\n{}```\n", mappings::export_profile(&command).unwrap());
+        let screens = ask(sudo, vec![Enter]);
+        assert!(
+            screens.iter().any(|s| s
+                .contains("refused: Bank A Pad 1 would run a terminal command")
+                && s.contains("nothing saved")),
+            "{screens:?}"
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);
         ask(reply, vec![Down, Enter]); // Save this profile
