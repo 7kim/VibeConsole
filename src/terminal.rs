@@ -19182,7 +19182,7 @@ mod tests {
         ui.agent_states = vec![("claude".into(), "claude".into(), "thinking")];
         ui.output = Some(crate::keyboard::Output::recording(&[]).unwrap());
         ui.suspended = false;
-        let mut seen = |ui: &mut Terminal, from: u64, to: u64| {
+        let seen = |ui: &mut Terminal, from: u64, to: u64| {
             let mut modes = Vec::new();
             for ms in (from..to).step_by(10) {
                 ui.show_button_light_at(ms);
@@ -19339,7 +19339,7 @@ mod tests {
         ui.output = Some(output);
         ui.wanted_run = true;
         ui.suspended = false;
-        let mut tap = |ui: &mut Terminal, pad| {
+        let tap = |ui: &mut Terminal, pad| {
             ui.handle_events(vec![
                 Event::Press(pad),
                 Event::Release(pad, crate::ReleaseType::NoteOff),

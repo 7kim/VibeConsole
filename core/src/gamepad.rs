@@ -1828,11 +1828,11 @@ mod tests {
         tuning.sticks[0] = StickMode::sectors();
         let (mut down, mut pad) = (HashSet::new(), Analog::default());
         // Moves the left stick to `deg` at `push` (0–1) in one step.
-        let mut push = |deg: f32,
-                        push: f32,
-                        tuning: &Tuning,
-                        down: &mut HashSet<Control>,
-                        pad: &mut Analog| {
+        let push = |deg: f32,
+                    push: f32,
+                    tuning: &Tuning,
+                    down: &mut HashSet<Control>,
+                    pad: &mut Analog| {
             let (x, y) = (deg.to_radians().sin() * push, deg.to_radians().cos() * push);
             pad.left = (x, y);
             analog(down, pad, Motion::Axis(gilrs::Axis::LeftStickY, y), tuning)
