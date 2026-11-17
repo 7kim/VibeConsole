@@ -30,7 +30,9 @@ TABS = {
 # the session and send real shortcuts. bwrap hides /dev/input from the app (v7.7 ticket 150).
 # v7.7 ticket 178: without bwrap nothing runs, unless the user opts out on a machine with no
 # input devices and takes the risk.
-HIDE_INPUT = ["bwrap", "--dev-bind", "/", "/", "--tmpfs", "/dev/input"] if shutil.which("bwrap") else []
+# v7.7 ticket 203: nor the real journal: every scenario runs with no journal socket, so each
+# also checks that a run without a journal starts and shows no error.
+HIDE_INPUT = ["bwrap", "--dev-bind", "/", "/", "--tmpfs", "/dev/input", "--tmpfs", "/run/systemd/journal"] if shutil.which("bwrap") else []
 if not HIDE_INPUT:
     if os.environ.get("VIBECONSOLE_PTY_NO_BWRAP") != "1":
         raise SystemExit(
@@ -359,6 +361,7 @@ for ending in (*STARTUP, "quit", "sigint", "sigterm", "configuration_error", "cu
             # v7.7 ticket 159: mouse reporting was on while drawn and is off on every exit.
             assert b"\x1b[?1000h" in initial_screen or ending in ("sigint", "sigterm")
             assert b"\x1b[?1000l" in restored, restored[-200:]
+            assert b"journal" not in initial_screen + restored  # no journal: no error shown
             child.wait(timeout=3)
             assert child.returncode == (1 if ending in ("sigint", "sigterm") else 0)
             assert termios.tcgetattr(slave) == original

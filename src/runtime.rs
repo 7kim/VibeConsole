@@ -115,6 +115,19 @@ fn managed(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+/// v7.7 ticket 203: journald's native socket. A terminal run's status lines go there, under
+/// the login service's name, so `journalctl --user -t vibeconsole` shows both.
+pub const JOURNAL: &str = "/run/systemd/journal/socket";
+/// One line to the journal; with no journal it is dropped and the run goes on.
+pub fn journal(line: &str) {
+    let message = format!(
+        "SYSLOG_IDENTIFIER=vibeconsole\nPRIORITY=6\nMESSAGE={}\n",
+        line.replace('\n', " | ")
+    );
+    if let Ok(socket) = std::os::unix::net::UnixDatagram::unbound() {
+        let _ = socket.send_to(message.as_bytes(), JOURNAL);
+    }
+}
 /// Output is captured: Settings calls this inside the full-screen session.
 fn systemctl(args: &[&str]) -> Result<()> {
     let output = Command::new("systemctl")
@@ -959,6 +972,15 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                 println!("{line}");
             }
             println!("{}", login_doctor(unit()?.is_file(), systemctl));
+            // v7.7 ticket 203: where status lines go (checked, nothing written).
+            println!(
+                "{}",
+                if Path::new(JOURNAL).exists() {
+                    "Status log: the login service and a terminal run write their status changes to the journal: journalctl --user -t vibeconsole"
+                } else {
+                    "Status log: unavailable: no journal (no /run/systemd/journal/socket); a terminal run shows its status on screen only"
+                }
+            );
             println!("Agent terminals: tmux attach -t vibe");
             for codex in [false, true] {
                 println!("{}", crate::status::hooks_status(codex));

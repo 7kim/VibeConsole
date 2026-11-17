@@ -463,9 +463,66 @@ struct Terminal {
     /// An Enter that was held when the first frame came: its repeats are dropped while they
     /// keep coming, the last one at this time.
     held_enter: Option<Instant>,
+    /// v7.7 ticket 203: the status line last written to the journal.
+    journaled: String,
 }
 
 impl Terminal {
+    fn run_label(&self) -> &'static str {
+        if !self.wanted_run {
+            "PAUSED"
+        } else if !self.context_verified {
+            "RUNNING (detecting program; actions inactive)"
+        } else if self.suspended {
+            "RUNNING (menu open; actions suspended)"
+        } else if self.retry.is_some() || self.connecting {
+            "RUNNING (waiting for MIDI/readiness)"
+        } else {
+            "RUNNING"
+        }
+    }
+
+    /// v7.7 ticket 203: a terminal run leaves its status changes in the journal, as the login
+    /// service does: run state, program, notice and error, one line per change. Notices and
+    /// errors name controls, actions and prompt files, never what was pasted or typed.
+    fn journal_status(&mut self) {
+        let program = format!(
+            "Program {} {}",
+            self.context + 1,
+            if self.context_verified {
+                "verified"
+            } else {
+                "unverified"
+            }
+        );
+        let line = [
+            "Terminal run",
+            &program,
+            self.run_label(),
+            &self.notice,
+            &self.error,
+        ]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ");
+        if line != self.journaled {
+            self.journal(&line);
+            self.journaled = line;
+        }
+    }
+    /// The service has no screen and logs on its own; tests keep the lines in their script.
+    fn journal(&mut self, line: &str) {
+        #[cfg(test)]
+        if let Some(play) = &mut self.script {
+            play.journal.push(line.into());
+        }
+        #[cfg(not(test))]
+        if self.original.is_some() {
+            crate::runtime::journal(line);
+        }
+    }
+
     fn name(&self, control: Control) -> String {
         let program = self.program();
         match self.run_mappings.iter().find(|m| m.control == control) {
@@ -482,20 +539,7 @@ impl Terminal {
             .as_ref()
             .map(|o| o.keyboard.status(|control| self.name(control)))
             .unwrap_or_else(|| format!("PAUSED | {} saved assignments", self.run_mappings.len()));
-        let state = if self.wanted_run {
-            let label = if !self.context_verified {
-                "RUNNING (detecting program; actions inactive)"
-            } else if self.suspended {
-                "RUNNING (menu open; actions suspended)"
-            } else if self.retry.is_some() || self.connecting {
-                "RUNNING (waiting for MIDI/readiness)"
-            } else {
-                "RUNNING"
-            };
-            state.replacen("PAUSED", label, 1)
-        } else {
-            state
-        };
+        let state = state.replacen("PAUSED", self.run_label(), 1);
         let feedback = if !self.feedback_allowed
             && (self.idle.enabled() || self.run_mappings.iter().any(|m| m.feedback.enabled()))
         {
@@ -1099,6 +1143,7 @@ impl Terminal {
             rendered_size: (0, 0),
             drawn: false,
             held_enter: None,
+            journaled: String::new(),
         };
         for signal in [
             signal_hook::consts::SIGINT,
@@ -5458,6 +5503,9 @@ Changing musical settings while running is unsupported.",
 impl Drop for Terminal {
     fn drop(&mut self) {
         self.flush_usage(); // v7.7 ticket 164: the last counts
+        if self.drawn {
+            self.journal("Terminal run | quit");
+        }
         // Release before restoring terminal settings or waiting for MIDI shutdown.
         self.output = None;
         self.actions.cancel();
@@ -5583,6 +5631,7 @@ impl Ui for Terminal {
             }
         }
         self.drawn = true;
+        self.journal_status();
         let size = self.size();
         let screen = self.screen(text).render(
             size.0,
@@ -15994,6 +16043,60 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7.7 ticket 203: a terminal run writes one journal line per status change (run
+    /// state, program, a result, an error) and none for a redraw that changed nothing.
+    /// A prompt's line carries what the action reported (its file name), never its text.
+    #[test]
+    fn terminal_run_journals_each_status_change_once() {
+        let (dir, mut ui, _ran, [mute, ..]) = configure_session("journal");
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = fired.clone();
+        ui.actions = crate::actions::Dispatcher::with(move |_, _, _| {
+            match count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => Ok("Prompt review.md pasted into the focused window".into()),
+                _ => Err("Prompt review.md not sent: agent missing".into()),
+            }
+        });
+        ui.context_verified = true;
+        ui.at_menu = true;
+        ui.script = Some(Play::default());
+        let press = |ui: &mut Terminal| {
+            ui.handle_events(vec![
+                Event::Press(mute),
+                Event::Release(mute, crate::ReleaseType::NoteOff),
+            ])
+            .unwrap();
+            let before = (ui.notice.clone(), ui.error.clone());
+            for _ in 0..200 {
+                ui.draw("").unwrap();
+                if (ui.notice.clone(), ui.error.clone()) != before {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        ui.draw("").unwrap();
+        ui.draw("").unwrap(); // nothing changed: no second line
+        press(&mut ui);
+        press(&mut ui);
+        ui.pause().unwrap(); // what Live's ❚❚ Pause does
+        ui.draw("").unwrap();
+        ui.draw("").unwrap();
+        let mut play = ui.script.take().unwrap();
+        let run = "Terminal run | Program 1 verified";
+        let expected = [
+            format!("{run} | RUNNING"),
+            format!("{run} | RUNNING | Prompt review.md pasted into the focused window"),
+            format!(
+                "{run} | RUNNING | Prompt review.md pasted into the focused window | Action failed: Prompt review.md not sent: agent missing"
+            ),
+        ];
+        let paused = play.journal.pop().unwrap();
+        assert_eq!(play.journal, expected);
+        assert!(paused.starts_with(&format!("{run} | PAUSED")), "{paused}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// v7.7 ticket 164: a fired pad adds a press, its family and the keys it typed, and the
     /// day file holds names and numbers only; Insights builds the recap, tiles, heatmap and
     /// streaks from fixture day files.
@@ -22075,6 +22178,8 @@ mod tests {
         pub(super) ran: Vec<String>,
         /// v7.7 ticket 179: whether the login service says Start at login is on.
         pub(super) login: Option<bool>,
+        /// v7.7 ticket 203: the journal lines a terminal run wrote, never sent.
+        pub(super) journal: Vec<String>,
     }
     impl Terminal {
         pub(super) fn scripted_key(&mut self) -> Result<Option<Key>> {
