@@ -804,6 +804,22 @@ pub fn colour_word(c: Colour) -> String {
 }
 /// v7.7 ticket 199: a colour as `#rrggbb`, `r,g,b` (each 0–255) or one of `COLOURS`, or
 /// why not.
+/// v7.7 ticket 207: one of a colour's Red, Green or Blue, typed as a whole number 0–255; a
+/// wrong one is refused with the reason.
+pub fn parse_channel(name: &str, text: &str) -> Result<u8> {
+    let text = text.trim();
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(
+            format!("{name}: {text:?} isn't a number; type a whole number from 0 to 255").into(),
+        );
+    }
+    text.parse::<u16>()
+        .ok()
+        .and_then(|n| u8::try_from(n).ok())
+        .ok_or_else(|| {
+            format!("{name}: {text} is over 255; type a whole number from 0 to 255").into()
+        })
+}
 pub fn parse_colour(text: &str) -> Result<Colour> {
     let text = text.trim();
     if let Some(name) = COLOURS.iter().find(|c| **c == text) {

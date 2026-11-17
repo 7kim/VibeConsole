@@ -9167,16 +9167,18 @@ fn pick_timing(
     timing.intensity = (i > 0).then(|| levels[i - 1]);
     Ok(Some(timing))
 }
-/// v7.7 ticket 199: a named colour, or "Your own RGB…" typed as `#rrggbb` or `r,g,b`; a
-/// wrong one is refused with the reason and asked again.
+/// v7.7 ticket 199: a named colour, or your own. Ticket 207: your own is asked as Red, Green
+/// and Blue one after another (each 0–255, the current value filled in), or as a hex code;
+/// a wrong one is refused with the reason and that field asked again. Esc saves nothing.
 fn pick_colour(
     ui: &mut impl Ui,
     title: &str,
     current: crate::status::Colour,
 ) -> Result<Option<crate::status::Colour>> {
-    use crate::status::{COLOURS, colour_word, parse_colour, rgb_bytes};
+    use crate::status::{COLOURS, colour_word, parse_channel, parse_colour, rgb_bytes};
     let mut rows = COLOURS.map(String::from).to_vec();
-    rows.push("Your own RGB…".into());
+    rows.push("Your own colour: Red, Green, Blue…".into());
+    rows.push("Hex code (#rrggbb)…".into());
     let start = COLOURS
         .iter()
         .position(|c| rgb_bytes(c) == current)
@@ -9187,7 +9189,31 @@ fn pick_colour(
     if i < COLOURS.len() {
         return Ok(Some(rgb_bytes(COLOURS[i])));
     }
-    let mut prompt = format!("{title}: your own colour, #rrggbb or r,g,b (each 0–255)");
+    if i == COLOURS.len() {
+        let mut colour = current;
+        for (slot, name) in ["Red", "Green", "Blue"].into_iter().enumerate() {
+            let ask = format!("{title}: your own colour · {name}, 0–255");
+            let mut prompt = ask.clone();
+            let mut text = colour[slot].to_string();
+            loop {
+                let Some(entry) = text_entry(ui, &prompt, &text)? else {
+                    return Ok(None);
+                };
+                match parse_channel(name, &entry) {
+                    Ok(value) => {
+                        colour[slot] = value;
+                        break;
+                    }
+                    Err(error) => {
+                        prompt = format!("{error}\n{ask}");
+                        text = entry;
+                    }
+                }
+            }
+        }
+        return Ok(Some(colour));
+    }
+    let mut prompt = format!("{title}: hex code, #rrggbb");
     let mut text = colour_word(current);
     loop {
         let Some(entry) = text_entry(ui, &prompt, &text)? else {
@@ -9196,7 +9222,7 @@ fn pick_colour(
         match parse_colour(&entry) {
             Ok(colour) => return Ok(Some(colour)),
             Err(error) => {
-                prompt = format!("{error}. Type #rrggbb or r,g,b (each 0–255)");
+                prompt = format!("{error}. Type #rrggbb");
                 text = entry;
             }
         }
@@ -22051,8 +22077,8 @@ mod tests {
     }
 
     /// v7.7 ticket 199: Status light patterns: a shared state picks its effect from what
-    /// every light shows, then its colour; Your own RGB… refuses `#12345g` and `300,0,0` with
-    /// the reason and takes `18,52,86`; Per device gives the keyboard its own effects (from
+    /// every light shows, then its colour; Hex code refuses `#12345g` with the reason and
+    /// takes `#123456` (ticket 207); Per device gives the keyboard its own effects (from
     /// the shared ones), where reactive and its speed are offered.
     #[test]
     fn rgb_rows_pick_effect_settings_then_colour_and_a_per_device_override() {
@@ -22072,11 +22098,10 @@ mod tests {
         let mut keys = vec![Down; 19];
         keys.push(Enter); // RGB, all lights · Needs input: static #ff8000
         keys.extend([Down, Enter]); // breath: one colour
-        keys.extend(vec![Down; 5]);
-        keys.push(Enter); // Your own RGB…
+        keys.extend(vec![Down; 6]);
+        keys.push(Enter); // Hex code (#rrggbb)…
         keys.extend(typed("#12345g"));
-        keys.extend(typed("300,0,0"));
-        keys.extend(typed("18,52,86"));
+        keys.extend(typed("#123456"));
         keys.extend(vec![Down; 25]);
         keys.push(Enter); // Keyboard RGB · Per device: follows all lights -> its own
         keys.extend(vec![Down; 27]);
@@ -22106,7 +22131,6 @@ mod tests {
             "{shared}"
         );
         screen("#12345g isn't a colour: #rrggbb takes six hex digits");
-        screen("300,0,0 isn't a colour: each of r,g,b is 0–255, not 300");
         let own = screen("Keyboard RGB own · Needs input: effect");
         assert!(own.contains("reactive: lights on each key press"), "{own}");
         screen("Keyboard RGB · Per device: its own effects (below)");
@@ -22120,6 +22144,93 @@ mod tests {
             "started from the shared set"
         );
         assert!(lights.rgb_devices[1..].iter().all(|d| d.own.is_none()));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 207: your own colour is asked as Red, Green and Blue (each 0–255): 256,
+    /// -1 and ab are refused with the reason and asked again, and Red 255, Green 128, Blue 0
+    /// saves #ff8000; Esc partway saves nothing; Hex code #00ff00 still saves.
+    #[test]
+    fn own_colour_is_red_green_blue_or_a_hex_code() {
+        use crate::status::Rgb;
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-rgb-own-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let typed = |text: &str| {
+            let mut keys = vec![Backspace; 7];
+            keys.extend(text.bytes().map(Character));
+            keys.push(Enter);
+            keys
+        };
+        // RGB, all lights · Needs input, breath, then a row of the colour list.
+        let to_colour = |row: usize| {
+            let mut keys = vec![Down; 19];
+            keys.extend([Enter, Down, Enter]);
+            keys.extend(vec![Down; row]);
+            keys.push(Enter);
+            keys
+        };
+        let run = |keys: Vec<Key>| {
+            let mut ui = Script {
+                keys: keys.into(),
+                ..Default::default()
+            };
+            light_patterns_menu(&mut ui, &path).unwrap();
+            assert!(ui.keys.is_empty(), "keys left: {:?}", ui.keys);
+            ui.screens
+        };
+        let shared = || {
+            mappings::load_config(&path)
+                .unwrap()
+                .device_lights
+                .rgb_shared
+                .states[1]
+        };
+        let lights = || std::fs::read(dir.join("lights.json")).unwrap_or_default();
+
+        // Esc at Green: nothing saved, the file as it was.
+        let before = lights();
+        let mut keys = to_colour(5);
+        keys.extend(typed("10"));
+        keys.extend([Escape, Escape]);
+        run(keys);
+        assert_eq!(lights(), before, "Esc partway saves nothing");
+
+        let mut keys = to_colour(5);
+        for wrong in ["256", "-1", "ab"] {
+            keys.extend(typed(wrong));
+        }
+        keys.extend(typed("255"));
+        keys.extend(typed("128"));
+        keys.extend(typed("0"));
+        keys.push(Escape);
+        let screens = run(keys);
+        for reason in [
+            "Red: 256 is over 255",
+            "Red: \"-1\" isn't a number",
+            "Red: \"ab\" isn't a number",
+        ] {
+            assert!(screens.iter().any(|s| s.contains(reason)), "{reason}");
+        }
+        assert_eq!(shared(), Rgb::Breath([255, 128, 0], Default::default()));
+        assert!(String::from_utf8(lights()).unwrap().contains("#ff8000"));
+
+        // Breath is current now; the colour list opens on #ff8000's row, a named colour.
+        let (names, hex) = (crate::status::COLOURS, crate::status::COLOURS.len() + 1);
+        let at = (names.iter())
+            .position(|c| crate::status::rgb_bytes(c) == [255, 128, 0])
+            .unwrap_or(names.len());
+        let mut keys = vec![Down; 19];
+        keys.extend([Enter, Enter]); // the row, breath again
+        keys.extend(vec![Down; hex - at]);
+        keys.push(Enter); // Hex code
+        keys.extend(typed("#00ff00"));
+        keys.push(Escape);
+        run(keys);
+        assert_eq!(shared(), Rgb::Breath([0, 255, 0], Default::default()));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
