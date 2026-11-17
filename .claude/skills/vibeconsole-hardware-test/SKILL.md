@@ -15,7 +15,7 @@ Two kinds of test, never mixed:
 - a title with where it is run ("at the Xbox controller"), the ticket it belongs to, a `Status:` line and a `Blocked by:` line;
 - **How:** the build to install, the devices to connect, the app to focus;
 - **Checks:** the one sentence that must be true;
-- **How to do:** Prepare (back up `mappings.tsv`), numbered steps each with a `- [ ]` box that says what to see, then Restore;
+- **How to do:** Prepare (back up the config folder's `*.json` files), numbered steps each with a `- [ ]` box that says what to see, then Restore;
 - **Result:** date and notes, filled by the user.
 
 ## Rules

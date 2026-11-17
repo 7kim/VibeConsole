@@ -33,7 +33,7 @@ VibeConsole is a Rust terminal app that turns an Akai MPK mini 3 and Xbox contro
 
 ## Where things live
 
-- Config: `~/.config/vibeconsole/mappings.tsv` (saved atomically; the first line names its version).
+- Config: one JSON file per topic in `~/.config/vibeconsole/`: `mappings.json`, `devices.json`, `lights.json`, `agents.json`, `settings.json` (each with its own `version`, saved atomically; defaults ship in the program). `mappings.tsv` is the old file, kept as the backup it was moved from and no longer read.
 - Profiles, prompts and presets: folders beside it, `profiles/`, `prompts/`, `presets/`.
 - Login service: `vibeconsole startup-status`, `startup-start`, `startup-stop`. Only one VibeConsole runs at a time.
 - Agent terminals: `tmux attach -t vibe`.

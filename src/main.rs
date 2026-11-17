@@ -205,7 +205,7 @@ fn main() -> Result<()> {
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
             .unwrap_or_default();
         let look = mappings::config_path()
-            .and_then(|path| mappings::load_config(&path))
+            .and_then(|path| mappings::read_config(&path))
             .unwrap_or_default()
             .look;
         let binary = mappings::one_shot(&look, "")
@@ -226,7 +226,7 @@ fn main() -> Result<()> {
     if args == ["describe"] {
         plain_output();
         let config = mappings::config_path()
-            .and_then(|path| mappings::load_config(&path))
+            .and_then(|path| mappings::read_config(&path))
             .unwrap_or_default();
         let xbox = vibeconsole_core::gamepad::Pad::open()
             .map(|pad| pad.connections())

@@ -80,15 +80,18 @@ def read_until_any(master, tokens, seconds=3):
     return data
 
 
-def preserved(before, after):
-    """The file is as it was, or (v7.7 ticket 155) saved once as v33 to mark What moved seen,
-    with every mapping still there."""
-    if after == before:
-        return True
+def preserved(before, config):
+    """v7.7 ticket 197: mappings.tsv is moved into JSON files once and kept as it was, and
+    every old mapping is in mappings.json with its control and keys."""
+    import json
+    if (config / "mappings.tsv").read_bytes() != before:
+        return False
+    saved = json.loads((config / "mappings.json").read_text())["mappings"]
     # An old line `device kind channel id behaviour keys …` keeps its control and its keys.
     lines = [line.split(b"\t") for line in before.splitlines()[1:] if line.startswith(b"09e8:1049\t")]
-    kept = all(b"\t".join(f[:4]) in after and b"\t" + f[4] + b"\t" + f[5] + b"\t" in after for f in lines)
-    return after.startswith(b"vibeconsole-mappings-v34\n") and b"\nseen-7.7\ton\n" in after and kept
+    kept = all(any(m["message"] == f[1].decode() and m["channel"] == int(f[2]) and m["id"] == int(f[3])
+                   and m["behavior"] == f[4].decode() and m["keys"] == f[5].decode() for m in saved) for f in lines)
+    return kept
 
 
 def read_until(master, token, seconds=3):
@@ -139,7 +142,9 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
         (bin_dir / "systemctl").write_text('#!/bin/sh\necho "$@" >> "$(dirname "$0")/systemctl.log"\nexit 1\n')
         (bin_dir / "systemctl").chmod(0o755)
         if ending == "configuration_error":
-            (config / "mappings.tmp").write_text("occupied")
+            # Every config file's staging file is taken, so a save fails (v7.7 ticket 197).
+            for name in ("settings", "devices", "lights", "mappings", "agents"):
+                (config / f"{name}.json.tmp").write_text("occupied")
         master, slave = pty.openpty()
         original = termios.tcgetattr(slave)
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
@@ -194,7 +199,7 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
                 assert b"Wispr Flow not installed" in initial_screen
                 go(master, "Run", "Start Wispr Flow with VibeConsole")
                 read_until(master, "Start Wispr Flow with VibeConsole · Off".encode())
-                assert b"start-flow\toff\n" in path.read_bytes()
+                assert b'"start_flow": false' in (config / "settings.json").read_bytes()
                 go(master, "Start Wispr Flow with VibeConsole", "/quit")
             elif ending == "idle_no_device":
                 go(master, "Run", "/feedback-idle")
@@ -223,6 +228,7 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
                 pick(master, "Remove assignment")
                 read_until(master, b"Operation failed")
                 assert path.read_bytes() == contents
+                assert b'"keys": "Shift"' in (config / "mappings.json").read_bytes()
                 os.write(master, b"\r")
                 read_until(master, MENU)
                 go(master, "/configure", "/quit")
@@ -332,9 +338,10 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
             assert child.returncode == (1 if ending in ("sigint", "sigterm") else 0)
             assert termios.tcgetattr(slave) == original
             if ending == "flow_setting":
-                assert b"start-flow\toff\n" in path.read_bytes()
+                assert b'"start_flow": false' in (config / "settings.json").read_bytes()
+                assert path.read_bytes() == contents
             else:
-                assert preserved(contents, path.read_bytes())
+                assert preserved(contents, config)
             calls = (bin_dir / "systemctl.log").read_text() if (bin_dir / "systemctl.log").exists() else ""
             assert " start " not in f" {calls} ", calls
             print(f"{ending}: PASS (terminal restored, saved mappings preserved)")

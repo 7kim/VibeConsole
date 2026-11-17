@@ -1998,11 +1998,7 @@ impl Config {
         let lights = crate::config::shipped_lights();
         Self {
             mappings: Vec::new(),
-            // ponytail: the default agents are code until ticket 197 ships agents.json.
-            agents: vec![
-                Agent::new("claude", "claude", "claude").unwrap(),
-                Agent::new("codex", "codex", "codex").unwrap(),
-            ],
+            agents: Vec::new(),
             idle: Settings::default(),
             program_idle: std::collections::BTreeMap::new(),
             start_flow: false,
@@ -2036,7 +2032,7 @@ impl Config {
                 agent_cards: false,
                 share_usage: false,
                 seen_moved: false,
-                default_agent: AGENT_NAMES[0].into(),
+                default_agent: String::new(),
                 agent_model: String::new(),
                 notice: None,
             },
@@ -2147,7 +2143,7 @@ impl Host {
             Self::Herdr => "herdr",
         }
     }
-    fn parse(text: &str) -> Result<Self> {
+    pub(crate) fn parse(text: &str) -> Result<Self> {
         [Self::Tmux, Self::Orca, Self::Herdr]
             .into_iter()
             .find(|h| h.text() == text)
@@ -2223,7 +2219,7 @@ pub(crate) fn validate_variables(list: &[(String, String)], kind: &str) -> Resul
     Ok(())
 }
 /// A directory field before expansion: one nonempty line.
-fn directory_syntax(dir: &str) -> Result<()> {
+pub(crate) fn directory_syntax(dir: &str) -> Result<()> {
     if dir.trim().is_empty() || dir.len() > 4096 || dir.chars().any(char::is_control) {
         return Err("directory must be one nonempty line without control characters".into());
     }
@@ -2271,7 +2267,7 @@ pub fn absolute_directory(dir: &str, config: &Config) -> Result<String> {
     }
     Ok(expanded)
 }
-fn validate_agents(agents: &[Agent]) -> Result<()> {
+pub(crate) fn validate_agents(agents: &[Agent]) -> Result<()> {
     if agents.len() > 64 {
         return Err("too many agents".into());
     }
@@ -2786,7 +2782,7 @@ fn parse_device_lights(
     Ok(p)
 }
 
-fn parse_config(contents: &str) -> Result<Config> {
+pub(crate) fn parse_config(contents: &str) -> Result<Config> {
     let mut lines = contents.lines().peekable();
     // Files saved before the KeyAI → VibeConsole rename keep their old header.
     let version = lines.next().and_then(|header| {
@@ -3410,6 +3406,14 @@ pub fn load_config(path: &Path) -> Result<Config> {
         load_tsv(path)
     }
 }
+/// v7.7 ticket 197: the main config without moving `mappings.tsv` (hooks and read-only
+/// commands); the session moves it.
+pub fn read_config(path: &Path) -> Result<Config> {
+    match is_main(path) {
+        true => crate::config::peek(path),
+        false => load_tsv(path),
+    }
+}
 /// One TSV config file (any v1–v34); a missing file is the defaults.
 pub fn load_tsv(path: &Path) -> Result<Config> {
     match fs::read_to_string(path) {
@@ -3669,27 +3673,46 @@ pub(crate) fn keep_history(path: &Path, new: &[u8]) -> Result<()> {
     Ok(())
 }
 /// v7.7 ticket 163: history, newest first: (file, seconds since 1970 when it was replaced).
+/// Since ticket 197 an entry is `<stamp>.json` (the files one save replaced); older
+/// `<stamp>.tsv` entries (a whole `mappings.tsv`) still count and load.
 pub fn history(path: &Path) -> Vec<(PathBuf, u64)> {
-    let mut entries = fs::read_dir(history_dir(path))
+    history_in(&history_dir(path))
+}
+pub(crate) fn history_in(dir: &Path) -> Vec<(PathBuf, u64)> {
+    let mut entries = fs::read_dir(dir)
         .map(|dir| {
             dir.filter_map(|e| e.ok())
                 .filter_map(|e| {
                     let name = e.file_name().to_string_lossy().into_owned();
-                    let nanos = name.strip_suffix(".tsv")?.parse::<u128>().ok()?;
+                    let stamp = name
+                        .strip_suffix(".json")
+                        .or_else(|| name.strip_suffix(".tsv"))?;
+                    let nanos = stamp.parse::<u128>().ok()?;
                     Some((e.path(), (nanos / 1_000_000_000) as u64))
                 })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    entries.sort_by(|a, b| b.0.file_stem().cmp(&a.0.file_stem()));
     entries
 }
-/// v7.7 ticket 163: put a history file back: validated in full like a load, then saved
-/// atomically (so the restore lands in history and can itself be undone).
+/// v7.7 ticket 197: the config before the save that wrote this history entry, given the
+/// config after that save.
+pub fn before(entry: &Path, after: &Config) -> Result<Config> {
+    crate::config::before(entry, after)
+}
+/// v7.7 ticket 163: put the setup back to before a history entry's save: each newer entry
+/// is undone first, the result validated in full like a load, then saved atomically (so
+/// the restore lands in history and can itself be undone).
 pub fn restore(path: &Path, from: &Path) -> Result<()> {
-    let text = fs::read_to_string(from).map_err(|e| format!("history: {e}"))?;
-    let config = parse_config(&text).map_err(|e| format!("history: {e}; nothing restored"))?;
-    save_config(path, &config)
+    let mut config = load_config(path)?;
+    for (entry, _) in history(path) {
+        config = before(&entry, &config).map_err(|e| format!("{e}; nothing restored"))?;
+        if entry == from {
+            return save_config(path, &config);
+        }
+    }
+    Err("history: that save is no longer in history; nothing restored".into())
 }
 /// v7.7 ticket 163: what changed from `older` to `newer`, in control names:
 /// `Bank A Pad 5 → Orca IDE`, `+2 more`, or `settings` when no mapping changed.
@@ -3757,6 +3780,19 @@ pub fn save_tsv(path: &Path, config: &Config) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+    /// The saved config as TSV records, rebuilt from the JSON files (v7.7 ticket 197:
+    /// `mappings.tsv` is no longer written), for tests that look for a record.
+    fn saved_text(path: &Path) -> String {
+        super::serialize_config(&super::load_config(path).unwrap()).unwrap()
+    }
+    /// Every config file's bytes: equal before and after means nothing was saved.
+    fn config_bytes(path: &Path) -> Vec<u8> {
+        crate::config::FILES
+            .iter()
+            .flat_map(|f| std::fs::read(path.with_file_name(f)).unwrap_or_default())
+            .collect()
+    }
     /// v7.7 ticket 147: no AI reply may hold a terminal command (also inside a sequence) or
     /// a risky action; plain shortcuts pass; the request says so.
     #[test]
@@ -3789,8 +3825,8 @@ mod tests {
         );
     }
 
-    /// v7.7 ticket 163: every save keeps the file it replaced; restoring the newest puts the
-    /// previous save back byte for byte and is itself in history (undo the undo); a file
+    /// v7.7 ticket 163: every save keeps the files it replaced (ticket 197: as one JSON
+    /// step); restoring the newest puts the previous save back byte for byte and is itself in history (undo the undo); a file
     /// that doesn't load is refused and changes nothing; ten are kept; the summary names the
     /// control and its new action.
     #[test]
@@ -3804,15 +3840,19 @@ mod tests {
         let mut config = Config::default();
         save_config(&path, &config).unwrap();
         assert!(history(&path).is_empty(), "nothing replaced yet");
-        let before = fs::read(&path).unwrap();
+        let before = config_bytes(&path);
         let mut mapping = Mapping::new(pad, "Ctrl+T", "tap").unwrap();
         mapping.label = "Bank A Pad 5".into();
         config.mappings.push(mapping);
         save_config(&path, &config).unwrap();
-        let after = fs::read(&path).unwrap();
+        let after = config_bytes(&path);
         let (newest, _) = history(&path).remove(0);
-        assert_eq!(fs::read(&newest).unwrap(), before);
-        let older = load_config(&newest).unwrap();
+        let older = super::before(&newest, &config).unwrap();
+        assert_eq!(
+            older,
+            Config::default(),
+            "the step holds what the save replaced"
+        );
         assert_eq!(
             change_summary(&older, &config),
             format!("{} → Ctrl+T", config.mappings[0].name(None))
@@ -3823,14 +3863,10 @@ mod tests {
         );
 
         restore(&path, &newest).unwrap();
-        assert_eq!(fs::read(&path).unwrap(), before, "undo: byte for byte");
+        assert_eq!(config_bytes(&path), before, "undo: byte for byte");
         let (redo, _) = history(&path).remove(0);
         restore(&path, &redo).unwrap();
-        assert_eq!(
-            fs::read(&path).unwrap(),
-            after,
-            "the undo was itself undoable"
-        );
+        assert_eq!(config_bytes(&path), after, "the undo was itself undoable");
 
         let bad = dir.join("history/00000000000000000001.tsv");
         fs::write(&bad, "not a config").unwrap();
@@ -3840,7 +3876,7 @@ mod tests {
                 .to_string()
                 .contains("nothing restored")
         );
-        assert_eq!(fs::read(&path).unwrap(), after);
+        assert_eq!(config_bytes(&path), after);
         for n in 0..12 {
             config.tuning.dead_zone = n;
             save_config(&path, &config).unwrap();
@@ -3901,7 +3937,7 @@ mod tests {
         );
         config.mappings[0].risky = true;
         save_config(&path, &config).unwrap();
-        assert!(fs::read_to_string(&path).unwrap().contains("\trisky\t-\n"));
+        assert!(saved_text(&path).contains("\trisky\t-\n"));
         assert_eq!(load_config(&path).unwrap(), config);
         let cc = Control {
             channel: 1,
@@ -3936,7 +3972,7 @@ mod tests {
         let path = dir.join("mappings.tsv");
         save_config(&path, &config).unwrap();
         assert_eq!(load_config(&path).unwrap(), config);
-        let text = std::fs::read_to_string(&path).unwrap();
+        let text = saved_text(&path);
         assert!(text.contains("start-flow\toff\n"));
         assert!(parse_config(&text.replace("start-flow\toff", "start-flow\tmaybe")).is_err());
         std::fs::remove_dir_all(dir).unwrap();
@@ -4046,16 +4082,16 @@ mod tests {
         assert_eq!(load_config(&path).unwrap(), config);
         save(&path, &config.mappings).unwrap();
         assert_eq!(load_config(&path).unwrap(), config);
-        let before = fs::read(&path).unwrap();
+        let before = config_bytes(&path);
         let mut invalid = config.clone();
         invalid.mappings[0].input = Input::Piano;
         invalid.mappings[0].feedback = Feedback::default();
         assert!(save_config(&path, &invalid).is_err());
-        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(config_bytes(&path), before);
         invalid = config.clone();
         invalid.program_idle.insert(8, Settings::default());
         assert!(save_config(&path, &invalid).is_err());
-        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(config_bytes(&path), before);
         let text = String::from_utf8(before).unwrap();
         assert!(parse_config(&text.replace("program-idle\t2", "program-idle\t1")).is_err());
         fs::remove_dir_all(dir).unwrap();
@@ -4097,7 +4133,7 @@ mod tests {
         maps.sort_by_key(|m| (m.context, m.control));
         save(&path, &maps).unwrap();
         assert_eq!(load(&path).unwrap(), maps);
-        let contents = fs::read(&path).unwrap();
+        let contents = config_bytes(&path);
         let mut invalid = maps.clone();
         invalid[0].action = Action::Volume { up: true, step: 0 };
         assert!(save(&path, &invalid).is_err());
@@ -4108,7 +4144,7 @@ mod tests {
             .unwrap()
             .behavior = Behavior::Toggle;
         assert!(save(&path, &invalid).is_err());
-        assert_eq!(fs::read(&path).unwrap(), contents);
+        assert_eq!(config_bytes(&path), contents);
         assert!(load(&path).unwrap().iter().any(|m| m.keys == ["Shift"]));
         fs::remove_dir_all(dir).unwrap();
     }
@@ -4166,11 +4202,7 @@ mod tests {
         let mut relative = valid.clone();
         relative.mappings[1].input = Input::RelativeKnob { step: 2 };
         save_config(&path, &relative).unwrap();
-        assert!(
-            fs::read_to_string(&path)
-                .unwrap()
-                .starts_with("vibeconsole-mappings-v34\n")
-        );
+        assert!(saved_text(&path).starts_with("vibeconsole-mappings-v34\n"));
         assert!(
             load_config(&path)
                 .unwrap()
@@ -4179,7 +4211,7 @@ mod tests {
                 .any(|m| m.input == Input::RelativeKnob { step: 2 })
         );
         save_config(&path, &valid).unwrap();
-        let before = fs::read(&path).unwrap();
+        let before = config_bytes(&path);
         for input in [
             Input::Knob { step: 0 },
             Input::Joystick {
@@ -4200,7 +4232,7 @@ mod tests {
             let mut bad = valid.clone();
             bad.mappings[1].input = input;
             assert!(save_config(&path, &bad).is_err());
-            assert_eq!(fs::read(&path).unwrap(), before);
+            assert_eq!(config_bytes(&path), before);
         }
         let mut ambiguous = valid.clone();
         let mut other = knob;
@@ -4215,7 +4247,7 @@ mod tests {
         musical.idle = Settings::default();
         musical.mappings[0].feedback.octave = Some(Octave::Offset(1));
         assert!(save_config(&path, &musical).is_err());
-        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(config_bytes(&path), before);
         let mut isolated = valid;
         isolated.mappings[0].context = 1;
         isolated.idle.tempo = Some(120);
@@ -4252,15 +4284,15 @@ mod tests {
         config.mappings.push(custom.clone());
         save_config(&path, &config).unwrap();
         assert_eq!(load_config(&path).unwrap(), config);
-        let before = fs::read(&path).unwrap();
+        let before = config_bytes(&path);
         config.mappings.push(custom.clone());
         assert!(save_config(&path, &config).is_err());
-        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(config_bytes(&path), before);
         config.mappings.pop();
         custom.control = Control::note(3, 61).unwrap();
         config.mappings.push(custom);
         assert!(save_config(&path, &config).is_err()); // same physical label, different messages
-        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(config_bytes(&path), before);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -4296,11 +4328,11 @@ mod tests {
         mappings.push(other);
         save(&path, &mappings).unwrap();
         assert_eq!(load_config(&path).unwrap().idle, config.idle);
-        let before = fs::read(&path).unwrap();
+        let before = config_bytes(&path);
         let mut bad = load_config(&path).unwrap();
         bad.mappings[0].feedback.arp = Some(false);
         assert!(save_config(&path, &bad).is_err());
-        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(config_bytes(&path), before);
         for bad in [
             "vibeconsole-mappings-v2\n",
             "vibeconsole-mappings-v2\nidle\t5\t120\ton\n",
@@ -4341,7 +4373,11 @@ mod tests {
         let mut bad = config.clone();
         bad.tuning.dead_zone = 95;
         assert!(save_config(&path, &bad).is_err());
-        assert_eq!(fs::read_to_string(&path).unwrap(), V15);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            V15,
+            "mappings.tsv stays as moved"
+        );
         // Saving writes v16 with the tuning line; it round-trips.
         let mut tuned = config.clone();
         tuned.tuning = Tuning {
@@ -4354,7 +4390,7 @@ mod tests {
             headset: true,
         };
         save_config(&path, &tuned).unwrap();
-        let text = fs::read_to_string(&path).unwrap();
+        let text = saved_text(&path);
         assert!(text.starts_with("vibeconsole-mappings-v34\n"));
         assert!(text.contains("\ntuning\t20\t60\t25\ton\toff\n"));
         assert!(text.contains("\nxbox-headset\ton\n")); // v7 ticket 108
@@ -4525,12 +4561,12 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mappings.tsv");
         save_config(&path, &Config::default()).unwrap();
-        let before = fs::read(&path).unwrap();
+        let before = config_bytes(&path);
         let mut unsaveable = Config::default();
         unsaveable.look.theme = "../../etc".into();
         assert!(save_config(&path, &unsaveable).is_err());
         assert_eq!(
-            fs::read(&path).unwrap(),
+            config_bytes(&path),
             before,
             "a failed save keeps the last file"
         );
@@ -4591,7 +4627,7 @@ mod tests {
         let mut config = Config::default();
         assert_eq!(config.device_lights, DevicePatterns::default());
         save_config(&path, &config).unwrap();
-        let text = fs::read_to_string(&path).unwrap();
+        let text = saved_text(&path);
         assert!(text.starts_with("vibeconsole-mappings-v34\n"), "{text}");
         assert!(
             text.contains(concat!(
@@ -4620,7 +4656,7 @@ mod tests {
         config.device_lights.xbox[2] = (Light::Steady, Rumble::Long);
         config.device_lights.ps5[3] = ("purple", Light::Off, Rumble::Off);
         save_config(&path, &config).unwrap();
-        let saved = fs::read_to_string(&path).unwrap();
+        let saved = saved_text(&path);
         assert_eq!(load_config(&path).unwrap(), config);
         for (from, to) in [
             (
@@ -4637,11 +4673,7 @@ mod tests {
         let mut bad = config.clone();
         bad.device_lights.ps5[0].0 = "beige";
         assert!(save_config(&path, &bad).is_err());
-        assert_eq!(
-            fs::read_to_string(&path).unwrap(),
-            saved,
-            "the last valid file stays"
-        );
+        assert_eq!(saved_text(&path), saved, "the last valid file stays");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -5116,8 +5148,7 @@ mod tests {
         let mut config = Config::default();
         config.mappings = vec![Mapping::new_action(pad, Input::Pad, plain).unwrap()];
         save_config(&path, &config).unwrap();
-        let v18 = fs::read_to_string(&path)
-            .unwrap()
+        let v18 = saved_text(&path)
             .replace(DEFAULT_LOOK, "")
             .replace("vibeconsole-mappings-v34", "vibeconsole-mappings-v18")
             .lines()
@@ -5137,7 +5168,7 @@ mod tests {
         };
         config.mappings[0].action = Action::PromptSequence(vec![own, saved("build")]);
         save_config(&path, &config).unwrap();
-        let text = fs::read_to_string(&path).unwrap();
+        let text = saved_text(&path);
         assert!(text.starts_with("vibeconsole-mappings-v34\n"), "{text}");
         assert_eq!(load_config(&path).unwrap(), config);
         let mut bad = config.clone();
@@ -5148,11 +5179,7 @@ mod tests {
             text: "  ".into(),
         }]);
         assert!(save_config(&path, &bad).is_err());
-        assert_eq!(
-            fs::read_to_string(&path).unwrap(),
-            text,
-            "the last valid file stays"
-        );
+        assert_eq!(saved_text(&path), text, "the last valid file stays");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -5171,7 +5198,7 @@ mod tests {
             StickMode::Angle(vec![(50, 80), (330, 30)]),
         ];
         save_config(&path, &config).unwrap();
-        let text = fs::read_to_string(&path).unwrap();
+        let text = saved_text(&path);
         assert!(text.contains(
             "\nsticks\tangle:0-45,45-90,90-135,135-180,180-225,225-270,270-315,315-0\tangle:50-80,330-30\n"
         ));
@@ -5196,7 +5223,7 @@ mod tests {
             bad.tuning.sticks = sticks;
             bad.tuning.mouse = mouse;
             let error = save_config(&path, &bad).unwrap_err().to_string();
-            assert_eq!(fs::read_to_string(&path).unwrap(), text, "{error}");
+            assert_eq!(saved_text(&path), text, "{error}");
             error
         };
         let angle = |r: Vec<(u16, u16)>| StickMode::Angle(r);
@@ -5320,7 +5347,7 @@ mod tests {
         mapping.label = "nanoPAD2 note 60".into();
         config.mappings = vec![mapping];
         save_config(&path, &config).unwrap();
-        let text = fs::read_to_string(&path).unwrap();
+        let text = saved_text(&path);
         assert!(text.contains("\nmidi-devices\t2\nmidi-device\tLaunchkey\nmidi-device\tnanoPAD2\nmidi-active\tnanoPAD2\n"));
         assert!(text.contains("\tmidi\tnote\t1\t60\t"));
         assert_eq!(load_config(&path).unwrap(), config);
@@ -5341,7 +5368,7 @@ mod tests {
         let mut bad = config.clone();
         bad.mappings[0].feedback.tempo = Some(120);
         assert!(save_config(&path, &bad).is_err());
-        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        assert_eq!(saved_text(&path), text);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -5370,7 +5397,7 @@ mod tests {
             mappings: vec![firefox_pad1],
         }];
         save_config(&path, &config).unwrap();
-        let text = fs::read_to_string(&path).unwrap();
+        let text = saved_text(&path);
         assert!(text.contains(
             "\nprofiles\t1\nprofile\tFirefox\tfirefox.desktop,org.mozilla.firefox.desktop\t1\n0\t"
         ));
@@ -5396,7 +5423,7 @@ mod tests {
             let mut bad = config.clone();
             change(&mut bad);
             assert!(save_config(&path, &bad).is_err());
-            assert_eq!(fs::read_to_string(&path).unwrap(), text);
+            assert_eq!(saved_text(&path), text);
         };
         refused(&|c| c.profiles[0].name = "".into());
         refused(&|c| c.profiles[0].name = "a\tb".into());
@@ -5495,11 +5522,7 @@ mod tests {
             Some("Orca")
         );
         save_config(&path, &config).unwrap();
-        assert!(
-            fs::read_to_string(&path)
-                .unwrap()
-                .contains("\nprofile-lock\tOrca\n")
-        );
+        assert!(saved_text(&path).contains("\nprofile-lock\tOrca\n"));
         assert_eq!(load_config(&path).unwrap(), config);
         config.lock = Some(Lock::Default);
         assert_eq!(config.choice(Some("firefox.desktop")), None);
@@ -5743,7 +5766,7 @@ mod tests {
         fs::create_dir(&dir).unwrap();
         let path = dir.join("mappings.tsv");
         save_config(&path, &config).unwrap();
-        let full = fs::read_to_string(&path).unwrap();
+        let full = saved_text(&path);
         let early = full.replace(
             "midi-devices\t0\nmidi-active\t-\nxbox-programs\t-\t-\t-\t-\t-\t-\t-\t-\nprofiles\t0\nprofile-lock\t-\nfavourites\t0\nsequences\t0\n",
             "",
@@ -5773,7 +5796,7 @@ mod tests {
         let valid = vec![replacement.clone(), bank_b];
         save(&path, &valid).unwrap();
         assert_eq!(load(&path).unwrap(), valid);
-        let previous = fs::read(&path).unwrap();
+        let previous = config_bytes(&path);
 
         for shortcut in ["", "Ctrl++K", "Ctrl+Control", "F13", "shell:ls", "Ctrl+☃"] {
             assert!(Mapping::new(pad, shortcut, "hold").is_err());
@@ -5783,12 +5806,12 @@ mod tests {
         invalid.keys = vec!["Unknown".to_owned()];
         assert!(save(&path, &[invalid]).is_err());
         assert!(save(&path, &[replacement.clone(), replacement]).is_err());
-        assert_eq!(fs::read(&path).unwrap(), previous);
+        assert_eq!(config_bytes(&path), previous);
 
-        let temporary = path.with_extension("tmp");
+        let temporary = path.with_file_name("mappings.json.tmp");
         fs::write(&temporary, "occupied staging file").unwrap();
         assert!(save(&path, &[]).is_err());
-        assert_eq!(fs::read(&path).unwrap(), previous);
+        assert_eq!(config_bytes(&path), previous);
         assert_eq!(
             fs::read_to_string(&temporary).unwrap(),
             "occupied staging file"
@@ -5804,7 +5827,7 @@ mod tests {
             "vibeconsole-mappings-v1\n09e8:1049\tnote\t10\t52\thold\tShift\n",
         ] {
             fs::write(&path, malformed).unwrap();
-            assert!(load(&path).is_err());
+            assert!(load_tsv(&path).is_err(), "the move refuses it");
         }
         fs::remove_dir_all(directory).unwrap();
     }
@@ -5834,7 +5857,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mappings.tsv");
         save_config(&path, &config).unwrap();
-        let saved = fs::read_to_string(&path).unwrap();
+        let saved = saved_text(&path);
         assert!(saved.starts_with("vibeconsole-mappings-v34\n"));
         assert!(saved.contains("\tflow\t") && !saved.contains("flow-start"));
         assert_eq!(load_config(&path).unwrap(), config);
@@ -5858,11 +5881,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mappings.tsv");
         save_config(&path, &config).unwrap();
-        assert!(
-            fs::read_to_string(&path)
-                .unwrap()
-                .starts_with("vibeconsole-mappings-v34\n")
-        );
+        assert!(saved_text(&path).starts_with("vibeconsole-mappings-v34\n"));
         assert_eq!(load_config(&path).unwrap(), config);
         fs::remove_dir_all(dir).unwrap();
     }
@@ -5881,7 +5900,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mappings.tsv");
         save_config(&path, &config).unwrap();
-        let text = fs::read_to_string(&path).unwrap();
+        let text = saved_text(&path);
         assert!(text.starts_with("vibeconsole-mappings-v34\n") && text.contains("\tstatus\n"));
         assert_eq!(load_config(&path).unwrap(), config);
         let pad = Control::from_note(10, 37).unwrap();
@@ -5956,11 +5975,7 @@ mod tests {
             .unwrap(),
         );
         save_config(&path, &config).unwrap();
-        assert!(
-            fs::read_to_string(&path)
-                .unwrap()
-                .starts_with("vibeconsole-mappings-v34\n")
-        );
+        assert!(saved_text(&path).starts_with("vibeconsole-mappings-v34\n"));
         assert_eq!(load_config(&path).unwrap(), config);
         // ${NAME}: user variable, then startup variable; other text stays; no environment.
         assert!(expand("${HOME}", &config).is_err());
@@ -5983,7 +5998,7 @@ mod tests {
         plain.dir = None;
         assert_eq!(config.agent_directory(&plain).unwrap(), Some(work.clone()));
         // Invalid input is rejected before save; the file keeps its bytes.
-        let before = fs::read(&path).unwrap();
+        let before = config_bytes(&path);
         for bad in [
             |c: &mut Config| c.vars.push(("9BAD".into(), "x".into())),
             |c: &mut Config| c.env.push(("OK".into(), "two\nlines".into())),
@@ -5998,7 +6013,7 @@ mod tests {
             let mut changed = config.clone();
             bad(&mut changed);
             assert!(save_config(&path, &changed).is_err());
-            assert_eq!(fs::read(&path).unwrap(), before);
+            assert_eq!(config_bytes(&path), before);
         }
         fs::remove_dir_all(dir).unwrap();
     }

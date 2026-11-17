@@ -954,10 +954,10 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                 "Applications: {} visible installed entries (none launched)",
                 crate::actions::catalog()?.len()
             );
-            println!(
-                "Configuration: {} valid mappings",
-                crate::mappings::load(&crate::mappings::config_path()?)?.len()
-            );
+            // v7.7 ticket 197: each config file and whether it loaded (reads only).
+            for line in vibeconsole_core::config::report(&crate::mappings::config_path()?) {
+                println!("{line}");
+            }
             println!("{}", login_doctor(unit()?.is_file(), systemctl));
             println!("Agent terminals: tmux attach -t vibe");
             for codex in [false, true] {

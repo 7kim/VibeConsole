@@ -6082,7 +6082,7 @@ fn clock(secs: u64) -> String {
 /// v7.7 ticket 163: the newest history entry against `current`: `14:02 · <what changed>`.
 fn last_change(path: &Path, current: &mappings::Config) -> Option<String> {
     let (file, secs) = mappings::history(path).into_iter().next()?;
-    let older = mappings::load_config(&file).ok()?;
+    let older = mappings::before(&file, current).ok()?;
     Some(format!(
         "{} · {}",
         clock(secs),
@@ -6109,7 +6109,7 @@ fn history_menu(ui: &mut impl Ui, path: &Path) -> Result<Option<String>> {
     let mut newer = mappings::load_config(path)?;
     let mut rows = Vec::new();
     for (file, secs) in &entries {
-        let older = mappings::load_config(file).unwrap_or_default();
+        let older = mappings::before(file, &newer).unwrap_or_default();
         rows.push(format!(
             "{} · {}",
             clock(*secs),
@@ -12880,6 +12880,25 @@ Running/paused mode is retained; held keys and toggles start inactive.",
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Every config file's bytes (v7.7 ticket 197: the JSON files, no longer
+    /// `mappings.tsv`): equal before and after means nothing was saved.
+    fn config_bytes(path: &Path) -> Vec<u8> {
+        vibeconsole_core::config::FILES
+            .iter()
+            .flat_map(|f| std::fs::read(path.with_file_name(f)).unwrap_or_default())
+            .collect()
+    }
+    /// The saved config as TSV records (v7.7 ticket 197: rebuilt from the JSON files, as
+    /// `mappings.tsv` is no longer written), for tests that look for a record.
+    fn saved_text(path: &Path) -> String {
+        mappings::serialize_config(&mappings::load_config(path).unwrap()).unwrap()
+    }
+    /// Make the next save fail: every config file's staging file is taken.
+    fn block_saves(path: &Path) {
+        for file in vibeconsole_core::config::FILES {
+            std::fs::write(path.with_file_name(format!("{file}.tmp")), "occupied").unwrap();
+        }
+    }
     /// An install from before v7.7 ticket 194: this `mappings.tsv` and no JSON files yet.
     fn old_install(path: &Path, text: impl AsRef<[u8]>) {
         for file in vibeconsole_core::config::FILES {
@@ -13273,7 +13292,7 @@ mod tests {
         other_program.label = "Bank B Pad 1".into();
         let mut current = vec![other_program, saved.clone()];
         mappings::save(&path, &current).unwrap();
-        let before = std::fs::read(&path).unwrap();
+        let before = config_bytes(&path);
         let mut candidate = Mapping::new(pad, "Shift", "toggle").unwrap();
         candidate.context = 1;
         candidate.label = saved.label.clone();
@@ -13283,7 +13302,7 @@ mod tests {
                 .to_string()
                 .contains("duplicate physical label in context")
         );
-        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(config_bytes(&path), before);
         let labels = pad_labels(pad, &current, 1);
         assert!(
             !labels.contains(&saved.label),
@@ -14226,7 +14245,7 @@ mod tests {
         let a = Control::from_note(10, 36).unwrap();
         let mut current = vec![Mapping::new(a, "Shift", "hold").unwrap()];
         mappings::save(&path, &current).unwrap();
-        let saved = std::fs::read(&path).unwrap();
+        let saved = config_bytes(&path);
         let mut ui = Script {
             keys: [
                 Tab, Enter, Enter, // Edit -> saved pad
@@ -14250,7 +14269,7 @@ mod tests {
         assert!(shown("[x] Shift (saved)")); // key picker starts on the saved chord
         assert!(shown("> hold  [x] (saved)"));
         assert!(shown("> No hardware feedback  [x] (saved)"));
-        assert_eq!(std::fs::read(&path).unwrap(), saved); // cancel changes nothing
+        assert_eq!(config_bytes(&path), saved); // cancel changes nothing
 
         ui.screens.clear();
         ui.pads = [Control::from_note(10, 37).unwrap()].into();
@@ -15042,7 +15061,7 @@ mod tests {
         let path = dir.join("mappings.tsv");
         let pad = Control::from_note(10, 36).unwrap();
         mappings::save(&path, &[Mapping::new(pad, "Ctrl+A", "hold").unwrap()]).unwrap();
-        let before = std::fs::read(&path).unwrap();
+        let before = config_bytes(&path);
         let reply = |list: Vec<Mapping>| {
             format!(
                 "Here you go:\n```\n{}```\n",
@@ -15079,7 +15098,7 @@ mod tests {
                 .iter()
                 .any(|s| s.contains("Replace?\nBank A Pad 1: Ctrl+A → Ctrl+T"))
         );
-        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(config_bytes(&path), before);
         // Keep the old one, then Save: only the empty button is filled.
         run(&good, vec![Enter, Down, Enter]).0.unwrap();
         let config = mappings::load_config(&path).unwrap();
@@ -15112,7 +15131,7 @@ mod tests {
         };
         assert_eq!(on(pad).as_deref(), Some("Ctrl+T"));
         // A command is refused naming the control; nothing saved.
-        let saved = std::fs::read(&path).unwrap();
+        let saved = config_bytes(&path);
         let command = Mapping::new_action(
             Control::button(1),
             mappings::Input::Pad,
@@ -15129,7 +15148,7 @@ mod tests {
             error.contains("refused: Xbox B would run a terminal command"),
             "{error}"
         );
-        assert_eq!(std::fs::read(&path).unwrap(), saved);
+        assert_eq!(config_bytes(&path), saved);
         std::fs::remove_dir_all(dir).unwrap();
     }
     /// v7.7 ticket 168: Set up agents sends only CLI names found on a fake PATH and git folder
@@ -15160,7 +15179,7 @@ mod tests {
         }
         let path = dir.join("mappings.tsv");
         mappings::save(&path, &[]).unwrap();
-        let before = std::fs::read(&path).unwrap();
+        let before = config_bytes(&path);
         let proj = home.join("proj").display().to_string();
         let run = |claude: String, then: Vec<Key>| {
             let mut keys = vec![Enter];
@@ -15191,7 +15210,7 @@ mod tests {
         assert!(!request.contains(".hidden") && !request.contains("/d/e"));
         assert!(screens.iter().any(|s| s.contains("Agent api runs claude in tmux")
             && s.contains("Sent: the names of the agent CLIs found on PATH (claude) and the paths of 2 project folders")));
-        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(config_bytes(&path), before);
         run(good, vec![Down, Enter]).0.unwrap(); // Save
         let config = mappings::load_config(&path).unwrap();
         let api = config.agents.iter().find(|a| a.name == "api").unwrap();
@@ -15201,14 +15220,14 @@ mod tests {
         );
         assert_eq!(config.agent_dir.as_deref(), Some(proj.as_str()));
         // Options, a CLI that wasn't found and a folder that wasn't sent are refused.
-        let saved = std::fs::read(&path).unwrap();
+        let saved = config_bytes(&path);
         for bad in [
             format!("agent\tx\tclaude --dangerously-skip-permissions\t{proj}\t3\n"),
             format!("agent\tx\tcodex\t{proj}\t3\n"),
             "agent\tx\tclaude\t/etc\t3\n".to_string(),
         ] {
             assert!(run(bad, vec![]).0.is_err());
-            assert_eq!(std::fs::read(&path).unwrap(), saved);
+            assert_eq!(config_bytes(&path), saved);
         }
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -15273,13 +15292,13 @@ mod tests {
                 .octave,
             3
         );
-        let saved = std::fs::read(&path).unwrap();
+        let saved = config_bytes(&path);
         let error = run(reply("/work/other")).0.unwrap_err().to_string();
         assert!(
             error.contains("isn't a jump to one of your agents"),
             "{error}"
         );
-        assert_eq!(std::fs::read(&path).unwrap(), saved);
+        assert_eq!(config_bytes(&path), saved);
         std::fs::remove_dir_all(dir).unwrap();
     }
     /// v7.7 ticket 169: Ask for a prompt makes two calls: the questions, answered in text
@@ -15429,7 +15448,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mappings.tsv");
         mappings::save(&path, &[]).unwrap();
-        let before = std::fs::read(&path).unwrap();
+        let before = config_bytes(&path);
         let file = |list: Vec<Mapping>, name: &str| {
             format!(
                 "```\n{}```\n",
@@ -15466,7 +15485,7 @@ mod tests {
         assert!(screens.iter().any(|s| s.contains("not applied")));
         let preset = mappings::load_config(&presets_dir(&path).join("Stream.preset")).unwrap();
         assert_eq!(preset.mappings[0].keys, ["Ctrl", "N"]);
-        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(config_bytes(&path), before);
         // Whole setup: Cancel saves nothing; Save fills the button.
         let mut keys = typed("I stream");
         keys.extend([Enter, Down, Space, Enter]);
@@ -15475,7 +15494,7 @@ mod tests {
         let (result, _, asked) = ask(AskKind::Setup, cancel, xbox.clone());
         result.unwrap();
         assert!(asked[0].contains("A whole setup for: I stream."));
-        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(config_bytes(&path), before);
         keys.extend([Down, Enter]);
         ask(AskKind::Setup, keys, xbox).0.unwrap();
         let config = mappings::load_config(&path).unwrap();
@@ -15546,7 +15565,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mappings.tsv");
         mappings::save(&path, &[]).unwrap();
-        let before = std::fs::read(&path).unwrap();
+        let before = config_bytes(&path);
         let home = dir.join("home");
         let source = home.join(".local/share/vibeconsole/source");
         let source_text = source.display().to_string();
@@ -15595,7 +15614,7 @@ mod tests {
             [vec!["git", "-C", source_text.as_str(), "pull", "--ff-only"]]
         );
         assert!(shown[0][3].ends_with("\n---\n\nthemes"));
-        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(config_bytes(&path), before);
         std::fs::remove_dir_all(dir).unwrap();
     }
     /// v7.7 ticket 148: a question goes to the agent with what `describe` says; the answer is
@@ -15609,7 +15628,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mappings.tsv");
         mappings::save(&path, &[]).unwrap();
-        let before = std::fs::read(&path).unwrap();
+        let before = config_bytes(&path);
         let mut keys = typed("Why didn't Pad 6 fire?");
         keys.extend([Enter, Up, Enter]); // ask; Back (last row)
         let mut ui = Script {
@@ -15628,7 +15647,7 @@ mod tests {
                 .iter()
                 .any(|s| s.contains("nothing was changed") && s.contains("Pad 6 has no mapping"))
         );
-        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(config_bytes(&path), before);
 
         // A proposed change: reviewed, then Cancel.
         let pad = Control::from_note(10, 36).unwrap();
@@ -15660,11 +15679,7 @@ mod tests {
                 .iter()
                 .any(|s| s.starts_with("Claude suggests profile Firefox"))
         );
-        assert_eq!(
-            std::fs::read(&path).unwrap(),
-            before,
-            "Cancel saves nothing"
-        );
+        assert_eq!(config_bytes(&path), before, "Cancel saves nothing");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -16230,7 +16245,7 @@ mod tests {
         );
 
         // What moved: a v32 file hasn't seen it.
-        let v33 = std::fs::read_to_string(&path).unwrap();
+        let v33 = saved_text(&path);
         let v32 = v33
             .replace("vibeconsole-mappings-v34", "vibeconsole-mappings-v32")
             .lines()
@@ -16543,9 +16558,7 @@ mod tests {
             cards[2].0
         );
         assert!(
-            std::fs::read_to_string(&path)
-                .unwrap()
-                .contains("\nagents-view\tgallery\n"),
+            saved_text(&path).contains("\nagents-view\tgallery\n"),
             "the view is saved"
         );
         std::fs::remove_dir_all(dir).unwrap();
@@ -16602,19 +16615,19 @@ mod tests {
             )
             .unwrap();
         mappings::save_config(&path, &config).unwrap();
-        let before = std::fs::read(&path).unwrap();
-        let settings = path.with_file_name("settings.json");
-        let settings_before = std::fs::read(&settings).unwrap();
+        // An old install's mappings.tsv (kept after the move) is backed up too.
+        std::fs::write(&path, "kept since the move").unwrap();
+        let before =
+            vibeconsole_core::config::FILES.map(|f| std::fs::read(path.with_file_name(f)).unwrap());
         let backup = reset_file_at(&path, "20260101-000000").unwrap();
         assert_eq!(backup.file_name().unwrap(), "*.bak-20260101-000000");
+        for (file, before) in vibeconsole_core::config::FILES.iter().zip(before) {
+            let copy = dir.join(format!("{file}.bak-20260101-000000"));
+            assert_eq!(std::fs::read(copy).unwrap(), before, "{file} is backed up");
+        }
         assert_eq!(
             std::fs::read(dir.join("mappings.tsv.bak-20260101-000000")).unwrap(),
-            before
-        );
-        assert_eq!(
-            std::fs::read(dir.join("settings.json.bak-20260101-000000")).unwrap(),
-            settings_before,
-            "every config file is backed up"
+            b"kept since the move"
         );
         assert_eq!(
             mappings::load_config(&path).unwrap(),
@@ -16629,7 +16642,7 @@ mod tests {
         std::fs::create_dir(&failed).unwrap();
         let failed_path = failed.join("mappings.tsv");
         mappings::save_config(&failed_path, &config).unwrap();
-        std::fs::write(failed_path.with_extension("tmp"), "occupied").unwrap();
+        block_saves(&failed_path);
         assert!(reset_file(&failed_path).is_err());
         assert_eq!(mappings::load_config(&failed_path).unwrap(), config);
         std::fs::remove_dir_all(dir).unwrap();
@@ -16673,7 +16686,7 @@ mod tests {
             .to_string_lossy()
             .replace('*', "");
         assert!(
-            dir.join(format!("mappings.tsv{stamp}")).exists(),
+            dir.join(format!("settings.json{stamp}")).exists(),
             "{backup:?}"
         );
         std::fs::remove_dir_all(dir).unwrap();
@@ -16731,11 +16744,7 @@ mod tests {
         assert_eq!(saved.mappings[0].control, note);
         assert_eq!(saved.mappings[0].keys, ["Ctrl"]);
         assert!(!saved.mappings[0].feedback.enabled());
-        assert!(
-            std::fs::read_to_string(&path)
-                .unwrap()
-                .contains("\tmidi\tnote\t1\t60\t")
-        );
+        assert!(saved_text(&path).contains("\tmidi\tnote\t1\t60\t"));
 
         let mut keys = to_device.to_vec();
         keys.extend([Enter, Escape]); // back to the Akai
@@ -16788,7 +16797,7 @@ mod tests {
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].context, mappings::GAMEPAD_CONTEXT);
         assert_eq!(saved[0].keys, ["Ctrl"]);
-        let text = std::fs::read_to_string(&path).unwrap();
+        let text = saved_text(&path);
         assert!(text.contains("\txbox\tbutton\t1\t0\t0\t"), "{text}");
         let layout = crate::gamepad::layout(&saved);
         assert_eq!(
@@ -16939,7 +16948,7 @@ mod tests {
         assert!(saved.iter().any(|m| m.context == mappings::GAMEPAD_LAYER_2
             && m.action == crate::actions::Action::OutputMute));
         // Layer 2 is taken now: learning X there asks, naming that layer's action; Cancel keeps it.
-        let before = std::fs::read(&path).unwrap();
+        let before = config_bytes(&path);
         ui.screens.clear();
         ui.pads = [x].into();
         ui.keys = [Enter, Down, Enter, Enter, Escape].into(); // learn X, layer 2, Cancel, leave
@@ -16950,11 +16959,7 @@ mod tests {
             "{screens}"
         );
         assert!(screens.contains("Already assigned:"), "{screens}");
-        assert_eq!(
-            std::fs::read(&path).unwrap(),
-            before,
-            "Cancel changes nothing"
-        );
+        assert_eq!(config_bytes(&path), before, "Cancel changes nothing");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -17395,7 +17400,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mappings.tsv");
         mappings::save(&path, &[]).unwrap();
-        let before = std::fs::read(&path).unwrap();
+        let before = config_bytes(&path);
         let mut keys = vec![Enter, Enter]; // learn, layer 1 (v7 ticket 97)
         keys.extend(vec![Down; 8]); // herdr, with no agents running
         keys.extend([Enter, Enter]); // herdr -> Back
@@ -17414,7 +17419,7 @@ mod tests {
                 .iter()
                 .any(|s| { s.starts_with("Not saved: validation: herdr has no agents running") })
         );
-        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(config_bytes(&path), before);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -17492,8 +17497,8 @@ mod tests {
                 .iter()
                 .any(|s| s.contains("Xbox tuning: stick dead zone 20%, triggers fire at 60%"))
         );
-        let before = std::fs::read(&path).unwrap();
-        std::fs::write(path.with_extension("tmp"), "occupied").unwrap();
+        let before = config_bytes(&path);
+        block_saves(&path);
         let mut keys = to_tuning;
         keys.extend([Enter, Enter, Up, Enter, Enter, Escape]); // 21% -> Not saved -> Back
         let mut ui = Script {
@@ -17502,7 +17507,7 @@ mod tests {
         };
         settings_menu(&mut ui, &path).unwrap();
         assert!(ui.screens.iter().any(|s| s.contains("Not saved")));
-        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(config_bytes(&path), before);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -17723,7 +17728,7 @@ mod tests {
             sticks,
             [mappings::StickMode::sectors(), mappings::StickMode::Linear]
         );
-        let before = std::fs::read(&path).unwrap();
+        let before = config_bytes(&path);
         let mut keys = vec![Down; 8];
         keys.push(Enter);
         keys.extend(vec![Down; 6]);
@@ -17741,7 +17746,7 @@ mod tests {
             "{:?}",
             ui.screens.last()
         );
-        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(config_bytes(&path), before);
         assert!(
             ui.screens
                 .iter()
@@ -17959,14 +17964,14 @@ mod tests {
             "vibeconsole-profile-v1\nprofile\tX\t../x\t0\n",
         )
         .unwrap();
-        let before = std::fs::read(&path).unwrap();
+        let before = config_bytes(&path);
         let screens = profiles(vec![Down, Down, Enter, Enter, Enter]);
         assert!(
             screens
                 .iter()
                 .any(|s| s.contains("Not saved: Bad.profile:") && s.contains("nothing imported"))
         );
-        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(config_bytes(&path), before);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -18687,10 +18692,10 @@ mod tests {
             crate::actions::Action::AppToggleQuit(local("com.t3tools.T3Code.desktop"))
         );
 
-        let before = std::fs::read(&path).unwrap();
+        let before = config_bytes(&path);
         let (_, screens) = pick(4, &[Escape, Escape]); // herdr (not installed): error, leave
         assert!(screens.contains("herdr not installed"), "{screens}");
-        assert_eq!(std::fs::read(&path).unwrap(), before, "nothing saved");
+        assert_eq!(config_bytes(&path), before, "nothing saved");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -18794,14 +18799,14 @@ mod tests {
         presets(vec![Enter, Enter, Enter]); // Work.preset -> Load it -> Back
         assert_eq!(mappings::load(&path).unwrap(), [a]);
         std::fs::write(dir.join("presets/Bad.preset"), "not a config").unwrap();
-        let before = std::fs::read(&path).unwrap();
+        let before = config_bytes(&path);
         let screens = presets(vec![Enter, Enter, Enter]); // Bad.preset -> Load -> Back
         assert!(
             screens
                 .iter()
                 .any(|s| s.contains("Bad.preset") && s.contains("nothing loaded"))
         );
-        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(config_bytes(&path), before);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -18911,11 +18916,11 @@ mod tests {
         );
 
         // A "program preset" holding two programs is refused whole.
-        std::fs::copy(&path, dir.join("presets/Two.program-preset")).unwrap();
-        let before = std::fs::read(&path).unwrap();
+        std::fs::write(dir.join("presets/Two.program-preset"), saved_text(&path)).unwrap();
+        let before = config_bytes(&path);
         let screens = presets(vec![Down, Down, Enter, Enter, Enter]); // Two -> Load -> Back
         assert!(screens.contains("nothing loaded"), "{screens}");
-        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(config_bytes(&path), before);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -18975,21 +18980,21 @@ mod tests {
             assert!(ui.keys.is_empty());
             ui.screens
         };
-        let before = std::fs::read(&path).unwrap();
+        let before = config_bytes(&path);
         let screens = ask(reply.replace("Ctrl+T", "Ctrl+Nope"), vec![Enter]);
         assert!(
             screens
                 .iter()
                 .any(|s| s.contains("Claude's profile:") && s.contains("nothing saved"))
         );
-        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(config_bytes(&path), before);
         let screens = ask(reply.clone(), vec![Enter]); // Cancel
         assert!(
             screens
                 .iter()
                 .any(|s| s.starts_with("Claude suggests profile Firefox"))
         );
-        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(config_bytes(&path), before);
         // v7.7 ticket 147: a terminal command from Claude is refused by name; nothing saved.
         let mut command = profile.clone();
         command.mappings = vec![
@@ -19009,7 +19014,7 @@ mod tests {
                 && s.contains("nothing saved")),
             "{screens:?}"
         );
-        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(config_bytes(&path), before);
         ask(reply, vec![Down, Enter]); // Save this profile
         assert_eq!(mappings::load_config(&path).unwrap().profiles, [profile]);
         std::fs::remove_dir_all(dir).unwrap();
@@ -19127,7 +19132,7 @@ mod tests {
         assert_eq!(current, mappings::load(&path).unwrap());
         assert_eq!(current.len(), 1);
         assert_eq!(current[0].keys, ["Shift"]);
-        std::fs::write(path.with_extension("tmp"), "occupied").unwrap();
+        block_saves(&path);
         let previous = current.clone();
         assert!(commit(&path, &mut current, a, 0, None, None).is_err());
         assert_eq!(current, previous);
@@ -19220,7 +19225,7 @@ mod tests {
         assert!(!ui.screens.iter().any(|s| s.starts_with("Status feedback")));
 
         // Failures name their stage and leave the file byte-for-byte unchanged.
-        let before = std::fs::read(&path).unwrap();
+        let before = config_bytes(&path);
         let mut ui = Script {
             keys: [Down, Down, Enter].into(),
             ..Default::default()
@@ -19234,7 +19239,7 @@ mod tests {
         config.mappings.retain(|m| m.input != Input::Piano);
         mappings::save_config(&path, &config).unwrap();
         current = config.mappings.clone();
-        let before_piano = std::fs::read(&path).unwrap();
+        let before_piano = config_bytes(&path);
         let mut ui = Script {
             keys: [Down, Enter, Enter, Escape].into(), // learn piano -> Back -> leave
             pads: [Control::note(1, 62).unwrap()].into(),
@@ -19248,8 +19253,8 @@ mod tests {
                     && s.contains("feedback comes from the idle settings"))
         );
         assert!(!ui.screens.iter().any(|s| s.starts_with("Action family"))); // refused before any choice
-        assert_eq!(std::fs::read(&path).unwrap(), before_piano);
-        std::fs::write(path.with_extension("tmp"), "occupied").unwrap();
+        assert_eq!(config_bytes(&path), before_piano);
+        block_saves(&path);
         let mut ui = Script {
             keys: [Down, Down, Enter, Down, Enter, Enter, Enter, Enter, Enter].into(),
             motions: [(
@@ -19264,7 +19269,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.starts_with("file I/O: "), "{error}");
-        assert_eq!(std::fs::read(&path).unwrap(), before_piano);
+        assert_eq!(config_bytes(&path), before_piano);
         assert_ne!(before, before_piano);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -19308,7 +19313,7 @@ mod tests {
         let a = Control::from_note(10, 36).unwrap();
         let mut current = vec![Mapping::new(a, "Shift", "hold").unwrap()];
         mappings::save(&path, &current).unwrap();
-        let before = std::fs::read(&path).unwrap();
+        let before = config_bytes(&path);
         let mut ui = Script {
             keys: [Enter, Enter, Escape].into(), // learn A -> Cancel (default) -> leave
             pads: [a].into(),
@@ -19322,7 +19327,7 @@ mod tests {
             .expect("warning shown");
         assert!(warning.contains("Shift") && warning.contains("> Cancel"));
         assert!(!ui.screens.iter().any(|s| s.starts_with("Action family")));
-        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(config_bytes(&path), before);
         assert_eq!(current[0].keys, ["Shift"]);
         // Replace: Down to Replace, then shortcut Ctrl, hold, no feedback, pressed, save and finish.
         // The key picker starts with saved Shift selected: add Ctrl, drop Shift.
@@ -19388,8 +19393,8 @@ mod tests {
             std::fs::read_to_string(dir.join("prompts/review")).unwrap(),
             "Review this change.\n"
         );
-        let before = std::fs::read(&path).unwrap();
-        std::fs::write(path.with_extension("tmp"), "occupied").unwrap();
+        let before = config_bytes(&path);
+        block_saves(&path);
         ui.keys = [
             Enter, Down, Down, Down, Enter, Enter, Enter, Enter, Enter, Enter, Enter, Enter,
         ]
@@ -19399,7 +19404,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.starts_with("file I/O: "), "{error}");
-        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(config_bytes(&path), before);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -19972,7 +19977,7 @@ mod tests {
             .unwrap(),
         ];
         mappings::save_config(&path, &config).unwrap();
-        let before = std::fs::read(&path).unwrap();
+        let before = config_bytes(&path);
         let mut keys = vec![Enter, Down, Down, Enter, Enter]; // notes -> Delete -> (refused) Back
         keys.extend([Enter, Down, Enter]); // notes -> Rename
         keys.extend(vec![Backspace; 5]);
@@ -19988,7 +19993,7 @@ mod tests {
             screens.contains("Not saved: validation: sequence notes is used by"),
             "{screens}"
         );
-        assert_ne!(std::fs::read(&path).unwrap(), before, "the rename saved");
+        assert_ne!(config_bytes(&path), before, "the rename saved");
         let saved = mappings::load_config(&path).unwrap();
         assert_eq!(saved.sequences[0].0, "daily");
         assert_eq!(
@@ -20827,7 +20832,7 @@ mod tests {
             keys: keys.into(),
             ..Default::default()
         };
-        let before = std::fs::read(&path).unwrap();
+        let before = config_bytes(&path);
         settings_menu(&mut ui, &path).unwrap();
         assert!(ui.keys.is_empty());
         let notes = ui
@@ -21532,7 +21537,7 @@ mod tests {
         assert_eq!(config.agents[0].octave, -1);
         assert_eq!(config.light_patterns, crate::status::Patterns::default());
         mappings::save_config(&path, &config).unwrap();
-        let saved = std::fs::read_to_string(&path).unwrap();
+        let saved = saved_text(&path);
         assert!(saved.contains(concat!(
             "status-lights\ton\nlight-tempos\t50\t240\n",
             "light-pattern\tneeds-decision\tfast\talternate\n",

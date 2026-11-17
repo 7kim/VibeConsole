@@ -13,11 +13,12 @@ use std::path::{Path, PathBuf};
 pub const VERSION: u64 = 1;
 /// The files, in the order they are applied: each one's references (variables, MIDI
 /// devices, idle settings) are in place before it is checked.
-pub const FILES: [&str; 4] = [
+pub const FILES: [&str; 5] = [
     "settings.json",
     "devices.json",
     "lights.json",
     "mappings.json",
+    "agents.json",
 ];
 
 /// The config folder of the main config path (`…/vibeconsole/mappings.tsv`).
@@ -26,35 +27,99 @@ fn folder(path: &Path) -> Result<&Path> {
         .ok_or_else(|| "configuration path has no parent".into())
 }
 
-/// Read the config: the files over the base, or, when none exists yet, the one-time move
-/// from `mappings.tsv`.
+/// Read the config: the files over the shipped defaults, or, when none exists yet, the
+/// one-time move from `mappings.tsv`. After the move `mappings.tsv` is only the backup it was
+/// moved from (ticket 197): never read or written again.
 pub fn load(path: &Path) -> Result<Config> {
     let dir = folder(path)?;
-    let base = mappings::load_tsv(path)?;
-    if !FILES.iter().any(|f| dir.join(f).exists()) {
-        if path.exists() {
-            move_from_tsv(dir, &base)?;
-        }
-        return Ok(base);
+    if !FILES.iter().any(|f| dir.join(f).exists()) && path.exists() {
+        let config = mappings::load_tsv(path)?;
+        move_from_tsv(dir, &config)?;
+        return Ok(config);
     }
-    read_files(dir, base)
+    read_files(dir, Config::default())
+}
+/// The same config, reading only: a `mappings.tsv` not moved yet is read as it is and left
+/// for the session (which holds the owner lock) to move. For hooks and read-only commands.
+pub fn peek(path: &Path) -> Result<Config> {
+    let dir = folder(path)?;
+    match FILES.iter().any(|f| dir.join(f).exists()) {
+        true => read_files(dir, Config::default()),
+        false => mappings::load_tsv(path),
+    }
 }
 
 /// Apply each file that exists onto `config`, checking the whole config after each.
 fn read_files(dir: &Path, mut config: Config) -> Result<Config> {
     for file in FILES {
-        let path = dir.join(file);
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(format!("{}: {e}", path.display()).into()),
-        };
-        let named = |e: Box<dyn std::error::Error>| format!("{}: {e}", path.display());
-        let value: Value = serde_json::from_str(&text).map_err(|e| named(e.into()))?;
-        apply(file, &value, &mut config).map_err(named)?;
-        mappings::serialize_config(&config).map_err(named)?;
+        read_file(dir, file, &mut config)?;
     }
     Ok(config)
+}
+/// Apply one file onto `config` and check the whole config; false when it doesn't exist.
+fn read_file(dir: &Path, file: &str, config: &mut Config) -> Result<bool> {
+    let path = dir.join(file);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("{}: {e}", path.display()).into()),
+    };
+    let named = |e: Box<dyn std::error::Error>| format!("{}: {e}", path.display());
+    let value: Value = serde_json::from_str(&text).map_err(|e| named(e.into()))?;
+    apply(file, &value, config).map_err(named)?;
+    mappings::serialize_config(config).map_err(named)?;
+    Ok(true)
+}
+
+/// v7.7 ticket 197: for `doctor`: each config file and whether it loaded, then the mapping
+/// count. Only reads: a `mappings.tsv` not moved yet is left for the next start.
+pub fn report(path: &Path) -> Vec<String> {
+    let Ok(dir) = folder(path) else {
+        return vec!["Config: the configuration path has no folder".into()];
+    };
+    let count =
+        |config: &Config| format!("Configuration: {} valid mappings", config.mappings.len());
+    if !FILES.iter().any(|f| dir.join(f).exists()) {
+        return match path.exists() {
+            false => vec!["Config: no files yet; the shipped defaults are in use".into()],
+            true => vec![
+                format!(
+                    "Config: {} not moved yet; VibeConsole moves it into {} at its next start",
+                    path.display(),
+                    FILES.join(", ")
+                ),
+                match mappings::load_tsv(path) {
+                    Ok(config) => count(&config),
+                    Err(e) => format!("Configuration: {e}"),
+                },
+            ],
+        };
+    }
+    let mut lines = Vec::new();
+    let mut config = Config::default();
+    let mut refused = false;
+    for file in FILES {
+        let state = if refused {
+            "not checked (an earlier file was refused)".to_owned()
+        } else {
+            match read_file(dir, file, &mut config) {
+                Ok(true) => "loaded".to_owned(),
+                Ok(false) => "missing: its shipped defaults are in use".to_owned(),
+                Err(e) => {
+                    refused = true;
+                    format!("refused: {e}")
+                }
+            }
+        };
+        lines.push(format!("Config {file}: {state}"));
+    }
+    if path.exists() {
+        lines.push("Config mappings.tsv: the backup it was moved from; no longer read".into());
+    }
+    if !refused {
+        lines.push(count(&config));
+    }
+    lines
 }
 
 /// The one-time move: write every file from the `mappings.tsv` config, load them back and
@@ -84,19 +149,22 @@ fn move_from_tsv(dir: &Path, config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Save the config: every file whose text changed, each atomically, all or none.
+/// Save the config: every file whose text changed, each atomically, all or none. The files
+/// it replaced go to history as one step (ticket 197).
 pub fn save(path: &Path, config: &Config) -> Result<()> {
     let dir = folder(path)?;
-    let mut files = vec![(path.to_path_buf(), mappings::serialize_config(config)?)];
+    // The whole config is checked with every rule before any file is written.
+    mappings::serialize_config(config)?;
+    let mut files = Vec::new();
     for file in FILES {
         files.push((dir.join(file), text(file, config)?));
     }
-    write_all(&files)
+    write_all(&files, Some(&mappings::history_dir(path)))
 }
 
 /// Write each changed file through a staging file, then rename them all; if a rename fails
 /// the files already renamed get their old text back, so nothing is saved partially.
-fn write_all(files: &[(PathBuf, String)]) -> Result<()> {
+fn write_all(files: &[(PathBuf, String)], history: Option<&Path>) -> Result<()> {
     let changed = files
         .iter()
         .filter(|(path, text)| fs::read(path).ok().as_deref() != Some(text.as_bytes()))
@@ -127,12 +195,8 @@ fn write_all(files: &[(PathBuf, String)]) -> Result<()> {
         staged.push(temporary);
     }
     let mut done: Vec<(&PathBuf, Option<Vec<u8>>)> = Vec::new();
-    for ((path, text), temporary) in changed.iter().zip(&staged) {
+    for ((path, _), temporary) in changed.iter().zip(&staged) {
         let old = fs::read(path).ok();
-        // v7.7 ticket 163: the replaced `mappings.tsv` goes to history; best effort.
-        if path.extension().is_some_and(|e| e == "tsv") {
-            let _ = mappings::keep_history(path, text.as_bytes());
-        }
         if let Err(e) = fs::rename(temporary, path) {
             unstage(&staged);
             for (path, old) in done.into_iter().rev() {
@@ -149,7 +213,62 @@ fn write_all(files: &[(PathBuf, String)]) -> Result<()> {
         }
         done.push((path, old));
     }
+    // v7.7 ticket 163: what this save replaced goes to history; best effort, never blocks.
+    if let Some(dir) = history.filter(|_| !done.is_empty()) {
+        let _ = keep_history(dir, &done);
+    }
     Ok(())
+}
+
+/// One history step: the text each changed file had before. A file that didn't exist yet
+/// has nothing to put back, so a first save leaves no step.
+fn keep_history(dir: &Path, replaced: &[(&PathBuf, Option<Vec<u8>>)]) -> Result<()> {
+    let files = replaced
+        .iter()
+        .filter_map(|(path, old)| {
+            let name = path.file_name()?.to_string_lossy().into_owned();
+            Some((name, json!(String::from_utf8_lossy(old.as_ref()?))))
+        })
+        .collect::<Map<_, _>>();
+    if files.is_empty() {
+        return Ok(());
+    }
+    let snapshot = json!({"version": VERSION, "files": files});
+    fs::create_dir_all(dir)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    write_new(
+        &dir.join(format!("{stamp:020}.json")),
+        serde_json::to_string_pretty(&snapshot)?.as_bytes(),
+    )?;
+    for (old, _) in mappings::history_in(dir).iter().skip(mappings::HISTORY) {
+        fs::remove_file(old)?;
+    }
+    Ok(())
+}
+
+/// The config before the save that wrote this history entry, from the config after it: a
+/// JSON entry holds the files that save replaced; an old `.tsv` entry the whole config.
+pub fn before(entry: &Path, after: &Config) -> Result<Config> {
+    let raw = fs::read_to_string(entry).map_err(|e| format!("history: {e}"))?;
+    if entry.extension().is_some_and(|e| e == "tsv") {
+        return mappings::parse_config(&raw).map_err(|e| format!("history: {e}").into());
+    }
+    let mut config = after.clone();
+    let snapshot: Value = serde_json::from_str(&raw).map_err(|e| format!("history: {e}"))?;
+    let top = Obj::top(&snapshot).map_err(|e| format!("history: {e}"))?;
+    top.only(&["version", "files"])?;
+    let files = top.obj("files")?;
+    files.only(&FILES)?;
+    // In load order, so each file's references are in place.
+    for file in FILES.iter().filter(|f| files.map.contains_key(**f)) {
+        let value =
+            serde_json::from_str(files.str(file)?).map_err(|e| format!("history: {file}: {e}"))?;
+        apply(file, &value, &mut config).map_err(|e| format!("history: {file}: {e}"))?;
+    }
+    mappings::serialize_config(&config).map_err(|e| format!("history: {e}"))?;
+    Ok(config)
 }
 
 /// Create a new file (owner-only) with these bytes, synced; an existing file is an error.
@@ -172,6 +291,7 @@ pub fn text(file: &str, config: &Config) -> Result<String> {
         "lights.json" => lights(config),
         "devices.json" => devices(config),
         "mappings.json" => mappings_json(config)?,
+        "agents.json" => agents(config),
         _ => return Err(format!("unknown config file {file}").into()),
     };
     Ok(serde_json::to_string_pretty(&value)? + "\n")
@@ -183,6 +303,7 @@ fn apply(file: &str, value: &Value, config: &mut Config) -> Result<()> {
         "settings.json" => apply_settings(&at, config),
         "devices.json" => apply_devices(&at, config),
         "mappings.json" => apply_mappings(&at, config),
+        "agents.json" => apply_agents(&at, config),
         "lights.json" => {
             let lights = Lights::read(&at)?;
             config.status_lights = lights.status_lights;
@@ -698,6 +819,93 @@ fn apply_mappings(at: &Obj, config: &mut Config) -> Result<()> {
     Ok(())
 }
 
+// ---- agents.json (ticket 197): the agents, their default folder and the default agent.
+
+fn agents(config: &Config) -> Value {
+    let agents = config
+        .agents
+        .iter()
+        .map(|a| {
+            json!({
+                "name": a.name,
+                "launch": a.launch,
+                "window": a.window,
+                "dir": a.dir,
+                "octave": a.octave,
+                "host": a.host.text(),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "version": VERSION,
+        "default_agent": config.look.default_agent,
+        "agent_model": config.look.agent_model,
+        "agent_dir": config.agent_dir,
+        "agents": agents,
+    })
+}
+fn apply_agents(at: &Obj, config: &mut Config) -> Result<()> {
+    at.only(&[
+        "version",
+        "default_agent",
+        "agent_model",
+        "agent_dir",
+        "agents",
+    ])?;
+    let optional = |at: &Obj, key: &str| -> Result<Option<String>> {
+        match at.get(key)? {
+            Value::Null => Ok(None),
+            _ => Ok(Some(at.str(key)?.to_owned())),
+        }
+    };
+    let agent_dir = optional(at, "agent_dir")?;
+    if let Some(dir) = &agent_dir {
+        at.check("agent_dir", mappings::directory_syntax(dir))?;
+    }
+    let mut agents = Vec::new();
+    for a in at.objects("agents")? {
+        a.only(&["name", "launch", "window", "dir", "octave", "host"])?;
+        let mut agent = a.check(
+            "name",
+            mappings::Agent::new(a.str("name")?, a.str("launch")?, a.str("window")?),
+        )?;
+        agent.dir = optional(&a, "dir")?;
+        if let Some(dir) = &agent.dir {
+            a.check("dir", mappings::directory_syntax(dir))?;
+        }
+        agent.octave = a.int("octave")?;
+        agent.host = a.check("host", mappings::Host::parse(a.str("host")?))?;
+        agents.push(agent);
+    }
+    at.check("agents", mappings::validate_agents(&agents))?;
+    // Lenient as in ticket 149: an agent this build doesn't know loads as the default and
+    // says so; a model belongs to Ollama only.
+    let (agent, model) = (at.str("default_agent")?, at.str("agent_model")?);
+    let known = mappings::AGENT_NAMES.contains(&agent);
+    if known && agent != "Ollama" && !model.is_empty() {
+        return Err(at.err("agent_model", "only Ollama has a model; leave it \"\""));
+    }
+    let look = &mut config.look;
+    if known && (agent != "Ollama" || mappings::valid_model(model)) {
+        look.default_agent = agent.into();
+        look.agent_model = model.into();
+    } else {
+        look.default_agent = mappings::AGENT_NAMES[0].into();
+        look.agent_model = String::new();
+        let unknown = format!(
+            "agents.json: unknown default_agent {agent:?} with model {model:?} (using {})",
+            mappings::AGENT_NAMES[0]
+        );
+        look.notice = Some(match look.notice.take() {
+            Some(notice) => format!("{notice}; {unknown}"),
+            None => unknown,
+        });
+    }
+    config.agent_dir = agent_dir;
+    config.agents = agents;
+    Ok(())
+}
+
 // ---- lights.json (ticket 195): status lights switch, the MPK's tempos and patterns, light
 // folders and other, the Xbox, DualSense and keyboard LED patterns, and the RGB devices.
 
@@ -724,10 +932,11 @@ pub fn shipped_lights() -> &'static Lights {
 }
 
 /// The shipped defaults besides the lights (`core/defaults/`, built in).
-const SHIPPED: [(&str, &str); 3] = [
+const SHIPPED: [(&str, &str); 4] = [
     ("settings.json", include_str!("../defaults/settings.json")),
     ("devices.json", include_str!("../defaults/devices.json")),
     ("mappings.json", include_str!("../defaults/mappings.json")),
+    ("agents.json", include_str!("../defaults/agents.json")),
 ];
 /// v7.7 ticket 196: `Config::default()`: the shipped files over a blank config, so no
 /// default value is a code literal.
@@ -1071,15 +1280,13 @@ mod tests {
         fs::write(&file, &good).unwrap();
 
         // A save that can't be staged changes no file.
-        let tsv = fs::read_to_string(&path).unwrap();
         fs::write(dir.join("settings.json.tmp"), "stale").unwrap();
         let mut next = changed();
         next.look.theme = "Dracula".into();
         next.start_flow = true;
         assert!(mappings::save_config(&path, &next).is_err());
         assert_eq!(fs::read_to_string(&file).unwrap(), good);
-        assert_eq!(fs::read_to_string(&path).unwrap(), tsv);
-        assert!(!dir.join("mappings.tmp").exists(), "staged TSV removed");
+        assert!(!path.exists(), "mappings.tsv is never written (ticket 197)");
         fs::remove_file(dir.join("settings.json.tmp")).unwrap();
         mappings::save_config(&path, &next).unwrap();
         assert_eq!(mappings::load_config(&path).unwrap(), next);
@@ -1375,5 +1582,125 @@ mod tests {
                 "{name}: TSV untouched"
             );
         }
+    }
+
+    /// Every part of agents.json changed: an agent with its own folder on Orca, one on
+    /// herdr, the default folder, and Ollama with a model as the default agent.
+    fn agents_changed() -> Config {
+        let mut config = controls();
+        let mut orca = mappings::Agent::new("review", "claude", "review").unwrap();
+        orca.host = mappings::Host::Orca;
+        orca.dir = Some("${PROJ}/api".into());
+        orca.octave = 3;
+        let mut herdr = mappings::Agent::new("helper", "codex", "helper").unwrap();
+        herdr.host = mappings::Host::Herdr;
+        herdr.octave = -2;
+        config.agents.extend([orca, herdr]);
+        config.agent_dir = Some("/home/me".into());
+        config.look.default_agent = "Ollama".into();
+        config.look.agent_model = "qwen2.5-coder:7b".into();
+        mappings::serialize_config(&config).unwrap();
+        config
+    }
+
+    /// Ticket 197: agents.json round-trips and refuses by file and field; a full v34
+    /// `mappings.tsv` moves into the five files and loads back equal to it; after the move
+    /// no save touches `mappings.tsv`, and doctor names each file.
+    #[test]
+    fn agents_json_and_the_full_move_retire_mappings_tsv() {
+        let dir = folder("agents");
+        let path = dir.join("mappings.tsv");
+        mappings::save_config(&path, &agents_changed()).unwrap();
+        assert_eq!(mappings::load_config(&path).unwrap(), agents_changed());
+        let file = dir.join("agents.json");
+        let good = fs::read_to_string(&file).unwrap();
+        for (bad, field) in [
+            (good.replace("\"orca\"", "\"t3\""), "agents[2].host"),
+            (
+                good.replace(
+                    "\"helper\",\n      \"launch\"",
+                    "\"review\",\n      \"launch\"",
+                ),
+                "agents",
+            ),
+            (good.replace("\"octave\": 3", "\"octave\": 9"), "agents"),
+            (good.replace("\"/home/me\"", "\"\""), "agent_dir"),
+            (good.replace("\"Ollama\"", "\"Codex\""), "agent_model"),
+        ] {
+            fs::write(&file, &bad).unwrap();
+            let error = mappings::load_config(&path).unwrap_err().to_string();
+            assert!(
+                error.contains("agents.json") && error.contains(field),
+                "{field}: {error}"
+            );
+            assert_eq!(fs::read_to_string(&file).unwrap(), bad);
+        }
+        // An agent this build doesn't know loads as the default and says so.
+        fs::write(&file, good.replace("\"Ollama\"", "\"Grok\"")).unwrap();
+        let lenient = mappings::load_config(&path).unwrap();
+        assert_eq!(lenient.look.default_agent, mappings::AGENT_NAMES[0]);
+        assert!(
+            lenient
+                .look
+                .notice
+                .unwrap()
+                .contains("agents.json: unknown default_agent")
+        );
+        fs::write(&file, &good).unwrap();
+
+        // The full move: every part from one v34 file, nothing lost, the TSV kept.
+        let mut all = agents_changed();
+        let (lights, settings) = (lit(), changed());
+        all.status_lights = lights.status_lights;
+        all.light_folders = lights.light_folders;
+        all.light_other = lights.light_other;
+        all.light_other_on = lights.light_other_on;
+        all.light_patterns = lights.light_patterns;
+        all.device_lights = lights.device_lights;
+        all.look.theme = settings.look.theme;
+        all.look.agent_cards = true;
+        all.start_flow = false;
+        all.env = settings.env;
+        let tsv = mappings::serialize_config(&all).unwrap();
+        let dir = folder("full-move");
+        let path = dir.join("mappings.tsv");
+        fs::write(&path, &tsv).unwrap();
+        assert_eq!(mappings::load_config(&path).unwrap(), all);
+        for file in FILES {
+            assert!(dir.join(file).exists(), "{file}");
+        }
+        assert_eq!(
+            mappings::load_config(&path).unwrap(),
+            all,
+            "loaded back from five files"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), tsv);
+        // Saves after the move never touch it.
+        let mut next = all.clone();
+        next.look.theme = "Dracula".into();
+        next.mappings.pop();
+        next.device_lights.rgb_on = false;
+        mappings::save_config(&path, &next).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            tsv,
+            "mappings.tsv is the backup"
+        );
+        assert_eq!(mappings::load_config(&path).unwrap(), next);
+        let shown = report(&path).join("\n");
+        for file in FILES {
+            assert!(shown.contains(&format!("Config {file}: loaded")), "{shown}");
+        }
+        assert!(
+            shown.contains("mappings.tsv: the backup it was moved from"),
+            "{shown}"
+        );
+        fs::write(dir.join("lights.json"), "{}").unwrap();
+        let shown = report(&path).join("\n");
+        assert!(shown.contains("Config lights.json: refused: "), "{shown}");
+        assert!(
+            shown.contains("Config mappings.json: not checked"),
+            "{shown}"
+        );
     }
 }

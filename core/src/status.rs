@@ -68,7 +68,8 @@ pub fn command(args: &[String]) -> Result<()> {
     } else {
         agent
     };
-    let config = crate::mappings::load_config(&crate::mappings::config_path()?)?;
+    // v7.7 ticket 197: a hook reads only; the session moves an old mappings.tsv.
+    let config = crate::mappings::read_config(&crate::mappings::config_path()?)?;
     let Some(window) = config
         .agents
         .iter()

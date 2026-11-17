@@ -9,7 +9,7 @@ description: Use when asked to make, suggest or review a VibeConsole app profile
 2. **Run `vibeconsole describe`.** Use only controls it lists, by the names it prints. Never invent a control and never write a raw note number.
 3. **Write the profile** in the [profile format](../vibeconsole/reference/formats.md): one override per control per device, a plain `shortcut` action with `Key+Key` names, behaviour `hold`. Copy a line from an [example](../vibeconsole/examples/browser-tabs.profile) and change only the keys.
 4. **Say it back in plain words** before anything is saved: "Bank A Pad 1 on the Akai presses Ctrl+Tab in Firefox." The user confirms; VibeConsole shows the same restatement on its review screen.
-5. **Never save over a working setup.** Profiles are imported whole or not at all, and the user keeps a backup of `mappings.tsv` before trying one.
+5. **Never save over a working setup.** Profiles are imported whole or not at all, and the user keeps a backup of `mappings.json` before trying one.
 
 ## Do not
 
