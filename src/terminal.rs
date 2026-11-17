@@ -1645,6 +1645,62 @@ impl Terminal {
         });
         found
     }
+    /// v7.7 ticket 165: Find's `>` actions: the argument-free actions the dispatcher knows
+    /// (volume, mutes) and every action a mapping uses, by label, family and control. Never
+    /// listed: risky mappings, commands, app quits, Flow, shortcuts (the keyboard's), knob
+    /// kinds and silenced controls.
+    fn action_matches(&self, query: &str) -> Vec<(String, crate::actions::Action)> {
+        use crate::actions::Action;
+        let words = query.to_lowercase();
+        let words = words.split_whitespace().collect::<Vec<_>>();
+        let config = self.view.clone().unwrap_or_default();
+        let mapped = (self.run_mappings.iter().cloned())
+            .chain(self.xbox_layout_in(&config))
+            .collect::<Vec<_>>();
+        let unsafe_family = |a: &Action| {
+            matches!(
+                a.family(),
+                "shortcut"
+                    | "nothing"
+                    | "command"
+                    | "app-toggle-quit"
+                    | "app-quit"
+                    | "flow"
+                    | "choice"
+                    | "value"
+            )
+        };
+        let mut actions = vec![
+            Action::Volume { up: true, step: 5 },
+            Action::Volume { up: false, step: 5 },
+            Action::OutputMute,
+            Action::MicrophoneMute,
+        ];
+        for m in &mapped {
+            if !m.risky && !unsafe_family(&m.action) && !actions.contains(&m.action) {
+                actions.push(m.action.clone());
+            }
+        }
+        actions
+            .into_iter()
+            .filter(|a| !mapped.iter().any(|m| m.action == *a && m.risky))
+            .map(|action| {
+                let control = (mapped.iter())
+                    .find(|m| m.action == action)
+                    .map_or("no control".into(), |m| self.name(m.control));
+                let label = format!(
+                    "{} · {} · on {control}",
+                    action.description(),
+                    action.family()
+                );
+                (label, action)
+            })
+            .filter(|(label, _)| {
+                let label = label.to_lowercase();
+                words.iter().all(|w| label.contains(w))
+            })
+            .collect()
+    }
     /// v7.7 ticket 155: `/` Find: type (at most 64 characters), ↑↓ choose, Enter goes to
     /// that tab and selects the row, Esc closes. Find opens nothing and fires nothing itself.
     fn find(&mut self) -> Result<()> {
@@ -1652,6 +1708,46 @@ impl Terminal {
         let mut at = 0;
         self.at_menu = false;
         let picked = loop {
+            // v7.7 ticket 165: `>` lists actions; Enter runs one once, through the dispatcher.
+            if let Some(rest) = query.strip_prefix('>') {
+                let actions = self.action_matches(rest);
+                at = at.min(actions.len().saturating_sub(1));
+                let mut text = format!(
+                    "/ {query}▌ · {} actions · Enter runs it now · risky actions need their pad (one-second hold)\n",
+                    actions.len()
+                );
+                for (index, (label, _)) in actions.iter().enumerate().take(60) {
+                    text += &format!("\n{}{label}", if index == at { "> " } else { "  " });
+                }
+                self.draw(&text).inspect_err(|_| self.at_menu = true)?;
+                match self.key().inspect_err(|_| self.at_menu = true)? {
+                    Some(Key::Escape) => break None,
+                    Some(Key::Enter) => {
+                        if let Some((label, action)) = actions.get(at) {
+                            self.notice =
+                                if self.output.is_some() && self.wanted_run && !self.suspended {
+                                    match self.actions.submit(action.clone(), None) {
+                                        Ok(()) => format!("Ran {label}"),
+                                        Err(error) => format!("find: {error}"),
+                                    }
+                                } else {
+                                    "Paused: nothing fires. Resume first.".into()
+                                };
+                        }
+                        break None;
+                    }
+                    Some(Key::Up) => at = at.saturating_sub(1),
+                    Some(Key::Down) => at = (at + 1).min(actions.len().saturating_sub(1)),
+                    Some(Key::Backspace) => {
+                        query.pop();
+                        at = 0;
+                    }
+                    Some(Key::Character(c)) if query.len() < 64 => query.push(char::from(c)),
+                    Some(Key::Space) if query.len() < 64 => query.push(' '),
+                    _ => {}
+                }
+                continue;
+            }
             let matches = self.find_matches(&query);
             at = at.min(matches.len().saturating_sub(1));
             let mut tabs = matches.iter().map(|m| m.1).collect::<Vec<_>>();
@@ -12734,6 +12830,67 @@ mod tests {
             mappings::xbox_program_name(&mappings::load_config(&path).unwrap(), 1),
             "Browser"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 165: `/ > vol` lists the volume actions; Enter runs the first through the
+    /// dispatcher once; an action on a risky mapping isn't listed; paused, nothing runs.
+    #[test]
+    fn find_actions_run_once_and_never_list_risky_ones() {
+        use crate::actions::Action;
+        let (dir, mut ui, ran, [mute, ..]) = configure_session("find-actions");
+        ui.at_menu = true;
+        for m in &mut ui.run_mappings {
+            if m.control == mute {
+                m.risky = true; // Output mute on a risky pad
+            }
+        }
+        let listed = ui.action_matches("");
+        assert!(
+            !listed.iter().any(|(_, a)| *a == Action::OutputMute),
+            "{listed:?}"
+        );
+        assert!(listed.iter().any(|(_, a)| *a == Action::MicrophoneMute));
+        let vol = ui.action_matches(" vol");
+        assert_eq!(vol.len(), 2, "{vol:?}");
+        assert!(vol[0].0.contains("on no control"), "{}", vol[0].0);
+        let mut steps = vec![Step::Key(Key::Character(b'/'))];
+        steps.extend(typed(">vol").into_iter().map(Step::Key));
+        steps.extend([Key::Enter, Key::Escape].map(Step::Key));
+        ui.script = Some(Play {
+            steps: steps.into(),
+            ..Play::default()
+        });
+        assert_eq!(command_menu(&mut ui).unwrap(), None);
+        let play = ui.script.take().unwrap();
+        assert!(
+            play.screens
+                .iter()
+                .any(|s| s.contains("2 actions · Enter runs it now"))
+        );
+        assert_eq!(
+            ran.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Action::Volume { up: true, step: 5 }
+        );
+        assert!(
+            ran.recv_timeout(Duration::from_millis(300)).is_err(),
+            "once"
+        );
+        ui.wanted_run = false;
+        ui.script = Some(Play {
+            steps: [
+                Key::Character(b'/'),
+                Key::Character(b'>'),
+                Key::Enter,
+                Key::Escape,
+            ]
+            .map(Step::Key)
+            .into(),
+            ..Play::default()
+        });
+        command_menu(&mut ui).unwrap();
+        assert!(ui.notice.starts_with("Paused: nothing fires"));
+        assert!(ran.recv_timeout(Duration::from_millis(300)).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
