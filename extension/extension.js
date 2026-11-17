@@ -14,6 +14,9 @@ const IFACE = `<node>
     <method name="Focused">
       <arg type="s" direction="out" name="app"/>
     </method>
+    <method name="FocusedTitle">
+      <arg type="s" direction="out" name="title"/>
+    </method>
     <method name="Apply">
       <arg type="s" direction="in" name="app"/>
       <arg type="s" direction="in" name="action"/>
@@ -45,6 +48,12 @@ class Windows {
     Focused() {
         const app = Shell.WindowTracker.get_default().focus_app;
         return app?.get_id() ?? '';
+    }
+
+    // v7.7 ticket 208: the focused window's title, so VibeConsole can tell its own terminal
+    // (it sets that title) from every other window; '' when nothing is focused.
+    FocusedTitle() {
+        return global.display.focus_window?.get_title() ?? '';
     }
 
     // minimize | close | restore; returns how many windows it acted on.

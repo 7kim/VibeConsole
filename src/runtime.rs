@@ -1060,6 +1060,14 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                     "Status log: unavailable: no journal (no /run/systemd/journal/socket); a terminal run shows its status on screen only"
                 }
             );
+            // v7.7 ticket 208: whether a terminal run can tell its own terminal is focused.
+            println!(
+                "{}",
+                match crate::actions::focused_title(crate::actions::gdbus_output) {
+                    Ok(_) => "Own terminal focus: available (window extension); Shift, Ctrl, Alt or Super alone are held back while VibeConsole's terminal is focused".to_owned(),
+                    Err(e) => format!("{e}; Shift, Ctrl, Alt or Super alone stay silent in menus. After vibeconsole install, log out and in once"),
+                }
+            );
             println!("Agent terminals: tmux attach -t vibe");
             for codex in [false, true] {
                 println!("{}", crate::status::hooks_status(codex));

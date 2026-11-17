@@ -464,6 +464,11 @@ struct Terminal {
     live_start: bool,
     /// v7.7 ticket 206: see [`Ui::rows_left`].
     rows_left: BTreeMap<String, (usize, String)>,
+    /// v7.7 ticket 208: whether VibeConsole's own terminal is focused; None when the window
+    /// extension can't tell. `own_title` is the title this run gives its terminal.
+    own_focus: Option<bool>,
+    own_focus_at: Instant,
+    own_title: String,
     rendered: String,
     rendered_size: (usize, usize),
     /// v7.7 ticket 213: the first frame is drawn; input typed before it was dropped.
@@ -1148,6 +1153,9 @@ impl Terminal {
             tab_rows: [0; 10],
             live_start: true,
             rows_left: BTreeMap::new(),
+            own_focus: None,
+            own_focus_at: Instant::now(),
+            own_title: format!("VibeConsole-{}", std::process::id()),
             rendered: String::new(),
             rendered_size: (0, 0),
             drawn: false,
@@ -1178,7 +1186,13 @@ impl Terminal {
         if unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw) } != 0 {
             return Err(io::Error::last_os_error().into());
         }
-        write!(io::stdout(), "\x1b[?1049h\x1b[?25l{MOUSE_ON}")?;
+        // v7.7 ticket 208: the terminal's title names this run, so the window extension can
+        // tell its window from every other; the old title is pushed and comes back on quit.
+        write!(
+            io::stdout(),
+            "\x1b[?1049h\x1b[?25l{MOUSE_ON}\x1b[22;0t\x1b]2;{}\x07",
+            terminal.own_title
+        )?;
         io::stdout().flush()?;
         Ok(terminal)
     }
@@ -2744,8 +2758,16 @@ impl Terminal {
                     .into_iter()
                     .map(|row| one(row, None)),
             );
+            // v7.7 ticket 208: Live says when this run can't tell its own terminal is focused
+            // (a title is cut to fit, never wrapped; doctor says why).
+            let focus = if (self.original.is_some() || self.scripted()) && self.own_focus.is_none()
+            {
+                " · own terminal focus: unavailable"
+            } else {
+                ""
+            };
             panes.push((
-                "Controller map · ◆ pressed ▶ running ● on · nothing mapped".into(),
+                format!("Controller map · ◆ pressed ▶ running ● on · nothing mapped{focus}"),
                 map,
             ));
         }
@@ -3445,8 +3467,12 @@ impl Terminal {
         if self.gamepad.is_some() {
             all.extend(self.xbox_layout()?);
         }
-        if self.configuring {
-            // v7 ticket 112: Shift, Ctrl, Alt or Super alone never fire inside configure.
+        // v7 ticket 112: Shift, Ctrl, Alt or Super alone never type into VibeConsole. v7.7
+        // ticket 208: with its own terminal's focus known, they are held back only while that
+        // terminal is focused, on every screen; unknown, only inside menus, as before (ticket
+        // 144's menus share /configure's rule). Wispr Flow's Shift hold then works on Status
+        // light patterns while another app is focused.
+        if self.own_focus.unwrap_or(self.configuring) {
             let modifiers = &mappings::key_groups()[0].1;
             all.retain(|m| m.keys.is_empty() || !m.keys.iter().all(|k| modifiers.contains(k)));
         }
@@ -3669,6 +3695,28 @@ impl Terminal {
             }
         }
         Ok(())
+    }
+    /// v7.7 ticket 208: whether this run's own terminal is focused, from the focused window's
+    /// title. A change is a transition: held keys are released, then modifier-only mappings
+    /// are held back or let through.
+    fn follow_own_focus(&mut self) -> Result<()> {
+        let own = self.focused_title().map(|title| title == self.own_title);
+        if own == self.own_focus {
+            return Ok(());
+        }
+        self.own_focus = own;
+        self.release_all()?;
+        self.reload_keyboard()
+    }
+    /// The focused window's title; None when it can't be told (no extension method, the
+    /// service, which has no terminal). Tests read their script's.
+    fn focused_title(&mut self) -> Option<String> {
+        #[cfg(test)]
+        if let Some(play) = &self.script {
+            return play.focus.clone();
+        }
+        self.original.as_ref()?;
+        crate::actions::focused_title(crate::actions::gdbus_output).ok()
     }
     /// Follow the focused app (v7 ticket 12): its profile, or Default. Without the window
     /// extension the focused app is "unavailable" and Default applies.
@@ -4722,6 +4770,16 @@ impl Terminal {
             self.connecting = false;
             self.error = error.to_string();
         }
+        // v7.7 ticket 208: every status interval (tests: every tick).
+        let due = self.own_focus_at.elapsed() >= STATUS_EVERY;
+        #[cfg(test)]
+        let due = due || self.script.is_some();
+        if due {
+            self.own_focus_at = Instant::now();
+            if let Err(error) = self.follow_own_focus() {
+                self.error = format!("own terminal focus: {error}");
+            }
+        }
         if self.status_at.elapsed() >= STATUS_EVERY {
             self.status_at = Instant::now();
             self.refresh_agent_states();
@@ -5542,7 +5600,10 @@ impl Drop for Terminal {
             signal_hook::low_level::unregister(signal);
         }
         if self.original.is_some() {
-            let _ = write!(io::stdout(), "{MOUSE_OFF}\x1b[0m\x1b[?25h\x1b[?1049l");
+            let _ = write!(
+                io::stdout(),
+                "{MOUSE_OFF}\x1b[0m\x1b[?25h\x1b[?1049l\x1b[23;0t"
+            );
         }
         let _ = io::stdout().flush();
     }
@@ -5633,7 +5694,11 @@ impl Ui for Terminal {
         if unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw) } != 0 {
             return Err(io::Error::last_os_error().into());
         }
-        write!(io::stdout(), "\x1b[?1049h\x1b[?25l\x1b[2J{MOUSE_ON}")?;
+        write!(
+            io::stdout(),
+            "\x1b[?1049h\x1b[?25l\x1b[2J{MOUSE_ON}\x1b]2;{}\x07",
+            self.own_title
+        )?;
         io::stdout().flush()?;
         self.rendered.clear();
         if !result?.success() {
@@ -21830,6 +21895,130 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7.7 ticket 208: with another app focused, a Shift-only hold (the user's Xbox RT,
+    /// Wispr Flow's talk key) fires on Live, on 3 Agents and inside Status light patterns.
+    /// The cause: inside a menu it was left out of the keyboard (ticket 112's rule for
+    /// /configure in `with_gamepad`, which every Settings menu shares since ticket 144).
+    #[test]
+    fn a_shift_hold_fires_on_every_screen_while_another_app_is_focused() {
+        let (dir, mut ui, _ran, [.., shift]) = configure_session("shift-everywhere");
+        let path = dir.join("mappings.tsv");
+        ui.context_verified = true;
+        ui.at_menu = true;
+        let mut steps = Vec::from(hold(shift)); // Live
+        steps.push(Step::Key(Key::Character(b'3'))); // 3 Agents: not a transition
+        steps.extend(hold(shift));
+        steps.push(Step::Key(Key::Escape));
+        ui.script = Some(Play {
+            steps: steps.into(),
+            focus: Some("Mozilla Firefox".into()),
+            ..Play::default()
+        });
+        command_menu(&mut ui).unwrap();
+        assert_eq!(shifts(&ui), 2, "Live and 3 Agents");
+        // 3 Agents › Status light patterns, opened as the session opens a Settings row.
+        ui.at_menu = false;
+        let mut steps = vec![Step::Key(Key::Down)]; // a key read resumes output there
+        steps.extend(hold(shift));
+        steps.push(Step::Key(Key::Escape));
+        ui.script = Some(Play {
+            steps: steps.into(),
+            focus: Some("Mozilla Firefox".into()),
+            ..Play::default()
+        });
+        ui.menu_fires(false, |ui| light_patterns_menu(ui, &path))
+            .unwrap();
+        assert_eq!(shifts(&ui), 3, "inside Status light patterns");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    fn hold(control: Control) -> [Step; 2] {
+        [
+            Step::Events(vec![Event::Press(control)]),
+            Step::Events(vec![Event::Release(control, crate::ReleaseType::NoteOff)]),
+        ]
+    }
+
+    /// v7.7 ticket 208, with a fake focus source: VibeConsole's own terminal focused, a
+    /// Shift-only hold sends nothing and a held Shift is released; another app focused, it
+    /// sends again. Other mapped keys (Down) still type, so pads keep driving the menus. With
+    /// no focus source, Shift fires on Live and stays silent in menus (ticket 112), and Live
+    /// says own-terminal focus is unavailable.
+    #[test]
+    fn own_terminal_focus_holds_back_shift_alone_and_releases_it() {
+        let (dir, mut ui, _ran, [_, down, _, shift]) = configure_session("own-focus");
+        let path = dir.join("mappings.tsv");
+        ui.context_verified = true;
+        ui.at_menu = true;
+        let own = ui.own_title.clone();
+        let downs = |ui: &Terminal| {
+            let recorded = &ui.output.as_ref().unwrap().recorded;
+            (recorded.iter())
+                .filter(|(k, d)| *k == evdev::KeyCode::KEY_DOWN && *d)
+                .count()
+        };
+        let play = |ui: &mut Terminal, focus: Option<&str>, steps: Vec<Step>| {
+            let mut steps = steps;
+            steps.push(Step::Key(Key::Escape));
+            ui.script = Some(Play {
+                steps: steps.into(),
+                focus: focus.map(String::from),
+                ..Play::default()
+            });
+            command_menu(ui).unwrap();
+            ui.script.take().unwrap().screens
+        };
+        // Shift held down while another app is focused, then VibeConsole's terminal is.
+        play(
+            &mut ui,
+            Some("Mozilla Firefox"),
+            vec![Step::Events(vec![Event::Press(shift)])],
+        );
+        assert_eq!(shifts(&ui), 1);
+        play(&mut ui, Some(&own), vec![]);
+        let recorded = &ui.output.as_ref().unwrap().recorded;
+        assert_eq!(
+            recorded.last(),
+            Some(&(evdev::KeyCode::KEY_LEFTSHIFT, false)),
+            "focusing VibeConsole released the held Shift"
+        );
+        // Focused on VibeConsole: Shift alone sends nothing; Down still types.
+        let mut steps = Vec::from(hold(shift));
+        steps.extend(hold(down));
+        play(&mut ui, Some(&own), steps);
+        assert_eq!(shifts(&ui), 1, "held back");
+        assert!(downs(&ui) >= 1, "Down still drives VibeConsole's menus");
+        // Another app again: it sends.
+        play(&mut ui, Some("Mozilla Firefox"), Vec::from(hold(shift)));
+        assert_eq!(shifts(&ui), 2);
+        // No focus source: Live fires, a menu stays silent, and Live says why.
+        play(&mut ui, None, Vec::from(hold(shift)));
+        assert_eq!(shifts(&ui), 3, "Live, focus unknown");
+        ui.read_view(None); // Live's controller map
+        ui.script = Some(Play::default());
+        let titles = (ui.live_panes(200, usize::MAX).into_iter())
+            .map(|(title, _)| title)
+            .collect::<Vec<_>>();
+        ui.script = None;
+        assert!(
+            titles
+                .iter()
+                .any(|t| t.ends_with("own terminal focus: unavailable")),
+            "Live says so: {titles:?}"
+        );
+        ui.at_menu = false;
+        let mut steps = vec![Step::Key(Key::Down)];
+        steps.extend(hold(shift));
+        steps.push(Step::Key(Key::Escape));
+        ui.script = Some(Play {
+            steps: steps.into(),
+            ..Play::default()
+        });
+        ui.menu_fires(false, |ui| light_patterns_menu(ui, &path))
+            .unwrap();
+        assert_eq!(shifts(&ui), 3, "a menu, focus unknown: ticket 112's rule");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// v7.7 ticket 206: back from a submenu, a menu's cursor is on the row you opened: 3
     /// Agents › Status light patterns › Keyboard lights that show it, then Esc; after a
     /// change saved in a submenu (Thinking's tempo), on the changed row.
@@ -22653,6 +22842,8 @@ mod tests {
         pub(super) login: Option<bool>,
         /// v7.7 ticket 203: the journal lines a terminal run wrote, never sent.
         pub(super) journal: Vec<String>,
+        /// v7.7 ticket 208: the focused window's title; None: focus can't be told.
+        pub(super) focus: Option<String>,
     }
     impl Terminal {
         pub(super) fn scripted_key(&mut self) -> Result<Option<Key>> {

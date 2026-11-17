@@ -1227,6 +1227,18 @@ pub fn focused_app(mut gdbus: impl FnMut(&[String]) -> Result<String>) -> Result
     }
     Ok(Some(id.to_owned()))
 }
+/// v7.7 ticket 208: the focused window's title through the window extension (an older
+/// extension without `FocusedTitle` answers with an error: unavailable).
+pub fn focused_title(mut gdbus: impl FnMut(&[String]) -> Result<String>) -> Result<String> {
+    let reply = gdbus(&windows_call("FocusedTitle", &[]))
+        .map_err(|e| format!("own terminal focus unavailable: {e}"))?;
+    reply
+        .trim()
+        .strip_prefix("('")
+        .and_then(|r| r.strip_suffix("',)"))
+        .map(str::to_owned)
+        .ok_or_else(|| "own terminal focus unavailable: unexpected reply".into())
+}
 pub fn gdbus_output(argv: &[String]) -> Result<String> {
     let output = Command::new("gdbus").args(argv).output()?;
     if !output.status.success() {
@@ -2866,6 +2878,25 @@ impl Action {
 
 #[cfg(test)]
 mod tests {
+    /// v7.7 ticket 208: the focused window's title from the extension; an extension without
+    /// `FocusedTitle` (before a re-login) is "own terminal focus unavailable".
+    #[test]
+    fn focused_title_reads_the_extension_or_is_unavailable() {
+        let reply = |out: &'static str| move |_: &[String]| -> Result<String> { Ok(out.into()) };
+        assert_eq!(
+            focused_title(reply("('VibeConsole-42',)\n")).unwrap(),
+            "VibeConsole-42"
+        );
+        let missing = focused_title(|_: &[String]| -> Result<String> {
+            Err("No such method 'FocusedTitle'".into())
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            missing.starts_with("own terminal focus unavailable"),
+            "{missing}"
+        );
+    }
     use super::*;
 
     /// v7.7 ticket 182: a tmux jump round-trips, refuses a window that isn't a simple name,
