@@ -192,6 +192,10 @@ trait Ui {
     }
     /// v7 ticket 26: the user's own `claude -p` (their login, no key stored), 3 minutes at
     /// most. Tests answer with a fake reply.
+    /// v7.7 ticket 146: where the usage log lives (None: nothing counted).
+    fn usage_dir(&self) -> Option<PathBuf> {
+        None
+    }
     fn ask_claude(&mut self, request: &str) -> Result<String> {
         let output = std::process::Command::new("timeout")
             .args(["180", "claude", "-p", request])
@@ -2261,10 +2265,10 @@ impl Terminal {
                 let settings = vec![
                     (
                         vec![format!(
-                            "  Share usage counts with {agent} · {} · asked once; counts only, never text",
+                            "Share usage counts with {agent} · {} · asked once; counts only, never text",
                             on(config.look.share_usage)
                         )],
-                        None,
+                        Some(Open::Command(SHARE_SWITCH)),
                     ),
                     (
                         vec![format!(
@@ -2293,11 +2297,16 @@ impl Terminal {
                     ),
                     (
                         "AI Recommendations · from your usage counts and mappings".into(),
-                        vec![(
-                            vec![format!(
-                                "  None yet: they need Share usage counts with {agent} (asked once)"
-                            )],
-                            None,
+                        vec![one(
+                            format!(
+                                "Get recommendations · from your usage counts, 30 days{}",
+                                if config.look.share_usage {
+                                    ""
+                                } else {
+                                    " · asks first"
+                                }
+                            ),
+                            Some(ASK_RECOMMENDATIONS),
                         )],
                     ),
                     ("AI settings".into(), settings),
@@ -5266,6 +5275,9 @@ impl Drop for Terminal {
 }
 
 impl Ui for Terminal {
+    fn usage_dir(&self) -> Option<PathBuf> {
+        self.usage_dir.clone()
+    }
     fn xbox_program(&self) -> u8 {
         self.xbox_program
     }
@@ -6788,12 +6800,77 @@ fn pick_devices(
 enum AskKind {
     Profile,
     About,
+    Recommendations,
 }
 fn ask_for(ui: &mut impl Ui, path: &Path, kind: AskKind) -> Result<()> {
     match kind {
         AskKind::Profile => ai_profile(ui, path),
         AskKind::About => ask_about(ui, path),
+        AskKind::Recommendations => ask_recommendations(ui, path),
     }
+}
+/// v7.7 ticket 146: what the consent screen says leaves the computer.
+const SHARE_TEXT: &str = "AI Recommendations sends your usage counts to your default agent through your own login: how many times you pressed each control and how many times each action family fired, over the last 30 days. Never prompt text, keys typed, folder paths or agent output. Asked once; turn it off again in 0 AI › AI settings.";
+/// v7.7 ticket 146: the counts a recommendations request may hold, and nothing else:
+/// `press <control> <n>` and `family <family> <n>` for the last 30 days.
+fn usage_counts(dir: &Path) -> String {
+    let (days, _) = crate::usage::load(dir, crate::usage::today(), 30);
+    let mut all = crate::usage::Day::default();
+    for (_, day) in &days {
+        all.merge(day);
+    }
+    ["press", "family"]
+        .iter()
+        .flat_map(|kind| {
+            all.of(kind)
+                .map(move |(key, n)| format!("{kind}\t{key}\t{n}\n"))
+        })
+        .collect()
+}
+/// v7.7 ticket 146: AI Recommendations asks first (once): without a yes, or with sharing off
+/// again, nothing is sent; with it, only the counts go.
+fn ask_recommendations(ui: &mut impl Ui, path: &Path) -> Result<()> {
+    let mut config = mappings::load_config(path)?;
+    if !config.look.share_usage {
+        let consent = choose(
+            ui,
+            &format!("Share usage counts?\n\n{SHARE_TEXT}"),
+            &options(&["No, send nothing", "Yes, share the counts"]),
+        )?;
+        if consent != Some(1) {
+            return Ok(());
+        }
+        config.look.share_usage = true;
+        mappings::save_config(path, &config)?;
+    }
+    let counts = ui
+        .usage_dir()
+        .map(|dir| usage_counts(&dir))
+        .unwrap_or_default();
+    if counts.is_empty() {
+        choose(
+            ui,
+            "No usage counted yet: use VibeConsole for a while first.",
+            &options(&["Back"]),
+        )?;
+        return Ok(());
+    }
+    let request = format!(
+        "You help with VibeConsole, which maps an Akai MPK mini and an Xbox controller to keys, prompts and apps. From these usage counts (last 30 days), suggest up to three changes that would save presses, each in one sentence with why. Counts:\n{counts}"
+    );
+    ui.draw("Asking your agent… this can take a minute.")?;
+    let reply = ui.ask_claude(&request)?;
+    let lines = crate::screen::wrap(reply.trim(), ui.width().saturating_sub(6));
+    let mut rows = lines;
+    rows.push("Back".into());
+    choose(ui, "AI Recommendations · nothing was changed", &rows)?;
+    Ok(())
+}
+/// v7.7 ticket 146: the AI settings switch: sharing on or off (config v33 `ai-share-usage`).
+fn switch_share(path: &Path) -> Result<()> {
+    let mut config = mappings::load_config(path)?;
+    config.look.share_usage = !config.look.share_usage;
+    mappings::save_config(path, &config)
 }
 /// v7.7 ticket 148: a free question about the setup ("Why didn't Pad 6 fire?"), answered in
 /// words from what `vibeconsole describe` and doctor's problems say (read-only). The answer
@@ -10691,6 +10768,9 @@ const PROFILE: usize = 4 * ROWS;
 const TUNING: usize = 5 * ROWS;
 /// v7.7 ticket 148: the AI tab's "about my setup" row.
 const ASK_ABOUT: usize = 6 * ROWS;
+/// v7.7 ticket 146: AI Recommendations and the sharing switch.
+const ASK_RECOMMENDATIONS: usize = 7 * ROWS;
+const SHARE_SWITCH: usize = 8 * ROWS;
 /// Opens tab row `id` (`SETTING..`): one Settings row, or one row of the Agents, Prompts,
 /// Saved prompt sequences, App profiles or Xbox tuning lists, as those lists do.
 fn tab_row(ui: &mut impl Ui, path: &Path, id: usize) -> Result<()> {
@@ -10702,6 +10782,14 @@ fn tab_row(ui: &mut impl Ui, path: &Path, id: usize) -> Result<()> {
         SEQUENCE => sequence_choice(ui, path, row),
         PROFILE => profile_choice(ui, path, row),
         ASK_ABOUT => match ask_for(ui, path, AskKind::About) {
+            Err(error) => not_saved(ui, &error),
+            ok => ok,
+        },
+        ASK_RECOMMENDATIONS => match ask_for(ui, path, AskKind::Recommendations) {
+            Err(error) => not_saved(ui, &error),
+            ok => ok,
+        },
+        SHARE_SWITCH => match switch_share(path) {
             Err(error) => not_saved(ui, &error),
             ok => ok,
         },
@@ -11539,6 +11627,8 @@ mod tests {
     }
     #[derive(Default)]
     struct Script {
+        /// v7.7 ticket 146: the usage log a recommendations ask reads.
+        usage: Option<PathBuf>,
         keys: VecDeque<Key>,
         pads: VecDeque<Control>,
         recordings: VecDeque<Result<Vec<String>>>,
@@ -11610,6 +11700,9 @@ mod tests {
         }
         fn t3_key_file(&mut self) -> Result<String> {
             Ok(self.t3.clone())
+        }
+        fn usage_dir(&self) -> Option<PathBuf> {
+            self.usage.clone()
         }
         fn ask_claude(&mut self, request: &str) -> Result<String> {
             self.asked.push(request.to_owned());
@@ -12904,7 +12997,13 @@ mod tests {
             .len();
         let lists = (0..agents + 4)
             .map(|n| AGENT + n)
-            .chain([PROMPT, SEQUENCE, ASK_ABOUT])
+            .chain([
+                PROMPT,
+                SEQUENCE,
+                ASK_ABOUT,
+                ASK_RECOMMENDATIONS,
+                SHARE_SWITCH,
+            ])
             .chain((0..3).map(|n| PROFILE + n))
             .chain((0..12).map(|n| TUNING + n));
         let mut expected = commands
@@ -12994,6 +13093,63 @@ mod tests {
             mappings::xbox_program_name(&mappings::load_config(&path).unwrap(), 1),
             "Browser"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 146: the first recommendations ask shows the consent screen and No sends
+    /// nothing; Yes is saved and the next ask goes straight through with counts only; the
+    /// switch Off asks again.
+    #[test]
+    fn recommendations_ask_before_sending_counts_only() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-consent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let usage = dir.join("usage");
+        let mut day = crate::usage::Day::default();
+        day.add("press", "Bank A Pad 5", 40);
+        day.add("family", "prompt", 12);
+        day.add("prompt", "my-secret-plan", 12);
+        day.add("keys", "-", 99);
+        crate::usage::flush(&usage, crate::usage::today(), &day).unwrap();
+        let script = |keys: Vec<Key>| Script {
+            keys: keys.into(),
+            usage: Some(usage.clone()),
+            claude: "Put Orca jump on Pad 5.".into(),
+            ..Default::default()
+        };
+        let mut no = script(vec![Enter]); // "No, send nothing" is first
+        ask_for(&mut no, &path, AskKind::Recommendations).unwrap();
+        assert!(
+            no.screens[0].contains("Never prompt text, keys typed, folder paths or agent output")
+        );
+        assert!(no.asked.is_empty(), "No sends nothing");
+        assert!(!mappings::load_config(&path).unwrap().look.share_usage);
+        let mut yes = script(vec![Down, Enter, Enter]);
+        ask_for(&mut yes, &path, AskKind::Recommendations).unwrap();
+        assert!(
+            mappings::load_config(&path).unwrap().look.share_usage,
+            "Yes is saved"
+        );
+        let sent = &yes.asked[0];
+        assert!(sent.contains("press\tBank A Pad 5\t40") && sent.contains("family\tprompt\t12"));
+        assert!(
+            !sent.contains("my-secret-plan") && !sent.contains("keys\t"),
+            "{sent}"
+        );
+        assert!(
+            !sent.contains(&dir.display().to_string()),
+            "no folder paths"
+        );
+        let mut again = script(vec![Enter]);
+        ask_for(&mut again, &path, AskKind::Recommendations).unwrap();
+        assert_eq!(again.asked.len(), 1, "straight through");
+        switch_share(&path).unwrap();
+        let mut off = script(vec![Enter]);
+        ask_for(&mut off, &path, AskKind::Recommendations).unwrap();
+        assert!(off.asked.is_empty(), "the switch Off asks again");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
