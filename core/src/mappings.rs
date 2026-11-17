@@ -1330,6 +1330,73 @@ pub fn sequence_from_reply(
     }
     Ok((name, steps, new))
 }
+/// v7.7 ticket 171: one AI recommendation: what to change and why, each one printable line,
+/// and the change itself, a profile file of exactly one override (app `-`: a Default
+/// mapping; else an app profile). It is still checked in full when reviewed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Recommendation {
+    pub what: String,
+    pub why: String,
+    pub text: String,
+}
+/// v7.7 ticket 171: the recommendations in a reply: each `recommendation<TAB><what><TAB>
+/// <why>` line followed by its profile file; one without a one-override file is dropped;
+/// ten at most.
+pub fn recommendations_from_reply(reply: &str) -> Vec<Recommendation> {
+    let clean = |t: &str| {
+        t.trim()
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(200)
+            .collect::<String>()
+    };
+    let mut found = Vec::new();
+    let mut parts = reply.split("recommendation\t").skip(1);
+    for part in parts.by_ref() {
+        let (head, body) = part.split_once('\n').unwrap_or((part, ""));
+        let Some((what, why)) = head.split_once('\t') else {
+            continue;
+        };
+        let Some(text) = profile_text_from_reply(body) else {
+            continue;
+        };
+        let one = text
+            .lines()
+            .nth(1)
+            .is_some_and(|l| l.split('\t').nth(3) == Some("1"));
+        if one && !clean(what).is_empty() {
+            found.push(Recommendation {
+                what: clean(what),
+                why: clean(why),
+                text,
+            });
+        }
+    }
+    found.truncate(10);
+    found
+}
+/// v7.7 ticket 171: the Default mappings as a recommendations request may hold them: each
+/// control by name with its keys, or only the kind of action (never prompt text, commands,
+/// folders or app paths).
+pub fn mappings_summary(config: &Config) -> String {
+    config
+        .mappings
+        .iter()
+        .map(|m| {
+            let what = if m.action == crate::actions::Action::Shortcut {
+                m.keys.join("+")
+            } else {
+                m.action.family().to_owned()
+            };
+            let name = if m.label.is_empty() {
+                m.name(None)
+            } else {
+                m.label.clone()
+            };
+            format!("- {} {name}: {what}\n", program_label(m.context))
+        })
+        .collect()
+}
 /// v7.7 ticket 168: the agent CLIs Set up agents looks for on PATH (looked up, never run).
 pub const AGENT_CLIS: [&str; 10] = [
     "claude", "codex", "opencode", "ollama", "gemini", "aider", "goose", "qwen", "copilot", "omp",

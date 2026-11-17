@@ -6885,7 +6885,7 @@ fn ask_for(ui: &mut impl Ui, path: &Path, kind: AskKind) -> Result<()> {
     }
 }
 /// v7.7 ticket 146: what the consent screen says leaves the computer.
-const SHARE_TEXT: &str = "AI Recommendations sends your usage counts to your default agent through your own login: how many times you pressed each control and how many times each action family fired, over the last 30 days. Never prompt text, keys typed, folder paths or agent output. Asked once; turn it off again in 0 AI › AI settings.";
+const SHARE_TEXT: &str = "AI Recommendations sends your usage counts to your default agent through your own login: how many times you pressed each control and how many times each action family fired, over the last 30 days, and what each mapped control does (its keys, or only the kind of action). Never prompt text, keys typed, folder paths or agent output. Asked once; turn it off again in 0 AI › AI settings.";
 /// v7.7 ticket 146: the counts a recommendations request may hold, and nothing else:
 /// `press <control> <n>` and `family <family> <n>` for the last 30 days.
 fn usage_counts(dir: &Path) -> String {
@@ -6918,28 +6918,152 @@ fn ask_recommendations(ui: &mut impl Ui, path: &Path) -> Result<()> {
         config.look.share_usage = true;
         mappings::save_config(path, &config)?;
     }
-    let counts = ui
-        .usage_dir()
-        .map(|dir| usage_counts(&dir))
-        .unwrap_or_default();
-    if counts.is_empty() {
+    let Some(usage) = ui.usage_dir() else {
         choose(
             ui,
             "No usage counted yet: use VibeConsole for a while first.",
             &options(&["Back"]),
         )?;
         return Ok(());
-    }
-    let request = format!(
-        "You help with VibeConsole, which maps an Akai MPK mini and an Xbox controller to keys, prompts and apps. From these usage counts (last 30 days), suggest up to three changes that would save presses, each in one sentence with why. Counts:\n{counts}"
+    };
+    // v7.7 ticket 171: the last reply is kept beside the usage log until R asks again;
+    // a recommendation put off with Space stays hidden for 30 days.
+    let state = usage.parent().unwrap_or(&usage).to_path_buf();
+    let (cache, hidden_file) = (
+        state.join("recommendations.txt"),
+        state.join("recommendations-hidden.tsv"),
     );
-    ui.draw("Asking your agent… this can take a minute.")?;
-    let reply = ui.ask_claude(&request)?;
-    let lines = crate::screen::wrap(reply.trim(), ui.width().saturating_sub(6));
-    let mut rows = lines;
-    rows.push("Back".into());
-    choose(ui, "AI Recommendations · nothing was changed", &rows)?;
-    Ok(())
+    let mut reply = std::fs::read_to_string(&cache).ok();
+    let mut cursor = 0;
+    loop {
+        let text = match &reply {
+            Some(text) => text.clone(),
+            None => {
+                let counts = usage_counts(&usage);
+                if counts.is_empty() {
+                    choose(
+                        ui,
+                        "No usage counted yet: use VibeConsole for a while first.",
+                        &options(&["Back"]),
+                    )?;
+                    return Ok(());
+                }
+                let pad = Control::from_note(10, 36).ok_or("no example pad")?;
+                let example = mappings::export_profile(&mappings::Profile {
+                    name: "AI".into(),
+                    apps: Vec::new(),
+                    mappings: vec![Mapping::new(pad, "Ctrl+T", "hold")?],
+                })?;
+                let request = format!(
+                    "You help with VibeConsole, which maps an Akai MPK mini and an Xbox controller to keys, prompts and apps. From these usage counts (last 30 days) and mappings, suggest up to three changes that would save presses. For each, write one line `recommendation<TAB><what to change, one sentence><TAB><why, one sentence>`, then the change as a file in VibeConsole's tab-separated format with exactly one override line: for a Default mapping keep the profile name AI and the app field -; for an app's profile give a new profile name and the app's desktop ID. Example:\n{example}\nOverrides use the action word shortcut with keys in the 9th field. Terminal commands (`command:`) and risky actions are not available to you: VibeConsole refuses a reply that has one.\n\nCounts:\n{counts}\nMappings:\n{}",
+                    mappings::mappings_summary(&mappings::load_config(path)?)
+                );
+                ui.draw("Asking your agent… this can take a minute.")?;
+                let text = ui.ask_claude(&request)?;
+                std::fs::create_dir_all(&state)?;
+                crate::actions::write_atomic(&cache, &text)?;
+                reply = Some(text.clone());
+                text
+            }
+        };
+        let today = crate::usage::today();
+        let hidden_text = std::fs::read_to_string(&hidden_file).unwrap_or_default();
+        let hidden = hidden_text
+            .lines()
+            .filter_map(|l| l.split_once('\t'))
+            .filter(|(day, _)| day.parse::<i64>().is_ok_and(|d| today - d < 30))
+            .map(|(_, what)| what.to_owned())
+            .collect::<Vec<_>>();
+        let shown = mappings::recommendations_from_reply(&text)
+            .into_iter()
+            .filter(|r| !hidden.contains(&r.what))
+            .collect::<Vec<_>>();
+        cursor = cursor.min(shown.len().saturating_sub(1));
+        let agent = mappings::load_config(path)?.look.default_agent;
+        let rows = if shown.is_empty() {
+            "  No recommendations now. R asks again.".to_owned()
+        } else {
+            shown
+                .iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    format!(
+                        "{} {}\n    {}",
+                        if i == cursor { ">" } else { " " },
+                        r.what,
+                        r.why
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        ui.draw(&format!(
+            "AI Recommendations · Enter: review and save · Space: not now · R: refresh · Esc: back\n{rows}\n\nWritten by {agent} from your usage counts (Insights) and mappings."
+        ))?;
+        let hide = |what: &str| -> Result<()> {
+            let mut kept = hidden_text
+                .lines()
+                .filter(|l| {
+                    l.split_once('\t')
+                        .is_some_and(|(d, _)| d.parse::<i64>().is_ok_and(|d| today - d < 30))
+                })
+                .map(|l| format!("{l}\n"))
+                .collect::<String>();
+            kept += &format!("{today}\t{what}\n");
+            std::fs::create_dir_all(&state)?;
+            crate::actions::write_atomic(&hidden_file, &kept)
+        };
+        match ui.key()? {
+            Some(Key::Up) => cursor = cursor.saturating_sub(1),
+            Some(Key::Down) if cursor + 1 < shown.len() => cursor += 1,
+            Some(Key::Space) if !shown.is_empty() => hide(&shown[cursor].what)?,
+            Some(Key::Enter) if !shown.is_empty() => {
+                match review_recommendation(ui, path, &shown[cursor]) {
+                    Ok(true) => hide(&shown[cursor].what)?,
+                    Ok(false) => {}
+                    Err(error) => not_saved(ui, &error)?,
+                }
+            }
+            Some(Key::Character(b'r' | b'R')) => reply = None,
+            Some(Key::Escape) => return Ok(()),
+            _ => {}
+        }
+    }
+}
+/// v7.7 ticket 171: one recommendation's change, reviewed like any AI reply: a Default
+/// mapping (its replacement needs its yes) or an app profile; true when saved.
+fn review_recommendation(
+    ui: &mut impl Ui,
+    path: &Path,
+    recommendation: &mappings::Recommendation,
+) -> Result<bool> {
+    let mut config = mappings::load_config(path)?;
+    let devices = mappings::profile_devices(&config, ui.context(), ui.program().as_ref());
+    let profile = recommendation.text.lines().nth(1).unwrap_or_default();
+    if profile.split('\t').nth(2) != Some("-") {
+        return review_profile(ui, path, config, &recommendation.text, &devices);
+    }
+    let new = mappings::mappings_from_reply(&recommendation.text, &config, &devices)
+        .map_err(|e| format!("the recommendation: {e}; nothing saved"))?;
+    let words = merge_default(ui, &mut config, new, true)?;
+    if words.is_empty() {
+        return Ok(false);
+    }
+    if choose(
+        ui,
+        &format!(
+            "{}\n{}\n\n{}",
+            recommendation.what,
+            recommendation.why,
+            words.join("\n")
+        ),
+        &options(&["Cancel", "Save"]),
+    )? != Some(1)
+    {
+        return Ok(false);
+    }
+    mappings::save_config(path, &config)?;
+    Ok(true)
 }
 /// v7.7 ticket 146: the AI settings switch: sharing on or off (config v33 `ai-share-usage`).
 fn switch_share(path: &Path) -> Result<()> {
@@ -6998,7 +7122,7 @@ fn ask_about(ui: &mut impl Ui, path: &Path) -> Result<()> {
     match (proposal, picked) {
         (Some(text), Some(at)) if at + 2 == lines.len() => {
             let devices = mappings::profile_devices(&config, ui.context(), ui.program().as_ref());
-            review_profile(ui, path, config, &text, &devices)
+            review_profile(ui, path, config, &text, &devices).map(drop)
         }
         _ => Ok(()),
     }
@@ -7027,7 +7151,7 @@ fn ai_profile(ui: &mut impl Ui, path: &Path) -> Result<()> {
     let reply = ui.ask_claude(&request)?;
     let text = mappings::profile_text_from_reply(&reply)
         .ok_or("Claude's reply has no profile in VibeConsole's format; nothing saved")?;
-    review_profile(ui, path, config, &text, &devices)
+    review_profile(ui, path, config, &text, &devices).map(drop)
 }
 /// v7.7 ticket 168: Ask for mappings (fills empty Default controls) and Ask to map agents
 /// (jump buttons, needs-me, octave lights). The reply is checked in full like an import;
@@ -7103,29 +7227,7 @@ fn ask_mappings(ui: &mut impl Ui, path: &Path, kind: AskKind) -> Result<()> {
     } else {
         Vec::new()
     };
-    let mut words = Vec::new();
-    for m in new {
-        match mappings::default_on(&config, m.context, m.control).cloned() {
-            None => words.push(format!("{}: {} (was empty)", m.label, m.action_label())),
-            Some(old) => {
-                let change = format!("{}: {} → {}", m.label, old.action_label(), m.action_label());
-                if preset.is_none()
-                    && choose(
-                        ui,
-                        &format!("Replace?\n{change}"),
-                        &options(&["Keep what it does now", "Replace it"]),
-                    )? != Some(1)
-                {
-                    continue;
-                }
-                config
-                    .mappings
-                    .retain(|x| !(x.context == m.context && x.control == m.control));
-                words.push(change);
-            }
-        }
-        config.mappings.push(m);
-    }
+    let mut words = merge_default(ui, &mut config, new, preset.is_none())?;
     for (name, octave) in octaves {
         if let Some(agent) = config.agents.iter_mut().find(|a| a.name == name) {
             if agent.octave != octave {
@@ -7173,6 +7275,39 @@ fn ask_mappings(ui: &mut impl Ui, path: &Path, kind: AskKind) -> Result<()> {
         }
         None => mappings::save_config(path, &config),
     }
+}
+/// v7.7 ticket 168: AI mappings into Default: an empty control is filled; a control in use
+/// is replaced only after its own yes (when `ask` is set). Returns each change in words.
+fn merge_default(
+    ui: &mut impl Ui,
+    config: &mut mappings::Config,
+    new: Vec<Mapping>,
+    ask: bool,
+) -> Result<Vec<String>> {
+    let mut words = Vec::new();
+    for m in new {
+        match mappings::default_on(config, m.context, m.control).cloned() {
+            None => words.push(format!("{}: {} (was empty)", m.label, m.action_label())),
+            Some(old) => {
+                let change = format!("{}: {} → {}", m.label, old.action_label(), m.action_label());
+                if ask
+                    && choose(
+                        ui,
+                        &format!("Replace?\n{change}"),
+                        &options(&["Keep what it does now", "Replace it"]),
+                    )? != Some(1)
+                {
+                    continue;
+                }
+                config
+                    .mappings
+                    .retain(|x| !(x.context == m.context && x.control == m.control));
+                words.push(change);
+            }
+        }
+        config.mappings.push(m);
+    }
+    Ok(words)
 }
 /// v7.7 ticket 168: Ask to set up agents. Agent CLIs are looked up on PATH (never run) and
 /// git folders found under home; only their names and paths are sent. Each proposed agent
@@ -7602,7 +7737,7 @@ fn review_profile(
     mut config: mappings::Config,
     text: &str,
     devices: &[mappings::ProfileDevice],
-) -> Result<()> {
+) -> Result<bool> {
     let mut profile = mappings::import_profile(text, &config)
         .map_err(|e| format!("Claude's profile: {e}; nothing saved"))?;
     mappings::check_profile_controls(&mut profile, devices)
@@ -7637,10 +7772,11 @@ fn review_profile(
         &options(&["Cancel", "Save this profile"]),
     )? != Some(1)
     {
-        return Ok(());
+        return Ok(false);
     }
     config.profiles.push(profile);
-    mappings::save_config(path, &config)
+    mappings::save_config(path, &config)?;
+    Ok(true)
 }
 fn new_profile(ui: &mut impl Ui, path: &Path) -> Result<()> {
     let Some(name) = text_entry(ui, "Profile name (1–32 characters)", "")? else {
@@ -13842,7 +13978,7 @@ mod tests {
         );
         assert!(no.asked.is_empty(), "No sends nothing");
         assert!(!mappings::load_config(&path).unwrap().look.share_usage);
-        let mut yes = script(vec![Down, Enter, Enter]);
+        let mut yes = script(vec![Down, Enter, Escape]);
         ask_for(&mut yes, &path, AskKind::Recommendations).unwrap();
         assert!(
             mappings::load_config(&path).unwrap().look.share_usage,
@@ -13858,7 +13994,11 @@ mod tests {
             !sent.contains(&dir.display().to_string()),
             "no folder paths"
         );
-        let mut again = script(vec![Enter]);
+        // v7.7 ticket 171: straight through to the kept reply; R asks again.
+        let mut again = script(vec![Escape]);
+        ask_for(&mut again, &path, AskKind::Recommendations).unwrap();
+        assert!(again.asked.is_empty(), "the kept reply");
+        let mut again = script(vec![Character(b'r'), Escape]);
         ask_for(&mut again, &path, AskKind::Recommendations).unwrap();
         assert_eq!(again.asked.len(), 1, "straight through");
         switch_share(&path).unwrap();
@@ -13868,6 +14008,130 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7.7 ticket 171: recommendations come from the counts and the mappings (keys or the
+    /// kind of action only); Space hides one for 30 days; Enter reviews it and Save applies it
+    /// (a Default mapping or an app profile); a command is refused; R asks again.
+    #[test]
+    fn recommendations_review_save_and_not_now() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-recs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let mut config = mappings::Config::default();
+        config.look.share_usage = true;
+        let pad = Control::from_note(10, 36).unwrap();
+        let mut prompt = Mapping::new_action(
+            Control::from_note(10, 37).unwrap(),
+            mappings::Input::Pad,
+            crate::actions::Action::Prompt {
+                file: "secret-plan".into(),
+                target: crate::actions::Target::Agent("claude".into()),
+                enter: true,
+            },
+        )
+        .unwrap();
+        prompt.label = "Bank A Pad 2".into();
+        config.mappings = vec![Mapping::new(pad, "Ctrl+A", "hold").unwrap(), prompt];
+        mappings::save_config(&path, &config).unwrap();
+        let usage = dir.join("usage");
+        let mut day = crate::usage::Day::default();
+        day.add("press", "Xbox A", 40);
+        crate::usage::flush(&usage, crate::usage::today(), &day).unwrap();
+        let file = |name: &str, apps: Vec<String>, m: Mapping| {
+            format!(
+                "```\n{}```\n",
+                mappings::export_profile(&mappings::Profile {
+                    name: name.into(),
+                    apps,
+                    mappings: vec![m],
+                })
+                .unwrap()
+            )
+        };
+        let command = Mapping::new_action(
+            Control::button(2),
+            mappings::Input::Pad,
+            crate::actions::Action::Command {
+                window: "c".into(),
+                dir: "/tmp".into(),
+                line: "rm -rf ~".into(),
+            },
+        )
+        .unwrap();
+        let reply = format!(
+            "recommendation\tPut new tab on Xbox A\tYou press A 40 times a day\n{}recommendation\tA Firefox profile\tPad 1 closes tabs there\n{}recommendation\tClean up\tIt's quicker\n{}",
+            file(
+                "AI",
+                vec![],
+                Mapping::new(Control::button(0), "Ctrl+T", "hold").unwrap()
+            ),
+            file(
+                "Firefox",
+                vec!["firefox.desktop".into()],
+                Mapping::new(pad, "Ctrl+W", "hold").unwrap()
+            ),
+            file("AI", vec![], command),
+        );
+        let run = |keys: Vec<Key>| {
+            let mut ui = Script {
+                keys: keys.into(),
+                usage: Some(usage.clone()),
+                claude: reply.clone(),
+                ..Default::default()
+            };
+            ask_for(&mut ui, &path, AskKind::Recommendations).unwrap();
+            assert!(ui.keys.is_empty());
+            (ui.screens, ui.asked)
+        };
+        // Not now on the first; review and Save the profile; the command is refused.
+        let (screens, asked) = run(vec![Space, Enter, Down, Enter, Enter, Enter, Escape]);
+        let sent = &asked[0];
+        assert!(
+            sent.contains("- Program 1 Bank A Pad 1: Ctrl+A\n- Program 1 Bank A Pad 2: prompt\n"),
+            "{sent}"
+        );
+        assert!(!sent.contains("secret-plan") && !sent.contains(&dir.display().to_string()));
+        let lists = screens
+            .iter()
+            .filter(|s| s.starts_with("AI Recommendations"))
+            .collect::<Vec<_>>();
+        assert!(lists[0].contains("> Put new tab on Xbox A\n    You press A 40 times a day"));
+        assert!(lists[1].contains("> A Firefox profile"));
+        assert!(
+            screens
+                .iter()
+                .any(|s| s.starts_with("Not saved:") && s.contains("would run a terminal command"))
+        );
+        let config = mappings::load_config(&path).unwrap();
+        assert!(config.profile("Firefox").is_some(), "the profile is saved");
+        assert!(
+            mappings::default_on(&config, mappings::GAMEPAD_CONTEXT, Control::button(0)).is_none()
+        );
+        // Kept between visits; the hidden and saved ones stay hidden; R asks again.
+        let (screens, asked) = run(vec![Character(b'r'), Escape]);
+        assert_eq!(asked.len(), 1);
+        assert!(
+            screens
+                .iter()
+                .all(|s| !s.contains("Put new tab") && !s.contains("A Firefox profile"))
+        );
+        // After 30 days it's back; Enter, Save fills Xbox A.
+        let hidden = dir.join("recommendations-hidden.tsv");
+        let old = std::fs::read_to_string(&hidden).unwrap();
+        let today = crate::usage::today();
+        std::fs::write(
+            &hidden,
+            old.replace(&format!("{today}\tPut"), &format!("{}\tPut", today - 30)),
+        )
+        .unwrap();
+        run(vec![Enter, Down, Enter, Escape]);
+        let config = mappings::load_config(&path).unwrap();
+        let a =
+            mappings::default_on(&config, mappings::GAMEPAD_CONTEXT, Control::button(0)).unwrap();
+        assert_eq!(a.keys.join("+"), "Ctrl+T");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     /// v7.7 ticket 168: Ask for mappings fills empty controls, asks before each replacement,
     /// and saves only on Save; a reply with a command saves nothing.
     #[test]
