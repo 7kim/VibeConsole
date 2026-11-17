@@ -9585,26 +9585,36 @@ fn stamp() -> Result<String> {
     };
     Ok(stamp)
 }
-/// Back up `path` as `<name>.bak-<stamp>` (never overwriting one) and reset it.
+/// Back up every config file there is as `<name>.bak-<stamp>` (never overwriting one; all
+/// or none: v7.7 ticket 194 split the config into files) and reset the config. Returns the
+/// backups as a pattern, for the notice.
 fn reset_file_at(path: &Path, stamp: &str) -> Result<PathBuf> {
-    let backup = path.with_file_name(format!(
-        "{}.bak-{stamp}",
-        path.file_name()
-            .ok_or("Invalid configuration path")?
-            .to_string_lossy()
-    ));
-    let mut source = std::fs::File::open(path)?;
-    let mut target = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&backup)?;
-    if let Err(error) = io::copy(&mut source, &mut target).and_then(|_| target.sync_all()) {
-        let _ = std::fs::remove_file(&backup);
-        return Err(error.into());
+    let backup = |file: &str| path.with_file_name(format!("{file}.bak-{stamp}"));
+    let mut made = Vec::new();
+    let files = std::iter::once("mappings.tsv").chain(vibeconsole_core::config::FILES);
+    for file in files.filter(|f| path.with_file_name(f).exists()) {
+        let copy = || -> Result<()> {
+            let mut source = std::fs::File::open(path.with_file_name(file))?;
+            let mut target = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(backup(file))?;
+            io::copy(&mut source, &mut target)?;
+            target.sync_all()?;
+            Ok(())
+        };
+        if let Err(error) = copy() {
+            let _ = std::fs::remove_file(backup(file));
+            for made in made {
+                let _ = std::fs::remove_file(made);
+            }
+            return Err(error);
+        }
+        made.push(backup(file));
     }
     mappings::save_config(path, &mappings::Config::default())?;
-    Ok(backup)
+    Ok(backup("*"))
 }
 
 fn pad_labels(control: Control, current: &[Mapping], context: u8) -> Vec<String> {
@@ -16233,6 +16243,10 @@ mod tests {
             })
             .map(|l| format!("{l}\n"))
             .collect::<String>();
+        // An upgrade from v32 has no JSON files yet (ticket 194): they are moved from it.
+        for file in vibeconsole_core::config::FILES {
+            let _ = std::fs::remove_file(path.with_file_name(file));
+        }
         std::fs::write(&path, v32).unwrap();
         let mut script = Script {
             keys: [Key::Enter].into(),
@@ -16251,11 +16265,7 @@ mod tests {
             "{:?}",
             script.screens
         );
-        assert!(
-            std::fs::read_to_string(&path)
-                .unwrap()
-                .contains("\nseen-7.7\ton\n")
-        );
+        assert!(mappings::load_config(&path).unwrap().look.seen_moved);
         let mut again = Script::default();
         assert_eq!(
             what_moved_once(&mut again, &path).unwrap(),
@@ -16590,14 +16600,18 @@ mod tests {
             .unwrap();
         mappings::save_config(&path, &config).unwrap();
         let before = std::fs::read(&path).unwrap();
+        let settings = path.with_file_name("settings.json");
+        let settings_before = std::fs::read(&settings).unwrap();
         let backup = reset_file_at(&path, "20260101-000000").unwrap();
-        assert_eq!(std::fs::read(&backup).unwrap(), before);
-        assert!(
-            backup
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("mappings.tsv.bak-")
+        assert_eq!(backup.file_name().unwrap(), "*.bak-20260101-000000");
+        assert_eq!(
+            std::fs::read(dir.join("mappings.tsv.bak-20260101-000000")).unwrap(),
+            before
+        );
+        assert_eq!(
+            std::fs::read(dir.join("settings.json.bak-20260101-000000")).unwrap(),
+            settings_before,
+            "every config file is backed up"
         );
         assert_eq!(
             mappings::load_config(&path).unwrap(),
@@ -16650,7 +16664,15 @@ mod tests {
             mappings::load_config(&path).unwrap(),
             mappings::Config::default()
         );
-        assert!(backup.exists());
+        let stamp = backup
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .replace('*', "");
+        assert!(
+            dir.join(format!("mappings.tsv{stamp}")).exists(),
+            "{backup:?}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

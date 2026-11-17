@@ -2186,7 +2186,7 @@ pub fn variable_name(name: &str) -> bool {
         && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
-fn validate_variables(list: &[(String, String)], kind: &str) -> Result<()> {
+pub(crate) fn validate_variables(list: &[(String, String)], kind: &str) -> Result<()> {
     if list.len() > 64 {
         return Err(format!("too many {kind} variables").into());
     }
@@ -3379,7 +3379,20 @@ pub fn validate_light_folders(folders: &[(String, i8)]) -> Result<()> {
     Ok(())
 }
 
+/// v7.7 ticket 194: the main config (`…/vibeconsole/mappings.tsv`, from `config_path`) is
+/// the config folder's JSON files; any other path (a preset, a history file) is one TSV file.
+fn is_main(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == "mappings.tsv")
+}
 pub fn load_config(path: &Path) -> Result<Config> {
+    if is_main(path) {
+        crate::config::load(path)
+    } else {
+        load_tsv(path)
+    }
+}
+/// One TSV config file (any v1–v34); a missing file is the defaults.
+pub fn load_tsv(path: &Path) -> Result<Config> {
     match fs::read_to_string(path) {
         Ok(contents) => {
             parse_config(&contents).map_err(|error| format!("{}: {error}", path.display()).into())
@@ -3614,7 +3627,7 @@ pub fn history_dir(path: &Path) -> PathBuf {
 }
 /// How many replaced files history keeps.
 pub const HISTORY: usize = 10;
-fn keep_history(path: &Path, new: &[u8]) -> Result<()> {
+pub(crate) fn keep_history(path: &Path, new: &[u8]) -> Result<()> {
     let old = fs::read(path)?;
     if old == new {
         return Ok(());
@@ -3684,6 +3697,14 @@ pub fn change_summary(older: &Config, newer: &Config) -> String {
 }
 
 pub fn save_config(path: &Path, config: &Config) -> Result<()> {
+    if is_main(path) {
+        crate::config::save(path, config)
+    } else {
+        save_tsv(path, config)
+    }
+}
+/// One TSV config file, atomically (presets).
+pub fn save_tsv(path: &Path, config: &Config) -> Result<()> {
     let contents = serialize_config(config)?;
     fs::create_dir_all(path.parent().ok_or("configuration path has no parent")?)?;
     // ponytail: one staging file; concurrent saves fail safely. Remove a stale file after an interrupted save.

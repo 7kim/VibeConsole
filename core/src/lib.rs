@@ -1,6 +1,7 @@
 //! VibeConsole core: devices, the keyboard state machine, mappings and config, actions,
 //! status sources and Akai feedback. Both editions (cli, app) call it.
 pub mod actions;
+pub mod config;
 pub mod feedback;
 pub mod gamepad;
 pub mod keyboard;
