@@ -30,7 +30,7 @@ Rules:
 - Short sentences, one idea per bullet, no preamble or conclusion.
 - "How does X work?" → answer with an ASCII/UML diagram.
 - Start "What needs to be done" only after I say `approved` or ask directly. One `approved` covers the whole list.
-- `x` files every "make this better" item as a ticket, `x 2` only item 2; build nothing. Each is `tickets file ideas <slug> "<title>" --section "<spec heading>"` (the next free number in the working version, plus its agent-test and developer-test files, all `Status: needs-triage`); then fill in the bodies.
+- `x` files every "make this better" item as a ticket, `x 2` only item 2; build nothing. Each is one `tickets file ideas <slug> "<title>" --section "<spec heading>" --body <file>` call (the next free number in the working version, plus its agent-test and developer-test files, all `Status: needs-triage`); the body file has `## Asked`, `Where`, `What`, `Today`, `Rules`, `Boxes`, `How to do`. When I ask to make them ready: one `tickets set NN … ready`.
 - Second-to-last line: what you skipped or didn't check, and any risk.
 - Last line, nothing after it: `Say approved to start.` when there's a "What needs to be done", `Reply x to file all as tickets, or x 2 for one.` when there's a "make this better".
 
