@@ -627,6 +627,10 @@ pub struct DevicePatterns {
     /// v7.7 ticket 189 (config v34): the Razer speakers' and mousepad's RGB, in `ACCESSORIES`
     /// order, each off until turned on. Their brightness is left alone (below).
     pub accessories: [AccessoryRgb; 2],
+    /// v7.7 ticket 190 (config v34): the Logitech G502's logo light, off until turned on:
+    /// its effect per state. Its resting effect is the mouse's own stored one.
+    pub mouse_on: bool,
+    pub mouse: [Rgb; 4],
 }
 /// v7.7 ticket 189: one Razer accessory's RGB: its switch, resting effect and effect per state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -754,6 +758,13 @@ impl Default for DevicePatterns {
                     Rgb::Static("green"),
                 ],
             }; 2],
+            mouse_on: false,
+            mouse: [
+                Rgb::Static("red"),
+                Rgb::Static("orange"),
+                Rgb::Breath("blue"),
+                Rgb::Static("green"),
+            ],
         }
     }
 }

@@ -902,6 +902,137 @@ impl RgbKeyboards {
         }
     }
 }
+/// v7.7 ticket 190: the Logitech G502 (SE) HERO's G logo light through `logirgb`
+/// (github.com/mevdschee/logirgb, tested with v0.6.0), as one argument per value. A state is
+/// shown with `--preview`, which never stores into the mouse's onboard profiles. logirgb's
+/// `release` does nothing on the G502 (it only acts on 0x8071 devices; the G502 has 0x8070,
+/// seen 17 Nov 2026), so the restore reads the active profile's stored logo effect back and
+/// shows that. The mouse's own lighting is its resting effect: nothing to pick.
+pub struct MouseLight {
+    run: crate::gamepad::Runner,
+    shown: Option<crate::status::Rgb>,
+    /// Set when an effect the logo lacks was asked for, for the caller to show once.
+    pub unavailable: Option<String>,
+}
+/// v7.7 ticket 190: the real runner for logirgb: found on PATH, else where `go install`
+/// puts it (`~/go/bin`), which not every shell has on PATH. One argument per value.
+pub fn logirgb_runner() -> crate::gamepad::Runner {
+    let mut run = crate::gamepad::run_program();
+    let on_path = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .any(|dir| dir.join("logirgb").is_file());
+    let go_bin = std::env::var_os("HOME")
+        .map(|home| Path::new(&home).join("go/bin/logirgb"))
+        .filter(|p| !on_path && p.is_file())
+        .map(|p| p.to_string_lossy().into_owned());
+    Box::new(move |args: &[&str]| match (&go_bin, args.split_first()) {
+        (Some(program), Some((&"logirgb", rest))) => {
+            let mut full = vec![program.as_str()];
+            full.extend(rest);
+            run(&full)
+        }
+        _ => run(args),
+    })
+}
+/// logirgb's name for the mouse (`-d` takes a name fragment) and the logo zone.
+const MOUSE: [&str; 4] = ["-d", "g502", "-z", "1"];
+impl MouseLight {
+    /// Reachable only when `logirgb profiles` names the G502's active profile; nothing is
+    /// sent until `show`.
+    pub fn open(mut run: crate::gamepad::Runner) -> Result<Self> {
+        active_profile(&mut run).map_err(|e| {
+            format!(
+                "Mouse light (Logitech G502): unavailable: {e} (VibeConsole never installs logirgb)"
+            )
+        })?;
+        Ok(Self {
+            run,
+            shown: None,
+            unavailable: None,
+        })
+    }
+    /// The logo's effect for a state; nothing is sent when it already shows it.
+    pub fn show(&mut self, effect: crate::status::Rgb) -> Result<()> {
+        use crate::status::{Rgb, rgb_bytes};
+        if self.shown == Some(effect) {
+            return Ok(());
+        }
+        let hex = |c: &str| {
+            let [r, g, b] = rgb_bytes(c);
+            format!("#{r:02x}{g:02x}{b:02x}")
+        };
+        let words: Vec<String> = match effect {
+            Rgb::Off => vec!["off".into()],
+            Rgb::Static(c) => vec!["static".into(), "--color".into(), hex(c)],
+            Rgb::Breath(c) => vec!["breathe".into(), "--color".into(), hex(c)],
+            Rgb::Spectrum => vec!["cycle".into()],
+            Rgb::Wave | Rgb::Reactive(_) => {
+                self.unavailable = Some(format!(
+                    "{} unavailable on the G502 logo: it shows off, static, breathe and cycle only",
+                    crate::status::rgb_word(effect)
+                ));
+                return Ok(());
+            }
+        };
+        let mut args = vec!["logirgb", "set"];
+        args.extend(MOUSE);
+        args.extend(words.iter().map(String::as_str));
+        args.push("--preview");
+        (self.run)(&args)?;
+        self.shown = Some(effect);
+        Ok(())
+    }
+    /// The active profile's stored logo effect back, once something was shown. Pause, quit,
+    /// error; a failure is ignored (the next profile switch or replug restores it too).
+    pub fn restore(&mut self) {
+        if self.shown.take().is_some() {
+            let _ = self.put_back();
+        }
+    }
+    fn put_back(&mut self) -> Result<()> {
+        let profile = active_profile(&mut self.run)?;
+        let list = (self.run)(&["logirgb", "list"])?;
+        let words = stored_logo(&list, profile)
+            .ok_or_else(|| format!("logirgb list has no logo effect for profile {profile}"))?;
+        let mut args = vec!["logirgb", "set"];
+        args.extend(MOUSE);
+        args.extend(words.iter().map(String::as_str));
+        args.push("--preview");
+        (self.run)(&args).map(|_| ())
+    }
+}
+impl Drop for MouseLight {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+/// The G502's active onboard profile from `logirgb profiles -d g502` ("… 5 on (active)").
+fn active_profile(run: &mut crate::gamepad::Runner) -> Result<u8> {
+    let out = run(&["logirgb", "profiles", "-d", "g502"])?;
+    out.split(',')
+        .find(|p| p.contains("(active)"))
+        .and_then(|p| p.split_whitespace().rev().nth(2)?.parse().ok())
+        .ok_or_else(|| format!("no G502 active profile in logirgb's answer: {}", out.trim()).into())
+}
+/// The `set` words for a profile's stored logo effect in `logirgb list`, e.g.
+/// "profile 5: static color=#8000ff" under "zone 1 (logo)" → `static --color #8000ff`.
+fn stored_logo(list: &str, profile: u8) -> Option<Vec<String>> {
+    let zone = list.split("zone 1 (logo)").nth(1)?;
+    let line = zone
+        .lines()
+        .find_map(|l| l.trim().strip_prefix(&format!("profile {profile}: ")))?;
+    let mut words = line.split_whitespace();
+    let mut out = vec![words.next()?.to_owned()];
+    for pair in words {
+        let (key, value) = pair.split_once('=')?;
+        let value = value.trim_end_matches("ms").trim_end_matches('%');
+        if key == "form" && value == "default" {
+            continue;
+        }
+        out.extend([format!("--{key}"), value.to_owned()]);
+    }
+    Some(out)
+}
+
 impl Drop for RgbKeyboards {
     fn drop(&mut self) {
         self.restore();
@@ -2086,6 +2217,57 @@ mod tests {
             "{error}"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// v7.7 ticket 190: the G502 logo through a fake `logirgb`: a state is a `--preview`
+    /// set with the colour, sent once; wave and reactive are named unavailable, not sent;
+    /// restore (and drop) reads the active profile's stored effect and previews it; a
+    /// missing or failing logirgb is named unavailable at open.
+    #[test]
+    fn g502_logo_previews_each_state_and_restores_the_stored_effect() {
+        use crate::status::Rgb;
+        use std::sync::{Arc, Mutex};
+        const LIST: &str = "1. G502 HERO Gaming Mouse  [/dev/hidraw8, 046d:c08b]\n   zone 0 (primary): DPI LEDs, flash on DPI button press\n     profile 1: cycle period=8000ms intensity=100%\n     profile 2: static color=#ff0000\n   zone 1 (logo): G logo\n     profile 1: cycle period=8000ms intensity=100%\n     profile 2: breathe color=#00dcff period=8000ms form=default intensity=100%\n     - off\n";
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log = calls.clone();
+        let run: crate::gamepad::Runner = Box::new(move |args: &[&str]| {
+            log.lock().unwrap().push(args.join(" "));
+            Ok(match args[1] {
+                "profiles" => "G502 HERO Gaming Mouse profiles: 1 on, 2 on (active)\n".into(),
+                "list" => LIST.into(),
+                _ => String::new(),
+            })
+        });
+        let mut mouse = MouseLight::open(run).unwrap();
+        mouse.show(Rgb::Static("orange")).unwrap();
+        mouse.show(Rgb::Static("orange")).unwrap();
+        mouse.show(Rgb::Breath("blue")).unwrap();
+        mouse.show(Rgb::Spectrum).unwrap();
+        mouse.show(Rgb::Wave).unwrap();
+        assert_eq!(
+            mouse.unavailable.take().as_deref(),
+            Some("wave unavailable on the G502 logo: it shows off, static, breathe and cycle only")
+        );
+        drop(mouse);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                "logirgb profiles -d g502",
+                "logirgb set -d g502 -z 1 static --color #ff8000 --preview",
+                "logirgb set -d g502 -z 1 breathe --color #0000ff --preview",
+                "logirgb set -d g502 -z 1 cycle --preview",
+                "logirgb profiles -d g502",
+                "logirgb list",
+                "logirgb set -d g502 -z 1 breathe --color #00dcff --period 8000 --intensity 100 --preview",
+            ]
+        );
+        let missing: crate::gamepad::Runner =
+            Box::new(|_: &[&str]| Err("logirgb: No such file or directory (os error 2)".into()));
+        let error = MouseLight::open(missing).err().unwrap().to_string();
+        assert!(
+            error.starts_with("Mouse light (Logitech G502): unavailable: logirgb: No such file"),
+            "{error}"
+        );
     }
 
     #[test]

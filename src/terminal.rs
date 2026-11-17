@@ -301,6 +301,10 @@ struct Terminal {
     /// v7.7 ticket 189: the Razer speakers and mousepad, in `status::ACCESSORIES` order.
     accessories: [Option<crate::keyboard::RgbKeyboards>; 2],
     accessories_failed: [bool; 2],
+    /// v7.7 ticket 190: the Logitech G502's logo light through logirgb, opened when a state
+    /// is first due.
+    mouse: Option<crate::keyboard::MouseLight>,
+    mouse_failed: bool,
     /// The focused app's profile (v7 ticket 12); None is Default.
     profile: Option<String>,
     /// Real sessions follow the focused app; tests never call the desktop.
@@ -978,6 +982,8 @@ impl Terminal {
             rgb_failed: false,
             accessories: [None, None],
             accessories_failed: [false; 2],
+            mouse: None,
+            mouse_failed: false,
             profile: None,
             follow_apps: false,
             focus_unavailable: false,
@@ -2985,6 +2991,9 @@ impl Terminal {
                 rgb.restore();
             }
         }
+        if let Some(mouse) = &mut self.mouse {
+            mouse.restore(); // v7.7 ticket 190: paused, the mouse's own stored lighting
+        }
         self.holds.clear();
         if let Some(pad) = &mut self.gamepad {
             pad.stop_rumble();
@@ -3802,6 +3811,52 @@ impl Terminal {
                 },
                 label,
             );
+        }
+        self.show_mouse(&states, running);
+    }
+    /// v7.7 ticket 190: while running, the G502 logo shows the most urgent state's effect as
+    /// a logirgb preview; idle, paused or switched off, the mouse's own stored lighting goes
+    /// back. A missing logirgb is named once, and asked again after the switch goes off and on.
+    /// ponytail: logirgb runs on this thread (a few ms per change); move it off if it stalls.
+    fn show_mouse(&mut self, states: &[&str], running: bool) {
+        const LABEL: &str = "Mouse light (Logitech G502)";
+        let switched = self.device_lights.as_ref().filter(|p| p.mouse_on);
+        if switched.is_none() {
+            self.mouse_failed = false;
+        }
+        let wanted = switched
+            .filter(|_| running)
+            .and_then(|p| crate::status::accessory_rgb(states, &p.mouse));
+        let Some(effect) = wanted else {
+            if let Some(mouse) = &mut self.mouse {
+                mouse.restore();
+            }
+            return;
+        };
+        if self.mouse.is_none() && !self.mouse_failed {
+            #[cfg(not(test))]
+            let run = crate::keyboard::logirgb_runner();
+            // Tests never start the real logirgb; they put a fake one in `mouse`.
+            #[cfg(test)]
+            let run: crate::gamepad::Runner =
+                Box::new(|_: &[&str]| Err("logirgb: not run in tests".into()));
+            match crate::keyboard::MouseLight::open(run) {
+                Ok(mouse) => self.mouse = Some(mouse),
+                Err(error) => {
+                    self.mouse_failed = true;
+                    self.notice = error.to_string();
+                }
+            }
+        }
+        if let Some(mouse) = &mut self.mouse {
+            let sent = mouse.show(effect);
+            if let Some(missing) = mouse.unavailable.take() {
+                self.notice = format!("{LABEL}: {missing}");
+            }
+            if let Err(error) = sent {
+                self.mouse = None; // dropping it restores what it can
+                self.notice = format!("{LABEL}: {error}; given up");
+            }
         }
     }
     /// v7 ticket 40: Run with no verified MIDI program (none connected, or not detected yet)
@@ -8808,6 +8863,19 @@ fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 crate::status::rgb_word(a.rest)
             ));
         }
+        // v7.7 ticket 190: the G502 logo's switch and effect per state, rows 37–41; its
+        // resting effect is the mouse's own stored lighting.
+        rows.push(format!(
+            "Mouse light (Logitech G502 logo, needs logirgb): {}",
+            on(devices.mouse_on)
+        ));
+        for (name, effect) in NAMES.iter().zip(devices.mouse) {
+            rows.push(format!(
+                "Mouse light · {}: {}",
+                name.split(" (").next().unwrap_or(name),
+                crate::status::rgb_word(effect)
+            ));
+        }
         let blind = NAMES
             .iter()
             .zip(patterns.states)
@@ -8867,6 +8935,38 @@ fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 config.device_lights.keyboard_on = !devices.keyboard_on;
             } else if index == 18 {
                 config.device_lights.rgb_on = !devices.rgb_on;
+            } else if index == 37 {
+                config.device_lights.mouse_on = !devices.mouse_on;
+            } else if index > 37 {
+                // v7.7 ticket 190: only what the G502 logo can show.
+                let effects = crate::status::rgb_effects()
+                    .into_iter()
+                    .filter(|e| {
+                        !matches!(
+                            e,
+                            crate::status::Rgb::Wave | crate::status::Rgb::Reactive(_)
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let words = effects
+                    .iter()
+                    .map(|e| crate::status::rgb_word(*e))
+                    .collect::<Vec<_>>();
+                let state = index - 38;
+                let current = devices.mouse[state];
+                let Some(e) = choose_at(
+                    ui,
+                    &format!(
+                        "Mouse light · {}: effect (the G502 logo shows off, static, breathe and spectrum as its colour cycle)",
+                        NAMES[state]
+                    ),
+                    &words,
+                    effects.iter().position(|e| *e == current).unwrap_or(0),
+                )?
+                else {
+                    return Ok(());
+                };
+                config.device_lights.mouse[state] = effects[e];
             } else if index > 24 {
                 // v7.7 ticket 189: an accessory's switch, a state's effect, or its resting one.
                 let (i, row) = ((index - 25) / 6, (index - 25) % 6);
@@ -16126,6 +16226,7 @@ mod tests {
                     "default-agent\t",
                     "speakers-rgb\t",
                     "mousepad-rgb\t",
+                    "mouse-rgb\t",
                 ]
                 .iter()
                 .any(|k| l.starts_with(k))
@@ -21166,6 +21267,114 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7.7 ticket 190: while running, the G502 logo (a fake logirgb) previews the most
+    /// urgent state's effect once; a wave it can't show is named, not sent; idle puts the
+    /// mouse's stored effect back; pause sends nothing more; with the switch off and no
+    /// mouse open, nothing runs (tests never start the real logirgb).
+    #[test]
+    fn g502_logo_follows_agents_and_puts_the_stored_effect_back() {
+        use crate::status::Rgb;
+        use std::sync::{Arc, Mutex};
+        let dir = std::env::temp_dir().join(format!("vibeconsole-g502-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log = calls.clone();
+        let run: crate::gamepad::Runner = Box::new(move |args: &[&str]| {
+            log.lock().unwrap().push(args.join(" "));
+            Ok(match args[1] {
+                "profiles" => "G502 HERO Gaming Mouse profiles: 1 on, 5 on (active)\n".into(),
+                "list" => "   zone 1 (logo): G logo\n     profile 5: static color=#8000ff\n".into(),
+                _ => String::new(),
+            })
+        });
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        let mut patterns = crate::status::DevicePatterns::default();
+        ui.device_lights = Some(patterns.clone());
+        ui.agent_states = vec![("claude".into(), "claude".into(), "needs-input")];
+        ui.output = Some(crate::keyboard::Output::recording(&[]).unwrap());
+        ui.suspended = false;
+        ui.show_rgb();
+        assert!(
+            ui.mouse.is_none() && !ui.mouse_failed,
+            "switched off: nothing opened"
+        );
+        ui.mouse = Some(crate::keyboard::MouseLight::open(run).unwrap());
+        patterns.mouse_on = true;
+        patterns.mouse[2] = Rgb::Wave;
+        ui.device_lights = Some(patterns);
+        ui.show_rgb();
+        ui.show_rgb();
+        ui.agent_states[0].2 = "thinking";
+        ui.show_rgb();
+        assert!(
+            ui.notice.contains("wave unavailable on the G502 logo"),
+            "{}",
+            ui.notice
+        );
+        ui.agent_states[0].2 = "idle";
+        ui.show_rgb();
+        ui.suspend().unwrap();
+        drop(ui);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                "logirgb profiles -d g502",
+                "logirgb set -d g502 -z 1 static --color #ff8000 --preview",
+                "logirgb profiles -d g502",
+                "logirgb list",
+                "logirgb set -d g502 -z 1 static --color #8000ff --preview",
+            ]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 190: Status light patterns turns the mouse light on and offers only the
+    /// effects the G502 logo shows.
+    #[test]
+    fn mouse_light_rows_offer_only_what_the_logo_shows() {
+        use crate::status::Rgb;
+        use Key::*;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-g502-menu-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut keys = vec![Down; 37];
+        keys.push(Enter); // Mouse light: Off -> On
+        keys.extend(vec![Down; 41]);
+        keys.push(Enter); // Mouse light · Finished: static-green
+        keys.extend([Up, Enter]); // the one before it
+        keys.push(Escape);
+        let mut ui = Script {
+            keys: keys.into(),
+            ..Default::default()
+        };
+        light_patterns_menu(&mut ui, &path).unwrap();
+        assert!(ui.keys.is_empty(), "keys left: {:?}", ui.keys);
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains("Mouse light (Logitech G502 logo, needs logirgb): On"))
+        );
+        let menu = ui
+            .screens
+            .iter()
+            .find(|s| s.contains("Mouse light · Finished (answered, waiting for you): effect"))
+            .unwrap();
+        assert!(
+            !menu.contains("wave") && !menu.contains("reactive-"),
+            "{menu}"
+        );
+        let lights = mappings::load_config(&path).unwrap().device_lights;
+        assert!(lights.mouse_on);
+        assert_eq!(lights.mouse[3], Rgb::Static("red"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// v7 ticket 86: while running, the Xbox button light shows the most urgent agent
     /// state's Xbox pattern; the Xbox switch or the master Status lights switch off gives
     /// back the plain running light; paused stays paused; quitting restores the light.
@@ -21311,7 +21520,7 @@ mod tests {
         let v14 = saved
             .lines()
             .filter(|l| {
-                !["device-lights\t", "xbox-pattern\t", "ps5-pattern\t", "keyboard-lights\t", "keyboard-pattern\t", "xbox-headset\t", "keyboard-leds\t", "xbox-brightness\t", "keyboard-rgb\t", "speakers-rgb\t", "mousepad-rgb\t", "theme\t", "ai-share-usage\t", "seen-7.7\t", "agents-view\t", "default-agent\t"]
+                !["device-lights\t", "xbox-pattern\t", "ps5-pattern\t", "keyboard-lights\t", "keyboard-pattern\t", "xbox-headset\t", "keyboard-leds\t", "xbox-brightness\t", "keyboard-rgb\t", "speakers-rgb\t", "mousepad-rgb\t", "mouse-rgb\t", "theme\t", "ai-share-usage\t", "seen-7.7\t", "agents-view\t", "default-agent\t"]
                     .iter()
                     .any(|p| l.starts_with(p))
             })

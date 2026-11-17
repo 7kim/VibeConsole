@@ -925,6 +925,13 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                     Err(e) => println!("{e}"),
                 }
             }
+            // v7.7 ticket 190: the G502 logo through logirgb; only `logirgb profiles` runs.
+            match crate::keyboard::MouseLight::open(crate::keyboard::logirgb_runner()) {
+                Ok(_) => println!(
+                    "Mouse light (Logitech G502): available (logo: off, static, breathe, spectrum as cycle; a state is a logirgb preview, never stored in the mouse)"
+                ),
+                Err(e) => println!("{e}"),
+            }
             match crate::recording::permissions() {
                 Ok(n) => {
                     println!("Physical-key recording: {n} readable keyboard(s); no events captured")

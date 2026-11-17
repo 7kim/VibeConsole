@@ -2579,6 +2579,13 @@ fn device_lights_text(p: &crate::status::DevicePatterns) -> String {
             effects.join("\t")
         ));
     }
+    // v34 (v7.7 ticket 190): the G502 logo's switch and effect per state.
+    let effects = p.mouse.map(crate::status::rgb_word);
+    text.push_str(&format!(
+        "mouse-rgb\t{}\t{}\n",
+        on(p.mouse_on),
+        effects.join("\t")
+    ));
     text
 }
 fn parse_device_lights(
@@ -2741,6 +2748,21 @@ fn parse_device_lights(
                 *slot = parse(word)?;
             }
         }
+        let fields = next("mouse-rgb")?;
+        let [switch, effects @ ..] = &fields[..] else {
+            return Err("expected mouse-rgb on|off and 4 effects".into());
+        };
+        if effects.len() != BUSY.len() {
+            return Err("expected mouse-rgb effects for each of the 4 states".into());
+        }
+        p.mouse_on = match switch.as_str() {
+            "on" => true,
+            "off" => false,
+            other => return Err(format!("mouse-rgb must be on or off, not {other}").into()),
+        };
+        for (slot, word) in p.mouse.iter_mut().zip(effects) {
+            *slot = crate::status::parse_rgb(word).map_err(|e| format!("mouse-rgb: {e}"))?;
+        }
     }
     Ok(p)
 }
@@ -2803,7 +2825,8 @@ fn parse_config(contents: &str) -> Result<Config> {
         // v33 (v7.7 ticket 149): `theme`, `ai-share-usage`, `seen-7.7`, `agents-view` and
         // `default-agent`.
         Some("33") => 33,
-        // v34 (v7.7 ticket 189): `speakers-rgb` and `mousepad-rgb`, the Razer accessories.
+        // v34 (v7.7 tickets 189 and 190): `speakers-rgb` and `mousepad-rgb`, the Razer
+        // accessories, and `mouse-rgb`, the Logitech G502's logo.
         Some("34") => 34,
         _ => {
             return Err(
@@ -4476,9 +4499,9 @@ mod tests {
     /// The default `keyboard-rgb` line (v32), which files before v32 don't have.
     /// With the v34 accessory lines after it (v7.7 ticket 189), which files before v32 don't
     /// have either.
-    const DEFAULT_RGB: &str = "keyboard-rgb\toff\tspectrum\t255\tstatic-red\tstatic-orange\tbreath-blue\tstatic-green\nspeakers-rgb\toff\tspectrum\tstatic-red\tstatic-orange\tbreath-blue\tstatic-green\nmousepad-rgb\toff\tspectrum\tstatic-red\tstatic-orange\tbreath-blue\tstatic-green\n";
+    const DEFAULT_RGB: &str = "keyboard-rgb\toff\tspectrum\t255\tstatic-red\tstatic-orange\tbreath-blue\tstatic-green\nspeakers-rgb\toff\tspectrum\tstatic-red\tstatic-orange\tbreath-blue\tstatic-green\nmousepad-rgb\toff\tspectrum\tstatic-red\tstatic-orange\tbreath-blue\tstatic-green\nmouse-rgb\toff\tstatic-red\tstatic-orange\tbreath-blue\tstatic-green\n";
     /// The default v34 lines (v7.7 ticket 189), which files before v34 don't have.
-    const DEFAULT_ACCESSORIES: &str = "speakers-rgb\toff\tspectrum\tstatic-red\tstatic-orange\tbreath-blue\tstatic-green\nmousepad-rgb\toff\tspectrum\tstatic-red\tstatic-orange\tbreath-blue\tstatic-green\n";
+    const DEFAULT_ACCESSORIES: &str = "speakers-rgb\toff\tspectrum\tstatic-red\tstatic-orange\tbreath-blue\tstatic-green\nmousepad-rgb\toff\tspectrum\tstatic-red\tstatic-orange\tbreath-blue\tstatic-green\nmouse-rgb\toff\tstatic-red\tstatic-orange\tbreath-blue\tstatic-green\n";
     fn before_v26(text: &str) -> String {
         text.lines()
             .filter(|l| {
@@ -4490,6 +4513,7 @@ mod tests {
                     && !l.starts_with("keyboard-rgb\t")
                     && !l.starts_with("speakers-rgb\t")
                     && !l.starts_with("mousepad-rgb\t")
+                    && !l.starts_with("mouse-rgb\t")
             })
             .map(|l| format!("{l}\n"))
             .collect()
@@ -4507,6 +4531,7 @@ mod tests {
             "keyboard-rgb\t",
             "speakers-rgb\t",
             "mousepad-rgb\t",
+            "mouse-rgb\t",
         ]
         .iter()
         .any(|p| line.starts_with(p))
@@ -4762,6 +4787,19 @@ mod tests {
                 .to_string();
             assert!(error.contains(reason), "{error}");
         }
+        // v7.7 ticket 190: the G502 logo's line round-trips too.
+        config.device_lights.mouse_on = true;
+        config.device_lights.mouse[3] = Rgb::Off;
+        let text = serialize_config(&config).unwrap();
+        assert!(
+            text.contains("\nmouse-rgb\ton\tstatic-red\tstatic-orange\tbreath-blue\toff\n"),
+            "{text}"
+        );
+        assert_eq!(parse_config(&text).unwrap(), config);
+        let error = parse_config(&text.replace("mouse-rgb\ton", "mouse-rgb\tyes"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("mouse-rgb must be on or off"), "{error}");
         let short = text.replace("\twave\treactive-purple\toff\tspectrum\n", "\twave\n");
         let error = parse_config(&short).unwrap_err().to_string();
         assert!(
