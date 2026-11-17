@@ -3435,8 +3435,9 @@ fn load_file(path: &Path) -> Result<Config> {
         _ => load_tsv(path),
     }
 }
-/// v7.7 ticket 197: the main config without moving `mappings.tsv` (hooks and read-only
-/// commands); the session moves it.
+/// v7.7 ticket 197: the main config without moving `mappings.tsv`: hooks, read-only
+/// commands and actions read it this way; only the session (which holds the owner lock)
+/// moves it. Tests that reach the real config path therefore only ever read it.
 pub fn read_config(path: &Path) -> Result<Config> {
     match is_main(path) {
         true => crate::config::peek(path),

@@ -1836,7 +1836,7 @@ fn startup_env(config: &crate::mappings::Config) -> Vec<String> {
 }
 
 fn run_command(window: &str, dir: &str, line: &str) -> Result<String> {
-    let config = crate::mappings::load_config(&crate::mappings::config_path()?)?;
+    let config = crate::mappings::read_config(&crate::mappings::config_path()?)?;
     let dir = crate::mappings::absolute_directory(dir, &config)?;
     show_program(window, &dir, &["sh", "-c", line])
 }
@@ -1844,7 +1844,7 @@ fn run_command(window: &str, dir: &str, line: &str) -> Result<String> {
 /// v7.7 ticket 170: run a program (each argument one argument, no shell) in a new tmux
 /// window `window` of session `vibe` in `dir`, and show the session in a terminal.
 pub fn show_program(window: &str, dir: &str, argv: &[&str]) -> Result<String> {
-    let config = crate::mappings::load_config(&crate::mappings::config_path()?)?;
+    let config = crate::mappings::read_config(&crate::mappings::config_path()?)?;
     show_command(
         window,
         dir,
@@ -2040,7 +2040,7 @@ enum Reached {
 }
 /// Make sure the agent runs in its host and say where to send to.
 fn reach_agent(agent_name: &str, cancelled: &dyn Fn() -> bool) -> Result<Reached> {
-    let config = crate::mappings::load_config(&crate::mappings::config_path()?)?;
+    let config = crate::mappings::read_config(&crate::mappings::config_path()?)?;
     let agent = config
         .agents
         .iter()

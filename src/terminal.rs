@@ -10514,7 +10514,7 @@ fn mapping_label(mapping: &Mapping, program: Option<&(u8, crate::feedback::Paylo
             target: crate::actions::Target::Agent(agent),
             ..
         } => mappings::config_path()
-            .and_then(|p| mappings::load_config(&p))
+            .and_then(|p| mappings::read_config(&p))
             .is_ok_and(|c| !c.agents.iter().any(|a| &a.name == agent)),
         _ => false,
     };
