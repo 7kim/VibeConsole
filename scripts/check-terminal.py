@@ -28,9 +28,18 @@ TABS = {
 }
 # A connected Xbox controller (or any input device) must not reach a scenario: it could run
 # the session and send real shortcuts. bwrap hides /dev/input from the app (v7.7 ticket 150).
+# v7.7 ticket 178: without bwrap nothing runs, unless the user opts out on a machine with no
+# input devices and takes the risk.
 HIDE_INPUT = ["bwrap", "--dev-bind", "/", "/", "--tmpfs", "/dev/input"] if shutil.which("bwrap") else []
 if not HIDE_INPUT:
-    print("bwrap not found: a connected controller can reach these scenarios; unplug it first")
+    if os.environ.get("VIBECONSOLE_PTY_NO_BWRAP") != "1":
+        raise SystemExit(
+            "bwrap not found: a connected controller could reach these scenarios and send real "
+            "shortcuts, so nothing was run. Install it: sudo dnf install bubblewrap "
+            "(or set VIBECONSOLE_PTY_NO_BWRAP=1 on a machine with no input devices)."
+        )
+    print("VIBECONSOLE_PTY_NO_BWRAP=1: running without bwrap; any connected controller can reach "
+          "these scenarios. You take that risk.")
 # The names scenarios use for Live's buttons (v7.7 ticket 151 relabelled them).
 LIVE = {"Run": "▶ Resume", "Pause": "❚❚ Pause", "/release-all": "Release all", "/quit": "Quit",
         "Reset settings": "⚠ Reset settings"}
