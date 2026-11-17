@@ -699,6 +699,54 @@ pub fn problems(
     }
     found
 }
+/// v7.7 ticket 192: the status lights doctor checks, by their doctor label, each with
+/// whether Status light patterns has it on (the master Status lights switch included).
+pub fn light_switches(
+    status_lights: bool,
+    p: &crate::status::DevicePatterns,
+) -> [(&'static str, bool); 7] {
+    [
+        ("Xbox button light", p.on[1]),
+        ("Keyboard light", p.keyboard_on),
+        ("Keyboard M light", p.keyboard_on && p.keyboard_leds[3]),
+        ("RGB keyboard", p.rgb_devices[0].on),
+        ("Speakers RGB", p.rgb_devices[1].on),
+        ("Mousepad RGB", p.rgb_devices[2].on),
+        ("Mouse light (Logitech G502)", p.rgb_devices[3].on),
+    ]
+    .map(|(label, on)| (label, on && status_lights))
+}
+/// A light's doctor line (what its probe found) with its switch; switched on but
+/// unavailable is also a problem.
+pub fn light_check(
+    label: &'static str,
+    on: Option<bool>,
+    found: std::result::Result<String, String>,
+) -> (String, Option<Problem>) {
+    let switch = match on {
+        Some(true) => "on in Status light patterns",
+        Some(false) => "off in Status light patterns",
+        None => "switch unknown: the config didn't load",
+    };
+    let line = |text: &str| format!("{text} · {switch}");
+    match found {
+        Ok(text) => (line(&text), None),
+        Err(text) => (
+            line(&text),
+            (on == Some(true)).then(|| light_problem(label, text)),
+        ),
+    }
+}
+/// v7.7 ticket 192: a light switched on in Status light patterns that isn't available.
+pub fn light_problem(label: &'static str, message: String) -> Problem {
+    Problem {
+        stage: label,
+        message,
+        fix: Fix::Show(format!(
+            "{label} is switched on in Status light patterns but isn't available. Fix the cause above, or switch it off there."
+        )),
+    }
+}
 /// `/dev/uinput` for [`problems`]: `None` when it opens for writing, else whether it exists.
 pub fn uinput_state() -> Option<bool> {
     match OpenOptions::new()
@@ -892,60 +940,89 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                 Err(e) => println!("Xbox controllers: {e}"),
             }
             println!("{}", crate::gamepad::headset());
-            println!("{}", crate::gamepad::ButtonLight::status());
+            // v7.7 ticket 192: each light's probe, then its switch in Status light patterns.
+            let mut found: Vec<std::result::Result<String, String>> = Vec::new();
+            found.push(
+                crate::gamepad::ButtonLight::open(Path::new(crate::gamepad::LEDS))
+                    .map(|light| light.describe()),
+            );
             // v7 ticket 113: the keyboard's lock-key LED (opened only, nothing sent) and RGB.
-            match crate::keyboard::LockLights::open() {
-                Ok(lights) => println!("Keyboard light: available ({})", lights.names().join(", ")),
-                Err(e) => println!("Keyboard light: {e}"),
-            }
+            found.push(match crate::keyboard::LockLights::open() {
+                Ok(lights) => Ok(format!(
+                    "Keyboard light: available ({})",
+                    lights.names().join(", ")
+                )),
+                Err(e) => Err(format!("Keyboard light: {e}")),
+            });
             // v7 ticket 128: a Razer keyboard's M and G lights, and RGB.
             let razer = std::path::Path::new(crate::keyboard::RAZER);
-            match crate::keyboard::macro_leds(razer).as_slice() {
-                [] => println!(
-                    "Keyboard M light: unavailable: OpenRazer's razerkbd driver isn't loaded, or its macro_led_state isn't writable (VibeConsole never installs it)"
+            found.push(match crate::keyboard::macro_leds(razer).as_slice() {
+                [] => Err(
+                    "Keyboard M light: unavailable: OpenRazer's razerkbd driver isn't loaded, or its macro_led_state isn't writable (VibeConsole never installs it)".into()
                 ),
-                leds => println!(
+                leds => Ok(format!(
                     "Keyboard M light: available ({})",
                     leds.iter()
                         .map(|l| l.name.as_str())
                         .collect::<Vec<_>>()
                         .join(", ")
-                ),
-            }
-            println!(
-                "Keyboard G light: unavailable: lighting it turns on Razer game mode, which turns off the Super key"
-            );
+                )),
+            });
             // v7 ticket 128: opened only (brightness read), nothing sent.
-            match crate::keyboard::RgbKeyboards::open(razer, crate::status::Rgb::SPECTRUM) {
-                Ok(rgb) => println!(
-                    "RGB keyboard: available ({}; on pause and quit it goes back to the resting effect you pick in Status light patterns)",
-                    rgb.names().join(", ")
-                ),
-                Err(e) => println!("{e}"),
-            }
+            found.push(
+                crate::keyboard::RgbKeyboards::open(razer, crate::status::Rgb::SPECTRUM)
+                    .map(|rgb| format!(
+                        "RGB keyboard: available ({}; on pause and quit it goes back to the resting effect you pick in Status light patterns)",
+                        rgb.names().join(", ")
+                    ))
+                    .map_err(|e| e.to_string()),
+            );
             // v7.7 ticket 189: the Razer speakers and mousepad, opened only, nothing sent: each
             // device and the effects it can show.
             let accessory = std::path::Path::new(crate::keyboard::RAZER_ACCESSORY);
             for (_, label, model) in crate::status::ACCESSORIES {
-                match crate::keyboard::RgbKeyboards::open_accessory(
-                    accessory,
-                    crate::status::Rgb::SPECTRUM,
-                    label,
-                    model,
-                ) {
-                    Ok(rgb) => println!(
-                        "{label}: available ({}; its brightness is left as it is)",
-                        rgb.abilities().join("; ")
-                    ),
-                    Err(e) => println!("{e}"),
-                }
+                found.push(
+                    crate::keyboard::RgbKeyboards::open_accessory(
+                        accessory,
+                        crate::status::Rgb::SPECTRUM,
+                        label,
+                        model,
+                    )
+                    .map(|rgb| {
+                        format!(
+                            "{label}: available ({}; its brightness is left as it is)",
+                            rgb.abilities().join("; ")
+                        )
+                    })
+                    .map_err(|e| e.to_string()),
+                );
             }
             // v7.7 ticket 190: the G502 logo through logirgb; only `logirgb profiles` runs.
-            match crate::keyboard::MouseLight::open(crate::keyboard::logirgb_runner()) {
-                Ok(_) => println!(
-                    "Mouse light (Logitech G502): available (logo: off, static, breathe, spectrum as cycle; a state is a logirgb preview, never stored in the mouse)"
-                ),
-                Err(e) => println!("{e}"),
+            found.push(
+                crate::keyboard::MouseLight::open(crate::keyboard::logirgb_runner())
+                    .map(|_| "Mouse light (Logitech G502): available (logo: off, static, breathe, spectrum as cycle; a state is a logirgb preview, never stored in the mouse)".into())
+                    .map_err(|e| e.to_string()),
+            );
+            let lights = crate::mappings::load_config(&crate::mappings::config_path()?)
+                .ok()
+                .map(|c| light_switches(c.status_lights, &c.device_lights));
+            let mut light_problems = Vec::new();
+            for (index, found) in found.into_iter().enumerate() {
+                let (label, on) = match &lights {
+                    Some(switches) => (switches[index].0, Some(switches[index].1)),
+                    None => (light_switches(false, &Default::default())[index].0, None),
+                };
+                let (line, problem) = light_check(label, on, found);
+                println!("{line}");
+                light_problems.extend(problem);
+                if label == "Keyboard M light" {
+                    println!(
+                        "Keyboard G light: unavailable: lighting it turns on Razer game mode, which turns off the Super key"
+                    );
+                }
+            }
+            for problem in &light_problems {
+                println!("Problem · {}: {}", problem.stage, problem.message);
             }
             match crate::recording::permissions() {
                 Ok(n) => {
@@ -1198,6 +1275,77 @@ mod tests {
         assert_eq!(calls, ["start"]);
     }
 
+    /// v7.7 ticket 192: doctor's light lines say whether each light is on or off as saved
+    /// in Status light patterns (the master switch off turns every one off); a light switched
+    /// on that its probe found unavailable is a problem named by its stage, one switched off
+    /// is not.
+    #[test]
+    fn doctor_light_lines_say_on_or_off_as_saved() {
+        use crate::mappings;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-doctor-lights-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut config = mappings::load_config(&path).unwrap();
+        config.status_lights = true;
+        config.device_lights.on[1] = true; // Xbox
+        config.device_lights.keyboard_on = false;
+        config.device_lights.rgb_devices[0].on = true; // RGB keyboard
+        config.device_lights.rgb_devices[1].on = false; // speakers
+        config.device_lights.rgb_devices[3].on = true; // mouse
+        mappings::save_config(&path, &config).unwrap();
+        let saved = mappings::load_config(&path).unwrap();
+        let switches = light_switches(saved.status_lights, &saved.device_lights);
+        let on = switches
+            .iter()
+            .filter(|(_, on)| *on)
+            .map(|(l, _)| *l)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            on,
+            [
+                "Xbox button light",
+                "RGB keyboard",
+                "Mouse light (Logitech G502)"
+            ]
+        );
+        let lines = switches.map(|(label, on)| {
+            let found = if label.starts_with("Mouse") || label.starts_with("Speakers") {
+                Err(format!("{label}: unavailable: logirgb missing"))
+            } else {
+                Ok(format!("{label}: available"))
+            };
+            light_check(label, Some(on), found)
+        });
+        assert_eq!(
+            lines[0].0,
+            "Xbox button light: available · on in Status light patterns"
+        );
+        assert_eq!(
+            lines[1].0,
+            "Keyboard light: available · off in Status light patterns"
+        );
+        assert_eq!(
+            lines[4].0,
+            "Speakers RGB: unavailable: logirgb missing · off in Status light patterns"
+        );
+        let problems = lines
+            .iter()
+            .filter_map(|(_, p)| p.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(problems.len(), 1, "only the switched-on one: {problems:?}");
+        assert_eq!(problems[0].stage, "Mouse light (Logitech G502)");
+        assert!(matches!(&problems[0].fix, Fix::Show(t) if t.contains("switch it off")));
+        // The master Status lights switch off: every light is off.
+        let off = light_switches(false, &saved.device_lights);
+        assert!(off.iter().all(|(_, on)| !on));
+        // No config: the line says so, and nothing is a problem.
+        let (line, problem) = light_check("RGB keyboard", None, Err("RGB keyboard: x".into()));
+        assert!(line.ends_with("switch unknown: the config didn't load") && problem.is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
     /// v7 ticket 01: doctor warns when the unit is installed but won't start at login.
     #[test]
     fn doctor_warns_when_login_service_is_installed_but_disabled() {

@@ -1632,6 +1632,32 @@ impl Terminal {
             extension,
             &user,
         );
+        // v7.7 ticket 192: a light switched on in Status light patterns that this run found
+        // unavailable (no probe here: the mouse's would take half a second). The Xbox button
+        // light and the M light keep no such record; doctor checks those.
+        if let Some(lights) = &self.device_lights {
+            let mouse = self.mouse.as_ref().is_some_and(|m| m.unavailable());
+            let failed = [
+                false,
+                self.lock_failed,
+                false,
+                self.rgb_failed,
+                self.accessories_failed[0],
+                self.accessories_failed[1],
+                mouse,
+            ];
+            for ((label, on), failed) in crate::runtime::light_switches(true, lights)
+                .into_iter()
+                .zip(failed)
+            {
+                if on && failed {
+                    self.problems.push(crate::runtime::light_problem(
+                        label,
+                        format!("{label}: unavailable when this run tried it; vibeconsole doctor says why"),
+                    ));
+                }
+            }
+        }
         self.problems_at = Some(Instant::now());
     }
     /// v7.7 ticket 157: Enter on a problem: a fixed command asks first and runs through the
@@ -21678,6 +21704,49 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("the mouse worker never got there");
+    }
+
+    /// v7.7 ticket 192: a light switched on in Status light patterns that this run found
+    /// unavailable (logirgb can't open the mouse) is a System problem named by its stage;
+    /// switched off, it isn't.
+    #[test]
+    fn a_switched_on_unavailable_light_is_a_system_problem() {
+        use std::sync::{Arc, Mutex};
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-light-problem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log = calls.clone();
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        ui.mouse = Some(crate::keyboard::MouseWorker::start(move || {
+            let log = log.clone();
+            Box::new(move |args: &[&str]| {
+                log.lock().unwrap().push(args.join(" "));
+                Err("logirgb: No such file or directory (os error 2)".into())
+            })
+        }));
+        let mut patterns = crate::status::DevicePatterns::default();
+        patterns.rgb_devices[3].on = true;
+        ui.device_lights = Some(patterns.clone());
+        ui.agent_states = vec![("claude".into(), "claude".into(), "needs-input")];
+        ui.output = Some(crate::keyboard::Output::recording(&[]).unwrap());
+        ui.suspended = false;
+        ui.show_rgb();
+        until(|| ui.mouse.as_ref().unwrap().unavailable());
+        let mouse =
+            |ui: &Terminal| (ui.problems.iter()).any(|p| p.stage == "Mouse light (Logitech G502)");
+        ui.read_problems();
+        assert!(mouse(&ui), "{:?}", ui.problems);
+        patterns.rgb_devices[3].on = false;
+        ui.device_lights = Some(patterns);
+        ui.read_problems();
+        assert!(!mouse(&ui), "switched off: no problem");
+        drop(ui);
+        assert_eq!(*calls.lock().unwrap(), ["logirgb profiles -d g502"]);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// v7.7 ticket 191: logirgb takes about half a second a call on the G502, so it runs on

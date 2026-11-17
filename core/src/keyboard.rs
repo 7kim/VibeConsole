@@ -1050,12 +1050,16 @@ pub struct MouseWorker {
     notices: std::sync::mpsc::Receiver<String>,
     thread: Option<std::thread::JoinHandle<()>>,
     sent: Option<MouseWant>,
+    /// v7.7 ticket 192: logirgb couldn't open the mouse (until switched off).
+    failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 impl MouseWorker {
     /// `runner` makes a fresh logirgb runner for each open (again after a failed `set`).
     pub fn start(mut runner: impl FnMut() -> crate::gamepad::Runner + Send + 'static) -> Self {
         let (wants, wanted) = std::sync::mpsc::channel::<MouseWant>();
         let (notify, notices) = std::sync::mpsc::channel();
+        let unavailable = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = unavailable.clone();
         let thread = std::thread::spawn(move || {
             let mut mouse: Option<MouseLight> = None;
             let mut failed = false;
@@ -1068,6 +1072,7 @@ impl MouseWorker {
                         mouse.restore();
                     }
                     failed &= want != MouseWant::Off;
+                    seen.store(failed, std::sync::atomic::Ordering::Relaxed);
                     continue;
                 };
                 if mouse.is_none() && !failed {
@@ -1075,6 +1080,7 @@ impl MouseWorker {
                         Ok(opened) => mouse = Some(opened),
                         Err(error) => {
                             failed = true;
+                            seen.store(true, std::sync::atomic::Ordering::Relaxed);
                             let _ = notify.send(error.to_string());
                         }
                     }
@@ -1096,7 +1102,12 @@ impl MouseWorker {
             notices,
             thread: Some(thread),
             sent: None,
+            failed: unavailable,
         }
+    }
+    /// Whether logirgb couldn't open the mouse, as far as the worker has got.
+    pub fn unavailable(&self) -> bool {
+        self.failed.load(std::sync::atomic::Ordering::Relaxed)
     }
     /// Hands over a want when it differs from the last one; never waits for logirgb.
     pub fn want(&mut self, want: MouseWant) {
