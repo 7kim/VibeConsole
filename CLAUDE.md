@@ -40,7 +40,7 @@ Rules:
 - Each spec restates the Project rules it relies on, under **Safety Rules** (`/to-spec` does it). A spec may change a rule only with the user's agreement, and says so.
 - Recorded hardware limitations are under "Known limitations" in [docs/README.md](docs/README.md). Don't reopen them unless a ticket asks.
 - V1–V6 tickets and tests are in `archive/tickets/` and `archive/tests/`. Read them for history; don't add to them.
-- Trace affected callers before choosing a change. Treat spec status statements as historical; verify against the working tree and runnable checks.
+- Trace affected callers before choosing a change. For Rust symbols use the LSP tool first (definition, references, incoming calls), then `grep`/`sed`; it may need a minute to index after a session starts. Treat spec status statements as historical; verify against the working tree and runnable checks.
 
 ## Project rules
 
