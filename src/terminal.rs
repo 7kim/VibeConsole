@@ -18767,6 +18767,94 @@ mod tests {
 
     /// v7 ticket 25: save the setup as a preset, change it, load the preset back; a bad
     /// preset is refused and nothing changes.
+    /// v7.7 ticket 198: a change touching two files (a light and a mapping) is one undo
+    /// step; History… puts back every file of every newer step; an old `.preset` (TSV) still
+    /// applies through the merge, and an old `history/*.tsv` entry still restores.
+    #[test]
+    fn undo_puts_back_every_file_and_old_presets_and_history_still_load() {
+        use Key::*;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-undo-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let files =
+            || ["lights.json", "mappings.json"].map(|f| std::fs::read(dir.join(f)).unwrap());
+        let history = |keys: Vec<Key>| {
+            let mut ui = Script {
+                keys: keys.into(),
+                ..Default::default()
+            };
+            let note = history_menu(&mut ui, &path).unwrap();
+            assert!(ui.keys.is_empty());
+            (note, ui.screens)
+        };
+        let base = mappings::Config::default();
+        mappings::save_config(&path, &base).unwrap();
+        let before = files();
+        // One save that changes a light and a mapping: one step.
+        let mut both = base.clone();
+        both.device_lights.rgb_on = true;
+        let pad = Mapping::new(Control::from_note(10, 36).unwrap(), "F1", "hold").unwrap();
+        both.mappings.push(pad.clone());
+        mappings::save_config(&path, &both).unwrap();
+        assert_eq!(mappings::history(&path).len(), 1, "one step for both files");
+        let (note, screens) = history(vec![Enter]); // newest row: undo it
+        assert!(note.unwrap().starts_with("Put back: before"), "{screens:?}");
+        assert_eq!(
+            files(),
+            before,
+            "the light and the mapping are back together"
+        );
+        assert_eq!(mappings::load_config(&path).unwrap(), base);
+        assert!(
+            undo_last(&path).unwrap().starts_with("Undone:"),
+            "undo the undo"
+        );
+        assert_eq!(mappings::load_config(&path).unwrap(), both);
+
+        // Two saves, a light then a mapping: the older History row puts both back.
+        let mut light = both.clone();
+        light.device_lights.rgb_brightness = 100;
+        mappings::save_config(&path, &light).unwrap();
+        let mut mapping = light.clone();
+        mapping.mappings[0].keys = vec!["F2".into()];
+        mappings::save_config(&path, &mapping).unwrap();
+        history(vec![Down, Enter]);
+        assert_eq!(mappings::load_config(&path).unwrap(), both);
+
+        // An old history entry (a whole mappings.tsv from before 7.7) restores whole.
+        let old = "vibeconsole-mappings-v1\n09e8:1049\tnote\t10\t37\thold\tF9\n";
+        std::fs::write(dir.join("history/00000000000000000001.tsv"), old).unwrap();
+        let rows = mappings::history(&path).len();
+        let mut keys = vec![Down; rows - 1];
+        keys.push(Enter);
+        history(keys);
+        let restored = mappings::load_config(&path).unwrap();
+        assert_eq!(restored.mappings.len(), 1);
+        assert_eq!(restored.mappings[0].keys, ["F9"]);
+
+        // An old .preset (TSV) applies through the same merge as before.
+        std::fs::create_dir_all(dir.join("presets")).unwrap();
+        let tsv = "vibeconsole-mappings-v1\n09e8:1049\tnote\t10\t36\thold\tShift\n";
+        std::fs::write(dir.join("presets/Old.preset"), tsv).unwrap();
+        let mut keys = vec![Down; 11];
+        keys.extend([Enter, Enter, Enter, Enter, Escape, Escape]); // Presets -> Old -> Load -> Back
+        let mut ui = Script {
+            keys: keys.into(),
+            ..Default::default()
+        };
+        settings_menu(&mut ui, &path).unwrap();
+        let loaded = mappings::load_config(&path).unwrap();
+        assert_eq!(loaded.mappings.len(), 1);
+        assert_eq!(loaded.mappings[0].keys, ["Shift"]);
+        assert_eq!(
+            loaded.device_lights, restored.device_lights,
+            "settings stay"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn presets_save_load_and_refuse_bad_files() {
         use Key::*;
@@ -18793,7 +18881,11 @@ mod tests {
         save.extend(b"Work".map(Character));
         save.push(Enter);
         presets(save);
-        assert!(dir.join("presets/Work.preset").exists());
+        let saved = std::fs::read_to_string(dir.join("presets/Work.preset")).unwrap();
+        assert!(
+            saved.starts_with("{") && saved.contains("\"mappings.json\""),
+            "{saved}"
+        );
         let b = Mapping::new(Control::from_note(10, 37).unwrap(), "F2", "hold").unwrap();
         mappings::save(&path, &[b]).unwrap();
         presets(vec![Enter, Enter, Enter]); // Work.preset -> Load it -> Back

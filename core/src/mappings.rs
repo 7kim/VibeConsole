@@ -2,9 +2,7 @@ use crate::feedback::{Feedback, Octave, Settings};
 use crate::{Control, DEVICE, Result};
 use std::collections::HashSet;
 use std::fmt;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const NAMED_KEYS: &[&str] = &[
@@ -3403,7 +3401,16 @@ pub fn load_config(path: &Path) -> Result<Config> {
     if is_main(path) {
         crate::config::load(path)
     } else {
-        load_tsv(path)
+        load_file(path)
+    }
+}
+/// v7.7 ticket 198: a preset: the JSON format (`{`…) or an older TSV one.
+fn load_file(path: &Path) -> Result<Config> {
+    match fs::read_to_string(path) {
+        Ok(text) if text.trim_start().starts_with('{') => {
+            crate::config::from_preset(&text).map_err(|e| format!("{}: {e}", path.display()).into())
+        }
+        _ => load_tsv(path),
     }
 }
 /// v7.7 ticket 197: the main config without moving `mappings.tsv` (hooks and read-only
@@ -3411,7 +3418,7 @@ pub fn load_config(path: &Path) -> Result<Config> {
 pub fn read_config(path: &Path) -> Result<Config> {
     match is_main(path) {
         true => crate::config::peek(path),
-        false => load_tsv(path),
+        false => load_file(path),
     }
 }
 /// One TSV config file (any v1–v34); a missing file is the defaults.
@@ -3650,28 +3657,6 @@ pub fn history_dir(path: &Path) -> PathBuf {
 }
 /// How many replaced files history keeps.
 pub const HISTORY: usize = 10;
-pub(crate) fn keep_history(path: &Path, new: &[u8]) -> Result<()> {
-    let old = fs::read(path)?;
-    if old == new {
-        return Ok(());
-    }
-    let dir = history_dir(path);
-    fs::create_dir_all(&dir)?;
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_nanos();
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(dir.join(format!("{stamp:020}.tsv")))?
-        .write_all(&old)?;
-    let entries = history(path);
-    for (old, _) in entries.iter().skip(HISTORY) {
-        fs::remove_file(old)?;
-    }
-    Ok(())
-}
 /// v7.7 ticket 163: history, newest first: (file, seconds since 1970 when it was replaced).
 /// Since ticket 197 an entry is `<stamp>.json` (the files one save replaced); older
 /// `<stamp>.tsv` entries (a whole `mappings.tsv`) still count and load.
@@ -3742,42 +3727,9 @@ pub fn save_config(path: &Path, config: &Config) -> Result<()> {
     if is_main(path) {
         crate::config::save(path, config)
     } else {
-        save_tsv(path, config)
+        crate::config::save_preset(path, config)
     }
 }
-/// One TSV config file, atomically (presets).
-pub fn save_tsv(path: &Path, config: &Config) -> Result<()> {
-    let contents = serialize_config(config)?;
-    fs::create_dir_all(path.parent().ok_or("configuration path has no parent")?)?;
-    // ponytail: one staging file; concurrent saves fail safely. Remove a stale file after an interrupted save.
-    let temporary = path.with_extension("tmp");
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temporary)
-        .map_err(|error| {
-            format!(
-                "cannot create {}: {error}; saved mappings unchanged",
-                temporary.display()
-            )
-        })?;
-    let result = (|| -> Result<()> {
-        file.write_all(contents.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        // v7.7 ticket 163: the file this save replaces goes to history first; history is
-        // best effort and never blocks a save.
-        let _ = keep_history(path, contents.as_bytes());
-        fs::rename(&temporary, path)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;

@@ -439,6 +439,39 @@ fn pairs(at: &Obj, key: &str) -> Result<Vec<(String, String)>> {
         .collect()
 }
 
+/// v7.7 ticket 198: a preset file: every config file's JSON in one file. Presets hold the
+/// whole setup as before; loading one still merges only what `apply_preset` takes.
+pub fn preset_text(config: &Config) -> Result<String> {
+    mappings::serialize_config(config)?;
+    let mut files = Map::new();
+    for file in FILES {
+        files.insert(file.into(), serde_json::from_str(&text(file, config)?)?);
+    }
+    let preset = json!({"version": VERSION, "files": files});
+    Ok(serde_json::to_string_pretty(&preset)? + "\n")
+}
+/// A preset file read back: its files over the shipped defaults, checked like a load.
+pub fn from_preset(text: &str) -> Result<Config> {
+    let value: Value = serde_json::from_str(text)?;
+    let top = Obj::top(&value)?;
+    top.only(&["version", "files"])?;
+    let files = top.obj("files")?;
+    files.only(&FILES)?;
+    let mut config = Config::default();
+    for file in FILES {
+        if let Some(part) = files.map.get(file) {
+            let named = |e: Box<dyn std::error::Error>| format!("{file}: {e}");
+            apply(file, part, &mut config).map_err(named)?;
+            mappings::serialize_config(&config).map_err(named)?;
+        }
+    }
+    Ok(config)
+}
+/// Save a preset atomically (never into history: a preset isn't the config).
+pub fn save_preset(path: &Path, config: &Config) -> Result<()> {
+    write_all(&[(path.to_path_buf(), preset_text(config)?)], None)
+}
+
 // ---- settings.json (ticket 194): theme, Agents view, seen-7.7, AI usage sharing, Flow at
 // start, environment.
 
@@ -1702,5 +1735,27 @@ mod tests {
             shown.contains("Config mappings.json: not checked"),
             "{shown}"
         );
+    }
+
+    /// Ticket 198: a preset is every config file's JSON in one file: it round-trips whole,
+    /// a broken part is refused naming its file and field, and it never enters history.
+    #[test]
+    fn presets_hold_every_file_in_the_new_format() {
+        let dir = folder("preset");
+        let file = dir.join("Work.preset");
+        let config = agents_changed();
+        mappings::save_config(&file, &config).unwrap();
+        assert_eq!(mappings::load_config(&file).unwrap(), config);
+        let text = fs::read_to_string(&file).unwrap();
+        for name in FILES {
+            assert!(text.contains(&format!("\"{name}\"")), "{name}");
+        }
+        fs::write(&file, text.replace("\"headset\": true", "\"headset\": 1")).unwrap();
+        let error = mappings::load_config(&file).unwrap_err().to_string();
+        assert!(
+            error.contains("devices.json: field `tuning.headset`"),
+            "{error}"
+        );
+        assert!(!dir.join("history").exists(), "a preset isn't the config");
     }
 }
