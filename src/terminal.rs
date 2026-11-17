@@ -205,6 +205,17 @@ trait Ui {
             std::env::current_dir().ok(),
         )
     }
+    /// v7.7 ticket 170: run a program (each argument one argument, no shell) in tmux window
+    /// `window` in `dir`, shown in a terminal. Tests never start it.
+    fn show_in_terminal(&mut self, window: &str, dir: &str, argv: &[&str]) -> Result<String> {
+        #[cfg(test)]
+        {
+            let _ = (window, dir);
+            Err(format!("{}: not started in tests", argv[0]).into())
+        }
+        #[cfg(not(test))]
+        crate::actions::show_program(window, dir, argv)
+    }
     fn ask_claude(&mut self, request: &str) -> Result<String> {
         let output = std::process::Command::new("timeout")
             .args(["180", "claude", "-p", request])
@@ -2247,7 +2258,6 @@ impl Terminal {
                 // reply is checked like an import and saved only on Save.
                 let agent = config.look.default_agent.as_str();
                 let profile = PROFILE + cap(config.profiles.len()) + 2;
-                let later = |text: &str| (vec![format!("  for {text}")], None);
                 let ask = vec![
                     one(
                         format!(
@@ -2303,7 +2313,12 @@ impl Terminal {
                         ),
                         Some(ASK_ABOUT),
                     ),
-                    later("how to improve VibeConsole… · ideas and plugins (not yet)"),
+                    one(
+                        format!(
+                            "Ask {agent} how to improve VibeConsole… · Claude Code on its source"
+                        ),
+                        Some(ASK_IMPROVE),
+                    ),
                 ];
                 let settings = vec![
                     (
@@ -6850,6 +6865,7 @@ enum AskKind {
     Preset,
     Setup,
     Family,
+    Improve,
     About,
     Recommendations,
 }
@@ -6862,6 +6878,7 @@ fn ask_for(ui: &mut impl Ui, path: &Path, kind: AskKind) -> Result<()> {
         AskKind::Prompt => ask_prompt(ui, path),
         AskKind::Sequence => ask_sequence(ui, path),
         AskKind::Family => ask_family(ui, path),
+        AskKind::Improve => ask_improve(ui, path),
         AskKind::SetupAgents => ask_setup_agents(ui, path),
         AskKind::About => ask_about(ui, path),
         AskKind::Recommendations => ask_recommendations(ui, path),
@@ -7527,6 +7544,54 @@ fn family_mapping(
     copy.input = input;
     copy.label = pad.label();
     Ok(Some(copy))
+}
+/// v7.7 ticket 170: where VibeConsole's source is cloned from.
+const SOURCE_URL: &str = "https://github.com/7kim/vibeconsole";
+/// v7.7 ticket 170: Ask how to improve VibeConsole: the source is cloned (or updated) under
+/// `~/.local/share/vibeconsole/source` and Claude Code opens on it in a visible terminal with
+/// the wish as its first message. Every program gets its arguments one by one, never through
+/// a shell. VibeConsole saves nothing.
+fn ask_improve(ui: &mut impl Ui, _path: &Path) -> Result<()> {
+    let Some(wish) = text_entry(ui, "What should VibeConsole do better?", "")? else {
+        return Ok(());
+    };
+    // A leading `-` would read as an option of `claude`.
+    let wish = wish
+        .trim()
+        .trim_start_matches('-')
+        .trim()
+        .chars()
+        .take(1000)
+        .collect::<String>();
+    if wish.is_empty() {
+        return Ok(());
+    }
+    let (_, home, _) = ui.lookup_env();
+    let source = home
+        .ok_or("no home folder to keep the source in")?
+        .join(".local/share/vibeconsole/source");
+    let dir = source
+        .to_str()
+        .ok_or("the source folder isn't valid UTF-8")?
+        .to_owned();
+    ui.draw("Getting VibeConsole's source…")?;
+    if source.join(".git").is_dir() {
+        // Best effort: an offline or diverged clone still opens as it is.
+        let _ = ui.run(&["git", "-C", &dir, "pull", "--ff-only"]);
+    } else {
+        std::fs::create_dir_all(source.parent().unwrap_or(Path::new("/")))?;
+        ui.run(&["git", "clone", "--depth", "1", SOURCE_URL, &dir])
+            .map_err(|e| format!("git clone {SOURCE_URL}: {e}"))?;
+    }
+    let shown = ui.show_in_terminal("improve", &dir, &["claude", &wish])?;
+    choose(
+        ui,
+        &format!(
+            "{shown}.\nClaude Code is open on a clone of {SOURCE_URL} in {dir}, with your wish as its first message. VibeConsole saved nothing."
+        ),
+        &options(&["Back"]),
+    )?;
+    Ok(())
 }
 /// The one review every AI profile goes through (v7.7 tickets 147, 148, 167): checked in full
 /// like an import, against the devices' controls, never a command or a risky action, shown
@@ -11371,6 +11436,8 @@ const ASK_SEQUENCE: usize = 13 * ROWS;
 const ASK_PRESET: usize = 14 * ROWS;
 const ASK_SETUP: usize = 15 * ROWS;
 const ASK_FAMILY: usize = 16 * ROWS;
+/// v7.7 ticket 170: how to improve VibeConsole.
+const ASK_IMPROVE: usize = 17 * ROWS;
 /// Opens tab row `id` (`SETTING..`): one Settings row, or one row of the Agents, Prompts,
 /// Saved prompt sequences, App profiles or Xbox tuning lists, as those lists do.
 fn tab_row(ui: &mut impl Ui, path: &Path, id: usize) -> Result<()> {
@@ -11390,7 +11457,7 @@ fn tab_row(ui: &mut impl Ui, path: &Path, id: usize) -> Result<()> {
             ok => ok,
         },
         ASK_MAPPINGS | ASK_SETUP_AGENTS | ASK_MAP_AGENTS | ASK_PROMPT | ASK_SEQUENCE
-        | ASK_PRESET | ASK_SETUP | ASK_FAMILY => {
+        | ASK_PRESET | ASK_SETUP | ASK_FAMILY | ASK_IMPROVE => {
             let kind = match id / ROWS * ROWS {
                 ASK_MAPPINGS => AskKind::Mappings,
                 ASK_SETUP_AGENTS => AskKind::SetupAgents,
@@ -11399,7 +11466,8 @@ fn tab_row(ui: &mut impl Ui, path: &Path, id: usize) -> Result<()> {
                 ASK_SEQUENCE => AskKind::Sequence,
                 ASK_PRESET => AskKind::Preset,
                 ASK_SETUP => AskKind::Setup,
-                _ => AskKind::Family,
+                ASK_FAMILY => AskKind::Family,
+                _ => AskKind::Improve,
             };
             match ask_for(ui, path, kind) {
                 Err(error) => not_saved(ui, &error),
@@ -12286,6 +12354,10 @@ mod tests {
         driver: Option<&'static str>,
         cards: String,
         pub(super) ran: Vec<String>,
+        /// v7.7 ticket 170: every program run, argument by argument, and every program
+        /// shown in a terminal (window, folder, then its arguments).
+        argv: Vec<Vec<String>>,
+        shown: Vec<Vec<String>>,
         run_error: Option<String>,
         xone_missing: bool,
         rule: bool,
@@ -12299,6 +12371,7 @@ mod tests {
         }
         fn run(&mut self, args: &[&str]) -> Result<String> {
             self.ran.push(args.join(" "));
+            self.argv.push(args.iter().map(|a| a.to_string()).collect());
             if args.first() == Some(&"modinfo") {
                 return match self.xone_missing {
                     false => Ok("/lib/modules/7.3.3/extra/xone_wired.ko.xz\n".into()),
@@ -12327,6 +12400,12 @@ mod tests {
         }
         fn lookup_env(&self) -> (String, Option<PathBuf>, Option<PathBuf>) {
             self.lookup.clone()
+        }
+        fn show_in_terminal(&mut self, window: &str, dir: &str, argv: &[&str]) -> Result<String> {
+            let mut shown = vec![window.to_string(), dir.to_string()];
+            shown.extend(argv.iter().map(|a| a.to_string()));
+            self.shown.push(shown);
+            Ok("Command started in tmux window improve; terminal opened on session vibe".into())
         }
         fn ask_claude(&mut self, request: &str) -> Result<String> {
             self.asked.push(request.to_owned());
@@ -13638,6 +13717,7 @@ mod tests {
                 ASK_PRESET,
                 ASK_SETUP,
                 ASK_FAMILY,
+                ASK_IMPROVE,
             ])
             .chain((0..3).map(|n| PROFILE + n))
             .chain((0..12).map(|n| TUNING + n));
@@ -14291,6 +14371,71 @@ mod tests {
         assert!(!families_dir(&path).join("Bad.family").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
+    /// v7.7 ticket 170: Improve clones the source with the URL as one argument, then shows
+    /// Claude Code on it with the wish as one argument; nothing goes through a shell and
+    /// nothing is saved.
+    #[test]
+    fn ask_how_to_improve_opens_claude_code_on_the_source() {
+        use Key::*;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-ai-improve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let home = dir.join("home");
+        let source = home.join(".local/share/vibeconsole/source");
+        let source_text = source.display().to_string();
+        let run = |wish: &str| {
+            let mut keys = typed(wish);
+            keys.extend([Enter, Enter]);
+            let mut ui = Script {
+                keys: keys.into(),
+                lookup: (String::new(), Some(home.clone()), None),
+                ..Default::default()
+            };
+            ask_for(&mut ui, &path, AskKind::Improve).unwrap();
+            assert!(ui.keys.is_empty());
+            (ui.argv, ui.shown, ui.screens)
+        };
+        let (argv, shown, screens) = run("--add a; rm -rf ~ plugin");
+        assert_eq!(
+            argv,
+            [vec![
+                "git",
+                "clone",
+                "--depth",
+                "1",
+                "https://github.com/7kim/vibeconsole",
+                source_text.as_str()
+            ]]
+        );
+        assert_eq!(
+            shown,
+            [vec![
+                "improve",
+                source_text.as_str(),
+                "claude",
+                "add a; rm -rf ~ plugin"
+            ]]
+        );
+        assert!(
+            screens
+                .iter()
+                .any(|s| s.contains("VibeConsole saved nothing"))
+        );
+        // Already cloned: updated, never cloned again.
+        std::fs::create_dir_all(source.join(".git")).unwrap();
+        let (argv, shown, _) = run("themes");
+        assert_eq!(
+            argv,
+            [vec!["git", "-C", source_text.as_str(), "pull", "--ff-only"]]
+        );
+        assert_eq!(shown[0][2..], ["claude", "themes"]);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     /// v7.7 ticket 148: a question goes to the agent with what `describe` says; the answer is
     /// shown and nothing is saved; a proposed profile goes through the review and Cancel
     /// saves nothing.
@@ -14391,7 +14536,10 @@ mod tests {
             opens(&ui, 9, "for a prompt…"),
             Some(Open::Command(ASK_PROMPT))
         );
-        assert_eq!(opens(&ui, 9, "how to improve"), None, "not built yet");
+        assert_eq!(
+            opens(&ui, 9, "how to improve"),
+            Some(Open::Command(ASK_IMPROVE))
+        );
         let titles = ui
             .tab_panes(9, 100, usize::MAX)
             .into_iter()

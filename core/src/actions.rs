@@ -1788,11 +1788,13 @@ pub fn write_atomic(path: &Path, contents: &str) -> Result<()> {
     })
 }
 
+/// `command` runs as given: `sh -c <line>` for a terminal command, or a program and its
+/// arguments, each one argument, with no shell (v7.7 ticket 170).
 fn command_tmux_args<'a>(
     session: bool,
     window: &'a str,
     dir: &'a str,
-    line: &'a str,
+    command: &[&'a str],
     env: &'a [String],
 ) -> Vec<&'a str> {
     let mut args = if session {
@@ -1806,16 +1808,8 @@ fn command_tmux_args<'a>(
     for variable in env {
         args.extend(["-e", variable.as_str()]);
     }
-    args.extend([
-        "sh",
-        "-c",
-        line,
-        ";",
-        "set-option",
-        "-w",
-        "remain-on-exit",
-        "on",
-    ]);
+    args.extend(command);
+    args.extend([";", "set-option", "-w", "remain-on-exit", "on"]);
     args
 }
 
@@ -1833,14 +1827,20 @@ fn startup_env(config: &crate::mappings::Config) -> Vec<String> {
 fn run_command(window: &str, dir: &str, line: &str) -> Result<String> {
     let config = crate::mappings::load_config(&crate::mappings::config_path()?)?;
     let dir = crate::mappings::absolute_directory(dir, &config)?;
+    show_program(window, &dir, &["sh", "-c", line])
+}
+
+/// v7.7 ticket 170: run a program (each argument one argument, no shell) in a new tmux
+/// window `window` of session `vibe` in `dir`, and show the session in a terminal.
+pub fn show_program(window: &str, dir: &str, argv: &[&str]) -> Result<String> {
+    let config = crate::mappings::load_config(&crate::mappings::config_path()?)?;
     show_command(
         window,
-        &dir,
-        line,
+        dir,
+        argv,
         &startup_env(&config),
         &mut |args| {
             let output = tmux(args)?;
-            // Success: stdout; failure: stderr, for the error message.
             let text = if output.status.success() {
                 &output.stdout
             } else {
@@ -1854,13 +1854,12 @@ fn run_command(window: &str, dir: &str, line: &str) -> Result<String> {
         &mut open_terminal,
     )
 }
-
 /// Send the command to tmux, then show the session: open a terminal attached to it unless a
 /// client already is. Only a successful open is reported as shown.
 fn show_command(
     window: &str,
     dir: &str,
-    line: &str,
+    command: &[&str],
     env: &[String],
     tmux: &mut dyn FnMut(&[&str]) -> Result<(bool, String)>,
     open: &mut dyn FnMut() -> Result<()>,
@@ -1869,7 +1868,7 @@ fn show_command(
         return Err(format!("working directory {dir} is missing").into());
     }
     let (session, _) = tmux(&["has-session", "-t", "=vibe"])?;
-    let args = command_tmux_args(session, window, dir, line, env);
+    let args = command_tmux_args(session, window, dir, command, env);
     let (ok, output) = tmux(&args)?;
     if !ok {
         return Err(format!("tmux {}: {output}", args.join(" ")).into());
@@ -3454,7 +3453,7 @@ mod tests {
             true,
             "Bank-A-Pad-1",
             "/home/u/repo",
-            "gh pr create; echo done",
+            &["sh", "-c", "gh pr create; echo done"],
             &[],
         );
         assert_eq!(args[..3], ["new-window", "-t", "=vibe:"]);
@@ -3463,7 +3462,7 @@ mod tests {
             false,
             "Bank-A-Pad-1",
             "/home/u/repo",
-            "gh pr create; echo done",
+            &["sh", "-c", "gh pr create; echo done"],
             &[],
         );
         assert_eq!(args[..4], ["new-session", "-d", "-s", "vibe"]);
@@ -4024,7 +4023,7 @@ mod tests {
             let result = show_command(
                 "Bank-A-Pad-5",
                 dir,
-                "claude",
+                &["sh", "-c", "claude"],
                 &[],
                 &mut |args| {
                     tmux_calls.push(args[0].to_string());
@@ -4179,7 +4178,13 @@ mod tests {
                 "claude"
             ]
         );
-        let args = command_tmux_args(true, "w", "/tmp", "echo $ANTHROPIC_MODEL", &env);
+        let args = command_tmux_args(
+            true,
+            "w",
+            "/tmp",
+            &["sh", "-c", "echo $ANTHROPIC_MODEL"],
+            &env,
+        );
         let at = args.iter().position(|a| *a == "-e").unwrap();
         assert_eq!(args[at + 1], "ANTHROPIC_MODEL=opus");
         assert!(at < args.iter().position(|a| *a == "sh").unwrap()); // options before the command
