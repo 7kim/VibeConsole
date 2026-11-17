@@ -24,9 +24,9 @@ How: by the user, <one line: program, pads, service state>.
 
 ## Checks
 
-All of these must pass. Tick them in **How to do** as you go.
+All of these must pass. Tick each one once its step in **How to do** shows it.
 
-- <one observable pass criterion per line>
+- [ ] <one observable pass criterion per line>
 
 ## How to do
 
@@ -59,7 +59,7 @@ How: by the user, <one line: where and what state>.
 
 ## Checks
 
-- <one observable pass criterion per line>
+- [ ] <one observable pass criterion per line>
 
 ## How to do
 
