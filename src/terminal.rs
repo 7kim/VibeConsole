@@ -444,6 +444,8 @@ struct Terminal {
     menu: usize,
     /// The active tab (v7.7 ticket 150); `menu` is the selected row inside it.
     tab: usize,
+    /// v7.7 ticket 177: the row each tab was left on, in memory only.
+    tab_rows: [usize; 10],
     rendered: String,
     rendered_size: (usize, usize),
 }
@@ -1072,6 +1074,7 @@ impl Terminal {
             akai_owned: false,
             menu: 0, // Live's Pause / Resume (v7.7 ticket 151)
             tab: 0,
+            tab_rows: [0; 10],
             rendered: String::new(),
             rendered_size: (0, 0),
         };
@@ -12172,8 +12175,11 @@ fn command_menu(ui: &mut Terminal) -> Result<Option<usize>> {
             }
             _ => continue,
         };
+        // v7.7 ticket 177: back on a tab, its row again (the loop moves it on when that row no
+        // longer opens anything).
+        ui.tab_rows[ui.tab] = ui.menu;
         ui.tab = tab;
-        ui.menu = 0;
+        ui.menu = ui.tab_rows[tab];
         ui.read_view(None); // 7 Xbox reads its rows when opened
     }
 }
@@ -13962,6 +13968,9 @@ mod tests {
                 steps.extend((0..row).map(|_| Step::Key(Key::Down)));
                 // An Esc closes What moved (8 System › About), one more leaves.
                 steps.extend([Key::Enter, Key::Escape, Key::Escape].map(Step::Key));
+                // Counted from the first row: forget the rows tabs were left on (ticket 177).
+                ui.tab_rows = [0; 10];
+                ui.menu = 0;
                 ui.script = Some(Play {
                     steps: steps.into(),
                     ..Play::default()
@@ -14346,6 +14355,51 @@ mod tests {
         assert_eq!(argv[..2], ["codex", "exec"]);
         assert_eq!(argv.len(), 3);
         assert!(argv[2].contains("Question: Why didn't Pad 6 fire?"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    /// v7.7 ticket 177: coming back to a tab selects the row it was left on, whether Tab, ←
+    /// or a number key switched; each tab keeps its own.
+    #[test]
+    fn a_tab_remembers_its_row() {
+        use Key::*;
+        let (dir, mut ui, _ran, _) = configure_session("tab-rows");
+        let play = |ui: &mut Terminal, keys: Vec<Key>| {
+            let mut keys = keys;
+            keys.push(Escape);
+            ui.script = Some(Play {
+                steps: keys.into_iter().map(Step::Key).collect(),
+                ..Play::default()
+            });
+            assert_eq!(command_menu(ui).unwrap(), None);
+            (ui.tab, ui.menu)
+        };
+        ui.tab = 1;
+        ui.menu = 0;
+        ui.read_view(None);
+        let (_, third) = play(&mut ui, vec![Down, Down]);
+        assert!(third > 0);
+        assert_eq!(
+            play(&mut ui, vec![Tab, Tab, Tab, BackTab, BackTab, BackTab]),
+            (1, third),
+            "Tab"
+        );
+        assert_eq!(
+            play(&mut ui, vec![Right, Right, Right, Left, Left, Left]),
+            (1, third),
+            "←"
+        );
+        assert_eq!(
+            play(&mut ui, vec![Character(b'5'), Character(b'2')]),
+            (1, third),
+            "2"
+        );
+        // 5 Devices keeps its own row.
+        let (tab, devices) = play(&mut ui, vec![Character(b'5'), Down]);
+        assert_eq!(tab, 4);
+        assert_eq!(
+            play(&mut ui, vec![Character(b'2'), Character(b'5')]),
+            (4, devices)
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
     /// v7.7 ticket 176: 3 Agents lists each agent as installed when its binary is on a fake

@@ -40,17 +40,18 @@ MENU = "1–0".encode()
 
 
 def go(master, source, target):
-    """Open the target row by name: its tab's number key (which selects the tab's first row),
-    then Down until it, Enter only once it is highlighted; `source` is the highlighted row.
-    Flow commands would launch the real application, so no scenario may open them."""
+    """Open the target row by name: its tab's number key, then Down until it is highlighted
+    (v7.7 ticket 177: a tab opens on the row it was left on, so the row is found by name, not
+    counted from the first), then Enter; `source` is the highlighted row. Flow commands would
+    launch the real application, so no scenario may open them."""
     assert target != "Start or repair Wispr Flow", target
-    if source != target:  # otherwise it is already highlighted, and an unchanged row isn't redrawn
-        name = LIVE.get("Run" if target == "Pause" else target, target)
-        key, rows = next((key, rows) for key, rows in TABS.items() if name in rows)
-        os.write(master, key + b"\x1b[B" * rows.index(name))
-        visible = "Start Wispr Flow with V" if target == "Start Wispr Flow with VibeConsole" else LIVE.get(target, target)
-        read_until(master, b"> " + visible.encode())
-    os.write(master, b"\r")
+    if source == target:  # already highlighted, and an unchanged row isn't redrawn
+        os.write(master, b"\r")
+        return
+    name = LIVE.get("Run" if target == "Pause" else target, target)
+    key = next(key for key, rows in TABS.items() if name in rows)
+    os.write(master, key)
+    pick(master, "Start Wispr Flow with V" if target == "Start Wispr Flow with VibeConsole" else LIVE.get(target, target))
 
 
 def signal_app(child, number):
