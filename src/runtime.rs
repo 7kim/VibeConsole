@@ -908,6 +908,23 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                 ),
                 Err(e) => println!("{e}"),
             }
+            // v7.7 ticket 189: the Razer speakers and mousepad, opened only, nothing sent: each
+            // device and the effects it can show.
+            let accessory = std::path::Path::new(crate::keyboard::RAZER_ACCESSORY);
+            for (_, label, model) in crate::status::ACCESSORIES {
+                match crate::keyboard::RgbKeyboards::open_accessory(
+                    accessory,
+                    crate::status::Rgb::Spectrum,
+                    label,
+                    model,
+                ) {
+                    Ok(rgb) => println!(
+                        "{label}: available ({}; its brightness is left as it is)",
+                        rgb.abilities().join("; ")
+                    ),
+                    Err(e) => println!("{e}"),
+                }
+            }
             match crate::recording::permissions() {
                 Ok(n) => {
                     println!("Physical-key recording: {n} readable keyboard(s); no events captured")

@@ -624,7 +624,25 @@ pub struct DevicePatterns {
     pub rgb: [Rgb; 4],
     pub rgb_rest: Rgb,
     pub rgb_brightness: u8,
+    /// v7.7 ticket 189 (config v34): the Razer speakers' and mousepad's RGB, in `ACCESSORIES`
+    /// order, each off until turned on. Their brightness is left alone (below).
+    pub accessories: [AccessoryRgb; 2],
 }
+/// v7.7 ticket 189: one Razer accessory's RGB: its switch, resting effect and effect per state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AccessoryRgb {
+    pub on: bool,
+    pub rest: Rgb,
+    pub effects: [Rgb; 4],
+}
+/// v7.7 ticket 189: the Razer accessories under OpenRazer's `razeraccessory` driver: the
+/// config word, the name shown, and what its `device_type` contains.
+/// ponytail: matched by model name (the user's Nommo Chroma and Firefly V2); add a
+/// Goliathus or Strider here when someone has one.
+pub const ACCESSORIES: [(&str, &str, &str); 2] = [
+    ("speakers-rgb", "Speakers RGB (Razer Nommo)", "Nommo"),
+    ("mousepad-rgb", "Mousepad RGB (Razer Firefly)", "Firefly"),
+];
 /// v7 ticket 128: an RGB backlight effect, through OpenRazer's `matrix_effect_*` files.
 /// Colours are `COLOURS` names.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -685,6 +703,11 @@ pub fn keyboard_rgb(states: &[&str], patterns: &DevicePatterns) -> Option<Rgb> {
     let busy = BUSY.iter().position(|s| states.contains(s))?;
     Some(patterns.rgb[busy])
 }
+/// v7.7 ticket 189: the same for a Razer accessory's own effects.
+pub fn accessory_rgb(states: &[&str], effects: &[Rgb; 4]) -> Option<Rgb> {
+    let busy = BUSY.iter().position(|s| states.contains(s))?;
+    Some(effects[busy])
+}
 /// The keyboard lights a pattern can use (v7 ticket 128): lock-key LEDs, then a Razer
 /// keyboard's M (macro) light through OpenRazer's driver.
 pub const KEY_LEDS: [&str; 4] = ["scroll", "caps", "num", "macro"];
@@ -721,6 +744,16 @@ impl Default for DevicePatterns {
             ],
             rgb_rest: Rgb::Spectrum,
             rgb_brightness: 255,
+            accessories: [AccessoryRgb {
+                on: false,
+                rest: Rgb::Spectrum,
+                effects: [
+                    Rgb::Static("red"),
+                    Rgb::Static("orange"),
+                    Rgb::Breath("blue"),
+                    Rgb::Static("green"),
+                ],
+            }; 2],
         }
     }
 }

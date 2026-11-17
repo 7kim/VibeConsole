@@ -677,15 +677,30 @@ pub struct RgbKeyboards {
     /// one shows at once.
     resting: Option<crate::status::Rgb>,
     pub rest: crate::status::Rgb,
+    /// v7.7 ticket 189: set when a write skipped a device that lacks the effect, for the
+    /// caller to show once.
+    pub unavailable: Option<String>,
 }
 struct RgbBoard {
     dir: std::path::PathBuf,
     name: String,
-    brightness: u8,
+    /// Its own brightness, read at the start; None: left alone (v7.7 ticket 189).
+    brightness: Option<u8>,
+    /// The effect files it has and can write.
+    can: Vec<&'static str>,
 }
-fn write_rgb(dir: &Path, effect: crate::status::Rgb) -> io::Result<()> {
+const EFFECT_FILES: [&str; 6] = [
+    "matrix_effect_none",
+    "matrix_effect_spectrum",
+    "matrix_effect_wave",
+    "matrix_effect_static",
+    "matrix_effect_breath",
+    "matrix_effect_reactive",
+];
+/// The effect file and the bytes OpenRazer's driver takes for an effect.
+fn rgb_write(effect: crate::status::Rgb) -> (&'static str, Vec<u8>) {
     use crate::status::{Rgb, rgb_bytes};
-    let (file, bytes) = match effect {
+    match effect {
         Rgb::Off => ("matrix_effect_none", b"1".to_vec()),
         Rgb::Spectrum => ("matrix_effect_spectrum", b"1".to_vec()),
         Rgb::Wave => ("matrix_effect_wave", b"1".to_vec()),
@@ -693,13 +708,48 @@ fn write_rgb(dir: &Path, effect: crate::status::Rgb) -> io::Result<()> {
         Rgb::Breath(c) => ("matrix_effect_breath", rgb_bytes(c).to_vec()),
         // Speed 2 of 1–4 (`razer_chroma_standard_matrix_effect_reactive` clamps it).
         Rgb::Reactive(c) => ("matrix_effect_reactive", [&[2][..], &rgb_bytes(c)].concat()),
-    };
-    std::fs::write(dir.join(file), bytes)
+    }
 }
+impl RgbBoard {
+    /// Ok(false): this device lacks the effect, so nothing is written.
+    fn write(&self, effect: crate::status::Rgb) -> io::Result<bool> {
+        let (file, bytes) = rgb_write(effect);
+        if !self.can.contains(&file) {
+            return Ok(false);
+        }
+        std::fs::write(self.dir.join(file), bytes)?;
+        Ok(true)
+    }
+}
+/// v7.7 ticket 189: OpenRazer's driver for speakers, mousepads and other accessories.
+pub const RAZER_ACCESSORY: &str = "/sys/bus/hid/drivers/razeraccessory";
 impl RgbKeyboards {
     /// Every keyboard under `driver` whose brightness can be read and whose effect files can
     /// be written. Nothing is sent until `show`.
     pub fn open(driver: &Path, rest: crate::status::Rgb) -> Result<Self> {
+        Self::open_with(driver, rest, None).map_err(|()| {
+            "RGB keyboard: unavailable: OpenRazer's razerkbd driver isn't loaded, or its matrix effect files aren't writable (VibeConsole never installs it)".into()
+        })
+    }
+    /// v7.7 ticket 189: the Razer accessories under `driver` whose `device_type` contains
+    /// `model` (`status::ACCESSORIES`). Their brightness is left alone: OpenRazer reads the
+    /// Nommo Chroma's from another LED than it writes (it reads 0), so writing it back would
+    /// turn them dark. An effect file a device lacks is never written.
+    pub fn open_accessory(
+        driver: &Path,
+        rest: crate::status::Rgb,
+        label: &str,
+        model: &str,
+    ) -> Result<Self> {
+        Self::open_with(driver, rest, Some(model)).map_err(|()| {
+            format!("{label}: unavailable: no Razer {model} under OpenRazer's razeraccessory driver, or its matrix effect files aren't writable (VibeConsole never installs it)").into()
+        })
+    }
+    fn open_with(
+        driver: &Path,
+        rest: crate::status::Rgb,
+        model: Option<&str>,
+    ) -> std::result::Result<Self, ()> {
         let mut dirs = std::fs::read_dir(driver)
             .map(|entries| entries.flatten().map(|e| e.path()).collect::<Vec<_>>())
             .unwrap_or_default();
@@ -713,61 +763,120 @@ impl RgbKeyboards {
         let boards = dirs
             .into_iter()
             .filter_map(|dir| {
-                let brightness = std::fs::read_to_string(dir.join("matrix_brightness"))
-                    .ok()?
-                    .trim()
-                    .parse()
-                    .ok()?;
-                let files = [
-                    "matrix_brightness",
-                    "matrix_effect_none",
-                    "matrix_effect_spectrum",
-                    "matrix_effect_wave",
-                    "matrix_effect_static",
-                    "matrix_effect_breath",
-                    "matrix_effect_reactive",
-                ];
-                if !files.iter().all(|f| writable(&dir, f)) {
-                    return None;
-                }
                 let name = std::fs::read_to_string(dir.join("device_type"))
                     .map(|t| t.trim().to_owned())
-                    .unwrap_or_else(|_| "Razer keyboard".into());
-                Some(RgbBoard {
+                    .ok();
+                let brightness = match model {
+                    Some(model) => {
+                        name.as_deref().filter(|n| n.contains(model))?;
+                        None
+                    }
+                    None => {
+                        let level = std::fs::read_to_string(dir.join("matrix_brightness"))
+                            .ok()?
+                            .trim()
+                            .parse()
+                            .ok()?;
+                        if !writable(&dir, "matrix_brightness") {
+                            return None;
+                        }
+                        Some(level)
+                    }
+                };
+                let can = EFFECT_FILES
+                    .into_iter()
+                    .filter(|f| writable(&dir, f))
+                    .collect::<Vec<_>>();
+                // A keyboard has them all (v7 ticket 128); an accessory at least `none`.
+                let enough = match model {
+                    None => can.len() == EFFECT_FILES.len(),
+                    Some(_) => can.contains(&"matrix_effect_none"),
+                };
+                enough.then(|| RgbBoard {
                     dir,
-                    name,
+                    name: name.unwrap_or_else(|| "Razer keyboard".into()),
                     brightness,
+                    can,
                 })
             })
             .collect::<Vec<_>>();
         if boards.is_empty() {
-            return Err("RGB keyboard: unavailable: OpenRazer's razerkbd driver isn't loaded, or its matrix effect files aren't writable (VibeConsole never installs it)".into());
+            return Err(());
         }
         Ok(Self {
             boards,
             shown: None,
             resting: None,
             rest,
+            unavailable: None,
         })
     }
     pub fn names(&self) -> Vec<&str> {
         self.boards.iter().map(|b| b.name.as_str()).collect()
     }
-    /// Show an effect at a brightness; nothing is sent when it already shows them. A keyboard
-    /// whose write fails (unplugged) is dropped; only when none is left is it an error.
+    /// v7.7 ticket 189: each device and the effects it can show, for `doctor`.
+    pub fn abilities(&self) -> Vec<String> {
+        self.boards
+            .iter()
+            .map(|b| {
+                let words = b
+                    .can
+                    .iter()
+                    .map(|f| match *f {
+                        "matrix_effect_none" => "off",
+                        f => f.trim_start_matches("matrix_effect_"),
+                    })
+                    .collect::<Vec<_>>();
+                format!("{}: {}", b.name, words.join(", "))
+            })
+            .collect()
+    }
+    /// Write `effect` to every device (with `brightness` first where it's ours to set). A
+    /// device that lacks it is skipped and named in `unavailable`; one whose write fails
+    /// (unplugged) is dropped, and only when none is left is it an error.
+    fn send(&mut self, effect: crate::status::Rgb, brightness: Option<u8>) -> io::Result<()> {
+        let mut failed = None;
+        let mut lacking = Vec::new();
+        self.boards.retain(|board| {
+            let level = brightness.filter(|_| board.brightness.is_some());
+            let sent = level
+                .map_or(Ok(()), |l| {
+                    std::fs::write(board.dir.join("matrix_brightness"), l.to_string())
+                })
+                .and_then(|()| board.write(effect))
+                .and_then(|written| {
+                    if !written {
+                        lacking.push(board.name.clone());
+                    }
+                    // The resting effect goes back with its own brightness.
+                    match (brightness, board.brightness) {
+                        (None, Some(own)) => {
+                            std::fs::write(board.dir.join("matrix_brightness"), own.to_string())
+                        }
+                        _ => Ok(()),
+                    }
+                });
+            sent.map_err(|e| failed = Some(e)).is_ok()
+        });
+        if !lacking.is_empty() {
+            self.unavailable = Some(format!(
+                "{} unavailable on {}: it has no {} effect",
+                crate::status::rgb_word(effect),
+                lacking.join(", "),
+                rgb_write(effect).0.trim_start_matches("matrix_effect_")
+            ));
+        }
+        match (failed, self.boards.is_empty()) {
+            (Some(error), true) => Err(error),
+            _ => Ok(()),
+        }
+    }
+    /// Show an effect at a brightness; nothing is sent when it already shows them.
     pub fn show(&mut self, effect: crate::status::Rgb, brightness: u8) -> io::Result<()> {
         if self.shown == Some((effect, brightness)) {
             return Ok(());
         }
-        let mut failed = None;
-        self.boards.retain(|board| {
-            let sent = std::fs::write(board.dir.join("matrix_brightness"), brightness.to_string())
-                .and_then(|()| write_rgb(&board.dir, effect));
-            sent.map_err(|e| failed = Some(e)).is_ok()
-        });
-        if let (Some(error), true) = (failed, self.boards.is_empty()) {
-            return Err(error);
-        }
+        self.send(effect, Some(brightness))?;
         self.shown = Some((effect, brightness));
         self.resting = None;
         Ok(())
@@ -779,22 +888,9 @@ impl RgbKeyboards {
         if self.shown.is_none() && self.resting == Some(self.rest) {
             return Ok(());
         }
-        let rest = self.rest;
-        let mut failed = None;
-        self.boards.retain(|board| {
-            let sent = write_rgb(&board.dir, rest).and_then(|()| {
-                std::fs::write(
-                    board.dir.join("matrix_brightness"),
-                    board.brightness.to_string(),
-                )
-            });
-            sent.map_err(|e| failed = Some(e)).is_ok()
-        });
-        if let (Some(error), true) = (failed, self.boards.is_empty()) {
-            return Err(error);
-        }
+        self.send(self.rest, None)?;
         self.shown = None;
-        self.resting = Some(rest);
+        self.resting = Some(self.rest);
         Ok(())
     }
     /// The resting effect and each keyboard's own brightness back, once something was shown
@@ -1907,6 +2003,88 @@ mod tests {
         drop(rgb);
         assert_eq!(read(&one, "matrix_effect_wave"), b"1");
         assert_eq!(read(&one, "matrix_brightness"), b"180");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// v7.7 ticket 189: the Nommo and the Firefly under fake `razeraccessory` files: each is
+    /// found by its model, written its own effect, never its brightness; the Nommo's missing
+    /// reactive is named unavailable and nothing is written for it; the resting effect goes
+    /// back on restore and on drop; a model that isn't there is named.
+    #[test]
+    fn razer_accessories_show_their_effects_skip_what_they_lack_and_rest() {
+        use crate::status::Rgb;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-acc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let device = |id: &str, name: &str, effects: &[&str]| {
+            let d = dir.join(id);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("device_type"), format!("{name}\n")).unwrap();
+            std::fs::write(d.join("matrix_brightness"), "0\n").unwrap();
+            for f in effects {
+                std::fs::write(d.join(format!("matrix_effect_{f}")), "").unwrap();
+            }
+            d
+        };
+        let all = ["none", "spectrum", "wave", "static", "breath", "reactive"];
+        let nommo = device("0003:1532:0517.000B", "Razer Nommo Chroma", &all[..5]);
+        let firefly = device("0003:1532:0C04.0001", "Razer Firefly V2", &all);
+        let read = |d: &Path, f: &str| std::fs::read(d.join(f)).unwrap();
+        let mut speakers =
+            RgbKeyboards::open_accessory(&dir, Rgb::Wave, "Speakers RGB", "Nommo").unwrap();
+        let mut pad =
+            RgbKeyboards::open_accessory(&dir, Rgb::Spectrum, "Mousepad RGB", "Firefly").unwrap();
+        assert_eq!(speakers.names(), ["Razer Nommo Chroma"]);
+        assert_eq!(pad.names(), ["Razer Firefly V2"]);
+        assert_eq!(
+            speakers.abilities(),
+            ["Razer Nommo Chroma: off, spectrum, wave, static, breath"]
+        );
+        speakers.show(Rgb::Static("white"), 90).unwrap();
+        pad.show(Rgb::Breath("blue"), 90).unwrap();
+        assert_eq!(read(&nommo, "matrix_effect_static"), [255, 255, 255]);
+        assert_eq!(read(&firefly, "matrix_effect_breath"), [0, 0, 255]);
+        assert!(
+            read(&firefly, "matrix_effect_static").is_empty(),
+            "its own effect"
+        );
+        assert_eq!(
+            read(&nommo, "matrix_brightness"),
+            b"0\n",
+            "brightness left alone"
+        );
+        assert_eq!(speakers.unavailable, None);
+        speakers.show(Rgb::Reactive("red"), 90).unwrap();
+        assert_eq!(
+            speakers.unavailable.take().as_deref(),
+            Some("reactive-red unavailable on Razer Nommo Chroma: it has no reactive effect")
+        );
+        assert!(
+            !nommo.join("matrix_effect_reactive").exists(),
+            "never written"
+        );
+        pad.show(Rgb::Reactive("red"), 90).unwrap();
+        assert_eq!(read(&firefly, "matrix_effect_reactive"), [2, 255, 0, 0]);
+        speakers.restore();
+        assert_eq!(
+            read(&nommo, "matrix_effect_wave"),
+            b"1",
+            "the resting effect"
+        );
+        drop(pad);
+        assert_eq!(
+            read(&firefly, "matrix_effect_spectrum"),
+            b"1",
+            "quit: resting"
+        );
+        assert_eq!(read(&firefly, "matrix_brightness"), b"0\n");
+        let error = RgbKeyboards::open_accessory(&dir, Rgb::Off, "Mousepad RGB", "Goliathus")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.starts_with("Mousepad RGB: unavailable: no Razer Goliathus"),
+            "{error}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

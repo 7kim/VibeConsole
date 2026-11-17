@@ -88,7 +88,7 @@ def preserved(before, after):
     # An old line `device kind channel id behaviour keys …` keeps its control and its keys.
     lines = [line.split(b"\t") for line in before.splitlines()[1:] if line.startswith(b"09e8:1049\t")]
     kept = all(b"\t".join(f[:4]) in after and b"\t" + f[4] + b"\t" + f[5] + b"\t" in after for f in lines)
-    return after.startswith(b"vibeconsole-mappings-v33\n") and b"\nseen-7.7\ton\n" in after and kept
+    return after.startswith(b"vibeconsole-mappings-v34\n") and b"\nseen-7.7\ton\n" in after and kept
 
 
 def read_until(master, token, seconds=3):
