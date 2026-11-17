@@ -2580,7 +2580,7 @@ fn device_lights_text(p: &crate::status::DevicePatterns) -> String {
         "keyboard-rgb\t{}\t{}\t{}\t{}\n",
         on(p.rgb_devices[0].on),
         crate::status::rgb_word(keyboard.rest),
-        p.rgb_brightness,
+        p.rgb_brightness[0], // the TSV holds one level (v7.7 ticket 209 keeps four in lights.json)
         words(keyboard)
     ));
     // v34 (v7.7 ticket 189): each Razer accessory's switch, resting effect, then the effect
@@ -2734,9 +2734,11 @@ fn parse_device_lights(
         };
         // v7.7 ticket 199: the keyboard's effects become the shared set.
         p.rgb_shared.rest = crate::status::parse_rgb(rest)?;
-        p.rgb_brightness = level
+        // v7.7 ticket 209: one level in the TSV, for every state.
+        p.rgb_brightness = [level
             .parse()
             .map_err(|_| format!("keyboard-rgb brightness must be 0–255, not {level}"))?;
+            4];
         for (slot, word) in p.rgb_shared.states.iter_mut().zip(effects) {
             *slot = crate::status::parse_rgb(word)?;
         }
@@ -4833,7 +4835,7 @@ mod tests {
             d.rgb_shared, shared,
             "the keyboard's effects are the shared set"
         );
-        assert_eq!(d.rgb_brightness, 90);
+        assert_eq!(d.rgb_brightness, [90; 4], "one TSV level for every state");
         assert!(d.rgb_devices.iter().all(|d| d.on));
         assert_eq!(d.rgb_devices[0].own, None);
         assert_eq!(

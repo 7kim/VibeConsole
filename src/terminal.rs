@@ -3923,11 +3923,9 @@ impl Terminal {
             // v7.7 ticket 188: idle while running is wanted too, for the resting effect.
             keyboard.filter(|_| running).map(|p| {
                 let set = p.rgb_set(0);
-                (
-                    crate::status::rgb_for(&states, &set),
-                    p.rgb_brightness,
-                    set.rest,
-                )
+                // v7.7 ticket 209: the most urgent state's own brightness.
+                let level = crate::status::busy_index(&states).map_or(0, |i| p.rgb_brightness[i]);
+                (crate::status::rgb_for(&states, &set), level, set.rest)
             }),
             |rest| RgbKeyboards::open(std::path::Path::new(crate::keyboard::RAZER), rest),
             "RGB keyboard",
@@ -8952,8 +8950,8 @@ enum RgbRow {
     Shared(Option<usize>),
     /// An RGB device's switch (`status::RGB_DEVICES` order).
     Switch(usize),
-    /// The keyboard's brightness while it shows a state.
-    Brightness,
+    /// The keyboard's brightness while it shows a state (`BUSY` order, ticket 209).
+    Brightness(usize),
     /// A device's Per device row: its own effects on or off.
     Own(usize),
     /// A device's own effect for a state, or (None) its own resting effect.
@@ -8985,13 +8983,17 @@ fn rgb_rows(d: &crate::status::DevicePatterns, names: &[&str; 4]) -> Vec<(String
         let device = d.rgb_devices[j];
         rows.push((format!("{label}: {}", on(device.on)), RgbRow::Switch(j)));
         if j == 0 {
-            rows.push((
-                format!(
-                    "Keyboard RGB brightness while it shows a state: {} of 255",
-                    d.rgb_brightness
-                ),
-                RgbRow::Brightness,
-            ));
+            // v7.7 ticket 209: one brightness per state; at rest the keyboard keeps its own.
+            for (i, name) in names.iter().enumerate() {
+                rows.push((
+                    format!(
+                        "Keyboard RGB brightness · {}: {} of 255 (while it shows; rest keeps yours)",
+                        short(name),
+                        d.rgb_brightness[i]
+                    ),
+                    RgbRow::Brightness(i),
+                ));
+            }
         }
         let name = short(label);
         let follows = match device.own {
@@ -9035,15 +9037,18 @@ fn rgb_row(
                 None => Some(d.rgb_shared),
             }
         }
-        RgbRow::Brightness => {
+        RgbRow::Brightness(i) => {
             if let Some(level) = number(
                 ui,
-                "Keyboard RGB brightness while it shows a state (0–255; yours comes back after)",
-                d.rgb_brightness.into(),
+                &format!(
+                    "Keyboard RGB brightness while it shows {} (0–255; at rest the keyboard keeps its own)",
+                    names[i].split(" (").next().unwrap_or(names[i])
+                ),
+                d.rgb_brightness[i].into(),
                 0,
                 255,
             )? {
-                d.rgb_brightness = u8::try_from(level)?;
+                d.rgb_brightness[i] = u8::try_from(level)?;
             }
         }
         RgbRow::Shared(state) => {
@@ -19299,7 +19304,7 @@ mod tests {
 
         // Two saves, a light then a mapping: the older History row puts both back.
         let mut light = both.clone();
-        light.device_lights.rgb_brightness = 100;
+        light.device_lights.rgb_brightness = [100; 4];
         mappings::save_config(&path, &light).unwrap();
         let mut mapping = light.clone();
         mapping.mappings[0].keys = vec!["F2".into()];
@@ -20200,7 +20205,7 @@ mod tests {
         );
         let mut patterns = crate::status::DevicePatterns::default();
         patterns.rgb_devices[0].on = true;
-        patterns.rgb_brightness = 120;
+        patterns.rgb_brightness = [120; 4];
         ui.device_lights = Some(patterns);
         ui.agent_states = vec![("claude".into(), "claude".into(), "needs-input")];
         ui.output = Some(crate::keyboard::Output::recording(&[]).unwrap());
@@ -20258,6 +20263,64 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7.7 ticket 209: each state shows at its own brightness (fake OpenRazer files); with
+    /// every agent and session idle, and on pause and quit, the keyboard's own comes back. The
+    /// user's report: `agent-status claude idle` left 30 because an outside Claude Code
+    /// session was still finished, the most urgent state, so finished's brightness stayed.
+    #[test]
+    fn keyboard_rgb_brightness_follows_each_state_and_rests_at_your_own() {
+        use crate::status::Rgb;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-rgb-levels-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let kbd = dir.join("razerkbd/0003:1532:021A.0001");
+        std::fs::create_dir_all(&kbd).unwrap();
+        std::fs::write(kbd.join("matrix_brightness"), "90\n").unwrap();
+        for f in ["none", "spectrum", "wave", "static", "breath", "reactive"] {
+            std::fs::write(kbd.join(format!("matrix_effect_{f}")), "").unwrap();
+        }
+        let level = || std::fs::read_to_string(kbd.join("matrix_brightness")).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        ui.rgb = Some(
+            crate::keyboard::RgbKeyboards::open(&dir.join("razerkbd"), Rgb::SPECTRUM).unwrap(),
+        );
+        let mut patterns = crate::status::DevicePatterns::default();
+        patterns.rgb_devices[0].on = true;
+        patterns.rgb_brightness = [200, 120, 60, 20];
+        ui.device_lights = Some(patterns);
+        ui.output = Some(crate::keyboard::Output::recording(&[]).unwrap());
+        ui.suspended = false;
+        ui.agent_states = vec![("claude".into(), "claude".into(), "idle")];
+        for (state, want) in crate::status::BUSY.iter().zip(["200", "120", "60", "20"]) {
+            ui.agent_states[0].2 = state;
+            ui.show_rgb();
+            assert_eq!(level(), want, "{state}");
+        }
+        ui.agent_states[0].2 = "idle";
+        ui.show_rgb();
+        assert_eq!(level(), "90", "every agent idle: your own brightness");
+        // The report: claude idle, an outside session still finished.
+        ui.light_sessions = vec![("/home/me/other".into(), "finished", 0)];
+        ui.show_rgb();
+        assert_eq!(level(), "20", "a session still finished keeps finished's");
+        ui.light_sessions[0].1 = "idle";
+        ui.show_rgb();
+        assert_eq!(level(), "90", "all idle again: yours");
+        ui.agent_states[0].2 = "thinking";
+        ui.show_rgb();
+        assert_eq!(level(), "60");
+        ui.suspend().unwrap();
+        assert_eq!(level(), "90", "pause: yours");
+        ui.suspended = false;
+        ui.show_rgb();
+        assert_eq!(level(), "60");
+        drop(ui);
+        assert_eq!(level(), "90", "quit: yours");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// v7.7 ticket 188 (seen by the user: a picked static white never showed): running and
     /// idle, the resting effect shows from the start, before any state did, with the
     /// keyboard's own brightness, once; a resting effect changed while idle shows at once;
@@ -20283,7 +20346,7 @@ mod tests {
         );
         let mut patterns = crate::status::DevicePatterns::default();
         patterns.rgb_devices[0].on = true;
-        patterns.rgb_brightness = 120;
+        patterns.rgb_brightness = [120; 4];
         patterns.rgb_shared.rest = Rgb::Static([255, 255, 255]);
         ui.device_lights = Some(patterns.clone());
         ui.agent_states = vec![("claude".into(), "claude".into(), "idle")];
@@ -22291,9 +22354,9 @@ mod tests {
         keys.push(Enter); // Hex code (#rrggbb)…
         keys.extend(typed("#12345g"));
         keys.extend(typed("#123456"));
-        keys.extend(vec![Down; 25]);
+        keys.extend(vec![Down; 28]); // past the four brightness rows (ticket 209)
         keys.push(Enter); // Keyboard RGB · Per device: follows all lights -> its own
-        keys.extend(vec![Down; 27]);
+        keys.extend(vec![Down; 30]);
         keys.push(Enter); // Keyboard RGB own · Needs input
         keys.extend([Down, Down, Down, Enter]); // reactive
         keys.extend([Down, Down, Down, Down, Enter]); // 4, long
@@ -22448,7 +22511,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mappings.tsv");
         mappings::save(&path, &[]).unwrap();
-        let mut keys = vec![Down; 30];
+        let mut keys = vec![Down; 33]; // past the four brightness rows (ticket 209)
         keys.push(Enter); // Mouse light: Off -> On
         keys.extend(vec![Down; 20]);
         keys.push(Enter); // RGB, all lights · Thinking: breath #0000ff
@@ -22457,9 +22520,9 @@ mod tests {
         keys.extend([Down, Down, Enter]); // sine
         keys.extend([Down, Down, Enter]); // 50 %
         keys.push(Enter); // blue
-        keys.extend(vec![Down; 31]);
+        keys.extend(vec![Down; 34]);
         keys.push(Enter); // Mouse light · Per device -> its own
-        keys.extend(vec![Down; 32]);
+        keys.extend(vec![Down; 35]);
         keys.extend([Enter, Escape]); // Mouse light own · Needs a decision -> back
         keys.push(Escape);
         let mut ui = Script {

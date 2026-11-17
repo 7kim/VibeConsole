@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "status_lights": true,
   "folders": [],
   "other": {
@@ -103,7 +103,12 @@
   "keyboard_rgb": {
     "on": false,
     "own": null,
-    "brightness": 255
+    "brightness": {
+      "needs-decision": 255,
+      "needs-input": 255,
+      "thinking": 255,
+      "finished": 255
+    }
   },
   "speakers_rgb": {
     "on": false,

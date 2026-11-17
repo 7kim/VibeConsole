@@ -624,8 +624,9 @@ pub struct DevicePatterns {
     pub rgb_shared: RgbSet,
     pub rgb_devices: [RgbDevice; 4],
     /// v7 ticket 128: the Razer keyboard's brightness while it shows a state (its own comes
-    /// back after). The accessories' and the mouse's brightness are left alone (ticket 189).
-    pub rgb_brightness: u8,
+    /// back after). v7.7 ticket 209: one per state, in `BUSY` order. The accessories' and the
+    /// mouse's brightness are left alone (ticket 189).
+    pub rgb_brightness: [u8; 4],
 }
 /// v7.7 ticket 199: an effect per busy state (`BUSY` order) and the resting effect shown
 /// when idle, paused and after quit. The G502 logo rests on its own stored lighting instead.
@@ -986,8 +987,11 @@ pub fn rgb_bytes(colour: &str) -> [u8; 3] {
 /// v7 ticket 128: the RGB effect for these source states: the most urgent busy state's.
 /// None when nothing is busy (the resting effect then shows).
 pub fn rgb_for(states: &[&str], set: &RgbSet) -> Option<Rgb> {
-    let busy = BUSY.iter().position(|s| states.contains(s))?;
-    Some(set.states[busy])
+    Some(set.states[busy_index(states)?])
+}
+/// The most urgent busy state among `states`, as its place in `BUSY`; None when all idle.
+pub fn busy_index(states: &[&str]) -> Option<usize> {
+    BUSY.iter().position(|s| states.contains(s))
 }
 /// The keyboard lights a pattern can use (v7 ticket 128): lock-key LEDs, then a Razer
 /// keyboard's M (macro) light through OpenRazer's driver.

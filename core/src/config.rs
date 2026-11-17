@@ -11,6 +11,9 @@ use std::path::{Path, PathBuf};
 
 /// Every file's format version.
 pub const VERSION: u64 = 1;
+/// v7.7 ticket 209: lights.json's own version: 2 holds the keyboard RGB brightness per
+/// state; a version 1 file's single brightness loads into all four.
+pub const LIGHTS_VERSION: u64 = 2;
 /// The files, in the order they are applied: each one's references (variables, MIDI
 /// devices, idle settings) are in place before it is checked.
 pub const FILES: [&str; 5] = [
@@ -298,7 +301,11 @@ pub fn text(file: &str, config: &Config) -> Result<String> {
 }
 
 fn apply(file: &str, value: &Value, config: &mut Config) -> Result<()> {
-    let at = Obj::top(value)?;
+    let at = if file == "lights.json" {
+        Obj::top_of(value, LIGHTS_VERSION)?
+    } else {
+        Obj::top(value)?
+    };
     match file {
         "settings.json" => apply_settings(&at, config),
         "devices.json" => apply_devices(&at, config),
@@ -325,14 +332,19 @@ struct Obj<'a> {
 }
 impl<'a> Obj<'a> {
     fn top(value: &'a Value) -> Result<Self> {
+        Self::top_of(value, VERSION)
+    }
+    /// A file whose versions 1 to `newest` all load (older ones with safe defaults).
+    fn top_of(value: &'a Value, newest: u64) -> Result<Self> {
         let obj = Self::new(value, "")?;
         match obj.map.get("version").and_then(Value::as_u64) {
-            Some(VERSION) => Ok(obj),
-            Some(n) if n > VERSION => Err(format!(
-                "field `version`: {n} is from a newer VibeConsole (this one reads {VERSION})"
+            Some(n) if (1..=newest).contains(&n) => Ok(obj),
+            Some(n) if n > newest => Err(format!(
+                "field `version`: {n} is from a newer VibeConsole (this one reads {newest})"
             )
             .into()),
-            _ => Err(format!("field `version`: must be {VERSION}").into()),
+            _ if newest == 1 => Err("field `version`: must be 1".into()),
+            _ => Err(format!("field `version`: must be 1 to {newest}").into()),
         }
     }
     fn new(value: &'a Value, at: &str) -> Result<Self> {
@@ -958,7 +970,7 @@ pub fn shipped_lights() -> &'static Lights {
     SHIPPED.get_or_init(|| {
         let value = serde_json::from_str(include_str!("../defaults/lights.json"))
             .expect("shipped lights.json is JSON (checked by a test)");
-        Obj::top(&value)
+        Obj::top_of(&value, LIGHTS_VERSION)
             .and_then(|at| Lights::read(&at))
             .expect("shipped lights.json is valid (checked by a test)")
     })
@@ -1013,12 +1025,12 @@ fn lights(config: &Config) -> Value {
         let own = d.rgb_devices[i].own.as_ref().map(set);
         let mut out = json!({"on": d.rgb_devices[i].on, "own": own});
         if i == 0 {
-            out["brightness"] = json!(d.rgb_brightness);
+            out["brightness"] = by_state(d.rgb_brightness.map(|b| json!(b)).to_vec());
         }
         out
     };
     json!({
-        "version": VERSION,
+        "version": LIGHTS_VERSION,
         "status_lights": config.status_lights,
         "folders": config.light_folders.iter()
             .map(|(folder, octave)| json!({"folder": folder, "octave": octave}))
@@ -1134,7 +1146,7 @@ impl Lights {
             on: false,
             own: None,
         }; 4];
-        let mut rgb_brightness = 0;
+        let mut rgb_brightness = [0; 4];
         for (i, (slot, (key, ..))) in rgb_devices
             .iter_mut()
             .zip(crate::status::RGB_DEVICES)
@@ -1147,7 +1159,17 @@ impl Lights {
                 &["on", "own"]
             })?;
             if i == 0 {
-                rgb_brightness = d.int("brightness")?;
+                // v7.7 ticket 209: one per state; version 1 held one for all four.
+                rgb_brightness = if at.int::<u64>("version")? == 1 {
+                    [d.int("brightness")?; 4]
+                } else {
+                    let levels = d.states("brightness")?;
+                    let mut out = [0; 4];
+                    for (slot, state) in out.iter_mut().zip(BUSY) {
+                        *slot = levels.int(state)?;
+                    }
+                    out
+                };
             }
             let own = match d.get("own")? {
                 Value::Null => None,
@@ -1395,7 +1417,7 @@ mod tests {
                 Rgb::BreathTwo([1, 2, 3], [250, 251, 252]),
             ],
         };
-        d.rgb_brightness = 128;
+        d.rgb_brightness = [200, 120, 60, 20];
         for device in &mut d.rgb_devices {
             device.on = true;
         }
@@ -1432,8 +1454,8 @@ mod tests {
                 "xbox",
             ),
             (
-                good.replace("\"brightness\": 128", "\"brightness\": 300"),
-                "keyboard_rgb.brightness",
+                good.replace("\"needs-decision\": 200", "\"needs-decision\": 300"),
+                "keyboard_rgb.brightness.needs-decision",
             ),
             (good.replace("\"slow\": 33", "\"slow\": 0"), "mpk.tempos"),
             (good.replace("\"octave\": -3", "\"octave\": 7"), "folders"),
@@ -1451,6 +1473,23 @@ mod tests {
             );
             assert_eq!(fs::read_to_string(&file).unwrap(), bad);
         }
+
+        // v7.7 ticket 209: a version 1 file's one keyboard brightness loads into all four
+        // states, and the next save writes version 2 with one per state.
+        let v1 = good.replace("\"version\": 2", "\"version\": 1");
+        let at = v1.find("\"brightness\": {").unwrap();
+        let end = at + v1[at..].find('}').unwrap() + 1;
+        let v1 = format!("{}\"brightness\": 77{}", &v1[..at], &v1[end..]);
+        fs::write(&file, &v1).unwrap();
+        let old = mappings::load_config(&path).unwrap();
+        assert_eq!(old.device_lights.rgb_brightness, [77; 4]);
+        mappings::save_config(&path, &old).unwrap();
+        let saved = fs::read_to_string(&file).unwrap();
+        assert!(
+            saved.contains("\"version\": 2") && saved.contains("\"thinking\": 77"),
+            "{saved}"
+        );
+        fs::write(&file, &good).unwrap();
 
         let v34 = mappings::serialize_config(&lit()).unwrap();
         for (name, tsv) in [("v34", v34.as_str()), ("v15", OLDER)] {
@@ -1481,7 +1520,7 @@ mod tests {
             assert_eq!(text(file, &config).unwrap(), shipped, "{file}");
         }
         let value: Value = serde_json::from_str(include_str!("../defaults/lights.json")).unwrap();
-        let lights = Lights::read(&Obj::top(&value).unwrap()).unwrap();
+        let lights = Lights::read(&Obj::top_of(&value, LIGHTS_VERSION).unwrap()).unwrap();
         let config = Config::default();
         assert_eq!(config.device_lights, lights.devices);
         assert_eq!(config.light_patterns, lights.patterns);
@@ -1726,6 +1765,8 @@ mod tests {
         all.light_other_on = lights.light_other_on;
         all.light_patterns = lights.light_patterns;
         all.device_lights = lights.device_lights;
+        // The TSV holds one keyboard brightness for every state (ticket 209).
+        all.device_lights.rgb_brightness = [200; 4];
         all.look.theme = settings.look.theme;
         all.look.agent_cards = true;
         all.start_flow = false;
