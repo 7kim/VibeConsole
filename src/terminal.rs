@@ -1840,7 +1840,7 @@ impl Terminal {
                 None => "nothing to undo yet".into(),
             };
         }
-        if self.tab == 2 {
+        if self.tab == 2 || self.tab == 9 {
             self.skills_installed =
                 home_dir().is_some_and(|h| crate::runtime::skills_installed(&h));
         }
@@ -2229,6 +2229,75 @@ impl Terminal {
                     ("Theme · 14 themes · Enter picks one".into(), rows)
                 },
             ],
+            9 => {
+                // v7.7 ticket 167: the AI tab. The Ask list sends to the default agent; each
+                // reply is checked like an import and saved only on Save.
+                let agent = config.look.default_agent.as_str();
+                let profile = PROFILE + cap(config.profiles.len()) + 2;
+                let later = |text: &str| (vec![format!("  for {text}")], None);
+                let ask = vec![
+                    one(
+                        format!(
+                            "Ask {agent} for a profile… · an app's pads · same as Apps & profiles"
+                        ),
+                        Some(profile),
+                    ),
+                    later("mappings… · fills your empty Default buttons (not yet)"),
+                    later("setting up agents… · finds agent CLIs and project folders (not yet)"),
+                    later("mapping agents… · jump buttons, octave lights (not yet)"),
+                    later("a prompt… · asks what you need, then writes it (not yet)"),
+                    later("a prompt sequence… · from your skills and prompts (not yet)"),
+                    later("a preset… · a named whole setup (not yet)"),
+                    later("a whole setup… · \"I stream\", \"I code with Claude\" (not yet)"),
+                    later("an action family… · a named family of actions (not yet)"),
+                    later("about my setup… · read-only answers (not yet)"),
+                    later("how to improve VibeConsole… · ideas and plugins (not yet)"),
+                ];
+                let settings = vec![
+                    (
+                        vec![format!(
+                            "  Share usage counts with {agent} · {} · asked once; counts only, never text",
+                            on(config.look.share_usage)
+                        )],
+                        None,
+                    ),
+                    (
+                        vec![format!(
+                            "  Terminal commands from {agent} · never · add them yourself in /configure"
+                        )],
+                        None,
+                    ),
+                    (
+                        vec![format!(
+                            "  VibeConsole skills · {} · 3 Agents › Install /skills makes replies better",
+                            if self.skills_installed {
+                                "installed"
+                            } else {
+                                "not installed"
+                            }
+                        )],
+                        None,
+                    ),
+                ];
+                vec![
+                    (
+                        format!(
+                            "Ask {agent} · its own login, 3 min max; change the agent in 3 Agents · nothing is saved until you press Save"
+                        ),
+                        ask,
+                    ),
+                    (
+                        "AI Recommendations · from your usage counts and mappings".into(),
+                        vec![(
+                            vec![format!(
+                                "  None yet: they need Share usage counts with {agent} (asked once)"
+                            )],
+                            None,
+                        )],
+                    ),
+                    ("AI settings".into(), settings),
+                ]
+            }
             8 if !self.insights.is_empty() => (self.insights.iter())
                 .map(|(title, rows)| {
                     let rows = rows.iter().map(|row| (vec![row.clone()], None)).collect();
@@ -6456,7 +6525,7 @@ fn profile_choice(ui: &mut impl Ui, path: &Path, choice: usize) -> Result<()> {
         Some(profile) => profile_menu(ui, path, &profile.name),
         None if choice == config.profiles.len() => new_profile(ui, path),
         None if choice == config.profiles.len() + 1 => import_profile_file(ui, path),
-        None => ai_profile(ui, path),
+        None => ask_for(ui, path, AskKind::Profile),
     };
     if let Err(error) = result {
         not_saved(ui, &error)?;
@@ -6705,6 +6774,18 @@ fn pick_devices(
             Some(Key::Escape) => return Ok(None),
             _ => {}
         }
+    }
+}
+/// v7.7 ticket 167: what the AI tab can ask the default agent for. One path: gather the
+/// input, build the request, ask, check the reply in full like an import, review it in plain
+/// words with what was sent, Save or Cancel. Kinds arrive with their tickets (168–170).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum AskKind {
+    Profile,
+}
+fn ask_for(ui: &mut impl Ui, path: &Path, kind: AskKind) -> Result<()> {
+    match kind {
+        AskKind::Profile => ai_profile(ui, path),
     }
 }
 fn ai_profile(ui: &mut impl Ui, path: &Path) -> Result<()> {
@@ -12830,6 +12911,35 @@ mod tests {
             mappings::xbox_program_name(&mappings::load_config(&path).unwrap(), 1),
             "Browser"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 167: the AI tab names the default agent and its Ask for a profile opens
+    /// the same flow as Apps & profiles' (one ask path, whose tests cover both entries); the
+    /// kinds that aren't built yet are listed but open nothing.
+    #[test]
+    fn ai_tab_asks_the_default_agent_through_the_profile_path() {
+        let (dir, mut ui, _ran, _) = configure_session("ai-tab");
+        ui.read_view(None);
+        let opens = |ui: &Terminal, tab: usize, text: &str| {
+            (ui.tab_panes(tab, 100, usize::MAX).into_iter())
+                .flat_map(|(_, entries)| entries)
+                .find(|(lines, _)| lines[0].contains(text))
+                .unwrap_or_else(|| panic!("{text} on tab {tab}"))
+                .1
+        };
+        let ai = opens(&ui, 9, "Ask Claude Code for a profile…");
+        assert!(ai.is_some());
+        assert_eq!(ai, opens(&ui, 5, "Ask Claude for a profile…"));
+        assert_eq!(opens(&ui, 9, "for mappings…"), None, "not built yet");
+        let titles = ui
+            .tab_panes(9, 100, usize::MAX)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect::<Vec<_>>();
+        assert!(titles[0].starts_with("Ask Claude Code ·"), "{titles:?}");
+        assert!(titles.iter().any(|t| t.starts_with("AI Recommendations")));
+        assert!(titles.iter().any(|t| t == "AI settings"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
