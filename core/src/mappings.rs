@@ -652,6 +652,9 @@ pub struct Look {
     pub seen_moved: bool,
     /// One of [`AGENT_NAMES`].
     pub default_agent: String,
+    /// v7.7 ticket 175: the model Ollama runs when it is the default agent (saved as
+    /// `default-agent Ollama <model>`); empty for every other agent.
+    pub agent_model: String,
     /// Why a saved value was replaced by its default while loading; never saved.
     pub notice: Option<String>,
 }
@@ -663,6 +666,7 @@ impl Default for Look {
             share_usage: false,
             seen_moved: true,
             default_agent: AGENT_NAMES[0].into(),
+            agent_model: String::new(),
             notice: None,
         }
     }
@@ -683,13 +687,17 @@ impl Look {
         if !AGENT_NAMES.contains(&self.default_agent.as_str()) {
             return Err(format!("unknown default agent {:?}", self.default_agent).into());
         }
+        if (self.default_agent == "Ollama") != valid_model(&self.agent_model) {
+            return Err("Ollama needs one model name, and only Ollama has one".into());
+        }
+        let agent = self.agent_label();
         let on = |b: bool| if b { "on" } else { "off" };
         let values = [
             self.theme.as_str(),
             on(self.share_usage),
             on(self.seen_moved),
             if self.agent_cards { "gallery" } else { "table" },
-            self.default_agent.as_str(),
+            agent.as_str(),
         ];
         Ok(Self::KEYS
             .iter()
@@ -737,8 +745,11 @@ impl Look {
             "gallery" => look.agent_cards = true,
             other => unknown.push(format!("agents-view {other:?} (using table)")),
         }
-        if AGENT_NAMES.contains(&agent) {
+        if AGENT_NAMES.contains(&agent) && agent != "Ollama" {
             look.default_agent = agent.into();
+        } else if let Some(model) = agent.strip_prefix("Ollama ").filter(|m| valid_model(m)) {
+            look.default_agent = "Ollama".into();
+            look.agent_model = model.into();
         } else {
             unknown.push(format!(
                 "default-agent {agent:?} (using {})",
@@ -750,6 +761,81 @@ impl Look {
         }
         Ok(look)
     }
+}
+impl Look {
+    /// The default agent as the screen names it: "Claude Code", or "Ollama llama3.2".
+    pub fn agent_label(&self) -> String {
+        if self.agent_model.is_empty() {
+            self.default_agent.clone()
+        } else {
+            format!("{} {}", self.default_agent, self.agent_model)
+        }
+    }
+}
+/// v7.7 ticket 175: an Ollama model name (`llama3.2`, `qwen2.5-coder:7b`): one word of
+/// letters, digits, `.`, `_`, `:`, `/` and `-`, never an option.
+pub fn valid_model(model: &str) -> bool {
+    !model.is_empty()
+        && model.len() <= 64
+        && !model.starts_with('-')
+        && model
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._:/-".contains(&b))
+}
+/// v7.7 ticket 175: each agent the AI tab can ask: its name, its binary, and the arguments
+/// of its one-shot command before the request (None: not checked, so it can't be the
+/// default). Ollama's model goes after `run`.
+pub const AGENT_TABLE: [(&str, &str, Option<&[&str]>); 8] = [
+    ("Claude Code", "claude", Some(&["-p"])),
+    ("Codex", "codex", Some(&["exec"])),
+    ("OpenCode", "opencode", Some(&["run"])),
+    ("Oh My Pi", "omp", None),
+    ("Ollama", "ollama", Some(&["run"])),
+    ("Gemini CLI", "gemini", Some(&["-p"])),
+    ("Qwen Code", "qwen", Some(&["-p"])),
+    ("GitHub Copilot CLI", "copilot", Some(&["-p"])),
+];
+/// v7.7 ticket 175: the default agent's one-shot command for `request`: the binary, its
+/// fixed arguments (and Ollama's model), then the request as one argument.
+pub fn one_shot(look: &Look, request: &str) -> Result<Vec<String>> {
+    let (_, binary, args) = AGENT_TABLE
+        .iter()
+        .find(|(name, _, _)| *name == look.default_agent)
+        .ok_or("unknown default agent")?;
+    let args = args.ok_or_else(|| {
+        format!(
+            "{} has no checked one-shot command; pick another default agent in 3 Agents",
+            look.default_agent
+        )
+    })?;
+    let mut argv = vec![binary.to_string()];
+    argv.extend(args.iter().map(|a| a.to_string()));
+    if !look.agent_model.is_empty() {
+        argv.push(look.agent_model.clone());
+    }
+    argv.push(request.to_owned());
+    Ok(argv)
+}
+/// v7.7 ticket 175: the agent after `current` (in table order, wrapping) that is installed
+/// and has a one-shot command; `current` itself when there is none.
+pub fn next_default_agent(current: &str, installed: impl Fn(&str) -> bool) -> &'static str {
+    let at = AGENT_TABLE
+        .iter()
+        .position(|(n, _, _)| *n == current)
+        .unwrap_or(0);
+    (1..=AGENT_TABLE.len())
+        .map(|i| AGENT_TABLE[(at + i) % AGENT_TABLE.len()])
+        .find(|(_, binary, args)| args.is_some() && installed(binary))
+        .map_or(AGENT_TABLE[at].0, |(name, _, _)| name)
+}
+/// v7.7 ticket 168: an executable file named `name` in a `PATH` directory (looked up, never
+/// run).
+pub fn executable_on_path(path_var: &str, name: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(path_var).any(|dir| {
+        fs::metadata(dir.join(name))
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    })
 }
 /// A mapping's favourite key: its context and control, which stay the same when its
 /// action is edited.
@@ -1403,15 +1489,9 @@ pub const AGENT_CLIS: [&str; 10] = [
 ];
 /// v7.7 ticket 168: which of [`AGENT_CLIS`] are executable files in a `PATH` directory.
 pub fn clis_on_path(path_var: &str) -> Vec<String> {
-    use std::os::unix::fs::PermissionsExt;
     AGENT_CLIS
         .iter()
-        .filter(|name| {
-            std::env::split_paths(path_var).any(|dir| {
-                fs::metadata(dir.join(name))
-                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-            })
-        })
+        .filter(|name| executable_on_path(path_var, name))
         .map(|name| name.to_string())
         .collect()
 }
@@ -4247,6 +4327,7 @@ mod tests {
             share_usage: true,
             seen_moved: false,
             default_agent: "Codex".into(),
+            agent_model: String::new(),
             notice: None,
         };
         let text = serialize_config(&config).unwrap();
@@ -4262,10 +4343,28 @@ mod tests {
             let text = serialize_config(&config).unwrap();
             assert_eq!(parse_config(&text).unwrap().look.theme, theme);
         }
-        for agent in AGENT_NAMES {
-            config.look.default_agent = agent.into();
+        for agent in AGENT_NAMES.iter().filter(|a| **a != "Ollama") {
+            config.look.default_agent = agent.to_string();
             let text = serialize_config(&config).unwrap();
-            assert_eq!(parse_config(&text).unwrap().look.default_agent, agent);
+            assert_eq!(parse_config(&text).unwrap().look.default_agent, *agent);
+        }
+        // v7.7 ticket 175: Ollama carries its model; without one (or with an option for a
+        // model) it can't be saved, and such a line loads as Claude Code with a notice.
+        config.look.default_agent = "Ollama".into();
+        assert!(serialize_config(&config).is_err());
+        config.look.agent_model = "qwen2.5-coder:7b".into();
+        let text = serialize_config(&config).unwrap();
+        assert!(text.contains("\ndefault-agent\tOllama qwen2.5-coder:7b\n"));
+        assert_eq!(parse_config(&text).unwrap(), config);
+        for bad in ["Ollama", "Ollama --help", "Ollama a b"] {
+            let look = parse_config(&text.replace("Ollama qwen2.5-coder:7b", bad))
+                .unwrap()
+                .look;
+            assert_eq!(
+                (look.default_agent.as_str(), look.agent_model.as_str()),
+                ("Claude Code", "")
+            );
+            assert!(look.notice.unwrap().contains("default-agent"));
         }
 
         let bad = default
@@ -5288,6 +5387,46 @@ mod tests {
 
     /// v7 ticket 25: a preset brings back mappings, profiles and their devices; settings
     /// stay; a lock on a profile the preset lacks is dropped.
+    /// v7.7 ticket 175: the one-shot command is the binary, its fixed arguments (and
+    /// Ollama's model), then the request as one argument; cycling skips agents that aren't
+    /// installed or have no checked one-shot command (Oh My Pi).
+    #[test]
+    fn default_agent_one_shot_and_cycling() {
+        let mut look = Look::default();
+        let request = "a; rm -rf ~ \"quoted\"";
+        assert_eq!(one_shot(&look, request).unwrap(), ["claude", "-p", request]);
+        look.default_agent = "Codex".into();
+        assert_eq!(
+            one_shot(&look, request).unwrap(),
+            ["codex", "exec", request]
+        );
+        look.default_agent = "Ollama".into();
+        look.agent_model = "llama3.2".into();
+        assert_eq!(
+            one_shot(&look, request).unwrap(),
+            ["ollama", "run", "llama3.2", request]
+        );
+        look.default_agent = "Oh My Pi".into();
+        look.agent_model.clear();
+        assert!(one_shot(&look, request).is_err());
+        let installed = |have: &'static [&'static str]| move |b: &str| have.contains(&b);
+        assert_eq!(
+            next_default_agent("Claude Code", installed(&["claude", "omp", "gemini"])),
+            "Gemini CLI"
+        );
+        assert_eq!(
+            next_default_agent("Gemini CLI", installed(&["claude", "omp", "gemini"])),
+            "Claude Code"
+        );
+        assert_eq!(
+            next_default_agent("Claude Code", installed(&["claude"])),
+            "Claude Code"
+        );
+        assert_eq!(
+            next_default_agent("Claude Code", installed(&["omp"])),
+            "Claude Code"
+        );
+    }
     #[test]
     fn presets_bring_back_the_setup_and_keep_settings() {
         let pad = Control::from_note(10, 36).unwrap();

@@ -216,20 +216,14 @@ trait Ui {
         #[cfg(not(test))]
         crate::actions::show_program(window, dir, argv)
     }
-    fn ask_claude(&mut self, request: &str) -> Result<String> {
-        let output = std::process::Command::new("timeout")
-            .args(["180", "claude", "-p", request])
-            .stdin(std::process::Stdio::null())
-            .output()
-            .map_err(|e| format!("Claude CLI unavailable: {e}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "claude -p failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )
-            .into());
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    /// v7.7 ticket 175: the default agent's one-shot command (`mappings::one_shot`: its
+    /// binary, fixed arguments, then the request as one argument), 3 minutes at most, through
+    /// the injected runner: no shell. Tests answer with a fake reply.
+    fn ask_agent(&mut self, argv: &[String]) -> Result<String> {
+        let mut args = vec!["timeout", "180"];
+        args.extend(argv.iter().map(String::as_str));
+        self.run(&args)
+            .map_err(|e| format!("{} (the default agent): {e}", argv[0]).into())
     }
     /// The free-key helper's write (v7 ticket 19): backup first, then an atomic write.
     fn write_t3_key_file(&mut self, text: &str) -> Result<String> {
@@ -2015,6 +2009,13 @@ impl Terminal {
                                 .unwrap_or("not set (tmux default)")
                         ),
                         Some(SETTING),
+                    ),
+                    one(
+                        format!(
+                            "Default agent · {} · the AI tab asks it · Enter: next installed agent",
+                            config.look.agent_label()
+                        ),
+                        Some(DEFAULT_AGENT_SWITCH),
                     ),
                 ]);
                 vec![(
@@ -6884,6 +6885,12 @@ fn ask_for(ui: &mut impl Ui, path: &Path, kind: AskKind) -> Result<()> {
         AskKind::Recommendations => ask_recommendations(ui, path),
     }
 }
+/// v7.7 ticket 175: ask the default agent (3 Agents › Default agent) through its one-shot
+/// command. Whoever answers, the reply gets the same checks.
+fn ask(ui: &mut impl Ui, path: &Path, request: &str) -> Result<String> {
+    let look = mappings::load_config(path)?.look;
+    ui.ask_agent(&mappings::one_shot(&look, request)?)
+}
 /// v7.7 ticket 146: what the consent screen says leaves the computer.
 const SHARE_TEXT: &str = "AI Recommendations sends your usage counts to your default agent through your own login: how many times you pressed each control and how many times each action family fired, over the last 30 days, and what each mapped control does (its keys, or only the kind of action). Never prompt text, keys typed, folder paths or agent output. Asked once; turn it off again in 0 AI › AI settings.";
 /// v7.7 ticket 146: the counts a recommendations request may hold, and nothing else:
@@ -6959,7 +6966,7 @@ fn ask_recommendations(ui: &mut impl Ui, path: &Path) -> Result<()> {
                     mappings::mappings_summary(&mappings::load_config(path)?)
                 );
                 ui.draw("Asking your agent… this can take a minute.")?;
-                let text = ui.ask_claude(&request)?;
+                let text = ask(ui, path, &request)?;
                 std::fs::create_dir_all(&state)?;
                 crate::actions::write_atomic(&cache, &text)?;
                 reply = Some(text.clone());
@@ -7065,6 +7072,45 @@ fn review_recommendation(
     mappings::save_config(path, &config)?;
     Ok(true)
 }
+/// v7.7 ticket 175: 3 Agents › Default agent: Enter moves to the next agent that is on PATH
+/// and has a one-shot command (looked up, never run); Ollama asks for its model first, and
+/// Esc keeps the current agent.
+fn next_agent(ui: &mut impl Ui, path: &Path) -> Result<()> {
+    let mut config = mappings::load_config(path)?;
+    let (path_var, _, _) = ui.lookup_env();
+    let next = mappings::next_default_agent(&config.look.default_agent, |binary| {
+        mappings::executable_on_path(&path_var, binary)
+    });
+    if next == config.look.default_agent && next != "Ollama" {
+        choose(
+            ui,
+            &format!(
+                "No other installed agent has a one-shot command; {} stays the default. Install one in 3 Agents › Install agents.",
+                config.look.agent_label()
+            ),
+            &options(&["Back"]),
+        )?;
+        return Ok(());
+    }
+    let model = if next == "Ollama" {
+        let Some(model) = text_entry(ui, "Ollama model to ask (e.g. llama3.2)", "")? else {
+            return Ok(());
+        };
+        let model = model.trim().to_owned();
+        if !mappings::valid_model(&model) {
+            return Err(
+                "an Ollama model is one word of letters, digits, . _ : / and -; nothing saved"
+                    .into(),
+            );
+        }
+        model
+    } else {
+        String::new()
+    };
+    config.look.default_agent = next.into();
+    config.look.agent_model = model;
+    mappings::save_config(path, &config)
+}
 /// v7.7 ticket 146: the AI settings switch: sharing on or off (config v33 `ai-share-usage`).
 fn switch_share(path: &Path) -> Result<()> {
     let mut config = mappings::load_config(path)?;
@@ -7104,7 +7150,7 @@ fn ask_about(ui: &mut impl Ui, path: &Path) -> Result<()> {
         }
     );
     ui.draw("Asking your agent… this can take a minute.")?;
-    let reply = ui.ask_claude(&request)?;
+    let reply = ask(ui, path, &request)?;
     let answer = reply
         .split("```")
         .next()
@@ -7147,8 +7193,8 @@ fn ai_profile(ui: &mut impl Ui, path: &Path) -> Result<()> {
         .map(|(_, d)| d)
         .collect::<Vec<_>>();
     let request = mappings::profile_request(&app, &wish, &devices)?;
-    ui.draw("Asking Claude (claude -p)… this can take a minute.")?;
-    let reply = ui.ask_claude(&request)?;
+    ui.draw("Asking your agent… this can take a minute.")?;
+    let reply = ask(ui, path, &request)?;
     let text = mappings::profile_text_from_reply(&reply)
         .ok_or("Claude's reply has no profile in VibeConsole's format; nothing saved")?;
     review_profile(ui, path, config, &text, &devices).map(drop)
@@ -7219,7 +7265,7 @@ fn ask_mappings(ui: &mut impl Ui, path: &Path, kind: AskKind) -> Result<()> {
         mappings::mappings_request(&wish, &devices, &config)?
     };
     ui.draw("Asking your agent… this can take a minute.")?;
-    let reply = ui.ask_claude(&request)?;
+    let reply = ask(ui, path, &request)?;
     let refused = |e: Box<dyn std::error::Error>| format!("the reply: {e}; nothing saved");
     let new = mappings::mappings_from_reply(&reply, &config, &devices).map_err(refused)?;
     let octaves = if agents {
@@ -7325,7 +7371,7 @@ fn ask_setup_agents(ui: &mut impl Ui, path: &Path) -> Result<()> {
     let config = mappings::load_config(path)?;
     let request = mappings::setup_agents_request(&wish, &clis, &folders, &config);
     ui.draw("Asking your agent… this can take a minute.")?;
-    let reply = ui.ask_claude(&request)?;
+    let reply = ask(ui, path, &request)?;
     let (new, words) = mappings::agent_setup_from_reply(&reply, &clis, &folders, &config)
         .map_err(|e| format!("the reply: {e}; nothing saved"))?;
     if choose(
@@ -7360,9 +7406,13 @@ fn ask_prompt(ui: &mut impl Ui, path: &Path) -> Result<()> {
         return Ok(());
     }
     ui.draw("Asking your agent… this can take a minute.")?;
-    let reply = ui.ask_claude(&format!(
-        "You help write a prompt for a coding agent; VibeConsole sends it from a controller pad. The user wants: {wish}\n\nBefore writing it, ask up to three short questions whose answers you need, one per line, each starting with `Q:`. Reply with only the questions."
-    ))?;
+    let reply = ask(
+        ui,
+        path,
+        &format!(
+            "You help write a prompt for a coding agent; VibeConsole sends it from a controller pad. The user wants: {wish}\n\nBefore writing it, ask up to three short questions whose answers you need, one per line, each starting with `Q:`. Reply with only the questions."
+        ),
+    )?;
     let mut answers = String::new();
     for question in mappings::questions_from_reply(&reply) {
         let Some(answer) = text_entry(ui, &question, "")? else {
@@ -7374,9 +7424,13 @@ fn ask_prompt(ui: &mut impl Ui, path: &Path) -> Result<()> {
         );
     }
     ui.draw("Asking your agent… this can take a minute.")?;
-    let reply = ui.ask_claude(&format!(
-        "Write the prompt. The user wants: {wish}\n{answers}\nReply with only the prompt text: no code fences, nothing before or after it."
-    ))?;
+    let reply = ask(
+        ui,
+        path,
+        &format!(
+            "Write the prompt. The user wants: {wish}\n{answers}\nReply with only the prompt text: no code fences, nothing before or after it."
+        ),
+    )?;
     let body = reply
         .lines()
         .filter(|l| !l.trim_start().starts_with("```"))
@@ -7462,7 +7516,7 @@ fn ask_sequence(ui: &mut impl Ui, path: &Path) -> Result<()> {
         },
     );
     ui.draw("Asking your agent… this can take a minute.")?;
-    let reply = ui.ask_claude(&request)?;
+    let reply = ask(ui, path, &request)?;
     let (name, steps, new) = mappings::sequence_from_reply(&reply, &saved)
         .map_err(|e| format!("the reply: {e}; nothing saved"))?;
     let mut config = mappings::load_config(path)?;
@@ -7585,7 +7639,7 @@ fn ask_family(ui: &mut impl Ui, path: &Path) -> Result<()> {
         },
     );
     ui.draw("Asking your agent… this can take a minute.")?;
-    let reply = ui.ask_claude(&request)?;
+    let reply = ask(ui, path, &request)?;
     let refused = |e: Box<dyn std::error::Error>| format!("the reply: {e}; nothing saved");
     let text = mappings::profile_text_from_reply(&reply)
         .ok_or("the reply has no family in VibeConsole's format; nothing saved")?;
@@ -11574,6 +11628,8 @@ const ASK_SETUP: usize = 15 * ROWS;
 const ASK_FAMILY: usize = 16 * ROWS;
 /// v7.7 ticket 170: how to improve VibeConsole.
 const ASK_IMPROVE: usize = 17 * ROWS;
+/// v7.7 ticket 175: 3 Agents › Default agent.
+const DEFAULT_AGENT_SWITCH: usize = 18 * ROWS;
 /// Opens tab row `id` (`SETTING..`): one Settings row, or one row of the Agents, Prompts,
 /// Saved prompt sequences, App profiles or Xbox tuning lists, as those lists do.
 fn tab_row(ui: &mut impl Ui, path: &Path, id: usize) -> Result<()> {
@@ -11610,6 +11666,10 @@ fn tab_row(ui: &mut impl Ui, path: &Path, id: usize) -> Result<()> {
                 ok => ok,
             }
         }
+        DEFAULT_AGENT_SWITCH => match next_agent(ui, path) {
+            Err(error) => not_saved(ui, &error),
+            ok => ok,
+        },
         SHARE_SWITCH => match switch_share(path) {
             Err(error) => not_saved(ui, &error),
             ok => ok,
@@ -12481,6 +12541,8 @@ mod tests {
         replies: VecDeque<String>,
         /// Every request sent to Claude (v7 ticket 141).
         asked: Vec<String>,
+        /// v7.7 ticket 175: each ask's whole command, argument by argument.
+        agent_argv: Vec<Vec<String>>,
         /// The verified program, when a test needs its pad and knob table (v7 ticket 45).
         program: Option<(u8, crate::feedback::Payload)>,
         /// An Xbox controller is connected (v7 ticket 111).
@@ -12543,8 +12605,9 @@ mod tests {
             self.shown.push(shown);
             Ok("Command started in tmux window improve; terminal opened on session vibe".into())
         }
-        fn ask_claude(&mut self, request: &str) -> Result<String> {
-            self.asked.push(request.to_owned());
+        fn ask_agent(&mut self, argv: &[String]) -> Result<String> {
+            self.agent_argv.push(argv.to_vec());
+            self.asked.push(argv.last().cloned().unwrap_or_default());
             Ok(self
                 .replies
                 .pop_front()
@@ -13854,6 +13917,7 @@ mod tests {
                 ASK_SETUP,
                 ASK_FAMILY,
                 ASK_IMPROVE,
+                DEFAULT_AGENT_SWITCH,
             ])
             .chain((0..3).map(|n| PROFILE + n))
             .chain((0..12).map(|n| TUNING + n));
@@ -14130,6 +14194,68 @@ mod tests {
         let a =
             mappings::default_on(&config, mappings::GAMEPAD_CONTEXT, Control::button(0)).unwrap();
         assert_eq!(a.keys.join("+"), "Ctrl+T");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    /// v7.7 ticket 175: 3 Agents › Default agent cycles through agents on a fake PATH that
+    /// have a one-shot command (Oh My Pi is skipped; Ollama asks for its model); an Ask then
+    /// goes through that agent's command with the request as one argument.
+    #[test]
+    fn default_agent_cycles_installed_agents_and_asks_through_its_command() {
+        use Key::*;
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-default-agent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for name in ["claude", "omp", "codex", "ollama"] {
+            std::fs::write(bin.join(name), "").unwrap();
+            std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let switch = |keys: Vec<Key>| {
+            let mut ui = Script {
+                keys: keys.into(),
+                lookup: (bin.display().to_string(), None, None),
+                ..Default::default()
+            };
+            next_agent(&mut ui, &path).unwrap();
+            assert!(ui.keys.is_empty());
+            mappings::load_config(&path).unwrap().look.agent_label()
+        };
+        assert_eq!(
+            switch(vec![]),
+            "Codex",
+            "OpenCode isn't installed; Codex is next"
+        );
+        let mut keys = typed("llama3.2");
+        keys.push(Enter);
+        assert_eq!(
+            switch(keys),
+            "Ollama llama3.2",
+            "OpenCode and Oh My Pi skipped"
+        );
+        assert_eq!(switch(vec![]), "Claude Code", "back round to Claude Code");
+        // Esc at Ollama's model keeps the agent.
+        let mut config = mappings::load_config(&path).unwrap();
+        config.look.default_agent = "Codex".into();
+        mappings::save_config(&path, &config).unwrap();
+        assert_eq!(switch(vec![Escape]), "Codex");
+        // An Ask goes through Codex's one-shot, the request one argument.
+        let mut keys = typed("Why didn't Pad 6 fire?");
+        keys.extend([Enter, Enter]);
+        let mut ui = Script {
+            keys: keys.into(),
+            claude: "It isn't mapped.".into(),
+            ..Default::default()
+        };
+        ask_for(&mut ui, &path, AskKind::About).unwrap();
+        let argv = &ui.agent_argv[0];
+        assert_eq!(argv[..2], ["codex", "exec"]);
+        assert_eq!(argv.len(), 3);
+        assert!(argv[2].contains("Question: Why didn't Pad 6 fire?"));
         std::fs::remove_dir_all(dir).unwrap();
     }
     /// v7.7 ticket 168: Ask for mappings fills empty controls, asks before each replacement,
