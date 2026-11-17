@@ -4,7 +4,7 @@ Ponytail full, loaded by the session-start hook. If the session did not start wi
 
 ## Research first
 
-Before any stack, library, framework, SDK, API or CLI answer: fetch current docs with the `context7` MCP, matched to the version in `Cargo.lock`, then check news for the current month with the `firecrawl` MCP. Reply only from what you verified, and name the URLs. Firecrawl down → say so, use WebFetch.
+When an answer depends on how a library, framework, SDK, API or CLI behaves: read its docs in the `context7` MCP, matched to `Cargo.lock`. Use `firecrawl` only if context7 is missing or stale, or for recent changes (down → say so, use WebFetch). Reply only from what you verified, and name the URLs.
 
 ## Reply format
 
