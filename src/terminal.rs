@@ -371,6 +371,9 @@ struct Terminal {
     /// 3 Agents), and the PATH tests look in instead of the real one.
     agents_found: Vec<bool>,
     lookup_path: Option<String>,
+    /// v7.7 ticket 179: Start at login as the login service said when 8 System was drawn;
+    /// None when it couldn't be read.
+    login_on: Option<bool>,
     /// v7.7 ticket 160: the controller map shows Bank B / Layer 2 (the view only).
     map_bank_b: bool,
     map_layer2: bool,
@@ -1016,6 +1019,7 @@ impl Terminal {
             skills_installed: false,
             agents_found: Vec::new(),
             lookup_path: None,
+            login_on: None,
             map_bank_b: false,
             map_layer2: false,
             agent_since: BTreeMap::new(),
@@ -1876,6 +1880,10 @@ impl Terminal {
                 .map(|(_, binary, _)| mappings::executable_on_path(&path_var, binary))
                 .collect();
         }
+        if self.tab == 7 {
+            // v7.7 ticket 179: asked each time, never a saved copy (ticket 21).
+            self.login_on = self.login(crate::runtime::Login::Enabled).ok();
+        }
         self.agent_cards = config.look.agent_cards;
         crate::screen::set_theme(&config.look.theme); // v7.7 ticket 154
         self.view = Some(config);
@@ -2226,7 +2234,17 @@ impl Terminal {
                     "System · VibeConsole itself: login, Wispr Flow, variables".into(),
                     vec![
                         head("Login service"),
-                        one("Start at login".into(), Some(SETTING + 6)),
+                        one(
+                            format!(
+                                "Start at login · {}",
+                                match self.login_on {
+                                    Some(true) => "On",
+                                    Some(false) => "Off",
+                                    None => "unknown",
+                                }
+                            ),
+                            Some(SETTING + 6),
+                        ),
                         head("Wispr Flow"),
                         one(
                             format!(
@@ -5409,6 +5427,12 @@ impl Ui for Terminal {
             .is_some_and(|pad| !pad.connected().is_empty())
     }
     fn login(&mut self, request: crate::runtime::Login) -> Result<bool> {
+        // v7.7 ticket 179: a test asks the scripted login service, never systemctl.
+        #[cfg(test)]
+        if request == crate::runtime::Login::Enabled {
+            return (self.script.as_ref().and_then(|play| play.login))
+                .ok_or_else(|| "login service: not asked in tests".into());
+        }
         crate::runtime::login(request)
     }
     fn edit_file(&mut self, path: &Path) -> Result<()> {
@@ -14357,6 +14381,30 @@ mod tests {
         assert!(argv[2].contains("Question: Why didn't Pad 6 fire?"));
         std::fs::remove_dir_all(dir).unwrap();
     }
+    /// v7.7 ticket 179: 8 System's Start at login row shows what the login service says,
+    /// asked each time the tab is drawn, and "unknown" when it can't be read.
+    #[test]
+    fn start_at_login_row_shows_the_login_service_state() {
+        let (dir, mut ui, _ran, _) = configure_session("login-row");
+        let row = |ui: &mut Terminal, login: Option<bool>| {
+            ui.script = Some(Play {
+                login,
+                ..Play::default()
+            });
+            ui.tab = 7;
+            ui.read_view(None);
+            ui.script = None;
+            (ui.tab_panes(7, 120, usize::MAX).into_iter())
+                .flat_map(|(_, entries)| entries)
+                .map(|(lines, _)| lines[0].clone())
+                .find(|l| l.contains("Start at login"))
+                .unwrap()
+        };
+        assert!(row(&mut ui, Some(true)).ends_with("Start at login · On"));
+        assert!(row(&mut ui, Some(false)).ends_with("Start at login · Off"));
+        assert!(row(&mut ui, None).ends_with("Start at login · unknown"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     /// v7.7 ticket 177: coming back to a tab selects the row it was left on, whether Tab, ←
     /// or a number key switched; each tab keeps its own.
     #[test]
@@ -20773,6 +20821,8 @@ mod tests {
         screens: Vec<String>,
         /// Programs `Ui::run` was asked to start, never started.
         pub(super) ran: Vec<String>,
+        /// v7.7 ticket 179: whether the login service says Start at login is on.
+        pub(super) login: Option<bool>,
     }
     impl Terminal {
         pub(super) fn scripted_key(&mut self) -> Result<Option<Key>> {
