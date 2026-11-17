@@ -2250,7 +2250,12 @@ impl Terminal {
                     later("a preset… · a named whole setup (not yet)"),
                     later("a whole setup… · \"I stream\", \"I code with Claude\" (not yet)"),
                     later("an action family… · a named family of actions (not yet)"),
-                    later("about my setup… · read-only answers (not yet)"),
+                    one(
+                        format!(
+                            "Ask {agent} about my setup… · \"Why didn't Pad 6 fire?\" · read-only"
+                        ),
+                        Some(ASK_ABOUT),
+                    ),
                     later("how to improve VibeConsole… · ideas and plugins (not yet)"),
                 ];
                 let settings = vec![
@@ -6782,10 +6787,68 @@ fn pick_devices(
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum AskKind {
     Profile,
+    About,
 }
 fn ask_for(ui: &mut impl Ui, path: &Path, kind: AskKind) -> Result<()> {
     match kind {
         AskKind::Profile => ai_profile(ui, path),
+        AskKind::About => ask_about(ui, path),
+    }
+}
+/// v7.7 ticket 148: a free question about the setup ("Why didn't Pad 6 fire?"), answered in
+/// words from what `vibeconsole describe` and doctor's problems say (read-only). The answer
+/// changes nothing; a profile it proposes goes through the same review, saved only on Save.
+fn ask_about(ui: &mut impl Ui, path: &Path) -> Result<()> {
+    let Some(question) = text_entry(ui, "Ask about your setup (e.g. Why didn't Pad 6 fire?)", "")?
+    else {
+        return Ok(());
+    };
+    let question = question.trim().chars().take(500).collect::<String>();
+    if question.is_empty() {
+        return Ok(());
+    }
+    let config = mappings::load_config(path)?;
+    let describe = mappings::describe_text(&config, None, &[]);
+    let problems = crate::runtime::problems(
+        crate::runtime::uinput_state(),
+        crate::runtime::on_path,
+        true,
+        "",
+    )
+    .iter()
+    .map(|p| format!("- {}: {}", p.stage, p.message))
+    .collect::<Vec<_>>()
+    .join("\n");
+    let request = format!(
+        "You help with VibeConsole, which maps an Akai MPK mini and an Xbox controller to keys, prompts and apps. Answer the question in plain words, short, from the facts below only; say when they don't tell. Change nothing yourself. If a change would help, you may add one app profile in VibeConsole's format in a ``` block (overrides use the word shortcut; terminal commands and risky actions are not available).\n\nQuestion: {question}\n\nThe setup (vibeconsole describe):\n{describe}\nProblems doctor sees:\n{}\n",
+        if problems.is_empty() {
+            "none".to_string()
+        } else {
+            problems
+        }
+    );
+    ui.draw("Asking your agent… this can take a minute.")?;
+    let reply = ui.ask_claude(&request)?;
+    let answer = reply
+        .split("```")
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    let mut lines = crate::screen::wrap(&answer, ui.width().saturating_sub(6));
+    let proposal = mappings::profile_text_from_reply(&reply);
+    lines.push(String::new());
+    if proposal.is_some() {
+        lines.push("Review the change it proposes".into());
+    }
+    lines.push("Back".into());
+    let picked = choose(ui, "The answer · nothing was changed", &lines)?;
+    match (proposal, picked) {
+        (Some(text), Some(at)) if at + 2 == lines.len() => {
+            let devices = mappings::profile_devices(&config, ui.context(), ui.program().as_ref());
+            review_profile(ui, path, config, &text, &devices)
+        }
+        _ => Ok(()),
     }
 }
 fn ai_profile(ui: &mut impl Ui, path: &Path) -> Result<()> {
@@ -6795,7 +6858,7 @@ fn ai_profile(ui: &mut impl Ui, path: &Path) -> Result<()> {
     let Some(wish) = text_entry(ui, "What should the pads do in this app? (optional)", "")? else {
         return Ok(());
     };
-    let mut config = mappings::load_config(path)?;
+    let config = mappings::load_config(path)?;
     // v7 ticket 141: which devices the profile is for; Claude is given each one's controls.
     let all = mappings::profile_devices(&config, ui.context(), ui.program().as_ref());
     let Some(picked) = pick_devices(ui, &all)? else {
@@ -6812,16 +6875,28 @@ fn ai_profile(ui: &mut impl Ui, path: &Path) -> Result<()> {
     let reply = ui.ask_claude(&request)?;
     let text = mappings::profile_text_from_reply(&reply)
         .ok_or("Claude's reply has no profile in VibeConsole's format; nothing saved")?;
-    let mut profile = mappings::import_profile(&text, &config)
+    review_profile(ui, path, config, &text, &devices)
+}
+/// The one review every AI profile goes through (v7.7 tickets 147, 148, 167): checked in full
+/// like an import, against the devices' controls, never a command or a risky action, shown
+/// by device and in plain words; saved only on Save.
+fn review_profile(
+    ui: &mut impl Ui,
+    path: &Path,
+    mut config: mappings::Config,
+    text: &str,
+    devices: &[mappings::ProfileDevice],
+) -> Result<()> {
+    let mut profile = mappings::import_profile(text, &config)
         .map_err(|e| format!("Claude's profile: {e}; nothing saved"))?;
-    mappings::check_profile_controls(&mut profile, &devices)
+    mappings::check_profile_controls(&mut profile, devices)
         .map_err(|e| format!("Claude's profile: {e}; nothing saved"))?;
     // v7.7 ticket 147: never a terminal command or a risky action from Claude.
     mappings::refuse_risky(&profile.mappings)
         .map_err(|e| format!("Claude's profile: {e}; nothing saved"))?;
     // By device, every control by its name, then the whole thing in plain words.
     let mut summary = String::new();
-    for device in &devices {
+    for device in devices {
         let rows = profile
             .mappings
             .iter()
@@ -10614,6 +10689,8 @@ const PROMPT: usize = 2 * ROWS;
 const SEQUENCE: usize = 3 * ROWS;
 const PROFILE: usize = 4 * ROWS;
 const TUNING: usize = 5 * ROWS;
+/// v7.7 ticket 148: the AI tab's "about my setup" row.
+const ASK_ABOUT: usize = 6 * ROWS;
 /// Opens tab row `id` (`SETTING..`): one Settings row, or one row of the Agents, Prompts,
 /// Saved prompt sequences, App profiles or Xbox tuning lists, as those lists do.
 fn tab_row(ui: &mut impl Ui, path: &Path, id: usize) -> Result<()> {
@@ -10624,6 +10701,10 @@ fn tab_row(ui: &mut impl Ui, path: &Path, id: usize) -> Result<()> {
         PROMPT => prompt_choice(ui, path, row),
         SEQUENCE => sequence_choice(ui, path, row),
         PROFILE => profile_choice(ui, path, row),
+        ASK_ABOUT => match ask_for(ui, path, AskKind::About) {
+            Err(error) => not_saved(ui, &error),
+            ok => ok,
+        },
         _ => match tuning_choice(ui, path, row) {
             Err(error) => not_saved(ui, &error),
             ok => ok,
@@ -11531,7 +11612,6 @@ mod tests {
             Ok(self.t3.clone())
         }
         fn ask_claude(&mut self, request: &str) -> Result<String> {
-            assert!(request.contains("vibeconsole-profile-v1"));
             self.asked.push(request.to_owned());
             Ok(self.claude.clone())
         }
@@ -12824,7 +12904,7 @@ mod tests {
             .len();
         let lists = (0..agents + 4)
             .map(|n| AGENT + n)
-            .chain([PROMPT, SEQUENCE])
+            .chain([PROMPT, SEQUENCE, ASK_ABOUT])
             .chain((0..3).map(|n| PROFILE + n))
             .chain((0..12).map(|n| TUNING + n));
         let mut expected = commands
@@ -12913,6 +12993,76 @@ mod tests {
         assert_eq!(
             mappings::xbox_program_name(&mappings::load_config(&path).unwrap(), 1),
             "Browser"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 148: a question goes to the agent with what `describe` says; the answer is
+    /// shown and nothing is saved; a proposed profile goes through the review and Cancel
+    /// saves nothing.
+    #[test]
+    fn ask_about_my_setup_answers_and_saves_nothing() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-about-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut keys = typed("Why didn't Pad 6 fire?");
+        keys.extend([Enter, Up, Enter]); // ask; Back (last row)
+        let mut ui = Script {
+            keys: keys.into(),
+            claude: "Pad 6 has no mapping in Program 1, so it does nothing.".into(),
+            ..Default::default()
+        };
+        ask_for(&mut ui, &path, AskKind::About).unwrap();
+        assert!(ui.asked[0].contains("Question: Why didn't Pad 6 fire?"));
+        assert!(
+            ui.asked[0].contains("VibeConsole: what each device has"),
+            "describe sent"
+        );
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains("nothing was changed") && s.contains("Pad 6 has no mapping"))
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        // A proposed change: reviewed, then Cancel.
+        let pad = Control::from_note(10, 36).unwrap();
+        let profile = mappings::Profile {
+            name: "Firefox".into(),
+            apps: vec!["firefox.desktop".into()],
+            mappings: vec![Mapping::new(pad, "Ctrl+T", "hold").unwrap()],
+        };
+        let reply = format!(
+            "Add a profile:\n```\n{}```\n",
+            mappings::export_profile(&profile).unwrap()
+        );
+        let mut keys = typed("Make Pad 1 open a tab in Firefox");
+        keys.extend([Enter, Up, Up, Enter, Enter]); // ask; Review; Cancel
+        let mut ui = Script {
+            keys: keys.into(),
+            claude: reply,
+            ..Default::default()
+        };
+        ask_for(&mut ui, &path, AskKind::About).unwrap();
+        assert!(ui.keys.is_empty());
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains("Review the change it proposes"))
+        );
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.starts_with("Claude suggests profile Firefox"))
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "Cancel saves nothing"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
