@@ -367,6 +367,10 @@ struct Terminal {
     problems_at: Option<Instant>,
     /// v7.7 ticket 158: every VibeConsole skill is in `~/.claude/skills` (read on 3 Agents).
     skills_installed: bool,
+    /// v7.7 ticket 176: which of `mappings::AGENT_TABLE`'s binaries are on PATH (read on
+    /// 3 Agents), and the PATH tests look in instead of the real one.
+    agents_found: Vec<bool>,
+    lookup_path: Option<String>,
     /// v7.7 ticket 160: the controller map shows Bank B / Layer 2 (the view only).
     map_bank_b: bool,
     map_layer2: bool,
@@ -1008,6 +1012,8 @@ impl Terminal {
             problems: Vec::new(),
             problems_at: None,
             skills_installed: false,
+            agents_found: Vec::new(),
+            lookup_path: None,
             map_bank_b: false,
             map_layer2: false,
             agent_since: BTreeMap::new(),
@@ -1861,6 +1867,11 @@ impl Terminal {
         if self.tab == 2 || self.tab == 9 {
             self.skills_installed =
                 home_dir().is_some_and(|h| crate::runtime::skills_installed(&h));
+            let path_var = self.lookup_env().0;
+            self.agents_found = mappings::AGENT_TABLE
+                .iter()
+                .map(|(_, binary, _)| mappings::executable_on_path(&path_var, binary))
+                .collect();
         }
         self.agent_cards = config.look.agent_cards;
         crate::screen::set_theme(&config.look.theme); // v7.7 ticket 154
@@ -2017,7 +2028,26 @@ impl Terminal {
                         ),
                         Some(DEFAULT_AGENT_SWITCH),
                     ),
+                    head("Install agents · found on PATH or not"),
                 ]);
+                // v7.7 ticket 176: each agent found on PATH, or its fixed install command.
+                for (i, (name, binary, _)) in mappings::AGENT_TABLE.iter().enumerate() {
+                    rows.push(if self.agents_found.get(i) == Some(&true) {
+                        (
+                            vec![format!("✓ {name} · installed ({binary} on PATH)")],
+                            None,
+                        )
+                    } else {
+                        one(
+                            format!("+ {name} · {}", mappings::AGENT_INSTALL[i]),
+                            Some(INSTALL_AGENT + i),
+                        )
+                    });
+                }
+                rows.push((
+                    vec!["  Others… · added as plugins later (v7.9 note)".into()],
+                    None,
+                ));
                 vec![(
                     "Agents · who runs where, what the lights show, how agents report".into(),
                     rows,
@@ -5337,6 +5367,15 @@ impl Ui for Terminal {
     fn usage_dir(&self) -> Option<PathBuf> {
         self.usage_dir.clone()
     }
+    fn lookup_env(&self) -> (String, Option<PathBuf>, Option<PathBuf>) {
+        (
+            self.lookup_path
+                .clone()
+                .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default()),
+            home_dir(),
+            std::env::current_dir().ok(),
+        )
+    }
     fn xbox_program(&self) -> u8 {
         self.xbox_program
     }
@@ -7071,6 +7110,46 @@ fn review_recommendation(
     }
     mappings::save_config(path, &config)?;
     Ok(true)
+}
+/// v7.7 ticket 176: install a missing agent: asks first, showing the fixed command, then runs
+/// it in a visible terminal (the user sees every line and answers any password prompt).
+/// PATH is looked at again the next time 3 Agents is drawn.
+fn install_agent(ui: &mut impl Ui, index: usize) -> Result<()> {
+    let (name, binary, _) = *mappings::AGENT_TABLE.get(index).ok_or("no such agent")?;
+    let install = mappings::AGENT_INSTALL[index];
+    let (path_var, home, _) = ui.lookup_env();
+    if mappings::executable_on_path(&path_var, binary) {
+        choose(
+            ui,
+            &format!("{name} is installed ({binary} on PATH)."),
+            &options(&["Back"]),
+        )?;
+        return Ok(());
+    }
+    if choose(
+        ui,
+        &format!(
+            "Install {name}?\n\nThis runs in a visible terminal, where you see every line and answer any password prompt:\n  {install}"
+        ),
+        &options(&["Cancel", "Install in a terminal"]),
+    )? != Some(1)
+    {
+        return Ok(());
+    }
+    let dir = home.unwrap_or_else(|| PathBuf::from("/"));
+    let shown = ui.show_in_terminal(
+        &format!("install-{binary}"),
+        &dir.display().to_string(),
+        &["sh", "-c", install],
+    )?;
+    choose(
+        ui,
+        &format!(
+            "{shown}.\nWhen it finishes, 3 Agents shows {name} as installed if {binary} is on PATH."
+        ),
+        &options(&["Back"]),
+    )?;
+    Ok(())
 }
 /// v7.7 ticket 175: 3 Agents › Default agent: Enter moves to the next agent that is on PATH
 /// and has a one-shot command (looked up, never run); Ollama asks for its model first, and
@@ -11630,6 +11709,8 @@ const ASK_FAMILY: usize = 16 * ROWS;
 const ASK_IMPROVE: usize = 17 * ROWS;
 /// v7.7 ticket 175: 3 Agents › Default agent.
 const DEFAULT_AGENT_SWITCH: usize = 18 * ROWS;
+/// v7.7 ticket 176: 3 Agents › Install agents, one row per `mappings::AGENT_TABLE` entry.
+const INSTALL_AGENT: usize = 19 * ROWS;
 /// Opens tab row `id` (`SETTING..`): one Settings row, or one row of the Agents, Prompts,
 /// Saved prompt sequences, App profiles or Xbox tuning lists, as those lists do.
 fn tab_row(ui: &mut impl Ui, path: &Path, id: usize) -> Result<()> {
@@ -11666,6 +11747,10 @@ fn tab_row(ui: &mut impl Ui, path: &Path, id: usize) -> Result<()> {
                 ok => ok,
             }
         }
+        INSTALL_AGENT => match install_agent(ui, row) {
+            Err(error) => not_saved(ui, &error),
+            ok => ok,
+        },
         DEFAULT_AGENT_SWITCH => match next_agent(ui, path) {
             Err(error) => not_saved(ui, &error),
             ok => ok,
@@ -13919,6 +14004,11 @@ mod tests {
                 ASK_IMPROVE,
                 DEFAULT_AGENT_SWITCH,
             ])
+            .chain(
+                (0..mappings::AGENT_TABLE.len())
+                    .filter(|i| ui.agents_found.get(*i) != Some(&true))
+                    .map(|i| INSTALL_AGENT + i),
+            )
             .chain((0..3).map(|n| PROFILE + n))
             .chain((0..12).map(|n| TUNING + n));
         let mut expected = commands
@@ -14256,6 +14346,78 @@ mod tests {
         assert_eq!(argv[..2], ["codex", "exec"]);
         assert_eq!(argv.len(), 3);
         assert!(argv[2].contains("Question: Why didn't Pad 6 fire?"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    /// v7.7 ticket 176: 3 Agents lists each agent as installed when its binary is on a fake
+    /// PATH, else with its fixed install command; Enter on a missing one asks first, then
+    /// runs exactly that command in a visible terminal; Cancel runs nothing.
+    #[test]
+    fn install_agents_marks_found_ones_and_installs_after_the_confirm() {
+        use Key::*;
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, mut ui, _ran, _) = configure_session("install-agents");
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for name in ["claude", "codex"] {
+            std::fs::write(bin.join(name), "").unwrap();
+            std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        ui.lookup_path = Some(bin.display().to_string());
+        ui.tab = 2;
+        ui.read_view(None);
+        let rows = ui
+            .tab_panes(2, 120, usize::MAX)
+            .into_iter()
+            .flat_map(|(_, entries)| entries)
+            .map(|(lines, open)| (lines[0].clone(), open))
+            .collect::<Vec<_>>();
+        let row = |text: &str| {
+            rows.iter()
+                .find(|(l, _)| l.contains(text))
+                .unwrap_or_else(|| panic!("{text}"))
+                .1
+        };
+        assert_eq!(row("✓ Claude Code · installed (claude on PATH)"), None);
+        assert_eq!(row("✓ Codex · installed (codex on PATH)"), None);
+        assert_eq!(
+            row("+ OpenCode · npm install -g opencode-ai"),
+            Some(Open::Command(INSTALL_AGENT + 2))
+        );
+        assert_eq!(
+            row("+ Oh My Pi · bun install -g @oh-my-pi/pi-coding-agent"),
+            Some(Open::Command(INSTALL_AGENT + 3))
+        );
+        assert_eq!(row("Others… · added as plugins later"), None);
+        let install = |keys: Vec<Key>, index| {
+            let mut script = Script {
+                keys: keys.into(),
+                lookup: (bin.display().to_string(), Some(dir.clone()), None),
+                ..Default::default()
+            };
+            install_agent(&mut script, index).unwrap();
+            assert!(script.keys.is_empty());
+            (script.shown, script.screens)
+        };
+        let (shown, screens) = install(vec![Enter], 2); // Cancel
+        assert!(shown.is_empty());
+        assert!(
+            screens[0].contains("Install OpenCode?")
+                && screens[0].contains("  npm install -g opencode-ai")
+        );
+        let (shown, _) = install(vec![Down, Enter, Enter], 2);
+        assert_eq!(
+            shown,
+            [vec![
+                "install-opencode",
+                dir.to_str().unwrap(),
+                "sh",
+                "-c",
+                "npm install -g opencode-ai"
+            ]]
+        );
+        let (shown, screens) = install(vec![Enter], 0); // installed already
+        assert!(shown.is_empty() && screens[0].contains("Claude Code is installed"));
         std::fs::remove_dir_all(dir).unwrap();
     }
     /// v7.7 ticket 168: Ask for mappings fills empty controls, asks before each replacement,

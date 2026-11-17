@@ -795,6 +795,20 @@ pub const AGENT_TABLE: [(&str, &str, Option<&[&str]>); 8] = [
     ("Qwen Code", "qwen", Some(&["-p"])),
     ("GitHub Copilot CLI", "copilot", Some(&["-p"])),
 ];
+/// v7.7 ticket 176: each agent's install command, in [`AGENT_TABLE`]'s order: constants run
+/// in a visible terminal, never typed or taken from a reply. Oh My Pi's and Qwen Code's were
+/// checked against their READMEs on 17 Nov 2026; Ollama's is its own script (it asks for the
+/// password).
+pub const AGENT_INSTALL: [&str; 8] = [
+    "npm install -g @anthropic-ai/claude-code",
+    "npm install -g @openai/codex",
+    "npm install -g opencode-ai",
+    "bun install -g @oh-my-pi/pi-coding-agent",
+    "curl -fsSL https://ollama.com/install.sh | sh",
+    "npm install -g @google/gemini-cli",
+    "npm install -g @qwen-code/qwen-code@latest",
+    "npm install -g @github/copilot",
+];
 /// v7.7 ticket 175: the default agent's one-shot command for `request`: the binary, its
 /// fixed arguments (and Ollama's model), then the request as one argument.
 pub fn one_shot(look: &Look, request: &str) -> Result<Vec<String>> {
