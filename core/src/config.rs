@@ -13,7 +13,12 @@ use std::path::{Path, PathBuf};
 pub const VERSION: u64 = 1;
 /// The files, in the order they are applied: each one's references (variables, MIDI
 /// devices, idle settings) are in place before it is checked.
-pub const FILES: [&str; 2] = ["settings.json", "lights.json"];
+pub const FILES: [&str; 4] = [
+    "settings.json",
+    "devices.json",
+    "lights.json",
+    "mappings.json",
+];
 
 /// The config folder of the main config path (`…/vibeconsole/mappings.tsv`).
 fn folder(path: &Path) -> Result<&Path> {
@@ -106,7 +111,11 @@ fn write_all(files: &[(PathBuf, String)]) -> Result<()> {
         }
     };
     for (path, text) in &changed {
-        let temporary = path.with_extension("tmp");
+        // `mappings.tsv` stages as `mappings.tmp` (as before); a JSON file as `<name>.json.tmp`.
+        let temporary = match path.extension().is_some_and(|e| e == "json") {
+            true => path.with_extension("json.tmp"),
+            false => path.with_extension("tmp"),
+        };
         if let Err(e) = write_new(&temporary, text.as_bytes()) {
             unstage(&staged);
             return Err(format!(
@@ -161,6 +170,8 @@ pub fn text(file: &str, config: &Config) -> Result<String> {
     let value = match file {
         "settings.json" => settings(config),
         "lights.json" => lights(config),
+        "devices.json" => devices(config),
+        "mappings.json" => mappings_json(config)?,
         _ => return Err(format!("unknown config file {file}").into()),
     };
     Ok(serde_json::to_string_pretty(&value)? + "\n")
@@ -170,6 +181,8 @@ fn apply(file: &str, value: &Value, config: &mut Config) -> Result<()> {
     let at = Obj::top(value)?;
     match file {
         "settings.json" => apply_settings(&at, config),
+        "devices.json" => apply_devices(&at, config),
+        "mappings.json" => apply_mappings(&at, config),
         "lights.json" => {
             let lights = Lights::read(&at)?;
             config.status_lights = lights.status_lights;
@@ -361,6 +374,330 @@ fn apply_settings(at: &Obj, config: &mut Config) -> Result<()> {
     Ok(())
 }
 
+// ---- devices.json (ticket 196): MIDI devices and the active one, idle settings and each
+// program's, the Xbox programs' names, stick tuning and the headset.
+
+fn idle_json(idle: crate::feedback::Settings) -> Value {
+    json!({"octave": idle.octave, "tempo": idle.tempo, "arp": idle.arp})
+}
+fn idle(at: &Obj, key: &str) -> Result<crate::feedback::Settings> {
+    let idle = at.obj(key)?;
+    idle.only(&["octave", "tempo", "arp"])?;
+    let optional = |field: &str| -> Result<Option<&Value>> {
+        let value = idle.get(field)?;
+        Ok((!value.is_null()).then_some(value))
+    };
+    let settings = crate::feedback::Settings {
+        octave: optional("octave")?
+            .map(|_| idle.int("octave"))
+            .transpose()?,
+        tempo: optional("tempo")?.map(|_| idle.int("tempo")).transpose()?,
+        arp: optional("arp")?.map(|_| idle.bool("arp")).transpose()?,
+    };
+    at.check(key, settings.validate())
+}
+const MOUSE: [(&str, mappings::MouseStick); 3] = [
+    ("off", mappings::MouseStick::Off),
+    ("left", mappings::MouseStick::Left),
+    ("right", mappings::MouseStick::Right),
+];
+
+fn devices(config: &Config) -> Value {
+    let t = &config.tuning;
+    let programs = (1..8u8)
+        .map(|c| (c.to_string(), idle_json(config.idle_for(c))))
+        .collect::<Map<_, _>>();
+    json!({
+        "version": VERSION,
+        "midi_devices": config.midi_devices,
+        "midi_active": config.midi_active,
+        "idle": idle_json(config.idle),
+        "program_idle": programs,
+        "xbox_programs": config.xbox_names,
+        "tuning": {
+            "dead_zone": t.dead_zone,
+            "trigger": t.trigger,
+            "mouse_speed": t.mouse_speed,
+            "rumble": t.rumble,
+            "mouse": t.mouse.text(),
+            "sticks": [t.sticks[0].text(), t.sticks[1].text()],
+            "headset": t.headset,
+        },
+    })
+}
+fn apply_devices(at: &Obj, config: &mut Config) -> Result<()> {
+    at.only(&[
+        "version",
+        "midi_devices",
+        "midi_active",
+        "idle",
+        "program_idle",
+        "xbox_programs",
+        "tuning",
+    ])?;
+    let strings = |key: &str| -> Result<Vec<String>> {
+        at.list(key)?
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| at.err(&format!("{key}[{i}]"), "must be a string"))
+            })
+            .collect()
+    };
+    let midi_devices = strings("midi_devices")?;
+    let midi_active = match at.get("midi_active")? {
+        Value::Null => None,
+        _ => Some(at.str("midi_active")?.to_owned()),
+    };
+    at.check(
+        "midi_devices",
+        mappings::validate_devices(&midi_devices, midi_active.as_ref()),
+    )?;
+    let idle_settings = idle(at, "idle")?;
+    let programs = at.obj("program_idle")?;
+    let keys = (1..8).map(|c: u8| c.to_string()).collect::<Vec<_>>();
+    programs.only(&keys.iter().map(String::as_str).collect::<Vec<_>>())?;
+    let mut program_idle = std::collections::BTreeMap::new();
+    for (context, key) in (1..8u8).zip(&keys) {
+        // As in the TSV: a program whose idle changes nothing follows the original idle.
+        let settings = idle(&programs, key)?;
+        if settings.enabled() {
+            program_idle.insert(context, settings);
+        }
+    }
+    let names = strings("xbox_programs")?;
+    let xbox_names: [String; mappings::XBOX_PROGRAMS as usize] = names
+        .try_into()
+        .map_err(|_| at.err("xbox_programs", "needs 8 names (\"\" for Program N)"))?;
+    at.check("xbox_programs", mappings::validate_xbox_names(&xbox_names))?;
+    let t = at.obj("tuning")?;
+    t.only(&[
+        "dead_zone",
+        "trigger",
+        "mouse_speed",
+        "rumble",
+        "mouse",
+        "sticks",
+        "headset",
+    ])?;
+    let sticks = t.list("sticks")?;
+    let stick = |i: usize| -> Result<mappings::StickMode> {
+        let text = sticks
+            .get(i)
+            .and_then(Value::as_str)
+            .ok_or_else(|| t.err("sticks", "must be two strings, left then right"))?;
+        t.check(&format!("sticks[{i}]"), mappings::StickMode::parse(text))
+    };
+    if sticks.len() != 2 {
+        return Err(t.err("sticks", "must be two strings, left then right"));
+    }
+    let tuning = mappings::Tuning {
+        dead_zone: t.int("dead_zone")?,
+        trigger: t.int("trigger")?,
+        mouse_speed: t.int("mouse_speed")?,
+        rumble: t.bool("rumble")?,
+        mouse: t.pick("mouse", &MOUSE)?,
+        sticks: [stick(0)?, stick(1)?],
+        headset: t.bool("headset")?,
+    };
+    config.tuning = at.check("tuning", tuning.validate())?;
+    config.midi_devices = midi_devices;
+    config.midi_active = midi_active;
+    config.idle = idle_settings;
+    config.program_idle = program_idle;
+    config.xbox_names = xbox_names;
+    Ok(())
+}
+
+// ---- mappings.json (ticket 196): what each control does: mappings, profiles and the lock,
+// favourites, saved sequences and user variables.
+
+/// A mapping's fields, in its TSV record's column order; `device` follows from `context`
+/// and isn't saved.
+const COLUMNS: [&str; 16] = [
+    "context",
+    "label",
+    "input",
+    "device",
+    "message",
+    "channel",
+    "id",
+    "direction",
+    "behavior",
+    "keys",
+    "octave",
+    "tempo",
+    "arp",
+    "action",
+    "risky",
+    "status",
+];
+const NUMBERS: [&str; 5] = ["context", "channel", "id", "direction", "tempo"];
+/// Columns whose `-` (nothing) is saved as null.
+const OPTIONAL: [&str; 4] = ["keys", "octave", "tempo", "arp"];
+
+fn mapping_json(mapping: &mappings::Mapping) -> Result<Value> {
+    let line = mappings::mapping_line(mapping)?;
+    let mut out = Map::new();
+    for (column, field) in COLUMNS.iter().zip(line.trim_end_matches('\n').split('\t')) {
+        let value = match *column {
+            "device" => continue,
+            "risky" | "status" => Value::Bool(field != "-"),
+            c if OPTIONAL.contains(&c) && field == "-" => Value::Null,
+            c if NUMBERS.contains(&c) => json!(field.parse::<i64>()?),
+            _ => Value::String(field.into()),
+        };
+        out.insert(column.to_string(), value);
+    }
+    Ok(out.into())
+}
+/// A mapping object read back through the TSV record's own parser, so every rule stays.
+fn mapping(at: &Obj, midi_devices: &[String]) -> Result<mappings::Mapping> {
+    at.only(
+        &COLUMNS
+            .iter()
+            .filter(|c| **c != "device")
+            .copied()
+            .collect::<Vec<_>>(),
+    )?;
+    let context: u8 = at.int("context")?;
+    let mut fields = Vec::new();
+    for column in COLUMNS {
+        let field = match column {
+            "device" => mappings::device_field(context).to_owned(),
+            "risky" => (if at.bool(column)? { "risky" } else { "-" }).to_owned(),
+            "status" => (if at.bool(column)? { "status" } else { "-" }).to_owned(),
+            c if OPTIONAL.contains(&c) && at.get(c)?.is_null() => "-".to_owned(),
+            c if NUMBERS.contains(&c) => at.int::<i64>(c)?.to_string(),
+            c => {
+                let text = at.str(c)?;
+                if text.contains(['\t', '\n', '\r']) {
+                    return Err(at.err(c, "must be one line without tabs"));
+                }
+                text.to_owned()
+            }
+        };
+        fields.push(field);
+    }
+    let line = fields.join("\t");
+    mappings::parse_mapping_line(&line, 34, midi_devices).map_err(|e| {
+        let at = at.at.trim_end_matches('.');
+        format!("field `{at}`: {e}").into()
+    })
+}
+
+fn mappings_json(config: &Config) -> Result<Value> {
+    let list = |m: &[mappings::Mapping]| m.iter().map(mapping_json).collect::<Result<Vec<_>>>();
+    let profiles = config
+        .profiles
+        .iter()
+        .map(|p| Ok(json!({"name": p.name, "apps": p.apps, "mappings": list(&p.mappings)?})))
+        .collect::<Result<Vec<_>>>()?;
+    let sequences = config
+        .sequences
+        .iter()
+        .map(|(name, steps)| {
+            let encoded = crate::actions::Action::PromptSequence(steps.clone()).encode();
+            json!({"name": name, "sequence": encoded})
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "version": VERSION,
+        "vars": pairs_json(&config.vars),
+        "mappings": list(&config.mappings)?,
+        "profiles": profiles,
+        "lock": match &config.lock {
+            None => Value::Null,
+            Some(mappings::Lock::Default) => "Default".into(),
+            Some(mappings::Lock::Profile(name)) => name.as_str().into(),
+        },
+        "favourites": config.favourites,
+        "sequences": sequences,
+    }))
+}
+fn apply_mappings(at: &Obj, config: &mut Config) -> Result<()> {
+    at.only(&[
+        "version",
+        "vars",
+        "mappings",
+        "profiles",
+        "lock",
+        "favourites",
+        "sequences",
+    ])?;
+    let vars = pairs(at, "vars")?;
+    at.check("vars", mappings::validate_variables(&vars, "user"))?;
+    let read = |at: &Obj, key: &str| -> Result<Vec<mappings::Mapping>> {
+        at.objects(key)?
+            .iter()
+            .map(|m| mapping(m, &config.midi_devices))
+            .collect()
+    };
+    let mut list = read(at, "mappings")?;
+    list.sort_by_key(|m| (m.context, m.control));
+    let mut profiles = Vec::new();
+    for p in at.objects("profiles")? {
+        p.only(&["name", "apps", "mappings"])?;
+        let apps = p
+            .list("apps")?
+            .iter()
+            .map(|a| {
+                a.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| p.err("apps", "must be strings"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        profiles.push(mappings::Profile {
+            name: p.str("name")?.to_owned(),
+            apps,
+            mappings: read(&p, "mappings")?,
+        });
+    }
+    at.check("profiles", mappings::validate_profiles(&profiles))?;
+    let lock = match at.get("lock")? {
+        Value::Null => None,
+        _ => match at.str("lock")? {
+            "Default" => Some(mappings::Lock::Default),
+            name if profiles.iter().any(|p| p.name == name) => {
+                Some(mappings::Lock::Profile(name.into()))
+            }
+            _ => return Err(at.err("lock", "the locked profile doesn't exist")),
+        },
+    };
+    let favourites = at
+        .list("favourites")?
+        .iter()
+        .map(|f| {
+            f.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| at.err("favourites", "must be strings"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    at.check("favourites", mappings::validate_favourites(&favourites))?;
+    let mut sequences = Vec::new();
+    for item in at.objects("sequences")? {
+        item.only(&["name", "sequence"])?;
+        let action = item.check(
+            "sequence",
+            crate::actions::Action::parse(item.str("sequence")?),
+        )?;
+        let crate::actions::Action::PromptSequence(steps) = action else {
+            return Err(item.err("sequence", "a saved sequence holds prompt steps"));
+        };
+        sequences.push((item.str("name")?.to_owned(), steps));
+    }
+    at.check("sequences", mappings::validate_sequences(&sequences))?;
+    config.vars = vars;
+    config.mappings = list;
+    config.profiles = profiles;
+    config.lock = lock;
+    config.favourites = favourites;
+    config.sequences = sequences;
+    Ok(())
+}
+
 // ---- lights.json (ticket 195): status lights switch, the MPK's tempos and patterns, light
 // folders and other, the Xbox, DualSense and keyboard LED patterns, and the RGB devices.
 
@@ -383,6 +720,26 @@ pub fn shipped_lights() -> &'static Lights {
         Obj::top(&value)
             .and_then(|at| Lights::read(&at))
             .expect("shipped lights.json is valid (checked by a test)")
+    })
+}
+
+/// The shipped defaults besides the lights (`core/defaults/`, built in).
+const SHIPPED: [(&str, &str); 3] = [
+    ("settings.json", include_str!("../defaults/settings.json")),
+    ("devices.json", include_str!("../defaults/devices.json")),
+    ("mappings.json", include_str!("../defaults/mappings.json")),
+];
+/// v7.7 ticket 196: `Config::default()`: the shipped files over a blank config, so no
+/// default value is a code literal.
+pub fn shipped() -> &'static Config {
+    static SHIPPED_CONFIG: std::sync::OnceLock<Config> = std::sync::OnceLock::new();
+    SHIPPED_CONFIG.get_or_init(|| {
+        let mut config = Config::blank();
+        for (file, text) in SHIPPED {
+            let value = serde_json::from_str(text).expect("shipped files are JSON (a test checks)");
+            apply(file, &value, &mut config).expect("shipped files are valid (a test checks)");
+        }
+        config
     })
 }
 
@@ -715,7 +1072,7 @@ mod tests {
 
         // A save that can't be staged changes no file.
         let tsv = fs::read_to_string(&path).unwrap();
-        fs::write(dir.join("settings.tmp"), "stale").unwrap();
+        fs::write(dir.join("settings.json.tmp"), "stale").unwrap();
         let mut next = changed();
         next.look.theme = "Dracula".into();
         next.start_flow = true;
@@ -723,7 +1080,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&file).unwrap(), good);
         assert_eq!(fs::read_to_string(&path).unwrap(), tsv);
         assert!(!dir.join("mappings.tmp").exists(), "staged TSV removed");
-        fs::remove_file(dir.join("settings.tmp")).unwrap();
+        fs::remove_file(dir.join("settings.json.tmp")).unwrap();
         mappings::save_config(&path, &next).unwrap();
         assert_eq!(mappings::load_config(&path).unwrap(), next);
 
@@ -836,10 +1193,17 @@ mod tests {
         }
     }
 
-    /// Ticket 195: the shipped light defaults parse and validate, and are what a fresh
-    /// config has.
+    /// Tickets 195–197: every shipped default parses, validates as a whole config, and is
+    /// exactly what a fresh config saves.
     #[test]
-    fn shipped_light_defaults_parse_and_validate() {
+    fn shipped_defaults_parse_and_validate() {
+        let config = Config::default();
+        mappings::serialize_config(&config).unwrap();
+        for (file, shipped) in SHIPPED {
+            let mut blank = Config::blank();
+            apply(file, &serde_json::from_str(shipped).unwrap(), &mut blank).unwrap();
+            assert_eq!(text(file, &config).unwrap(), shipped, "{file}");
+        }
         let value: Value = serde_json::from_str(include_str!("../defaults/lights.json")).unwrap();
         let lights = Lights::read(&Obj::top(&value).unwrap()).unwrap();
         let config = Config::default();
@@ -851,5 +1215,165 @@ mod tests {
             include_str!("../defaults/lights.json"),
             "the shipped file is in the saved format"
         );
+    }
+
+    /// A config using every part of mappings.json and devices.json: an Akai pad with
+    /// feedback, an Xbox button in program 2, another MIDI device, a profile and the lock, a
+    /// favourite, a saved sequence a pad uses, a user variable a command folder uses, idle
+    /// settings, Xbox names and stick tuning.
+    fn controls() -> Config {
+        use crate::actions::{Action, Target};
+        use mappings::{Input, Lock, Mapping, Profile, StickMode};
+        let mut config = Config::default();
+        config.midi_devices = vec!["Launchkey".into()];
+        config.midi_active = Some("Launchkey".into());
+        config.idle.tempo = Some(90);
+        config
+            .set_idle(
+                3,
+                crate::feedback::Settings {
+                    octave: Some(-2),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        config.xbox_names[1] = "Browser".into();
+        config.tuning.dead_zone = 20;
+        config.tuning.mouse = mappings::MouseStick::Right;
+        config.tuning.sticks[0] = StickMode::Angle(vec![(50, 80), (330, 30)]);
+        config.tuning.headset = true;
+        config.vars = vec![("PROJ".into(), "/home/me/project".into())];
+        let pad = |note| crate::Control::from_note(10, note).unwrap();
+        let mut akai = Mapping::new(pad(36), "Ctrl+T", "tap").unwrap();
+        akai.label = "Bank A Pad 1".into();
+        akai.context = 1;
+        akai.feedback.tempo = Some(120);
+        let step = |file: &str| Action::Prompt {
+            file: file.into(),
+            target: Target::Agent("claude".into()),
+            enter: true,
+        };
+        config.sequences = vec![("notes".into(), vec![step("plan"), step("notes")])];
+        let seq = Mapping::new_action(pad(37), Input::Pad, Action::SavedSequence("notes".into()))
+            .unwrap();
+        let command = Mapping::new_action(
+            pad(38),
+            Input::Pad,
+            Action::parse("command:dev:${PROJ}/web:make").unwrap(),
+        )
+        .unwrap();
+        let mut xbox = Mapping::new(crate::Control::button(0), "Enter", "tap").unwrap();
+        xbox.context = mappings::xbox_context(2, false);
+        let mut other = Mapping::new(crate::Control::note(1, 60).unwrap(), "F5", "hold").unwrap();
+        other.context = mappings::DEVICE_CONTEXT;
+        other.label = "Launchkey note 60".into();
+        config.mappings = vec![akai, seq, command, xbox, other];
+        config.mappings.sort_by_key(|m| (m.context, m.control));
+        let mut firefox = Mapping::new(pad(36), "Ctrl+W", "tap").unwrap();
+        firefox.label = "Bank A Pad 1".into();
+        config.profiles = vec![Profile {
+            name: "Firefox".into(),
+            apps: vec!["firefox.desktop".into()],
+            mappings: vec![firefox],
+        }];
+        config.lock = Some(Lock::Profile("Firefox".into()));
+        config.favourites = vec![mappings::profile_favourite_key("Firefox")];
+        mappings::serialize_config(&config).unwrap();
+        config
+    }
+
+    /// Ticket 196: mappings.json and devices.json round-trip, move from a v34 and an older
+    /// `mappings.tsv` (byte for byte unchanged), and a broken one is refused by file and
+    /// field without being rewritten.
+    #[test]
+    fn mappings_and_devices_json_round_trip_move_and_refuse() {
+        let dir = folder("controls");
+        let path = dir.join("mappings.tsv");
+        mappings::save_config(&path, &controls()).unwrap();
+        assert_eq!(mappings::load_config(&path).unwrap(), controls());
+        let read = |file: &str| fs::read_to_string(dir.join(file)).unwrap();
+        let (good_m, good_d) = (read("mappings.json"), read("devices.json"));
+        assert!(good_m.contains("\"label\": \"Bank A Pad 1\""), "{good_m}");
+        assert!(good_d.contains("\"Browser\""), "{good_d}");
+        let cases = [
+            (
+                "mappings.json",
+                good_m.replace("\"message\": \"note\"", "\"message\": \"drum\""),
+                "mappings[0]",
+            ),
+            (
+                "mappings.json",
+                good_m.replace("\"lock\": \"Firefox\"", "\"lock\": \"Chrome\""),
+                "lock",
+            ),
+            (
+                "mappings.json",
+                good_m.replace("\"Bank A Pad 1\"", "\"Bank\\tA\""),
+                "label",
+            ),
+            (
+                "mappings.json",
+                good_m.replace("\"name\": \"notes\"", "\"name\": \"other\""),
+                "mappings.json",
+            ),
+            (
+                "mappings.json",
+                good_m.replace("/home/me/project", "relative"),
+                "${PROJ}/web",
+            ),
+            (
+                "devices.json",
+                good_d.replace("\"Browser\",", ""),
+                "xbox_programs",
+            ),
+            (
+                "devices.json",
+                good_d.replace("\"dead_zone\": 20", "\"dead_zone\": 95"),
+                "tuning",
+            ),
+            (
+                "devices.json",
+                good_d.replace(
+                    "\"midi_active\": \"Launchkey\"",
+                    "\"midi_active\": \"nano\"",
+                ),
+                "midi_devices",
+            ),
+        ];
+        for (file, bad, field) in cases {
+            fs::write(dir.join(file), &bad).unwrap();
+            let error = mappings::load_config(&path).unwrap_err().to_string();
+            assert!(
+                error.contains(file) && error.contains(field),
+                "{field}: {error}"
+            );
+            assert_eq!(read(file), bad);
+            fs::write(
+                dir.join(file),
+                if file == "devices.json" {
+                    &good_d
+                } else {
+                    &good_m
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(mappings::load_config(&path).unwrap(), controls());
+
+        let v34 = mappings::serialize_config(&controls()).unwrap();
+        for (name, tsv) in [("v34", v34.as_str()), ("v15", OLDER)] {
+            let dir = folder(&format!("controls-move-{name}"));
+            let path = dir.join("mappings.tsv");
+            fs::write(&path, tsv).unwrap();
+            let from_tsv = mappings::load_tsv(&path).unwrap();
+            assert_eq!(mappings::load_config(&path).unwrap(), from_tsv, "{name}");
+            assert!(dir.join("mappings.json").exists() && dir.join("devices.json").exists());
+            assert_eq!(mappings::load_config(&path).unwrap(), from_tsv, "{name}");
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                tsv,
+                "{name}: TSV untouched"
+            );
+        }
     }
 }

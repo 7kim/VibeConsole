@@ -659,16 +659,9 @@ pub struct Look {
     pub notice: Option<String>,
 }
 impl Default for Look {
+    /// v7.7 ticket 196: the shipped `settings.json`.
     fn default() -> Self {
-        Self {
-            theme: THEMES[0].into(),
-            agent_cards: false,
-            share_usage: false,
-            seen_moved: true,
-            default_agent: AGENT_NAMES[0].into(),
-            agent_model: String::new(),
-            notice: None,
-        }
+        crate::config::shipped().look.clone()
     }
 }
 impl Look {
@@ -884,7 +877,9 @@ pub struct Profile {
 }
 /// v7 ticket 116: saved sequence names are simple names (they can't leave anything), unique,
 /// and each holds valid prompt steps.
-fn validate_sequences(sequences: &[(String, Vec<crate::actions::Action>)]) -> Result<()> {
+pub(crate) fn validate_sequences(
+    sequences: &[(String, Vec<crate::actions::Action>)],
+) -> Result<()> {
     let mut seen = HashSet::new();
     for (name, steps) in sequences {
         if !simple_name(name) || !seen.insert(name.as_str()) {
@@ -907,7 +902,7 @@ pub fn saved_sequence<'a>(config: &'a Config, name: &str) -> Option<&'a [crate::
 }
 /// v7 ticket 115: an Xbox program name is one printable line of at most 32 characters, with
 /// no tab, and not a lone `-` (which means "no name").
-fn validate_xbox_names(names: &[String]) -> Result<()> {
+pub(crate) fn validate_xbox_names(names: &[String]) -> Result<()> {
     if names
         .iter()
         .any(|n| n.chars().count() > 32 || n == "-" || n.chars().any(char::is_control))
@@ -944,7 +939,7 @@ pub fn valid_app_id(id: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
 }
-fn validate_profiles(profiles: &[Profile]) -> Result<()> {
+pub(crate) fn validate_profiles(profiles: &[Profile]) -> Result<()> {
     if profiles.len() > 32 {
         return Err("too many app profiles (32 at most)".into());
     }
@@ -1964,16 +1959,9 @@ impl MouseStick {
     }
 }
 impl Default for Tuning {
+    /// v7.7 ticket 196: the shipped `devices.json`.
     fn default() -> Self {
-        Self {
-            dead_zone: 15,
-            trigger: 30,
-            mouse_speed: 10,
-            rumble: false,
-            mouse: MouseStick::Off,
-            sticks: Default::default(),
-            headset: false,
-        }
+        crate::config::shipped().tuning.clone()
     }
 }
 impl Tuning {
@@ -2002,19 +1990,22 @@ impl Tuning {
         Ok(self)
     }
 }
-impl Default for Config {
-    fn default() -> Self {
-        // v7.7 ticket 195: the light parts come from the shipped `lights.json`.
+impl Config {
+    /// v7.7 ticket 196: a config with nothing in it yet, before the shipped JSON files
+    /// (`core/defaults/`) fill every part: `Config::default()`. Never used as it is.
+    pub(crate) fn blank() -> Self {
+        // The light parts are the shipped lights already (ticket 195).
         let lights = crate::config::shipped_lights();
         Self {
             mappings: Vec::new(),
+            // ponytail: the default agents are code until ticket 197 ships agents.json.
             agents: vec![
                 Agent::new("claude", "claude", "claude").unwrap(),
                 Agent::new("codex", "codex", "codex").unwrap(),
             ],
             idle: Settings::default(),
             program_idle: std::collections::BTreeMap::new(),
-            start_flow: true,
+            start_flow: false,
             agent_dir: None,
             env: Vec::new(),
             vars: Vec::new(),
@@ -2023,7 +2014,15 @@ impl Default for Config {
             light_other: lights.other,
             light_other_on: lights.other_on,
             light_patterns: lights.patterns,
-            tuning: Tuning::default(),
+            tuning: Tuning {
+                dead_zone: 0,
+                trigger: 0,
+                mouse_speed: 0,
+                rumble: false,
+                mouse: MouseStick::Off,
+                sticks: Default::default(),
+                headset: false,
+            },
             device_lights: lights.devices.clone(),
             midi_devices: Vec::new(),
             midi_active: None,
@@ -2032,12 +2031,26 @@ impl Default for Config {
             lock: None,
             favourites: Vec::new(),
             sequences: Vec::new(),
-            look: Look::default(),
+            look: Look {
+                theme: String::new(),
+                agent_cards: false,
+                share_usage: false,
+                seen_moved: false,
+                default_agent: AGENT_NAMES[0].into(),
+                agent_model: String::new(),
+                notice: None,
+            },
         }
     }
 }
+impl Default for Config {
+    /// v7.7 ticket 196: the shipped JSON files (`core/defaults/`), not code.
+    fn default() -> Self {
+        crate::config::shipped().clone()
+    }
+}
 /// The device column of a mapping line: the Akai's USB id, `midi` or `xbox`.
-fn device_field(context: u8) -> &'static str {
+pub(crate) fn device_field(context: u8) -> &'static str {
     match context {
         c if gamepad_context(c) => "xbox",
         c if c >= DEVICE_CONTEXT => "midi",
@@ -2087,7 +2100,7 @@ pub fn valid_device_name(name: &str) -> bool {
         && name.chars().count() <= 64
         && !name.chars().any(char::is_control)
 }
-fn validate_devices(devices: &[String], active: Option<&String>) -> Result<()> {
+pub(crate) fn validate_devices(devices: &[String], active: Option<&String>) -> Result<()> {
     if devices.len() > usize::from(u8::MAX - DEVICE_CONTEXT) + 1 {
         return Err("too many MIDI devices (16 at most)".into());
     }
@@ -2385,7 +2398,11 @@ pub fn orca_needs_me_steps() -> Vec<crate::actions::Step> {
 fn is_orca_needs_me(steps: &[crate::actions::Step]) -> bool {
     steps == orca_needs_me_steps().as_slice()
 }
-fn parse_mapping_line(line: &str, version: u32, midi_devices: &[String]) -> Result<Mapping> {
+pub(crate) fn parse_mapping_line(
+    line: &str,
+    version: u32,
+    midi_devices: &[String],
+) -> Result<Mapping> {
     let fields: Vec<_> = line.split('\t').collect();
     if fields.len()
         != match version {
@@ -3413,7 +3430,7 @@ pub fn save(path: &Path, mappings: &[Mapping]) -> Result<()> {
     save_config(path, &config)
 }
 
-fn validate_favourites(favourites: &[String]) -> Result<()> {
+pub(crate) fn validate_favourites(favourites: &[String]) -> Result<()> {
     if favourites.len() > 1024 {
         return Err("too many favourites".into());
     }
@@ -3429,7 +3446,7 @@ fn validate_favourites(favourites: &[String]) -> Result<()> {
 }
 
 /// One mapping as a config line (Default mappings and profile overrides alike).
-fn mapping_line(mapping: &Mapping) -> Result<String> {
+pub(crate) fn mapping_line(mapping: &Mapping) -> Result<String> {
     mapping.validate()?;
     let feedback = mapping.feedback;
     let device = device_field(mapping.context);

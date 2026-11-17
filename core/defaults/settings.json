@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "theme": "Tokyo Night",
+  "agents_view": "table",
+  "share_usage": false,
+  "seen_7_7": true,
+  "start_flow": true,
+  "env": []
+}
