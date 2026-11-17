@@ -6953,9 +6953,56 @@ fn ask_for(ui: &mut impl Ui, path: &Path, kind: AskKind) -> Result<()> {
 }
 /// v7.7 ticket 175: ask the default agent (3 Agents › Default agent) through its one-shot
 /// command. Whoever answers, the reply gets the same checks.
-fn ask(ui: &mut impl Ui, path: &Path, request: &str) -> Result<String> {
+/// v7.7 ticket 183: the request carries its kind's own skill (ticket 184), from the copy
+/// built into VibeConsole, so every agent gets the same context; Claude Code with the
+/// skills installed is also told to use it by name.
+fn ask(ui: &mut impl Ui, path: &Path, kind: AskKind, request: &str) -> Result<String> {
     let look = mappings::load_config(path)?.look;
-    ui.ask_agent(&mappings::one_shot(&look, request)?)
+    let home = ui.lookup_env().1;
+    let named = look.default_agent == "Claude Code"
+        && home.is_some_and(|h| crate::runtime::skills_installed(&h));
+    ui.ask_agent(&mappings::one_shot(
+        &look,
+        &with_skill(kind, named, request),
+    )?)
+}
+/// v7.7 ticket 183: each kind's own skill (ticket 184).
+fn skill_name(kind: AskKind) -> &'static str {
+    match kind {
+        AskKind::Profile => "vibeconsole-ask-profile",
+        AskKind::Mappings => "vibeconsole-ask-mappings",
+        AskKind::SetupAgents => "vibeconsole-ask-setup-agents",
+        AskKind::MapAgents => "vibeconsole-ask-map-agents",
+        AskKind::Prompt => "vibeconsole-ask-prompt",
+        AskKind::Sequence => "vibeconsole-ask-sequence",
+        AskKind::Preset => "vibeconsole-ask-preset",
+        AskKind::Setup => "vibeconsole-ask-setup",
+        AskKind::Family => "vibeconsole-ask-family",
+        AskKind::Improve => "vibeconsole-ask-improve",
+        AskKind::About => "vibeconsole-ask-about",
+        AskKind::Recommendations => "vibeconsole-ask-recommendations",
+    }
+}
+/// v7.7 ticket 183: `request` with its kind's skill text in front (and, when `named`, the
+/// line telling Claude Code to use that skill). The request's own rules come last and win.
+fn with_skill(kind: AskKind, named: bool, request: &str) -> String {
+    let name = skill_name(kind);
+    let text = crate::runtime::SKILLS
+        .iter()
+        .find(|(p, _)| p.strip_suffix("/SKILL.md") == Some(name))
+        .map_or("", |(_, text)| text);
+    format!(
+        "VibeConsole's instructions for this ask (the {name} skill):\n\n{text}\n---\n\n{}{request}",
+        if named {
+            format!("Use the {name} skill.\n\n")
+        } else {
+            String::new()
+        }
+    )
+}
+/// v7.7 ticket 183: what each review says went with the request.
+fn sent_skill(kind: AskKind) -> String {
+    format!("VibeConsole's {} skill went with it.", skill_name(kind))
 }
 /// v7.7 ticket 146: what the consent screen says leaves the computer.
 const SHARE_TEXT: &str = "AI Recommendations sends your usage counts to your default agent through your own login: how many times you pressed each control and how many times each action family fired, over the last 30 days, and what each mapped control does (its keys, or only the kind of action). Never prompt text, keys typed, folder paths or agent output. Asked once; turn it off again in 0 AI › AI settings.";
@@ -7032,7 +7079,7 @@ fn ask_recommendations(ui: &mut impl Ui, path: &Path) -> Result<()> {
                     mappings::mappings_summary(&mappings::load_config(path)?)
                 );
                 ui.draw("Asking your agent… this can take a minute.")?;
-                let text = ask(ui, path, &request)?;
+                let text = ask(ui, path, AskKind::Recommendations, &request)?;
                 std::fs::create_dir_all(&state)?;
                 crate::actions::write_atomic(&cache, &text)?;
                 reply = Some(text.clone());
@@ -7071,7 +7118,8 @@ fn ask_recommendations(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 .join("\n")
         };
         ui.draw(&format!(
-            "AI Recommendations · Enter: review and save · Space: not now · R: refresh · Esc: back\n{rows}\n\nWritten by {agent} from your usage counts (Insights) and mappings."
+            "AI Recommendations · Enter: review and save · Space: not now · R: refresh · Esc: back\n{rows}\n\nWritten by {agent} from your usage counts (Insights) and mappings. {}",
+            sent_skill(AskKind::Recommendations)
         ))?;
         let hide = |what: &str| -> Result<()> {
             let mut kept = hidden_text
@@ -7114,7 +7162,14 @@ fn review_recommendation(
     let devices = mappings::profile_devices(&config, ui.context(), ui.program().as_ref());
     let profile = recommendation.text.lines().nth(1).unwrap_or_default();
     if profile.split('\t').nth(2) != Some("-") {
-        return review_profile(ui, path, config, &recommendation.text, &devices);
+        return review_profile(
+            ui,
+            path,
+            config,
+            &recommendation.text,
+            &devices,
+            AskKind::Recommendations,
+        );
     }
     let new = mappings::mappings_from_reply(&recommendation.text, &config, &devices)
         .map_err(|e| format!("the recommendation: {e}; nothing saved"))?;
@@ -7256,7 +7311,7 @@ fn ask_about(ui: &mut impl Ui, path: &Path) -> Result<()> {
         }
     );
     ui.draw("Asking your agent… this can take a minute.")?;
-    let reply = ask(ui, path, &request)?;
+    let reply = ask(ui, path, AskKind::About, &request)?;
     let answer = reply
         .split("```")
         .next()
@@ -7266,6 +7321,7 @@ fn ask_about(ui: &mut impl Ui, path: &Path) -> Result<()> {
     let mut lines = crate::screen::wrap(&answer, ui.width().saturating_sub(6));
     let proposal = mappings::profile_text_from_reply(&reply);
     lines.push(String::new());
+    lines.push(sent_skill(AskKind::About));
     if proposal.is_some() {
         lines.push("Review the change it proposes".into());
     }
@@ -7274,7 +7330,7 @@ fn ask_about(ui: &mut impl Ui, path: &Path) -> Result<()> {
     match (proposal, picked) {
         (Some(text), Some(at)) if at + 2 == lines.len() => {
             let devices = mappings::profile_devices(&config, ui.context(), ui.program().as_ref());
-            review_profile(ui, path, config, &text, &devices).map(drop)
+            review_profile(ui, path, config, &text, &devices, AskKind::About).map(drop)
         }
         _ => Ok(()),
     }
@@ -7300,10 +7356,10 @@ fn ai_profile(ui: &mut impl Ui, path: &Path) -> Result<()> {
         .collect::<Vec<_>>();
     let request = mappings::profile_request(&app, &wish, &devices)?;
     ui.draw("Asking your agent… this can take a minute.")?;
-    let reply = ask(ui, path, &request)?;
+    let reply = ask(ui, path, AskKind::Profile, &request)?;
     let text = mappings::profile_text_from_reply(&reply)
         .ok_or("Claude's reply has no profile in VibeConsole's format; nothing saved")?;
-    review_profile(ui, path, config, &text, &devices).map(drop)
+    review_profile(ui, path, config, &text, &devices, AskKind::Profile).map(drop)
 }
 /// v7.7 ticket 168: Ask for mappings (fills empty Default controls) and Ask to map agents
 /// (jump buttons, needs-me, octave lights). The reply is checked in full like an import;
@@ -7371,7 +7427,7 @@ fn ask_mappings(ui: &mut impl Ui, path: &Path, kind: AskKind) -> Result<()> {
         mappings::mappings_request(&wish, &devices, &config)?
     };
     ui.draw("Asking your agent… this can take a minute.")?;
-    let reply = ask(ui, path, &request)?;
+    let reply = ask(ui, path, kind, &request)?;
     let refused = |e: Box<dyn std::error::Error>| format!("the reply: {e}; nothing saved");
     let new = mappings::mappings_from_reply(&reply, &config, &devices).map_err(refused)?;
     let octaves = if agents {
@@ -7403,7 +7459,7 @@ fn ask_mappings(ui: &mut impl Ui, path: &Path, kind: AskKind) -> Result<()> {
     if choose(
         ui,
         &format!(
-            "{} suggests:\n{}\n\nSent: the controls of the {sent} and what each does now{}.",
+            "{} suggests:\n{}\n\nSent: the controls of the {sent} and what each does now{}. {}",
             config.look.default_agent,
             words.join("\n"),
             match &preset {
@@ -7413,7 +7469,8 @@ fn ask_mappings(ui: &mut impl Ui, path: &Path, kind: AskKind) -> Result<()> {
                     file.display()
                 ),
                 None => String::new(),
-            }
+            },
+            sent_skill(kind)
         ),
         &options(&["Cancel", "Save"]),
     )? != Some(1)
@@ -7477,13 +7534,13 @@ fn ask_setup_agents(ui: &mut impl Ui, path: &Path) -> Result<()> {
     let config = mappings::load_config(path)?;
     let request = mappings::setup_agents_request(&wish, &clis, &folders, &config);
     ui.draw("Asking your agent… this can take a minute.")?;
-    let reply = ask(ui, path, &request)?;
+    let reply = ask(ui, path, AskKind::SetupAgents, &request)?;
     let (new, words) = mappings::agent_setup_from_reply(&reply, &clis, &folders, &config)
         .map_err(|e| format!("the reply: {e}; nothing saved"))?;
     if choose(
         ui,
         &format!(
-            "{} suggests:\n{}\n\nSent: the names of the agent CLIs found on PATH ({}) and the paths of {} project folders under your home folder. Nothing was run.",
+            "{} suggests:\n{}\n\nSent: the names of the agent CLIs found on PATH ({}) and the paths of {} project folders under your home folder. Nothing was run. {}",
             config.look.default_agent,
             words.join("\n"),
             if clis.is_empty() {
@@ -7491,7 +7548,8 @@ fn ask_setup_agents(ui: &mut impl Ui, path: &Path) -> Result<()> {
             } else {
                 clis.join(", ")
             },
-            folders.len()
+            folders.len(),
+            sent_skill(AskKind::SetupAgents)
         ),
         &options(&["Cancel", "Save"]),
     )? != Some(1)
@@ -7515,6 +7573,7 @@ fn ask_prompt(ui: &mut impl Ui, path: &Path) -> Result<()> {
     let reply = ask(
         ui,
         path,
+        AskKind::Prompt,
         &format!(
             "You help write a prompt for a coding agent; VibeConsole sends it from a controller pad. The user wants: {wish}\n\nBefore writing it, ask up to three short questions whose answers you need, one per line, each starting with `Q:`. Reply with only the questions."
         ),
@@ -7533,6 +7592,7 @@ fn ask_prompt(ui: &mut impl Ui, path: &Path) -> Result<()> {
     let reply = ask(
         ui,
         path,
+        AskKind::Prompt,
         &format!(
             "Write the prompt. The user wants: {wish}\n{answers}\nReply with only the prompt text: no code fences, nothing before or after it."
         ),
@@ -7550,8 +7610,9 @@ fn ask_prompt(ui: &mut impl Ui, path: &Path) -> Result<()> {
     if choose(
         ui,
         &format!(
-            "{} wrote this prompt:\n\n{body}",
-            mappings::load_config(path)?.look.default_agent
+            "{} wrote this prompt:\n\n{body}\n\n{}",
+            mappings::load_config(path)?.look.default_agent,
+            sent_skill(AskKind::Prompt)
         ),
         &options(&["Cancel", "Name it, then open it in $EDITOR"]),
     )? != Some(1)
@@ -7622,7 +7683,7 @@ fn ask_sequence(ui: &mut impl Ui, path: &Path) -> Result<()> {
         },
     );
     ui.draw("Asking your agent… this can take a minute.")?;
-    let reply = ask(ui, path, &request)?;
+    let reply = ask(ui, path, AskKind::Sequence, &request)?;
     let (name, steps, new) = mappings::sequence_from_reply(&reply, &saved)
         .map_err(|e| format!("the reply: {e}; nothing saved"))?;
     let mut config = mappings::load_config(path)?;
@@ -7641,8 +7702,9 @@ fn ask_sequence(ui: &mut impl Ui, path: &Path) -> Result<()> {
     if choose(
         ui,
         &format!(
-            "{} suggests sequence {name}:\n{words}\n\nSent: your skills' names and descriptions and your saved prompts' names with how often each was sent; never their text.",
-            config.look.default_agent
+            "{} suggests sequence {name}:\n{words}\n\nSent: your skills' names and descriptions and your saved prompts' names with how often each was sent; never their text. {}",
+            config.look.default_agent,
+            sent_skill(AskKind::Sequence)
         ),
         &options(&["Cancel", "Pick where it sends, then Save"]),
     )? != Some(1)
@@ -7745,7 +7807,7 @@ fn ask_family(ui: &mut impl Ui, path: &Path) -> Result<()> {
         },
     );
     ui.draw("Asking your agent… this can take a minute.")?;
-    let reply = ask(ui, path, &request)?;
+    let reply = ask(ui, path, AskKind::Family, &request)?;
     let refused = |e: Box<dyn std::error::Error>| format!("the reply: {e}; nothing saved");
     let text = mappings::profile_text_from_reply(&reply)
         .ok_or("the reply has no family in VibeConsole's format; nothing saved")?;
@@ -7766,10 +7828,11 @@ fn ask_family(ui: &mut impl Ui, path: &Path) -> Result<()> {
     if choose(
         ui,
         &format!(
-            "{} suggests family {}:\n{words}\n\nSaved under {}; pick it in /configure › Action family.",
+            "{} suggests family {}:\n{words}\n\nSaved under {}; pick it in /configure › Action family. {}",
             config.look.default_agent,
             family.name,
-            file.display()
+            file.display(),
+            sent_skill(AskKind::Family)
         ),
         &options(&["Cancel", "Save"]),
     )? != Some(1)
@@ -7878,11 +7941,13 @@ fn ask_improve(ui: &mut impl Ui, _path: &Path) -> Result<()> {
         ui.run(&["git", "clone", "--depth", "1", SOURCE_URL, &dir])
             .map_err(|e| format!("git clone {SOURCE_URL}: {e}"))?;
     }
-    let shown = ui.show_in_terminal("improve", &dir, &["claude", &wish])?;
+    let message = with_skill(AskKind::Improve, false, &wish);
+    let shown = ui.show_in_terminal("improve", &dir, &["claude", &message])?;
     choose(
         ui,
         &format!(
-            "{shown}.\nClaude Code is open on a clone of {SOURCE_URL} in {dir}, with your wish as its first message. VibeConsole saved nothing."
+            "{shown}.\nClaude Code is open on a clone of {SOURCE_URL} in {dir}, with your wish as its first message. {} VibeConsole saved nothing.",
+            sent_skill(AskKind::Improve)
         ),
         &options(&["Back"]),
     )?;
@@ -7897,6 +7962,7 @@ fn review_profile(
     mut config: mappings::Config,
     text: &str,
     devices: &[mappings::ProfileDevice],
+    kind: AskKind,
 ) -> Result<bool> {
     let mut profile = mappings::import_profile(text, &config)
         .map_err(|e| format!("Claude's profile: {e}; nothing saved"))?;
@@ -7919,8 +7985,9 @@ fn review_profile(
         }
     }
     summary += &format!(
-        "\nIn plain words:\n{}",
-        mappings::profile_in_words(&profile)
+        "\nIn plain words:\n{}\n\n{}",
+        mappings::profile_in_words(&profile),
+        sent_skill(kind)
     );
     if choose(
         ui,
@@ -14434,6 +14501,117 @@ mod tests {
         assert!(row(&mut ui, None).ends_with("Start at login · unknown"));
         std::fs::remove_dir_all(dir).unwrap();
     }
+    /// v7.7 ticket 183: every kind's request carries its own skill (never another's) for any
+    /// default agent; Claude Code with the skills installed is also told its name; the largest
+    /// request stays one argument under 128 KB; a review says the skill went with it.
+    #[test]
+    fn every_ask_carries_its_own_skill_for_every_agent() {
+        use Key::*;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-ask-skill-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let path = dir.join("mappings.tsv");
+        let kinds = [
+            AskKind::Profile,
+            AskKind::Mappings,
+            AskKind::SetupAgents,
+            AskKind::MapAgents,
+            AskKind::Prompt,
+            AskKind::Sequence,
+            AskKind::Preset,
+            AskKind::Setup,
+            AskKind::Family,
+            AskKind::Improve,
+            AskKind::About,
+            AskKind::Recommendations,
+        ];
+        let sent = |agent: &str, installed: bool| {
+            let mut config = mappings::Config::default();
+            config.look.default_agent = agent.into();
+            mappings::save_config(&path, &config).unwrap();
+            if installed {
+                crate::runtime::install_skills(&home).unwrap();
+            }
+            kinds
+                .iter()
+                .map(|kind| {
+                    let mut ui = Script {
+                        claude: "ok".into(),
+                        lookup: (String::new(), Some(home.clone()), None),
+                        ..Default::default()
+                    };
+                    ask(&mut ui, &path, *kind, "THE REQUEST").unwrap();
+                    (*kind, ui.agent_argv.remove(0))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (kind, argv) in sent("Codex", true) {
+            let name = skill_name(kind);
+            assert_eq!(argv[..2], ["codex", "exec"]);
+            let request = &argv[2];
+            assert!(request.starts_with(&format!(
+                "VibeConsole's instructions for this ask (the {name} skill):\n\n---\nname: {name}\n"
+            )));
+            assert_eq!(
+                request.matches("\nname: vibeconsole-ask-").count(),
+                1,
+                "{name}"
+            );
+            assert!(
+                !request.contains("Use the vibeconsole-ask-"),
+                "{name}: only Claude Code is told"
+            );
+            assert!(request.ends_with("\n---\n\nTHE REQUEST"), "{name}");
+        }
+        let _ = std::fs::remove_dir_all(home.join(".claude"));
+        for (kind, argv) in sent("Claude Code", false) {
+            assert!(
+                !argv[2].contains("Use the vibeconsole-ask-"),
+                "{:?}: not installed",
+                kind
+            );
+            assert!(argv[2].contains(&format!("(the {} skill)", skill_name(kind))));
+        }
+        for (kind, argv) in sent("Claude Code", true) {
+            let name = skill_name(kind);
+            assert_eq!(argv[..2], ["claude", "-p"]);
+            assert!(argv[2].ends_with(&format!("\n---\n\nUse the {name} skill.\n\nTHE REQUEST")));
+        }
+        // The largest: the biggest skill with a mappings request for both devices.
+        let config = mappings::Config::default();
+        let devices = mappings::profile_devices(&config, 0, None);
+        let request = mappings::mappings_request("", &devices, &config).unwrap();
+        let biggest = kinds
+            .iter()
+            .map(|k| with_skill(*k, true, &request).len())
+            .max()
+            .unwrap();
+        assert!(biggest < 128 * 1024, "{biggest}");
+        // A review says the skill went with it.
+        let reply = format!(
+            "```\n{}```\n",
+            mappings::export_profile(&mappings::Profile {
+                name: "AI".into(),
+                apps: vec![],
+                mappings: vec![Mapping::new(Control::button(0), "Ctrl+N", "hold").unwrap()],
+            })
+            .unwrap()
+        );
+        let mut ui = Script {
+            keys: vec![Enter, Down, Space, Enter, Enter].into(),
+            claude: reply,
+            ..Default::default()
+        };
+        ask_for(&mut ui, &path, AskKind::Mappings).unwrap();
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains("VibeConsole's vibeconsole-ask-mappings skill went with it."))
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     /// v7.7 ticket 177: coming back to a tab selects the row it was left on, whether Tab, ←
     /// or a number key switched; each tab keeps its own.
     #[test]
@@ -15094,15 +15272,14 @@ mod tests {
                 source_text.as_str()
             ]]
         );
-        assert_eq!(
-            shown,
-            [vec![
-                "improve",
-                source_text.as_str(),
-                "claude",
-                "add a; rm -rf ~ plugin"
-            ]]
-        );
+        // v7.7 ticket 183: the skill first, the wish last, all one argument.
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0][..3], ["improve", source_text.as_str(), "claude"]);
+        assert_eq!(shown[0].len(), 4);
+        assert!(shown[0][3].starts_with(
+            "VibeConsole's instructions for this ask (the vibeconsole-ask-improve skill)"
+        ));
+        assert!(shown[0][3].ends_with("\n---\n\nadd a; rm -rf ~ plugin"));
         assert!(
             screens
                 .iter()
@@ -15115,7 +15292,7 @@ mod tests {
             argv,
             [vec!["git", "-C", source_text.as_str(), "pull", "--ff-only"]]
         );
-        assert_eq!(shown[0][2..], ["claude", "themes"]);
+        assert!(shown[0][3].ends_with("\n---\n\nthemes"));
         assert_eq!(std::fs::read(&path).unwrap(), before);
         std::fs::remove_dir_all(dir).unwrap();
     }
