@@ -2388,16 +2388,28 @@ impl Terminal {
                     ),
                     (
                         vec![format!(
-                            "  VibeConsole skills · {} · 3 Agents › Install /skills makes replies better",
+                            "  VibeConsole skills · {} · each Ask sends its own skill to {agent}{}",
                             if self.skills_installed {
                                 "installed"
                             } else {
                                 "not installed"
+                            },
+                            if agent == "Claude Code" {
+                                "; installed, Claude Code also uses it by name"
+                            } else {
+                                " (only Claude Code reads installed skills)"
                             }
                         )],
                         None,
                     ),
                 ];
+                // v7.7 ticket 185: each Ask and its own skill, from the table the asks use.
+                let mut settings = settings;
+                settings.extend(
+                    ASK_SKILL_ROWS.iter().map(|(ask, kind)| {
+                        (vec![format!("    {ask} · {}", skill_name(*kind))], None)
+                    }),
+                );
                 vec![
                     (
                         format!(
@@ -6966,6 +6978,21 @@ fn ask(ui: &mut impl Ui, path: &Path, kind: AskKind, request: &str) -> Result<St
         &with_skill(kind, named, request),
     )?)
 }
+/// v7.7 ticket 185: the AI tab's asks as AI settings names them, each with its kind.
+const ASK_SKILL_ROWS: [(&str, AskKind); 12] = [
+    ("Ask for a profile", AskKind::Profile),
+    ("Ask for mappings", AskKind::Mappings),
+    ("Ask to set up agents", AskKind::SetupAgents),
+    ("Ask to map agents", AskKind::MapAgents),
+    ("Ask for a prompt", AskKind::Prompt),
+    ("Ask for a prompt sequence", AskKind::Sequence),
+    ("Ask for a preset", AskKind::Preset),
+    ("Ask for a whole setup", AskKind::Setup),
+    ("Ask for an action family", AskKind::Family),
+    ("Ask about my setup", AskKind::About),
+    ("Ask how to improve VibeConsole", AskKind::Improve),
+    ("AI Recommendations", AskKind::Recommendations),
+];
 /// v7.7 ticket 183: each kind's own skill (ticket 184).
 fn skill_name(kind: AskKind) -> &'static str {
     match kind {
@@ -14609,6 +14636,43 @@ mod tests {
             ui.screens
                 .iter()
                 .any(|s| s.contains("VibeConsole's vibeconsole-ask-mappings skill went with it."))
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    /// v7.7 ticket 185: AI settings list the twelve asks with their own skills and say the
+    /// skill goes to the default agent, for Claude Code and for Codex.
+    #[test]
+    fn ai_settings_show_each_asks_skill() {
+        let (dir, mut ui, _ran, _) = configure_session("ask-skill-rows");
+        let rows = |ui: &mut Terminal, agent: &str| {
+            let path = dir.join("mappings.tsv");
+            let mut config = mappings::load_config(&path).unwrap();
+            config.look.default_agent = agent.into();
+            mappings::save_config(&path, &config).unwrap();
+            ui.tab = 9;
+            ui.read_view(None);
+            (ui.tab_panes(9, 200, usize::MAX).into_iter())
+                .find(|(title, _)| title == "AI settings")
+                .unwrap()
+                .1
+                .into_iter()
+                .map(|(lines, _)| lines[0].clone())
+                .collect::<Vec<_>>()
+        };
+        let claude = rows(&mut ui, "Claude Code");
+        assert!(claude.iter().any(|l| l.contains("each Ask sends its own skill to Claude Code; installed, Claude Code also uses it by name")));
+        for (ask, kind) in ASK_SKILL_ROWS {
+            let want = format!("{ask} · {}", skill_name(kind));
+            assert!(claude.iter().any(|l| l.trim() == want), "{want}");
+        }
+        let codex = rows(&mut ui, "Codex");
+        assert!(codex.iter().any(|l| l.contains(
+            "each Ask sends its own skill to Codex (only Claude Code reads installed skills)"
+        )));
+        assert!(
+            codex
+                .iter()
+                .any(|l| l.trim() == "Ask for mappings · vibeconsole-ask-mappings")
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
