@@ -120,6 +120,10 @@ enum Learned {
 trait Ui {
     fn draw(&mut self, text: &str) -> Result<()>;
     fn key(&mut self) -> Result<Option<Key>>;
+    /// v7.7 ticket 206: the row last opened in each list, by the list's name, in memory only.
+    fn rows_left(&mut self) -> Option<&mut BTreeMap<String, (usize, String)>> {
+        None
+    }
     fn edit_file(&mut self, _path: &Path) -> Result<()> {
         Err("editor unavailable".into())
     }
@@ -458,6 +462,8 @@ struct Terminal {
     /// v7.7 ticket 205: no key has reached Live yet, so its cursor follows the most urgent
     /// agent (else Release all), never Pause.
     live_start: bool,
+    /// v7.7 ticket 206: see [`Ui::rows_left`].
+    rows_left: BTreeMap<String, (usize, String)>,
     rendered: String,
     rendered_size: (usize, usize),
     /// v7.7 ticket 213: the first frame is drawn; input typed before it was dropped.
@@ -1141,6 +1147,7 @@ impl Terminal {
             tab: 0,
             tab_rows: [0; 10],
             live_start: true,
+            rows_left: BTreeMap::new(),
             rendered: String::new(),
             rendered_size: (0, 0),
             drawn: false,
@@ -5542,6 +5549,9 @@ impl Drop for Terminal {
 }
 
 impl Ui for Terminal {
+    fn rows_left(&mut self) -> Option<&mut BTreeMap<String, (usize, String)>> {
+        Some(&mut self.rows_left)
+    }
     fn usage_dir(&self) -> Option<PathBuf> {
         self.usage_dir.clone()
     }
@@ -9908,6 +9918,29 @@ fn choose_at(
     if options.is_empty() {
         return Ok(None);
     }
+    // v7.7 ticket 206: a menu opens on the row last opened in it, so coming back from a
+    // submenu lands where you were: the same row by its text, else the same place (a row
+    // removed or renamed). Only menus of four rows or more: a short list is a question,
+    // and a stray Enter must never land on its answer. Never on a destructive row.
+    let name = list_name(title);
+    let remembers = options.len() >= 4;
+    let left = (initial == 0 && remembers)
+        .then(|| ui.rows_left().and_then(|rows| rows.get(&name).cloned()))
+        .flatten();
+    let initial = match left {
+        Some((at, text)) => {
+            let row = if options.get(at) == Some(&text) {
+                at
+            } else {
+                options
+                    .iter()
+                    .position(|o| *o == text)
+                    .unwrap_or(at.min(options.len() - 1))
+            };
+            if destructive(&options[row]) { 0 } else { row }
+        }
+        None => initial,
+    };
     let mut cursor = initial.min(options.len() - 1);
     // The options come first: a long title is cut (ending in "…") so at least five options,
     // or all of them, stay on screen. Before, a long title left room for one row only.
@@ -9946,11 +9979,33 @@ fn choose_at(
         match ui.key()? {
             Some(Key::Up) => cursor = (cursor + options.len() - 1) % options.len(),
             Some(Key::Down) => cursor = (cursor + 1) % options.len(),
-            Some(Key::Enter) => return Ok(Some(cursor)),
+            Some(Key::Enter) => {
+                if let Some(rows) = ui.rows_left().filter(|_| remembers) {
+                    rows.insert(name, (cursor, options[cursor].clone()));
+                }
+                return Ok(Some(cursor));
+            }
             Some(Key::Escape) => return Ok(None),
             _ => {}
         }
     }
+}
+/// v7.7 ticket 206: a list's name for [`Ui::rows_left`]: its title's first line up to the
+/// first `(`, `:` or `.`, so a count or value in the title doesn't make it a new list.
+fn list_name(title: &str) -> String {
+    let line = title.lines().next().unwrap_or_default();
+    line.split(['(', ':', '.'])
+        .next()
+        .unwrap_or(line)
+        .trim()
+        .to_owned()
+}
+/// A row a stray Enter must never land on when a list reopens.
+fn destructive(row: &str) -> bool {
+    let row = row.trim_start();
+    ["Remove", "Delete", "Reset", "Replace", "Quit", "Yes", "⚠"]
+        .iter()
+        .any(|word| row.starts_with(word))
 }
 /// Appends `[x] (saved)` to the saved option; the mark stays put while the cursor moves.
 fn mark_saved(mut options: Vec<String>, saved: Option<usize>) -> Vec<String> {
@@ -21746,6 +21801,103 @@ mod tests {
         ui.pause().unwrap(); // what the session does with it while running
         assert!(!ui.wanted_run);
         drop(ui);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 206: back from a submenu, a menu's cursor is on the row you opened: 3
+    /// Agents › Status light patterns › Keyboard lights that show it, then Esc; after a
+    /// change saved in a submenu (Thinking's tempo), on the changed row.
+    #[test]
+    fn back_from_a_submenu_lands_on_the_row_you_opened() {
+        let (dir, mut ui, _ran, _) = configure_session("rows-left");
+        let path = dir.join("mappings.tsv");
+        let run = |ui: &mut Terminal, keys: Vec<Key>| {
+            ui.script = Some(Play {
+                steps: keys.into_iter().map(Step::Key).collect(),
+                ..Play::default()
+            });
+            light_patterns_menu(ui, &path).unwrap();
+            ui.script.take().unwrap().screens
+        };
+        let selected = |screen: &str| {
+            (plain_rows(screen).into_iter())
+                .find_map(|l| {
+                    (l.trim_start_matches(['│', ' ']).strip_prefix("> ")).map(str::to_owned)
+                })
+                .unwrap_or_default()
+        };
+        // Down to row 17, open it, Esc back: the parent shows, then Esc leaves.
+        let mut keys = vec![Key::Down; 17];
+        keys.extend([Key::Enter, Key::Escape, Key::Escape]);
+        let screens = run(&mut ui, keys);
+        let back = selected(screens.last().unwrap());
+        assert!(back.starts_with("Keyboard lights that show it"), "{back}");
+        // Thinking (row 2): tempo one down, octave as it is: saved, and back on Thinking.
+        let before = mappings::load_config(&path).unwrap().light_patterns.states[2];
+        let mut keys = vec![Key::Up; 15]; // from row 17 back to row 2
+        keys.extend([Key::Enter, Key::Down, Key::Enter, Key::Enter, Key::Escape]);
+        let screens = run(&mut ui, keys);
+        let after = mappings::load_config(&path).unwrap().light_patterns.states[2];
+        assert_ne!(before.0, after.0, "the tempo was saved");
+        let back = selected(screens.last().unwrap());
+        assert!(back.starts_with("Thinking: tempo"), "{back}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 206: a menu reopens on the row last opened by its text; a row removed
+    /// while you were away puts the cursor at the same place; a question (under four rows)
+    /// and a destructive row never get a remembered cursor.
+    #[test]
+    fn a_menu_reopens_by_text_else_at_the_same_place_never_on_a_risky_row() {
+        let (dir, mut ui, _ran, _) = configure_session("rows-left-list");
+        let pick = |ui: &mut Terminal, title: &str, rows: &[&str], keys: Vec<Key>| {
+            ui.script = Some(Play {
+                steps: keys.into_iter().map(Step::Key).collect(),
+                ..Play::default()
+            });
+            choose(ui, title, &options(rows)).unwrap()
+        };
+        let five = ["a", "b", "c", "d", "e"];
+        assert_eq!(
+            pick(&mut ui, "Things (5)", &five, vec![Key::Up, Key::Enter]),
+            Some(4)
+        );
+        // Same list, its count changed in the title: opens on "e".
+        assert_eq!(
+            pick(
+                &mut ui,
+                "Things (6)",
+                &["z", "a", "b", "c", "d", "e"],
+                vec![Key::Enter]
+            ),
+            Some(5)
+        );
+        // "e" removed: the same place, the nearest row left.
+        assert_eq!(
+            pick(&mut ui, "Things", &["a", "b", "c", "d"], vec![Key::Enter]),
+            Some(3)
+        );
+        // A question: never remembered.
+        assert_eq!(
+            pick(
+                &mut ui,
+                "Sure?",
+                &["Cancel", "Delete"],
+                vec![Key::Down, Key::Enter]
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            pick(&mut ui, "Sure?", &["Cancel", "Delete"], vec![Key::Enter]),
+            Some(0)
+        );
+        // A destructive row opened last: the list opens at its top.
+        let rows = ["Edit", "Rename", "Move", "Remove"];
+        assert_eq!(
+            pick(&mut ui, "Item", &rows, vec![Key::Up, Key::Enter]),
+            Some(3)
+        );
+        assert_eq!(pick(&mut ui, "Item", &rows, vec![Key::Enter]), Some(0));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
