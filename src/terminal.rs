@@ -3763,9 +3763,10 @@ impl Terminal {
         if switched.is_none() {
             self.rgb_failed = false;
         }
-        let wanted = switched.filter(|_| running).and_then(|p| {
-            let effect = crate::status::keyboard_rgb(&states, p)?;
-            Some((effect, p.rgb_brightness, p.rgb_rest))
+        // v7.7 ticket 188: idle while running is wanted too, for the resting effect.
+        let wanted = switched.filter(|_| running).map(|p| {
+            let effect = crate::status::keyboard_rgb(&states, p);
+            (effect, p.rgb_brightness, p.rgb_rest)
         });
         let Some((effect, brightness, rest)) = wanted else {
             if let Some(rgb) = &mut self.rgb {
@@ -3785,7 +3786,11 @@ impl Terminal {
         }
         if let Some(rgb) = &mut self.rgb {
             rgb.rest = rest;
-            if let Err(error) = rgb.show(effect, brightness) {
+            let sent = match effect {
+                Some(effect) => rgb.show(effect, brightness),
+                None => rgb.show_rest(),
+            };
+            if let Err(error) = sent {
                 self.rgb = None; // dropping it restores what it can
                 self.notice = format!("RGB keyboard: {error}; given up");
             }
@@ -19426,6 +19431,69 @@ mod tests {
             "quit: the resting effect"
         );
         assert_eq!(read("matrix_brightness"), b"200");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 188 (seen by the user: a picked static white never showed): running and
+    /// idle, the resting effect shows from the start, before any state did, with the
+    /// keyboard's own brightness, once; a resting effect changed while idle shows at once;
+    /// pausing then writes nothing more, as it already shows.
+    #[test]
+    fn keyboard_rgb_resting_effect_shows_when_idle_from_the_start_and_when_changed() {
+        use crate::status::Rgb;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-rgb-rest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let kbd = dir.join("razerkbd/0003:1532:021A.0001");
+        std::fs::create_dir_all(&kbd).unwrap();
+        std::fs::write(kbd.join("matrix_brightness"), "200\n").unwrap();
+        for f in ["none", "spectrum", "wave", "static", "breath", "reactive"] {
+            std::fs::write(kbd.join(format!("matrix_effect_{f}")), "").unwrap();
+        }
+        let read = |f: &str| std::fs::read(kbd.join(f)).unwrap();
+        let clear = || std::fs::write(kbd.join("matrix_effect_static"), "").unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        ui.rgb = Some(
+            crate::keyboard::RgbKeyboards::open(&dir.join("razerkbd"), Rgb::Spectrum).unwrap(),
+        );
+        let mut patterns = crate::status::DevicePatterns::default();
+        patterns.rgb_on = true;
+        patterns.rgb_brightness = 120;
+        patterns.rgb_rest = Rgb::Static("white");
+        ui.device_lights = Some(patterns.clone());
+        ui.agent_states = vec![("claude".into(), "claude".into(), "idle")];
+        ui.output = Some(crate::keyboard::Output::recording(&[]).unwrap());
+        ui.suspended = false;
+        ui.show_rgb();
+        assert_eq!(
+            read("matrix_effect_static"),
+            [255, 255, 255],
+            "idle from the start: static white"
+        );
+        assert_eq!(read("matrix_brightness"), b"200", "its own brightness");
+        clear();
+        ui.show_rgb();
+        assert!(read("matrix_effect_static").is_empty(), "not sent twice");
+        patterns.rgb_rest = Rgb::Static("red");
+        ui.device_lights = Some(patterns);
+        ui.show_rgb();
+        assert_eq!(
+            read("matrix_effect_static"),
+            [255, 0, 0],
+            "changed while idle: shows at once"
+        );
+        clear();
+        ui.suspend().unwrap();
+        assert!(
+            read("matrix_effect_static").is_empty(),
+            "paused: already resting, nothing more"
+        );
+        drop(ui);
+        assert!(
+            read("matrix_effect_static").is_empty(),
+            "quit: nothing more"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

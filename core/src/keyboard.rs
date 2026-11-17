@@ -673,6 +673,9 @@ impl Drop for LockLights {
 pub struct RgbKeyboards {
     boards: Vec<RgbBoard>,
     shown: Option<(crate::status::Rgb, u8)>,
+    /// v7.7 ticket 188: the resting effect last written, so idle shows it once and a changed
+    /// one shows at once.
+    resting: Option<crate::status::Rgb>,
     pub rest: crate::status::Rgb,
 }
 struct RgbBoard {
@@ -743,6 +746,7 @@ impl RgbKeyboards {
         Ok(Self {
             boards,
             shown: None,
+            resting: None,
             rest,
         })
     }
@@ -765,18 +769,40 @@ impl RgbKeyboards {
             return Err(error);
         }
         self.shown = Some((effect, brightness));
+        self.resting = None;
         Ok(())
     }
-    /// The resting effect and each keyboard's own brightness back, once something was shown.
-    pub fn restore(&mut self) {
-        if self.shown.take().is_some() {
-            for board in &self.boards {
-                let _ = write_rgb(&board.dir, self.rest);
-                let _ = std::fs::write(
+    /// v7.7 ticket 188: running and idle, the resting effect with each keyboard's own
+    /// brightness: from the start, before any state showed, and at once when it changes.
+    /// Sent once; errors as `show`.
+    pub fn show_rest(&mut self) -> io::Result<()> {
+        if self.shown.is_none() && self.resting == Some(self.rest) {
+            return Ok(());
+        }
+        let rest = self.rest;
+        let mut failed = None;
+        self.boards.retain(|board| {
+            let sent = write_rgb(&board.dir, rest).and_then(|()| {
+                std::fs::write(
                     board.dir.join("matrix_brightness"),
                     board.brightness.to_string(),
-                );
-            }
+                )
+            });
+            sent.map_err(|e| failed = Some(e)).is_ok()
+        });
+        if let (Some(error), true) = (failed, self.boards.is_empty()) {
+            return Err(error);
+        }
+        self.shown = None;
+        self.resting = Some(rest);
+        Ok(())
+    }
+    /// The resting effect and each keyboard's own brightness back, once something was shown
+    /// (or a resting effect VibeConsole wrote has since changed). Pause, quit and error.
+    pub fn restore(&mut self) {
+        let stale = self.resting.is_some_and(|r| r != self.rest);
+        if self.shown.is_some() || stale {
+            let _ = self.show_rest();
         }
     }
 }
