@@ -118,7 +118,9 @@ fn managed(path: &Path) -> Result<()> {
 /// v7.7 ticket 203: journald's native socket. A terminal run's status lines go there, under
 /// the login service's name, so `journalctl --user -t vibeconsole` shows both.
 pub const JOURNAL: &str = "/run/systemd/journal/socket";
-/// One line to the journal; with no journal it is dropped and the run goes on.
+/// One line to the journal; with no journal it is dropped and the run goes on. Tests never
+/// call it (they keep the lines in their script).
+#[cfg_attr(test, allow(dead_code))]
 pub fn journal(line: &str) {
     let message = format!(
         "SYSLOG_IDENTIFIER=vibeconsole\nPRIORITY=6\nMESSAGE={}\n",

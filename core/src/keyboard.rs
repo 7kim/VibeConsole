@@ -1031,6 +1031,97 @@ impl Drop for MouseLight {
         self.restore();
     }
 }
+/// v7.7 ticket 191: what the G502 logo should show.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MouseWant {
+    Show(crate::status::Rgb),
+    /// The stored lighting back: idle or paused.
+    Rest,
+    /// Switched off: the stored lighting back, and a missing logirgb is asked again next time.
+    Off,
+}
+/// v7.7 ticket 191: logirgb takes about half a second per call on the G502 (17 Nov 2026:
+/// `profiles` 515 ms, `list` 507 ms, `set` 111 ms before it even reaches the mouse), so the
+/// logo is driven on its own thread and the screen never waits. Only the latest want is acted
+/// on; older ones are dropped, never replayed. Dropping the worker puts the stored lighting
+/// back and waits for it, so quit restores before VibeConsole exits.
+pub struct MouseWorker {
+    wants: Option<std::sync::mpsc::Sender<MouseWant>>,
+    notices: std::sync::mpsc::Receiver<String>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    sent: Option<MouseWant>,
+}
+impl MouseWorker {
+    /// `runner` makes a fresh logirgb runner for each open (again after a failed `set`).
+    pub fn start(mut runner: impl FnMut() -> crate::gamepad::Runner + Send + 'static) -> Self {
+        let (wants, wanted) = std::sync::mpsc::channel::<MouseWant>();
+        let (notify, notices) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let mut mouse: Option<MouseLight> = None;
+            let mut failed = false;
+            while let Ok(mut want) = wanted.recv() {
+                while let Ok(newer) = wanted.try_recv() {
+                    want = newer;
+                }
+                let MouseWant::Show(effect) = want else {
+                    if let Some(mouse) = &mut mouse {
+                        mouse.restore();
+                    }
+                    failed &= want != MouseWant::Off;
+                    continue;
+                };
+                if mouse.is_none() && !failed {
+                    match MouseLight::open(runner()) {
+                        Ok(opened) => mouse = Some(opened),
+                        Err(error) => {
+                            failed = true;
+                            let _ = notify.send(error.to_string());
+                        }
+                    }
+                }
+                let Some(open) = &mut mouse else { continue };
+                let shown = open.show(effect);
+                if let Some(missing) = open.unavailable.take() {
+                    let _ = notify.send(format!("Mouse light (Logitech G502): {missing}"));
+                }
+                if let Err(error) = shown {
+                    mouse = None; // dropping it restores what it can
+                    let _ = notify.send(format!("Mouse light (Logitech G502): {error}; given up"));
+                }
+            }
+            // The wants closed: `mouse` drops here and puts back what it showed.
+        });
+        Self {
+            wants: Some(wants),
+            notices,
+            thread: Some(thread),
+            sent: None,
+        }
+    }
+    /// Hands over a want when it differs from the last one; never waits for logirgb.
+    pub fn want(&mut self, want: MouseWant) {
+        if self.sent != Some(want) {
+            self.sent = Some(want);
+            if let Some(wants) = &self.wants {
+                let _ = wants.send(want);
+            }
+        }
+    }
+    /// What the worker reported since the last call (unavailable, given up), oldest first.
+    pub fn notices(&self) -> Vec<String> {
+        self.notices.try_iter().collect()
+    }
+}
+impl Drop for MouseWorker {
+    fn drop(&mut self) {
+        if let Some(wants) = self.wants.take() {
+            let _ = wants.send(MouseWant::Rest);
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
 /// The G502's active onboard profile from `logirgb profiles -d g502` ("… 5 on (active)").
 fn active_profile(run: &mut crate::gamepad::Runner) -> Result<u8> {
     let out = run(&["logirgb", "profiles", "-d", "g502"])?;

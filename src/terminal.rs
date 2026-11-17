@@ -301,10 +301,9 @@ struct Terminal {
     /// v7.7 ticket 189: the Razer speakers and mousepad, in `status::ACCESSORIES` order.
     accessories: [Option<crate::keyboard::RgbKeyboards>; 2],
     accessories_failed: [bool; 2],
-    /// v7.7 ticket 190: the Logitech G502's logo light through logirgb, opened when a state
-    /// is first due.
-    mouse: Option<crate::keyboard::MouseLight>,
-    mouse_failed: bool,
+    /// v7.7 ticket 190: the Logitech G502's logo light through logirgb, started when a state
+    /// is first due; ticket 191: on its own thread.
+    mouse: Option<crate::keyboard::MouseWorker>,
     /// The focused app's profile (v7 ticket 12); None is Default.
     profile: Option<String>,
     /// Real sessions follow the focused app; tests never call the desktop.
@@ -1032,7 +1031,6 @@ impl Terminal {
             accessories: [None, None],
             accessories_failed: [false; 2],
             mouse: None,
-            mouse_failed: false,
             profile: None,
             follow_apps: false,
             focus_unavailable: false,
@@ -3044,7 +3042,8 @@ impl Terminal {
             }
         }
         if let Some(mouse) = &mut self.mouse {
-            mouse.restore(); // v7.7 ticket 190: paused, the mouse's own stored lighting
+            // v7.7 ticket 190: paused, the mouse's own stored lighting.
+            mouse.want(crate::keyboard::MouseWant::Rest);
         }
         self.holds.clear();
         if let Some(pad) = &mut self.gamepad {
@@ -3876,45 +3875,30 @@ impl Terminal {
     /// v7.7 ticket 190: while running, the G502 logo shows the most urgent state's effect as
     /// a logirgb preview; idle, paused or switched off, the mouse's own stored lighting goes
     /// back. A missing logirgb is named once, and asked again after the switch goes off and on.
-    /// ponytail: logirgb runs on this thread (a few ms per change); move it off if it stalls.
+    /// Ticket 191: logirgb runs on the worker's thread; this only hands over the latest want.
     fn show_mouse(&mut self, states: &[&str], running: bool) {
-        const LABEL: &str = "Mouse light (Logitech G502)";
+        use crate::keyboard::MouseWant;
         let switched = self.device_lights.as_ref().filter(|p| p.rgb_devices[3].on);
-        if switched.is_none() {
-            self.mouse_failed = false;
-        }
-        let wanted = switched
-            .filter(|_| running)
-            .and_then(|p| crate::status::rgb_for(states, &p.rgb_set(3)));
-        let Some(effect) = wanted else {
-            if let Some(mouse) = &mut self.mouse {
-                mouse.restore();
-            }
-            return;
+        let want = match switched {
+            None => MouseWant::Off,
+            Some(p) => (crate::status::rgb_for(states, &p.rgb_set(3)))
+                .filter(|_| running)
+                .map_or(MouseWant::Rest, MouseWant::Show),
         };
-        if self.mouse.is_none() && !self.mouse_failed {
+        if self.mouse.is_none() && matches!(want, MouseWant::Show(_)) {
             #[cfg(not(test))]
-            let run = crate::keyboard::logirgb_runner();
+            let runner = crate::keyboard::logirgb_runner;
             // Tests never start the real logirgb; they put a fake one in `mouse`.
             #[cfg(test)]
-            let run: crate::gamepad::Runner =
-                Box::new(|_: &[&str]| Err("logirgb: not run in tests".into()));
-            match crate::keyboard::MouseLight::open(run) {
-                Ok(mouse) => self.mouse = Some(mouse),
-                Err(error) => {
-                    self.mouse_failed = true;
-                    self.notice = error.to_string();
-                }
-            }
+            let runner = || -> crate::gamepad::Runner {
+                Box::new(|_: &[&str]| Err("logirgb: not run in tests".into()))
+            };
+            self.mouse = Some(crate::keyboard::MouseWorker::start(runner));
         }
         if let Some(mouse) = &mut self.mouse {
-            let sent = mouse.show(effect);
-            if let Some(missing) = mouse.unavailable.take() {
-                self.notice = format!("{LABEL}: {missing}");
-            }
-            if let Err(error) = sent {
-                self.mouse = None; // dropping it restores what it can
-                self.notice = format!("{LABEL}: {error}; given up");
+            mouse.want(want);
+            if let Some(notice) = mouse.notices().pop() {
+                self.notice = notice;
             }
         }
     }
@@ -21620,15 +21604,7 @@ mod tests {
         let path = dir.join("mappings.tsv");
         mappings::save(&path, &[]).unwrap();
         let calls = Arc::new(Mutex::new(Vec::<String>::new()));
-        let log = calls.clone();
-        let run: crate::gamepad::Runner = Box::new(move |args: &[&str]| {
-            log.lock().unwrap().push(args.join(" "));
-            Ok(match args[1] {
-                "profiles" => "G502 HERO Gaming Mouse profiles: 1 on, 5 on (active)\n".into(),
-                "list" => "   zone 1 (logo): G logo\n     profile 5: static color=#8000ff\n".into(),
-                _ => String::new(),
-            })
-        });
+        let run = fake_logirgb(&calls, Duration::ZERO);
         let mut ui = Terminal::open_mode(&path, true).unwrap();
         let mut patterns = crate::status::DevicePatterns::default();
         ui.device_lights = Some(patterns.clone());
@@ -21636,27 +21612,24 @@ mod tests {
         ui.output = Some(crate::keyboard::Output::recording(&[]).unwrap());
         ui.suspended = false;
         ui.show_rgb();
-        assert!(
-            ui.mouse.is_none() && !ui.mouse_failed,
-            "switched off: nothing opened"
-        );
-        ui.mouse = Some(crate::keyboard::MouseLight::open(run).unwrap());
+        assert!(ui.mouse.is_none(), "switched off: nothing opened");
+        ui.mouse = Some(crate::keyboard::MouseWorker::start(run));
         patterns.rgb_devices[3].on = true;
         let mut own = patterns.rgb_shared;
         own.states[2] = Rgb::Wave(None);
         patterns.rgb_devices[3].own = Some(own);
         ui.device_lights = Some(patterns);
         ui.show_rgb();
+        until(|| calls.lock().unwrap().len() == 2);
         ui.show_rgb();
         ui.agent_states[0].2 = "thinking";
-        ui.show_rgb();
-        assert!(
-            ui.notice.contains("wave unavailable on the G502 logo"),
-            "{}",
-            ui.notice
-        );
+        until(|| {
+            ui.show_rgb();
+            ui.notice.contains("wave unavailable on the G502 logo")
+        });
         ui.agent_states[0].2 = "idle";
         ui.show_rgb();
+        until(|| calls.lock().unwrap().len() == 5);
         ui.suspend().unwrap();
         drop(ui);
         assert_eq!(
@@ -21668,6 +21641,112 @@ mod tests {
                 "logirgb list",
                 "logirgb set -d g502 -z 1 static --color #8000ff --preview",
             ]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 191: a fake logirgb that logs each call, takes `delay` per `set`, and
+    /// answers as the G502 does (active profile 5, its stored logo static #8000ff).
+    fn fake_logirgb(
+        calls: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        delay: Duration,
+    ) -> impl FnMut() -> crate::gamepad::Runner + Send + 'static {
+        let calls = calls.clone();
+        move || {
+            let log = calls.clone();
+            Box::new(move |args: &[&str]| {
+                if args[1] == "set" {
+                    std::thread::sleep(delay);
+                }
+                log.lock().unwrap().push(args.join(" "));
+                Ok(match args[1] {
+                    "profiles" => "G502 HERO Gaming Mouse profiles: 1 on, 5 on (active)\n".into(),
+                    "list" => {
+                        "   zone 1 (logo): G logo\n     profile 5: static color=#8000ff\n".into()
+                    }
+                    _ => String::new(),
+                })
+            })
+        }
+    }
+    /// The mouse worker acts on its own thread: wait up to 3 s for it.
+    fn until(mut done: impl FnMut() -> bool) {
+        for _ in 0..300 {
+            if done() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the mouse worker never got there");
+    }
+
+    /// v7.7 ticket 191: logirgb takes about half a second a call on the G502, so it runs on
+    /// the worker's thread: with a slow fake logirgb the screen's status pass still returns at
+    /// once, a want that came and went while a change was pending is dropped (only the
+    /// latest is sent), and quitting with a change pending still puts the stored lighting back.
+    #[test]
+    fn g502_logo_never_holds_up_the_screen_and_sends_only_the_latest() {
+        use crate::status::Rgb;
+        use std::sync::{Arc, Mutex};
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-g502-slow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        ui.mouse = Some(crate::keyboard::MouseWorker::start(fake_logirgb(
+            &calls,
+            Duration::from_millis(300),
+        )));
+        let mut patterns = crate::status::DevicePatterns::default();
+        patterns.rgb_devices[3].on = true;
+        let mut own = patterns.rgb_shared;
+        own.states = [
+            Rgb::Static([0, 0, 1]), // needs-decision
+            Rgb::Static([0, 0, 2]), // needs-input
+            Rgb::Static([0, 0, 3]), // thinking
+            Rgb::Static([0, 0, 4]), // finished
+        ];
+        patterns.rgb_devices[3].own = Some(own);
+        ui.device_lights = Some(patterns);
+        ui.output = Some(crate::keyboard::Output::recording(&[]).unwrap());
+        ui.suspended = false;
+        ui.agent_states = vec![("claude".into(), "claude".into(), "needs-input")];
+        let pass = |ui: &mut Terminal| {
+            let at = Instant::now();
+            ui.show_rgb();
+            at.elapsed()
+        };
+        assert!(pass(&mut ui) < Duration::from_millis(50));
+        until(|| calls.lock().unwrap().len() == 1); // the open; the set now takes 300 ms
+        for state in ["thinking", "finished"] {
+            ui.agent_states[0].2 = state;
+            assert!(pass(&mut ui) < Duration::from_millis(50), "{state}");
+        }
+        until(|| calls.lock().unwrap().len() == 3);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                "logirgb profiles -d g502",
+                "logirgb set -d g502 -z 1 static --color #000002 --preview",
+                "logirgb set -d g502 -z 1 static --color #000004 --preview",
+            ],
+            "thinking came and went while a change was pending: never sent"
+        );
+        ui.agent_states[0].2 = "needs-decision";
+        ui.show_rgb();
+        drop(ui); // quit while that change is pending
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls[calls.len() - 3..],
+            [
+                "logirgb profiles -d g502",
+                "logirgb list",
+                "logirgb set -d g502 -z 1 static --color #8000ff --preview",
+            ],
+            "{calls:?}"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -21850,18 +21929,7 @@ mod tests {
         let firefly = device(dir.join("acc/0003:1532:0C04.0001"), "Razer Firefly V2");
         let read = |d: &Path| std::fs::read(d.join("matrix_effect_static")).unwrap();
         let calls = Arc::new(Mutex::new(Vec::<String>::new()));
-        let log = calls.clone();
-        let run: crate::gamepad::Runner = Box::new(move |args: &[&str]| {
-            log.lock().unwrap().push(args.join(" "));
-            Ok(match args[1] {
-                "profiles" => "G502 HERO Gaming Mouse profiles: 1 on (active)\n".into(),
-                "list" => {
-                    "   zone 1 (logo): G logo\n     profile 1: cycle period=8000ms intensity=100%\n"
-                        .into()
-                }
-                _ => String::new(),
-            })
-        });
+        let run = fake_logirgb(&calls, Duration::ZERO);
         let path = dir.join("mappings.tsv");
         mappings::save(&path, &[]).unwrap();
         let mut ui = Terminal::open_mode(&path, true).unwrap();
@@ -21874,7 +21942,7 @@ mod tests {
         ui.accessories[1] = Some(
             RgbKeyboards::open_accessory(&acc, Rgb::SPECTRUM, "Mousepad RGB", "Firefly").unwrap(),
         );
-        ui.mouse = Some(crate::keyboard::MouseLight::open(run).unwrap());
+        ui.mouse = Some(crate::keyboard::MouseWorker::start(run));
         let mut patterns = crate::status::DevicePatterns::default();
         for d in &mut patterns.rgb_devices {
             d.on = true;
@@ -21895,15 +21963,10 @@ mod tests {
         );
         assert_eq!(read(&nommo), [18, 52, 86], "speakers: the same");
         assert_eq!(read(&firefly), [1, 2, 3], "mousepad: its own wins");
-        assert!(
-            calls
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|c| c == "logirgb set -d g502 -z 1 static --color #123456 --preview"),
-            "{:?}",
-            calls.lock().unwrap()
-        );
+        until(|| {
+            (calls.lock().unwrap().iter())
+                .any(|c| c == "logirgb set -d g502 -z 1 static --color #123456 --preview")
+        });
         ui.agent_states[0].2 = "thinking";
         ui.show_rgb();
         for d in [&kbd, &nommo, &firefly] {
