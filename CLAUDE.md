@@ -80,7 +80,7 @@ Specs, tickets and tests are markdown under `docs/<version>/` (git-ignored: the 
 
 ### Closing a ticket (before the next ticket and before committing)
 
-1. Run `cargo fmt --check`, `cargo check --locked`, `cargo test --locked`; report failures or missing prerequisites.
+1. Run `cargo-gate` (`cargo fmt --check`, `check --locked`, `test --locked`; one line on pass); report failures or missing prerequisites.
 2. Tick each acceptance box you built and checked. Leave a box unticked only when I must check it, and say so in the comment.
 3. Set `Status: resolved`, or `ready-for-human` when only my check is left. Change a status only with evidence.
 4. Add `### Builder · <date>` under `## Comments`: what was built, the commit, what's left open.
