@@ -189,9 +189,9 @@ pub fn login(request: Login) -> Result<bool> {
         }
     }
 }
-/// v7.7 ticket 158: the ten VibeConsole skills, embedded at build time: (path under
+/// v7.7 ticket 158: the VibeConsole skills (ten, and since ticket 184 one per Ask), embedded at build time: (path under
 /// `~/.claude/skills`, text). A test keeps this list equal to the repo's `.claude/skills`.
-pub const SKILLS: [(&str, &str); 17] = [
+pub const SKILLS: [(&str, &str); 29] = [
     (
         "vibeconsole-agents/SKILL.md",
         include_str!("../.claude/skills/vibeconsole-agents/SKILL.md"),
@@ -259,6 +259,54 @@ pub const SKILLS: [(&str, &str); 17] = [
     (
         "vibeconsole/reference/safety-rules.md",
         include_str!("../.claude/skills/vibeconsole/reference/safety-rules.md"),
+    ), // v7.7 ticket 184: one skill for each Ask.
+    (
+        "vibeconsole-ask-about/SKILL.md",
+        include_str!("../.claude/skills/vibeconsole-ask-about/SKILL.md"),
+    ),
+    (
+        "vibeconsole-ask-family/SKILL.md",
+        include_str!("../.claude/skills/vibeconsole-ask-family/SKILL.md"),
+    ),
+    (
+        "vibeconsole-ask-improve/SKILL.md",
+        include_str!("../.claude/skills/vibeconsole-ask-improve/SKILL.md"),
+    ),
+    (
+        "vibeconsole-ask-map-agents/SKILL.md",
+        include_str!("../.claude/skills/vibeconsole-ask-map-agents/SKILL.md"),
+    ),
+    (
+        "vibeconsole-ask-mappings/SKILL.md",
+        include_str!("../.claude/skills/vibeconsole-ask-mappings/SKILL.md"),
+    ),
+    (
+        "vibeconsole-ask-preset/SKILL.md",
+        include_str!("../.claude/skills/vibeconsole-ask-preset/SKILL.md"),
+    ),
+    (
+        "vibeconsole-ask-profile/SKILL.md",
+        include_str!("../.claude/skills/vibeconsole-ask-profile/SKILL.md"),
+    ),
+    (
+        "vibeconsole-ask-prompt/SKILL.md",
+        include_str!("../.claude/skills/vibeconsole-ask-prompt/SKILL.md"),
+    ),
+    (
+        "vibeconsole-ask-recommendations/SKILL.md",
+        include_str!("../.claude/skills/vibeconsole-ask-recommendations/SKILL.md"),
+    ),
+    (
+        "vibeconsole-ask-sequence/SKILL.md",
+        include_str!("../.claude/skills/vibeconsole-ask-sequence/SKILL.md"),
+    ),
+    (
+        "vibeconsole-ask-setup/SKILL.md",
+        include_str!("../.claude/skills/vibeconsole-ask-setup/SKILL.md"),
+    ),
+    (
+        "vibeconsole-ask-setup-agents/SKILL.md",
+        include_str!("../.claude/skills/vibeconsole-ask-setup-agents/SKILL.md"),
     ),
 ];
 /// v7.7 ticket 158: Install /skills into `home`'s `.claude/skills`: missing files are
@@ -744,7 +792,7 @@ mod tests {
         assert!(!skills_installed(&home));
         let note = install_skills(&home).unwrap();
         assert!(
-            note.contains("17 files written") && note.contains("backed up first"),
+            note.contains("29 files written") && note.contains("backed up first"),
             "{note}"
         );
         assert!(skills_installed(&home));

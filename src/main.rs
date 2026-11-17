@@ -461,6 +461,72 @@ mod tests {
     /// `reference/controls.md` are generated (run with `UPDATE_SKILLS=1` to rewrite them);
     /// every link must resolve; the example profiles must import; every `vibeconsole <command>`
     /// named must exist; and nothing may point at the private docs folder or hold a path or secret.
+    /// v7.7 ticket 184: each Ask's own skill is at most 8 KB, says which ask it is for, and its
+    /// `reply` example passes the checker that kind's replies go through.
+    #[test]
+    fn ask_skills_examples_pass_their_checkers() {
+        use vibeconsole_core::mappings;
+        let skill = |name: &str| {
+            crate::runtime::SKILLS
+                .iter()
+                .find(|(p, _)| *p == format!("{name}/SKILL.md"))
+                .unwrap_or_else(|| panic!("{name}"))
+                .1
+        };
+        let reply = |name: &str| {
+            let text = skill(&format!("vibeconsole-ask-{name}"));
+            let start = text.find("```reply\n").unwrap_or_else(|| panic!("{name}")) + 9;
+            let end = start + text[start..].find("\n```").unwrap();
+            text[start..=end].to_string()
+        };
+        let config = mappings::Config::default();
+        let devices = mappings::profile_devices(&config, 0, None);
+        for name in ["mappings", "preset", "setup"] {
+            mappings::mappings_from_reply(&reply(name), &config, &devices)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+        for name in ["profile", "about", "family"] {
+            let text = mappings::profile_text_from_reply(&reply(name)).unwrap();
+            let mut profile =
+                mappings::import_profile(&text, &config).unwrap_or_else(|e| panic!("{name}: {e}"));
+            mappings::refuse_risky(&profile.mappings).unwrap();
+            if name != "family" {
+                mappings::check_profile_controls(&mut profile, &devices).unwrap();
+            }
+        }
+        let map = reply("map-agents");
+        let jumps = mappings::mappings_from_reply(&map, &config, &devices).unwrap();
+        assert_eq!(
+            mappings::check_agent_mappings(&map, &jumps, &config)
+                .unwrap()
+                .len(),
+            2
+        );
+        mappings::agent_setup_from_reply(
+            &reply("setup-agents"),
+            &["claude".into()],
+            &["/srv/code/api".into()],
+            &config,
+        )
+        .unwrap();
+        assert_eq!(mappings::questions_from_reply(&reply("prompt")).len(), 2);
+        mappings::sequence_from_reply(&reply("sequence"), &["review".into()]).unwrap();
+        let recommendations = mappings::recommendations_from_reply(&reply("recommendations"));
+        assert_eq!(recommendations.len(), 1);
+        mappings::mappings_from_reply(&recommendations[0].text, &config, &devices).unwrap();
+        let asks = crate::runtime::SKILLS
+            .iter()
+            .filter(|(p, _)| p.starts_with("vibeconsole-ask-"))
+            .collect::<Vec<_>>();
+        assert_eq!(asks.len(), 12);
+        for (path, text) in asks {
+            assert!(text.len() <= 8192, "{path}");
+            assert!(
+                text.contains("\ndescription: Use when VibeConsole's 0 AI"),
+                "{path}"
+            );
+        }
+    }
     #[test]
     fn vibeconsole_skills_match_the_code() {
         use std::path::{Path, PathBuf};
@@ -498,10 +564,22 @@ mod tests {
                 "{file} is out of date: run UPDATE_SKILLS=1 cargo test vibeconsole_skills"
             );
         }
-        // The ten skills, each a name, a "Use when" description, and links that resolve.
+        // The skills (ten, and one per Ask since ticket 184), each a name, a "Use when" description, and links that resolve.
         let want = [
             "vibeconsole",
             "vibeconsole-agents",
+            "vibeconsole-ask-about",
+            "vibeconsole-ask-family",
+            "vibeconsole-ask-improve",
+            "vibeconsole-ask-map-agents",
+            "vibeconsole-ask-mappings",
+            "vibeconsole-ask-preset",
+            "vibeconsole-ask-profile",
+            "vibeconsole-ask-prompt",
+            "vibeconsole-ask-recommendations",
+            "vibeconsole-ask-sequence",
+            "vibeconsole-ask-setup",
+            "vibeconsole-ask-setup-agents",
             "vibeconsole-doctor",
             "vibeconsole-hardware-test",
             "vibeconsole-lights",
