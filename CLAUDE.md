@@ -82,7 +82,7 @@ Specs, tickets and tests are markdown under `docs/<version>/` (git-ignored: the 
 
 1. Run `cargo-gate` (`cargo fmt --check`, `check --locked`, `test --locked`; one line on pass); report failures or missing prerequisites.
 2. `tickets close NN --status resolved|ready-for-human --tick <boxes built and checked> --comment "<what was built, the commit, what's left open>"`: it ticks the boxes, sets the status, signs `### Builder · <date> <time>`, closes the agent test and adds the developer test to the run order. Leave a box unticked only when I must check it, and say so. Change a status only with evidence.
-3. Re-read the file to confirm, then commit the code with the ticket number in the message.
+3. Re-read the file to confirm, then commit the code with the ticket number in the message. If the ticket changed `~/.local/share/claude-scripts`, commit and push that repo too, with the same ticket number.
 
 At a version's end, `tickets check` prints nothing (no implemented ticket still says `ready-for-agent`, no box ticked only in your head).
 
