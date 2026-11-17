@@ -455,6 +455,9 @@ struct Terminal {
     tab: usize,
     /// v7.7 ticket 177: the row each tab was left on, in memory only.
     tab_rows: [usize; 10],
+    /// v7.7 ticket 205: no key has reached Live yet, so its cursor follows the most urgent
+    /// agent (else Release all), never Pause.
+    live_start: bool,
     rendered: String,
     rendered_size: (usize, usize),
     /// v7.7 ticket 213: the first frame is drawn; input typed before it was dropped.
@@ -1134,9 +1137,10 @@ impl Terminal {
             bend: None,
             at_menu: false,
             akai_owned: false,
-            menu: 0, // Live's Pause / Resume (v7.7 ticket 151)
+            menu: 0,
             tab: 0,
             tab_rows: [0; 10],
+            live_start: true,
             rendered: String::new(),
             rendered_size: (0, 0),
             drawn: false,
@@ -12705,6 +12709,17 @@ fn command_menu(ui: &mut Terminal) -> Result<Option<usize>> {
             Vec::new()
         };
         let opens = targets.iter().map(Option::is_some).collect::<Vec<_>>();
+        // v7.7 ticket 205: until a key reaches Live, a stray Enter goes to the most urgent
+        // agent (rows are sorted most urgent first) or releases held keys; it never pauses.
+        if ui.tab == 0 && ui.live_start {
+            let first =
+                |want: fn(&Open) -> bool| targets.iter().position(|t| t.as_ref().is_some_and(want));
+            if let Some(row) = first(|t| matches!(t, Open::Agent(_)))
+                .or_else(|| first(|t| matches!(t, Open::Command(5))))
+            {
+                ui.menu = row;
+            }
+        }
         ui.menu = ui.menu.min(targets.len() - 1);
         if !opens[ui.menu] {
             ui.menu = next_row(&opens, ui.menu, 1).unwrap_or(ui.menu);
@@ -12723,6 +12738,9 @@ fn command_menu(ui: &mut Terminal) -> Result<Option<usize>> {
             },
             key => key,
         };
+        if ui.tab == 0 && key.is_some() {
+            ui.live_start = false;
+        }
         let tab = match key {
             Some(Key::Tab | Key::Right) => (ui.tab + 1) % TABS.len(),
             Some(Key::BackTab | Key::Left) => (ui.tab + TABS.len() - 1) % TABS.len(),
@@ -14639,6 +14657,7 @@ mod tests {
                 // Counted from the first row: forget the rows tabs were left on (ticket 177).
                 ui.tab_rows = [0; 10];
                 ui.menu = 0;
+                ui.live_start = false; // ticket 205 starts Live elsewhere
                 ui.script = Some(Play {
                     steps: steps.into(),
                     ..Play::default()
@@ -16821,6 +16840,7 @@ mod tests {
         // (outside), idler, herdr-one, done. "done" is never entered: it would clear a real
         // status file.
         ui.menu = 0;
+        ui.live_start = false; // counted from the first row (ticket 205 starts elsewhere)
         ui.at_menu = true; // as the session does around `command_menu`
         let down = |n| (0..n).map(|_| Step::Key(Key::Down)).collect::<Vec<_>>();
         let mut steps = down(5); // asker (the heading is skipped)
@@ -21668,6 +21688,64 @@ mod tests {
                 "logirgb set -d g502 -z 1 static --color #8000ff --preview",
             ]
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 205: Live opens with the cursor on the most urgent agent, else on
+    /// Release all, never on Pause: a stray Enter goes to the agent or releases held keys
+    /// while output keeps running; Pause is a few rows up, and Enter there pauses.
+    #[test]
+    fn live_opens_off_pause_so_a_stray_enter_never_pauses() {
+        let enter_then = |ui: &mut Terminal, more: &[Key]| {
+            let mut steps = vec![Step::Key(Key::Enter)];
+            steps.extend(more.iter().map(|k| Step::Key(*k)));
+            ui.script = Some(Play {
+                steps: steps.into(),
+                ..Play::default()
+            });
+            let id = command_menu(ui).unwrap();
+            (id, ui.script.take().unwrap())
+        };
+        // No agents: Enter is Release all, and the held Shift is let go.
+        let (dir, mut ui, _ran, [.., shift]) = configure_session("live-start");
+        ui.status_at = Instant::now() + Duration::from_secs(3600); // no agents appear
+        ui.at_menu = true;
+        ui.handle_events(vec![Event::Press(shift)]).unwrap();
+        assert_eq!(shifts(&ui), 1);
+        let (id, _) = enter_then(&mut ui, &[]);
+        assert_eq!(id, Some(5), "Release all");
+        ui.release_all().unwrap(); // what the session does with it
+        let recorded = &ui.output.as_ref().unwrap().recorded;
+        assert_eq!(
+            recorded.last(),
+            Some(&(evdev::KeyCode::KEY_LEFTSHIFT, false))
+        );
+        assert!(ui.wanted_run, "output keeps running");
+        drop(ui);
+        std::fs::remove_dir_all(dir).unwrap();
+
+        // One agent: Enter goes to it; then up to Pause, and Enter pauses.
+        let (dir, mut ui, _ran, _) = configure_session("live-start-agent");
+        ui.status_at = Instant::now() + Duration::from_secs(3600); // keep the fake agent
+        ui.agent_states = vec![("asker".into(), "w5".into(), "needs-input")];
+        let folder = dir.to_string_lossy().into_owned();
+        ui.agent_places = vec![(mappings::Host::Tmux, Some(folder))];
+        ui.at_menu = true;
+        let (id, play) = enter_then(&mut ui, &[Key::Escape]);
+        assert_eq!(id, None);
+        assert_eq!(play.ran, ["tmux select-window -t vibe:w5"]);
+        assert!(ui.wanted_run, "output keeps running");
+        // Up: View, Quit until next login, Quit, Release all, Pause.
+        ui.script = Some(Play {
+            steps: [Key::Up, Key::Up, Key::Up, Key::Up, Key::Up, Key::Enter]
+                .map(Step::Key)
+                .into(),
+            ..Play::default()
+        });
+        assert_eq!(command_menu(&mut ui).unwrap(), Some(1), "❚❚ Pause");
+        ui.pause().unwrap(); // what the session does with it while running
+        assert!(!ui.wanted_run);
+        drop(ui);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

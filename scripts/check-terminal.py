@@ -17,7 +17,9 @@ import time
 
 binary = Path(__file__).resolve().parents[1] / "target/debug/vibeconsole"
 # v7.7 ticket 150: each tab's rows that open something, by the tab's number key (headings
-# are skipped). The session starts on 1 Live with Run/Pause selected.
+# are skipped). v7.7 ticket 205: the session starts on 1 Live with the top agent selected
+# (claude, from the old config's default agents, once its row appears), else Release all;
+# never on Pause. No scenario presses Enter on an agent: that would run the real tmux.
 TABS = {
     b"1": ["▶ Resume", "Release all", "Quit"],
     b"2": ["/configure", "/list", "Favourites", "Presets", "Undo last change", "History…", "⚠ Reset settings"],
@@ -178,7 +180,7 @@ for ending in (*STARTUP, "quit", "sigint", "sigterm", "configuration_error", "cu
                 os.write(master, b"\x1b")
                 initial_screen += read_until(master, MENU)
             if ending in STARTUP:
-                assert PAUSE in initial_screen and b"RUNNING" in initial_screen
+                assert PAUSE not in initial_screen and b"RUNNING" in initial_screen
                 assert b"PAUSED" not in initial_screen
                 # Idle on Live: nothing changes, so nothing is written between ticks.
                 time.sleep(1)
@@ -187,7 +189,7 @@ for ending in (*STARTUP, "quit", "sigint", "sigterm", "configuration_error", "cu
                 assert not select.select([master], [], [], 2)[0], "wrote while idle"
                 go(master, "Pause", "/quit")
             elif ending == "unverified_run":
-                go(master, "Run", "Run")
+                go(master, "Release all", "Run")
                 notice = read_until(master, b"Select /prog-select before running")
                 assert b"Operation failed" not in notice
                 assert b"PAUSED" in initial_screen
@@ -198,8 +200,8 @@ for ending in (*STARTUP, "quit", "sigint", "sigterm", "configuration_error", "cu
                 go(master, "Run", "/quit")
             elif ending == "toggle_run_pause":
                 assert b"RUNNING (detecting program" in initial_screen
-                assert PAUSE in initial_screen
-                go(master, "Pause", "Pause")
+                assert PAUSE not in initial_screen and "❚❚ Pause".encode() in initial_screen
+                go(master, "Release all", "Pause")
                 paused = read_until(master, RESUME)
                 assert b"PAUSED" in paused
                 go(master, "Run", "Run")
@@ -208,7 +210,18 @@ for ending in (*STARTUP, "quit", "sigint", "sigterm", "configuration_error", "cu
                 read_until(master, MENU)
                 go(master, "Run", "/quit")
             elif ending == "modified_navigation":
-                os.write(master, b"\x1b[1;2B")  # Shift+Down
+                # Shift+Up until Resume: Live starts on the top agent once its row is
+                # there, else on Release all (v7.7 ticket 205).
+                for _ in range(10):
+                    os.write(master, b"\x1b[1;2A")  # Shift+Up
+                    try:
+                        read_until(master, RESUME, seconds=0.5)
+                        break
+                    except AssertionError:
+                        pass
+                else:
+                    raise AssertionError("Shift+Up never reached Resume")
+                os.write(master, b"\x1b[1;5B")  # Ctrl+Down
                 read_until(master, b"> Release all")
                 os.write(master, b"\x1b[1;3A")  # Alt+Up
                 read_until(master, RESUME)
