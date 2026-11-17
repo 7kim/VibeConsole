@@ -996,8 +996,11 @@ fn lights(config: &Config) -> Value {
             .collect::<Map<_, _>>()
             .into()
     };
-    let rgb_states = |effects: &[crate::status::Rgb; 4]| {
-        by_state(effects.iter().map(|e| rgb_word(*e).into()).collect())
+    let set = |set: &crate::status::RgbSet| {
+        json!({
+            "rest": rgb_word(set.rest),
+            "states": by_state(set.states.iter().map(|e| rgb_word(*e).into()).collect()),
+        })
     };
     let leds = KEY_LEDS
         .iter()
@@ -1005,8 +1008,15 @@ fn lights(config: &Config) -> Value {
         .filter(|(_, on)| *on)
         .map(|(name, _)| *name)
         .collect::<Vec<_>>();
-    let [speakers, mousepad] = &d.accessories;
-    let accessory = |a: &crate::status::AccessoryRgb| json!({"on": a.on, "rest": rgb_word(a.rest), "states": rgb_states(&a.effects)});
+    // v7.7 ticket 199: one shared set; each device's switch and its own set or null.
+    let device = |i: usize| {
+        let own = d.rgb_devices[i].own.as_ref().map(set);
+        let mut out = json!({"on": d.rgb_devices[i].on, "own": own});
+        if i == 0 {
+            out["brightness"] = json!(d.rgb_brightness);
+        }
+        out
+    };
     json!({
         "version": VERSION,
         "status_lights": config.status_lights,
@@ -1038,15 +1048,11 @@ fn lights(config: &Config) -> Value {
             "leds": leds,
             "states": by_state(d.keyboard.iter().map(|l| word(&LIGHTS, *l).into()).collect()),
         },
-        "keyboard_rgb": {
-            "on": d.rgb_on,
-            "brightness": d.rgb_brightness,
-            "rest": rgb_word(d.rgb_rest),
-            "states": rgb_states(&d.rgb),
-        },
-        "speakers_rgb": accessory(speakers),
-        "mousepad_rgb": accessory(mousepad),
-        "mouse_rgb": {"on": d.mouse_on, "states": rgb_states(&d.mouse)},
+        "rgb_shared": set(&d.rgb_shared),
+        "keyboard_rgb": device(0),
+        "speakers_rgb": device(1),
+        "mousepad_rgb": device(2),
+        "mouse_rgb": device(3),
     })
 }
 
@@ -1062,19 +1068,25 @@ impl Lights {
             "xbox",
             "ps5",
             "keyboard_leds",
+            "rgb_shared",
             "keyboard_rgb",
             "speakers_rgb",
             "mousepad_rgb",
             "mouse_rgb",
         ])?;
         let rgb = |at: &Obj, key: &str| at.check(key, crate::status::parse_rgb(at.str(key)?));
-        let rgb_states = |at: &Obj| -> Result<[crate::status::Rgb; 4]> {
+        // v7.7 ticket 199: a set: the resting effect and one effect per state.
+        let set = |at: &Obj| -> Result<crate::status::RgbSet> {
+            at.only(&["rest", "states"])?;
             let states = at.states("states")?;
             let mut out = [crate::status::Rgb::Off; 4];
             for (slot, state) in out.iter_mut().zip(BUSY) {
                 *slot = rgb(&states, state)?;
             }
-            Ok(out)
+            Ok(crate::status::RgbSet {
+                rest: rgb(at, "rest")?,
+                states: out,
+            })
         };
         let folders = at
             .objects("folders")?
@@ -1117,10 +1129,35 @@ impl Lights {
         let keys = at.obj("keyboard_leds")?;
         keys.only(&["on", "leds", "states"])?;
         let key_states = keys.states("states")?;
-        let keyboard_rgb = at.obj("keyboard_rgb")?;
-        keyboard_rgb.only(&["on", "brightness", "rest", "states"])?;
-        let mouse = at.obj("mouse_rgb")?;
-        mouse.only(&["on", "states"])?;
+        let rgb_shared = set(&at.obj("rgb_shared")?)?;
+        let mut rgb_devices = [crate::status::RgbDevice {
+            on: false,
+            own: None,
+        }; 4];
+        let mut rgb_brightness = 0;
+        for (i, (slot, (key, ..))) in rgb_devices
+            .iter_mut()
+            .zip(crate::status::RGB_DEVICES)
+            .enumerate()
+        {
+            let d = at.obj(key)?;
+            d.only(if i == 0 {
+                &["on", "own", "brightness"]
+            } else {
+                &["on", "own"]
+            })?;
+            if i == 0 {
+                rgb_brightness = d.int("brightness")?;
+            }
+            let own = match d.get("own")? {
+                Value::Null => None,
+                _ => Some(set(&d.obj("own")?)?),
+            };
+            *slot = crate::status::RgbDevice {
+                on: d.bool("on")?,
+                own,
+            };
+        }
 
         let mut xbox_patterns = [(crate::status::Light::Off, crate::status::Rumble::Off); 4];
         let mut brightness = [0u8; 4];
@@ -1152,20 +1189,6 @@ impl Lights {
             })?;
             keyboard_leds[index] = true;
         }
-        let mut accessories = [crate::status::AccessoryRgb {
-            on: false,
-            rest: crate::status::Rgb::Off,
-            effects: [crate::status::Rgb::Off; 4],
-        }; 2];
-        for (slot, key) in accessories.iter_mut().zip(["speakers_rgb", "mousepad_rgb"]) {
-            let a = at.obj(key)?;
-            a.only(&["on", "rest", "states"])?;
-            *slot = crate::status::AccessoryRgb {
-                on: a.bool("on")?,
-                rest: rgb(&a, "rest")?,
-                effects: rgb_states(&a)?,
-            };
-        }
         let devices = crate::status::DevicePatterns {
             on: [mpk.bool("on")?, xbox.bool("on")?, ps5.bool("on")?],
             xbox: xbox_patterns,
@@ -1174,13 +1197,9 @@ impl Lights {
             keyboard,
             keyboard_leds,
             xbox_brightness: brightness,
-            rgb_on: keyboard_rgb.bool("on")?,
-            rgb: rgb_states(&keyboard_rgb)?,
-            rgb_rest: rgb(&keyboard_rgb, "rest")?,
-            rgb_brightness: keyboard_rgb.int("brightness")?,
-            accessories,
-            mouse_on: mouse.bool("on")?,
-            mouse: rgb_states(&mouse)?,
+            rgb_shared,
+            rgb_devices,
+            rgb_brightness,
         };
         at.check("xbox", devices.validate())?;
         Ok(Self {
@@ -1358,19 +1377,33 @@ mod tests {
         d.keyboard_on = true;
         d.keyboard = [Light::Steady; 4];
         d.keyboard_leds = [true, false, false, true];
-        d.rgb_on = true;
-        d.rgb = [
-            Rgb::Wave,
-            Rgb::Reactive("blue"),
-            Rgb::Breath("white"),
-            Rgb::Off,
-        ];
-        d.rgb_rest = Rgb::Static("purple");
+        // Ticket 199: a shared set with own colours and settings, an override on the speakers
+        // and the mouse, every device on.
+        d.rgb_shared = crate::status::RgbSet {
+            rest: Rgb::Static([18, 52, 86]),
+            states: [
+                Rgb::Wave(Some(2)),
+                Rgb::Reactive([0, 0, 255], Some(4)),
+                Rgb::Breath(
+                    [255, 136, 0],
+                    crate::status::Timing {
+                        period: Some(3000),
+                        form: Some(1),
+                        intensity: Some(50),
+                    },
+                ),
+                Rgb::BreathTwo([1, 2, 3], [250, 251, 252]),
+            ],
+        };
         d.rgb_brightness = 128;
-        d.accessories[0].on = true;
-        d.accessories[1].rest = Rgb::Reactive("white");
-        d.mouse_on = true;
-        d.mouse[3] = Rgb::Static("white");
+        for device in &mut d.rgb_devices {
+            device.on = true;
+        }
+        let mut own = d.rgb_shared;
+        own.states[0] = Rgb::BreathRandom;
+        d.rgb_devices[1].own = Some(own);
+        own.states = [Rgb::Static([9, 9, 9]); 4];
+        d.rgb_devices[3].own = Some(own);
         config
     }
 
@@ -1385,11 +1418,14 @@ mod tests {
         assert_eq!(mappings::load_config(&path).unwrap(), lit());
         let file = dir.join("lights.json");
         let good = fs::read_to_string(&file).unwrap();
-        assert!(good.contains("\"reactive-blue\""), "{good}");
+        assert!(good.contains("\"reactive #0000ff speed=4\""), "{good}");
         for (bad, field) in [
             (
-                good.replace("\"reactive-blue\"", "\"reactive-pink\""),
-                "keyboard_rgb.states.needs-input",
+                good.replace(
+                    "\"reactive #0000ff speed=4\"",
+                    "\"reactive #0000ff speed=5\"",
+                ),
+                "rgb_shared.states.needs-input",
             ),
             (
                 good.replace("\"brightness\": 50", "\"brightness\": 51"),
@@ -1712,7 +1748,7 @@ mod tests {
         let mut next = all.clone();
         next.look.theme = "Dracula".into();
         next.mappings.pop();
-        next.device_lights.rgb_on = false;
+        next.device_lights.rgb_devices[0].on = false;
         mappings::save_config(&path, &next).unwrap();
         assert_eq!(
             fs::read_to_string(&path).unwrap(),

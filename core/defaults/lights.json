@@ -91,44 +91,30 @@
       "finished": "blink"
     }
   },
-  "keyboard_rgb": {
-    "on": false,
-    "brightness": 255,
+  "rgb_shared": {
     "rest": "spectrum",
     "states": {
-      "needs-decision": "static-red",
-      "needs-input": "static-orange",
-      "thinking": "breath-blue",
-      "finished": "static-green"
+      "needs-decision": "static #ff0000",
+      "needs-input": "static #ff8000",
+      "thinking": "breath #0000ff",
+      "finished": "static #00ff00"
     }
+  },
+  "keyboard_rgb": {
+    "on": false,
+    "own": null,
+    "brightness": 255
   },
   "speakers_rgb": {
     "on": false,
-    "rest": "spectrum",
-    "states": {
-      "needs-decision": "static-red",
-      "needs-input": "static-orange",
-      "thinking": "breath-blue",
-      "finished": "static-green"
-    }
+    "own": null
   },
   "mousepad_rgb": {
     "on": false,
-    "rest": "spectrum",
-    "states": {
-      "needs-decision": "static-red",
-      "needs-input": "static-orange",
-      "thinking": "breath-blue",
-      "finished": "static-green"
-    }
+    "own": null
   },
   "mouse_rgb": {
     "on": false,
-    "states": {
-      "needs-decision": "static-red",
-      "needs-input": "static-orange",
-      "thinking": "breath-blue",
-      "finished": "static-green"
-    }
+    "own": null
   }
 }

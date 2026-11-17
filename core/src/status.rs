@@ -618,27 +618,86 @@ pub struct DevicePatterns {
     pub keyboard_leds: [bool; 4],
     /// v7 ticket 132 (config v29): the Xbox button light's brightness per state, 0–50.
     pub xbox_brightness: [u8; 4],
-    /// v7 ticket 128 (config v32): a Razer keyboard's RGB backlight, off until turned on:
-    /// its effect per state, the resting effect it gets back on pause and quit (the user
-    /// picks it: nothing can read the old effect back), and the brightness while it shows.
-    pub rgb_on: bool,
-    pub rgb: [Rgb; 4],
-    pub rgb_rest: Rgb,
+    /// v7.7 ticket 199: the RGB devices (`RGB_DEVICES`: keyboard, speakers, mousepad, mouse
+    /// logo) follow one shared effect per state and one resting effect; a device's own
+    /// set overrides it while it has one. Each device is off until turned on.
+    pub rgb_shared: RgbSet,
+    pub rgb_devices: [RgbDevice; 4],
+    /// v7 ticket 128: the Razer keyboard's brightness while it shows a state (its own comes
+    /// back after). The accessories' and the mouse's brightness are left alone (ticket 189).
     pub rgb_brightness: u8,
-    /// v7.7 ticket 189 (config v34): the Razer speakers' and mousepad's RGB, in `ACCESSORIES`
-    /// order, each off until turned on. Their brightness is left alone (below).
-    pub accessories: [AccessoryRgb; 2],
-    /// v7.7 ticket 190 (config v34): the Logitech G502's logo light, off until turned on:
-    /// its effect per state. Its resting effect is the mouse's own stored one.
-    pub mouse_on: bool,
-    pub mouse: [Rgb; 4],
 }
-/// v7.7 ticket 189: one Razer accessory's RGB: its switch, resting effect and effect per state.
+/// v7.7 ticket 199: an effect per busy state (`BUSY` order) and the resting effect shown
+/// when idle, paused and after quit. The G502 logo rests on its own stored lighting instead.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AccessoryRgb {
-    pub on: bool,
+pub struct RgbSet {
     pub rest: Rgb,
-    pub effects: [Rgb; 4],
+    pub states: [Rgb; 4],
+}
+/// v7.7 ticket 199: an RGB device's switch and its own set, which overrides the shared one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RgbDevice {
+    pub on: bool,
+    pub own: Option<RgbSet>,
+}
+impl DevicePatterns {
+    /// The set an RGB device shows: its own, else the shared one.
+    pub fn rgb_set(&self, device: usize) -> RgbSet {
+        self.rgb_devices[device].own.unwrap_or(self.rgb_shared)
+    }
+}
+/// v7.7 ticket 199: the RGB devices: config key, name shown, and the effects each shows
+/// (ticket 193's table: OpenRazer 3.12.4 files, logirgb 0.6.0's logo zone). The Firefly's
+/// reactive lights only on a trigger VibeConsole doesn't send, so it isn't offered.
+pub const RGB_DEVICES: [(&str, &str, &[RgbKind]); 4] = {
+    use RgbKind::*;
+    [
+        (
+            "keyboard_rgb",
+            "Keyboard RGB (Razer, needs OpenRazer's driver)",
+            &[
+                Off,
+                Static,
+                Breath,
+                BreathTwo,
+                BreathRandom,
+                Reactive,
+                Wave,
+                Spectrum,
+            ],
+        ),
+        (
+            "speakers_rgb",
+            "Speakers RGB (Razer Nommo)",
+            &[Off, Static, Breath, BreathTwo, BreathRandom, Wave, Spectrum],
+        ),
+        (
+            "mousepad_rgb",
+            "Mousepad RGB (Razer Firefly)",
+            &[Off, Static, Breath, BreathTwo, BreathRandom, Wave, Spectrum],
+        ),
+        (
+            "mouse_rgb",
+            "Mouse light (Logitech G502 logo, needs logirgb)",
+            &[Off, Static, Breath, Spectrum],
+        ),
+    ]
+};
+/// v7.7 ticket 199: the effects every switched-on device shows (all four when none is on),
+/// in `RGB_KINDS` order: what the shared set offers, so no device goes dark.
+pub fn shared_kinds(devices: &[RgbDevice; 4]) -> Vec<RgbKind> {
+    let any_on = devices.iter().any(|d| d.on);
+    RGB_KINDS
+        .iter()
+        .map(|(_, _, k)| *k)
+        .filter(|k| {
+            RGB_DEVICES
+                .iter()
+                .zip(devices)
+                .filter(|(_, d)| d.on || !any_on)
+                .all(|((_, _, kinds), _)| kinds.contains(k))
+        })
+        .collect()
 }
 /// v7.7 ticket 189: the Razer accessories under OpenRazer's `razeraccessory` driver: the
 /// config word, the name shown, and what its `device_type` contains.
@@ -648,50 +707,256 @@ pub const ACCESSORIES: [(&str, &str, &str); 2] = [
     ("speakers-rgb", "Speakers RGB (Razer Nommo)", "Nommo"),
     ("mousepad-rgb", "Mousepad RGB (Razer Firefly)", "Firefly"),
 ];
-/// v7 ticket 128: an RGB backlight effect, through OpenRazer's `matrix_effect_*` files.
-/// Colours are `COLOURS` names.
+/// v7.7 ticket 199: a colour, red, green and blue.
+pub type Colour = [u8; 3];
+/// v7.7 ticket 199: the G502 logo's breathe and cycle settings (logirgb 0.6.0); None: as
+/// the mouse has it. The Razer devices take no timing (their breath speed is in firmware).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Timing {
+    /// 1000–20000 ms.
+    pub period: Option<u16>,
+    /// An index into `FORMS`.
+    pub form: Option<u8>,
+    /// 1–100 %.
+    pub intensity: Option<u8>,
+}
+/// logirgb's breathe waveforms.
+pub const FORMS: [&str; 7] = [
+    "default",
+    "sine",
+    "square",
+    "triangle",
+    "sawtooth",
+    "shark-fin",
+    "exponential",
+];
+/// v7.7 ticket 199: an RGB effect with its settings (ticket 193's research). A setting left
+/// None keeps what VibeConsole did before: reactive speed 2, wave direction 1, the logo's
+/// own timing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Rgb {
     Off,
-    Spectrum,
+    Static(Colour),
+    Breath(Colour, Timing),
+    /// Razer only: two colours in turn.
+    BreathTwo(Colour, Colour),
+    /// Razer only: random colours.
+    BreathRandom,
+    /// Speed 1 (short) – 4 (long).
+    Reactive(Colour, Option<u8>),
+    /// Direction 1 or 2.
+    Wave(Option<u8>),
+    Spectrum(Timing),
+}
+impl Rgb {
+    pub const SPECTRUM: Rgb = Rgb::Spectrum(Timing {
+        period: None,
+        form: None,
+        intensity: None,
+    });
+}
+/// v7.7 ticket 199: an effect without its settings, as picked first in the menu.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RgbKind {
+    Off,
+    Static,
+    Breath,
+    BreathTwo,
+    BreathRandom,
+    Reactive,
     Wave,
-    Static(&'static str),
-    Breath(&'static str),
-    Reactive(&'static str),
+    Spectrum,
 }
-/// Every RGB effect, as its config word: off, spectrum, wave, then static-, breath- and
-/// reactive- with each colour.
-pub fn rgb_effects() -> Vec<Rgb> {
-    let mut all = vec![Rgb::Off, Rgb::Spectrum, Rgb::Wave];
-    let kinds: [fn(&'static str) -> Rgb; 3] = [Rgb::Static, Rgb::Breath, Rgb::Reactive];
-    for kind in kinds {
-        all.extend(COLOURS.map(kind));
+/// Each kind: its word in an effect, its menu label.
+pub const RGB_KINDS: [(&str, &str, RgbKind); 8] = [
+    ("off", "off", RgbKind::Off),
+    ("static", "static: one colour", RgbKind::Static),
+    (
+        "breath",
+        "breath: one colour fading in and out",
+        RgbKind::Breath,
+    ),
+    ("breath", "breath: two colours in turn", RgbKind::BreathTwo),
+    ("breath", "breath: random colours", RgbKind::BreathRandom),
+    (
+        "reactive",
+        "reactive: lights on each key press",
+        RgbKind::Reactive,
+    ),
+    ("wave", "wave: colours moving across", RgbKind::Wave),
+    ("spectrum", "spectrum: a colour cycle", RgbKind::Spectrum),
+];
+pub fn rgb_kind(effect: Rgb) -> RgbKind {
+    match effect {
+        Rgb::Off => RgbKind::Off,
+        Rgb::Static(_) => RgbKind::Static,
+        Rgb::Breath(..) => RgbKind::Breath,
+        Rgb::BreathTwo(..) => RgbKind::BreathTwo,
+        Rgb::BreathRandom => RgbKind::BreathRandom,
+        Rgb::Reactive(..) => RgbKind::Reactive,
+        Rgb::Wave(_) => RgbKind::Wave,
+        Rgb::Spectrum(_) => RgbKind::Spectrum,
     }
-    all
 }
+/// A colour as `#rrggbb`.
+pub fn colour_word(c: Colour) -> String {
+    format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])
+}
+/// v7.7 ticket 199: a colour as `#rrggbb`, `r,g,b` (each 0–255) or one of `COLOURS`, or
+/// why not.
+pub fn parse_colour(text: &str) -> Result<Colour> {
+    let text = text.trim();
+    if let Some(name) = COLOURS.iter().find(|c| **c == text) {
+        return Ok(rgb_bytes(name));
+    }
+    if let Some(hex) = text.strip_prefix('#') {
+        if hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex digits");
+            return Ok([byte(0), byte(2), byte(4)]);
+        }
+        return Err(
+            format!("{text} isn't a colour: #rrggbb takes six hex digits, 0–9 and a–f").into(),
+        );
+    }
+    let parts = text.split(',').map(str::trim).collect::<Vec<_>>();
+    let digits = |p: &&str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+    if parts.len() == 3 && parts.iter().all(digits) {
+        let mut out = [0u8; 3];
+        for (slot, part) in out.iter_mut().zip(&parts) {
+            *slot = part.parse().map_err(|_| {
+                format!("{text} isn't a colour: each of r,g,b is 0–255, not {part}")
+            })?;
+        }
+        return Ok(out);
+    }
+    Err(format!(
+        "{text} isn't a colour: type #rrggbb, r,g,b (each 0–255) or one of {}",
+        COLOURS.join(", ")
+    )
+    .into())
+}
+/// The effect as its config word: `off`, `static #ff0000`, `breath #0000ff period=3000`,
+/// `breath #ff0000 #0000ff`, `breath random`, `reactive #ffffff speed=3`,
+/// `wave direction=2`, `spectrum intensity=50`. Settings left as they were are left out.
 pub fn rgb_word(effect: Rgb) -> String {
+    let timing = |t: Timing| {
+        let mut out = String::new();
+        if let Some(p) = t.period {
+            out += &format!(" period={p}");
+        }
+        if let Some(f) = t.form {
+            out += &format!(" form={}", FORMS[usize::from(f) % FORMS.len()]);
+        }
+        if let Some(i) = t.intensity {
+            out += &format!(" intensity={i}");
+        }
+        out
+    };
     match effect {
         Rgb::Off => "off".into(),
-        Rgb::Spectrum => "spectrum".into(),
-        Rgb::Wave => "wave".into(),
-        Rgb::Static(c) => format!("static-{c}"),
-        Rgb::Breath(c) => format!("breath-{c}"),
-        Rgb::Reactive(c) => format!("reactive-{c}"),
+        Rgb::Static(c) => format!("static {}", colour_word(c)),
+        Rgb::Breath(c, t) => format!("breath {}{}", colour_word(c), timing(t)),
+        Rgb::BreathTwo(a, b) => format!("breath {} {}", colour_word(a), colour_word(b)),
+        Rgb::BreathRandom => "breath random".into(),
+        Rgb::Reactive(c, speed) => format!(
+            "reactive {}{}",
+            colour_word(c),
+            speed.map_or(String::new(), |s| format!(" speed={s}"))
+        ),
+        Rgb::Wave(d) => format!(
+            "wave{}",
+            d.map_or(String::new(), |d| format!(" direction={d}"))
+        ),
+        Rgb::Spectrum(t) => format!("spectrum{}", timing(Timing { form: None, ..t })),
     }
 }
+/// v7.7 ticket 199: an effect word, checked in full; also the older `static-red` words
+/// (config v32–34), whose named colour becomes its RGB.
 pub fn parse_rgb(word: &str) -> Result<Rgb> {
-    rgb_effects()
-        .into_iter()
-        .find(|e| rgb_word(*e) == word)
-        .ok_or_else(|| {
-            format!(
-                "keyboard RGB effect must be off, spectrum, wave, or static-, breath- or reactive- with {}, not {word}",
-                COLOURS.join(", ")
-            )
-            .into()
-        })
+    let fail =
+        |why: &str| -> Box<dyn std::error::Error> { format!("RGB effect {word:?}: {why}").into() };
+    let mut parts = word.split_whitespace();
+    let head = parts.next().ok_or_else(|| fail("is empty"))?;
+    let alone = parts.clone().next().is_none();
+    if let Some((kind, name)) = head.split_once('-').filter(|_| alone) {
+        let colour = COLOURS
+            .iter()
+            .find(|c| **c == name)
+            .map(|c| rgb_bytes(c))
+            .ok_or_else(|| fail(&format!("colour must be one of {}", COLOURS.join(", "))))?;
+        return match kind {
+            "static" => Ok(Rgb::Static(colour)),
+            "breath" => Ok(Rgb::Breath(colour, Timing::default())),
+            "reactive" => Ok(Rgb::Reactive(colour, None)),
+            _ => Err(fail(
+                "must be off, static, breath, reactive, wave or spectrum",
+            )),
+        };
+    }
+    let (mut colours, mut settings) = (Vec::new(), Vec::new());
+    let mut random = false;
+    for part in parts {
+        match part.split_once('=') {
+            Some(pair) => settings.push(pair),
+            None if part == "random" => random = true,
+            None => colours.push(parse_colour(part).map_err(|e| fail(&e.to_string()))?),
+        }
+    }
+    let number = |key: &str, value: &str, low: u16, high: u16| -> Result<u16> {
+        value
+            .parse::<u16>()
+            .ok()
+            .filter(|n| (low..=high).contains(n))
+            .ok_or_else(|| fail(&format!("{key} must be {low}–{high}, not {value}")))
+    };
+    let allowed: &[&str] = match head {
+        "breath" => &["period", "form", "intensity"],
+        "spectrum" => &["period", "intensity"],
+        "reactive" => &["speed"],
+        "wave" => &["direction"],
+        _ => &[],
+    };
+    let mut timing = Timing::default();
+    let (mut speed, mut direction) = (None, None);
+    for (key, value) in settings {
+        if !allowed.contains(&key) {
+            return Err(fail(&format!("{head} has no {key} setting")));
+        }
+        match key {
+            "period" => timing.period = Some(number(key, value, 1000, 20000)?),
+            "intensity" => timing.intensity = Some(number(key, value, 1, 100)? as u8),
+            "form" => {
+                let f = FORMS
+                    .iter()
+                    .position(|f| *f == value)
+                    .ok_or_else(|| fail(&format!("form must be one of {}", FORMS.join(", "))))?;
+                timing.form = Some(f as u8);
+            }
+            "speed" => speed = Some(number(key, value, 1, 4)? as u8),
+            _ => direction = Some(number(key, value, 1, 2)? as u8),
+        }
+    }
+    Ok(match (head, colours.as_slice(), random) {
+        ("off", [], false) => Rgb::Off,
+        ("static", [c], false) => Rgb::Static(*c),
+        ("breath", [c], false) => Rgb::Breath(*c, timing),
+        ("breath", [a, b], false) => Rgb::BreathTwo(*a, *b),
+        ("breath", [], true) => Rgb::BreathRandom,
+        ("reactive", [c], false) => Rgb::Reactive(*c, speed),
+        ("wave", [], false) => Rgb::Wave(direction),
+        ("spectrum", [], false) => Rgb::Spectrum(timing),
+        ("off" | "static" | "breath" | "reactive" | "wave" | "spectrum", ..) => {
+            return Err(fail("wrong colours for this effect"));
+        }
+        _ => {
+            return Err(fail(
+                "must be off, static, breath, reactive, wave or spectrum",
+            ));
+        }
+    })
 }
-/// A colour name's red, green and blue.
+/// A colour name's red, green and blue: the named shortcuts in `COLOURS`, saved as their
+/// RGB (ticket 199).
 pub fn rgb_bytes(colour: &str) -> [u8; 3] {
     match colour {
         "blue" => [0, 0, 255],
@@ -704,14 +969,9 @@ pub fn rgb_bytes(colour: &str) -> [u8; 3] {
 }
 /// v7 ticket 128: the RGB effect for these source states: the most urgent busy state's.
 /// None when nothing is busy (the resting effect then shows).
-pub fn keyboard_rgb(states: &[&str], patterns: &DevicePatterns) -> Option<Rgb> {
+pub fn rgb_for(states: &[&str], set: &RgbSet) -> Option<Rgb> {
     let busy = BUSY.iter().position(|s| states.contains(s))?;
-    Some(patterns.rgb[busy])
-}
-/// v7.7 ticket 189: the same for a Razer accessory's own effects.
-pub fn accessory_rgb(states: &[&str], effects: &[Rgb; 4]) -> Option<Rgb> {
-    let busy = BUSY.iter().position(|s| states.contains(s))?;
-    Some(effects[busy])
+    Some(set.states[busy])
 }
 /// The keyboard lights a pattern can use (v7 ticket 128): lock-key LEDs, then a Razer
 /// keyboard's M (macro) light through OpenRazer's driver.

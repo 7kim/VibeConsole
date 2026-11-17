@@ -901,7 +901,7 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                 "Keyboard G light: unavailable: lighting it turns on Razer game mode, which turns off the Super key"
             );
             // v7 ticket 128: opened only (brightness read), nothing sent.
-            match crate::keyboard::RgbKeyboards::open(razer, crate::status::Rgb::Spectrum) {
+            match crate::keyboard::RgbKeyboards::open(razer, crate::status::Rgb::SPECTRUM) {
                 Ok(rgb) => println!(
                     "RGB keyboard: available ({}; on pause and quit it goes back to the resting effect you pick in Status light patterns)",
                     rgb.names().join(", ")
@@ -914,7 +914,7 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
             for (_, label, model) in crate::status::ACCESSORIES {
                 match crate::keyboard::RgbKeyboards::open_accessory(
                     accessory,
-                    crate::status::Rgb::Spectrum,
+                    crate::status::Rgb::SPECTRUM,
                     label,
                     model,
                 ) {

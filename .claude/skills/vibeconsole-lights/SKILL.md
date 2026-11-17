@@ -12,7 +12,9 @@ One agent state, up to four devices. Patterns live in Settings, Agents, Status l
 | Akai MPK mini 3 | octave and tempo lights on a verified program | a verified program; restored on exit |
 | Xbox controller | the Xbox button light (modes, brightness, tempo) and rumble | the xone driver and its udev rule for the light; rumble only while VibeConsole owns the controller |
 | Razer keyboard | Caps Lock, Scroll Lock and the M light | the M light needs OpenRazer |
-| Razer keyboard RGB | a colour effect per state | OpenRazer; the effect can't be read back, so on idle, pause, quit and error the resting effect the user picked comes back |
+| RGB lights: Razer keyboard, Nommo speakers, Firefly mousepad, Logitech G502 logo | one shared effect per state and one resting effect that every switched-on light follows; Per device gives a light its own effects instead | OpenRazer (Razer), logirgb (G502); a Razer effect can't be read back, so idle, pause, quit and error show the resting effect; the G502 goes back to its own stored lighting |
+
+RGB effects (`lights.json`, words like `static #ff8800`): off, static, breath (one colour; Razer also two colours or random; the G502 logo also period, waveform, intensity), reactive (keyboard, speed 1–4), wave (Razer, direction 1–2), spectrum. A colour is a name (blue, orange, red, green, purple, white) or the user's own `#rrggbb` / `r,g,b`. The shared list offers only effects every switched-on light shows (with the G502 on: off, static, breath, spectrum); an effect a light lacks is named and never written.
 
 ## Designing a pattern
 

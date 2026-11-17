@@ -2572,32 +2572,33 @@ fn device_lights_text(p: &crate::status::DevicePatterns) -> String {
     let levels = p.xbox_brightness.map(|b| b.to_string());
     text.push_str(&format!("xbox-brightness\t{}\n", levels.join("\t")));
     // v32 (v7 ticket 128): the keyboard RGB switch, resting effect, brightness, then the
-    // effect per state.
-    let effects = p.rgb.map(crate::status::rgb_word);
+    // effect per state. v7.7 ticket 199: each device's lines hold the set it shows (its own,
+    // else the shared one); reading them back makes the keyboard's the shared set.
+    let words = |set: crate::status::RgbSet| set.states.map(crate::status::rgb_word).join("\t");
+    let keyboard = p.rgb_set(0);
     text.push_str(&format!(
         "keyboard-rgb\t{}\t{}\t{}\t{}\n",
-        on(p.rgb_on),
-        crate::status::rgb_word(p.rgb_rest),
+        on(p.rgb_devices[0].on),
+        crate::status::rgb_word(keyboard.rest),
         p.rgb_brightness,
-        effects.join("\t")
+        words(keyboard)
     ));
     // v34 (v7.7 ticket 189): each Razer accessory's switch, resting effect, then the effect
     // per state.
-    for ((record, _, _), a) in crate::status::ACCESSORIES.iter().zip(p.accessories) {
-        let effects = a.effects.map(crate::status::rgb_word);
+    for (i, (record, _, _)) in crate::status::ACCESSORIES.iter().enumerate() {
+        let set = p.rgb_set(1 + i);
         text.push_str(&format!(
             "{record}\t{}\t{}\t{}\n",
-            on(a.on),
-            crate::status::rgb_word(a.rest),
-            effects.join("\t")
+            on(p.rgb_devices[1 + i].on),
+            crate::status::rgb_word(set.rest),
+            words(set)
         ));
     }
     // v34 (v7.7 ticket 190): the G502 logo's switch and effect per state.
-    let effects = p.mouse.map(crate::status::rgb_word);
     text.push_str(&format!(
         "mouse-rgb\t{}\t{}\n",
-        on(p.mouse_on),
-        effects.join("\t")
+        on(p.rgb_devices[3].on),
+        words(p.rgb_set(3))
     ));
     text
 }
@@ -2726,21 +2727,29 @@ fn parse_device_lights(
         if effects.len() != BUSY.len() {
             return Err("expected keyboard-rgb effects for each of the 4 states".into());
         }
-        p.rgb_on = match switch.as_str() {
+        let switch = match switch.as_str() {
             "on" => true,
             "off" => false,
             other => return Err(format!("keyboard-rgb must be on or off, not {other}").into()),
         };
-        p.rgb_rest = crate::status::parse_rgb(rest)?;
+        // v7.7 ticket 199: the keyboard's effects become the shared set.
+        p.rgb_shared.rest = crate::status::parse_rgb(rest)?;
         p.rgb_brightness = level
             .parse()
             .map_err(|_| format!("keyboard-rgb brightness must be 0–255, not {level}"))?;
-        for (slot, word) in p.rgb.iter_mut().zip(effects) {
+        for (slot, word) in p.rgb_shared.states.iter_mut().zip(effects) {
             *slot = crate::status::parse_rgb(word)?;
         }
+        p.rgb_devices[0] = crate::status::RgbDevice {
+            on: switch,
+            own: None,
+        };
     }
     if version >= 34 {
-        for ((record, _, _), a) in crate::status::ACCESSORIES.iter().zip(&mut p.accessories) {
+        // v7.7 ticket 199: a device whose effects differ from the keyboard's keeps them as
+        // its own set.
+        let shared = p.rgb_shared;
+        for (i, (record, _, _)) in crate::status::ACCESSORIES.iter().enumerate() {
             let fields = next(record)?;
             let [switch, rest, effects @ ..] = &fields[..] else {
                 return Err(
@@ -2750,16 +2759,23 @@ fn parse_device_lights(
             if effects.len() != BUSY.len() {
                 return Err(format!("expected {record} effects for each of the 4 states").into());
             }
-            a.on = match switch.as_str() {
+            let on = match switch.as_str() {
                 "on" => true,
                 "off" => false,
                 other => return Err(format!("{record} must be on or off, not {other}").into()),
             };
             let parse = |w: &str| crate::status::parse_rgb(w).map_err(|e| format!("{record}: {e}"));
-            a.rest = parse(rest)?;
-            for (slot, word) in a.effects.iter_mut().zip(effects) {
+            let mut set = crate::status::RgbSet {
+                rest: parse(rest)?,
+                states: shared.states,
+            };
+            for (slot, word) in set.states.iter_mut().zip(effects) {
                 *slot = parse(word)?;
             }
+            p.rgb_devices[1 + i] = crate::status::RgbDevice {
+                on,
+                own: (set != shared).then_some(set),
+            };
         }
         let fields = next("mouse-rgb")?;
         let [switch, effects @ ..] = &fields[..] else {
@@ -2768,14 +2784,20 @@ fn parse_device_lights(
         if effects.len() != BUSY.len() {
             return Err("expected mouse-rgb effects for each of the 4 states".into());
         }
-        p.mouse_on = match switch.as_str() {
+        let on = match switch.as_str() {
             "on" => true,
             "off" => false,
             other => return Err(format!("mouse-rgb must be on or off, not {other}").into()),
         };
-        for (slot, word) in p.mouse.iter_mut().zip(effects) {
+        // The logo rests on its own stored lighting; its set keeps the shared resting one.
+        let mut set = shared;
+        for (slot, word) in set.states.iter_mut().zip(effects) {
             *slot = crate::status::parse_rgb(word).map_err(|e| format!("mouse-rgb: {e}"))?;
         }
+        p.rgb_devices[3] = crate::status::RgbDevice {
+            on,
+            own: (set != shared).then_some(set),
+        };
     }
     Ok(p)
 }
@@ -4527,9 +4549,9 @@ mod tests {
     /// The default `keyboard-rgb` line (v32), which files before v32 don't have.
     /// With the v34 accessory lines after it (v7.7 ticket 189), which files before v32 don't
     /// have either.
-    const DEFAULT_RGB: &str = "keyboard-rgb\toff\tspectrum\t255\tstatic-red\tstatic-orange\tbreath-blue\tstatic-green\nspeakers-rgb\toff\tspectrum\tstatic-red\tstatic-orange\tbreath-blue\tstatic-green\nmousepad-rgb\toff\tspectrum\tstatic-red\tstatic-orange\tbreath-blue\tstatic-green\nmouse-rgb\toff\tstatic-red\tstatic-orange\tbreath-blue\tstatic-green\n";
+    const DEFAULT_RGB: &str = "keyboard-rgb\toff\tspectrum\t255\tstatic #ff0000\tstatic #ff8000\tbreath #0000ff\tstatic #00ff00\nspeakers-rgb\toff\tspectrum\tstatic #ff0000\tstatic #ff8000\tbreath #0000ff\tstatic #00ff00\nmousepad-rgb\toff\tspectrum\tstatic #ff0000\tstatic #ff8000\tbreath #0000ff\tstatic #00ff00\nmouse-rgb\toff\tstatic #ff0000\tstatic #ff8000\tbreath #0000ff\tstatic #00ff00\n";
     /// The default v34 lines (v7.7 ticket 189), which files before v34 don't have.
-    const DEFAULT_ACCESSORIES: &str = "speakers-rgb\toff\tspectrum\tstatic-red\tstatic-orange\tbreath-blue\tstatic-green\nmousepad-rgb\toff\tspectrum\tstatic-red\tstatic-orange\tbreath-blue\tstatic-green\nmouse-rgb\toff\tstatic-red\tstatic-orange\tbreath-blue\tstatic-green\n";
+    const DEFAULT_ACCESSORIES: &str = "speakers-rgb\toff\tspectrum\tstatic #ff0000\tstatic #ff8000\tbreath #0000ff\tstatic #00ff00\nmousepad-rgb\toff\tspectrum\tstatic #ff0000\tstatic #ff8000\tbreath #0000ff\tstatic #00ff00\nmouse-rgb\toff\tstatic #ff0000\tstatic #ff8000\tbreath #0000ff\tstatic #00ff00\n";
     fn before_v26(text: &str) -> String {
         text.lines()
             .filter(|l| {
@@ -4771,113 +4793,86 @@ mod tests {
         assert!(parse_config(&text.replace("scroll,caps,macro", "scroll,game")).is_err());
     }
 
-    /// v7.7 ticket 189: the speakers' and mousepad's RGB round-trip in v34, each on its own
-    /// line; a v33 file loads with both off; a wrong switch or effect, or a missing state, is
-    /// refused with the reason.
+    /// v7.7 ticket 199 (lines from tickets 128, 189, 190): in a TSV the keyboard's RGB
+    /// effects become the shared set and a device whose effects differ keeps its own; the
+    /// older `static-red` words load as their RGB; files before v32/v34 load with the devices
+    /// off; a wrong switch, word or missing state is refused with the reason.
     #[test]
-    fn accessory_rgb_round_trips_in_v34_and_older_files_have_it_off() {
-        use crate::status::Rgb;
-        let mut config = Config::default();
-        let text = serialize_config(&config).unwrap();
-        assert!(text.contains(&format!("\n{DEFAULT_ACCESSORIES}")), "{text}");
-        let v33 = text
-            .replace(DEFAULT_ACCESSORIES, "")
-            .replace("vibeconsole-mappings-v34", "vibeconsole-mappings-v33");
-        let old = parse_config(&v33).unwrap();
-        assert!(old.device_lights.accessories.iter().all(|a| !a.on));
-        config.device_lights.accessories[0].on = true;
-        config.device_lights.accessories[0].rest = Rgb::Static("white");
-        config.device_lights.accessories[1].effects =
-            [Rgb::Wave, Rgb::Reactive("purple"), Rgb::Off, Rgb::Spectrum];
-        let text = serialize_config(&config).unwrap();
-        assert!(
-            text.contains("\nspeakers-rgb\ton\tstatic-white\tstatic-red\tstatic-orange\tbreath-blue\tstatic-green\nmousepad-rgb\toff\tspectrum\twave\treactive-purple\toff\tspectrum\n"),
-            "{text}"
-        );
-        assert_eq!(parse_config(&text).unwrap(), config);
-        let line = "speakers-rgb\ton\tstatic-white\tstatic-red";
-        for (wrong, reason) in [
-            (
-                "speakers-rgb\tmaybe\tstatic-white\tstatic-red",
-                "speakers-rgb must be on or off",
-            ),
-            (
-                "speakers-rgb\ton\tstatic-pink\tstatic-red",
-                "speakers-rgb: keyboard RGB effect must be",
-            ),
-        ] {
-            let error = parse_config(&text.replace(line, wrong))
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains(reason), "{error}");
-        }
-        // v7.7 ticket 190: the G502 logo's line round-trips too.
-        config.device_lights.mouse_on = true;
-        config.device_lights.mouse[3] = Rgb::Off;
-        let text = serialize_config(&config).unwrap();
-        assert!(
-            text.contains("\nmouse-rgb\ton\tstatic-red\tstatic-orange\tbreath-blue\toff\n"),
-            "{text}"
-        );
-        assert_eq!(parse_config(&text).unwrap(), config);
-        let error = parse_config(&text.replace("mouse-rgb\ton", "mouse-rgb\tyes"))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("mouse-rgb must be on or off"), "{error}");
-        let short = text.replace("\twave\treactive-purple\toff\tspectrum\n", "\twave\n");
-        let error = parse_config(&short).unwrap_err().to_string();
-        assert!(
-            error.contains("mousepad-rgb effects for each of the 4 states"),
-            "{error}"
-        );
-    }
-
-    /// v7 ticket 128: the keyboard RGB switch, resting effect, brightness and effects
-    /// round-trip in v32; a v31 file loads with RGB off; unknown effects, colours and
-    /// brightness are refused with the reason.
-    #[test]
-    fn keyboard_rgb_round_trips_in_v32_and_older_files_have_it_off() {
-        use crate::status::Rgb;
-        let mut config = Config::default();
-        let text = serialize_config(&config).unwrap();
+    fn rgb_lines_load_as_the_shared_set_with_own_sets_where_they_differ() {
+        use crate::status::{Rgb, RgbSet};
+        let text = serialize_config(&Config::default()).unwrap();
         assert!(text.contains(&format!("\n{DEFAULT_RGB}")), "{text}");
         let v31 = text
             .replace(DEFAULT_LOOK, "")
             .replace("vibeconsole-mappings-v34", "vibeconsole-mappings-v31")
             .replace(DEFAULT_RGB, "");
-        assert!(!parse_config(&v31).unwrap().device_lights.rgb_on);
-        config.device_lights.rgb_on = true;
-        config.device_lights.rgb = [Rgb::Wave, Rgb::Reactive("purple"), Rgb::Off, Rgb::Spectrum];
-        config.device_lights.rgb_rest = Rgb::Static("white");
-        config.device_lights.rgb_brightness = 90;
-        let text = serialize_config(&config).unwrap();
-        assert!(
-            text.contains(
-                "\nkeyboard-rgb\ton\tstatic-white\t90\twave\treactive-purple\toff\tspectrum\n"
+        let old = parse_config(&v31).unwrap().device_lights;
+        assert!(old.rgb_devices.iter().all(|d| !d.on && d.own.is_none()));
+        let v34 = text.replace(
+            DEFAULT_RGB,
+            concat!(
+                "keyboard-rgb\ton\tspectrum\t90\tbreath-red\tbreath-green\tbreath-blue\tstatic-white\n",
+                "speakers-rgb\ton\tspectrum\tstatic-red\tstatic-green\tbreath-blue\tstatic-green\n",
+                "mousepad-rgb\ton\tspectrum\tbreath-red\tbreath-green\tbreath-blue\tstatic-white\n",
+                "mouse-rgb\ton\tstatic-red\tstatic-green\tbreath-blue\tstatic-white\n",
             ),
-            "{text}"
         );
-        assert_eq!(parse_config(&text).unwrap(), config);
-        let line = "keyboard-rgb\ton\tstatic-white\t90\twave\treactive-purple";
+        let d = parse_config(&v34).unwrap().device_lights;
+        let breath = |c| Rgb::Breath(c, Default::default());
+        let shared = RgbSet {
+            rest: Rgb::SPECTRUM,
+            states: [
+                breath([255, 0, 0]),
+                breath([0, 255, 0]),
+                breath([0, 0, 255]),
+                Rgb::Static([255, 255, 255]),
+            ],
+        };
+        assert_eq!(
+            d.rgb_shared, shared,
+            "the keyboard's effects are the shared set"
+        );
+        assert_eq!(d.rgb_brightness, 90);
+        assert!(d.rgb_devices.iter().all(|d| d.on));
+        assert_eq!(d.rgb_devices[0].own, None);
+        assert_eq!(
+            d.rgb_devices[2].own, None,
+            "the same as the keyboard: follows it"
+        );
+        let speakers = d.rgb_devices[1].own.unwrap();
+        assert_eq!(speakers.states[1], Rgb::Static([0, 255, 0]));
+        assert_eq!(
+            d.rgb_devices[3].own.unwrap().states[0],
+            Rgb::Static([255, 0, 0])
+        );
+        // Each device's lines hold what it shows, in the new words, and load back so.
+        let mut config = Config::default();
+        config.device_lights = d.clone();
+        let saved = serialize_config(&config).unwrap();
+        assert!(saved.contains("\nspeakers-rgb\ton\tspectrum\tstatic #ff0000\tstatic #00ff00\tbreath #0000ff\tstatic #00ff00\n"), "{saved}");
+        assert_eq!(parse_config(&saved).unwrap().device_lights, d);
         for (wrong, reason) in [
-            (
-                "keyboard-rgb\ton\tstatic-white\t90\twave\treactive-pink",
-                "keyboard RGB effect must be",
-            ),
-            (
-                "keyboard-rgb\ton\tstatic-white\t256\twave\treactive-purple",
-                "brightness must be 0–255",
-            ),
-            (
-                "keyboard-rgb\tmaybe\tstatic-white\t90\twave\treactive-purple",
-                "must be on or off",
-            ),
+            ("keyboard-rgb\tmaybe", "keyboard-rgb must be on or off"),
+            ("speakers-rgb\tyes", "speakers-rgb must be on or off"),
+            ("mouse-rgb\tno", "mouse-rgb must be on or off"),
         ] {
-            let error = parse_config(&text.replace(line, wrong))
+            let key = wrong.split('\t').next().unwrap();
+            let error = parse_config(&v34.replace(&format!("{key}\ton"), wrong))
                 .unwrap_err()
                 .to_string();
             assert!(error.contains(reason), "{error}");
         }
+        let error = parse_config(&v34.replace("static-white\n", "static-pink\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("colour must be one of"), "{error}");
+        let error = parse_config(&v34.replace("\tbreath-blue\tstatic-white\nmouse", "\nmouse"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("mousepad-rgb effects for each of the 4 states"),
+            "{error}"
+        );
     }
 
     /// v7 ticket 116: saved prompt sequences round-trip in v25; a v24 file can't hold them; a

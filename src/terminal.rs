@@ -3779,20 +3779,28 @@ impl Terminal {
         let states = states.iter().map(|(_, s)| *s).collect::<Vec<_>>();
         let running = self.output.is_some() && !self.suspended;
         let lights = self.device_lights.clone();
-        let keyboard = lights.as_ref().filter(|p| p.rgb_on);
+        // v7.7 ticket 199: each device shows its own set, else the shared one.
+        let keyboard = lights.as_ref().filter(|p| p.rgb_devices[0].on);
         drive_rgb(
             (&mut self.rgb, &mut self.rgb_failed, &mut self.notice),
             keyboard.is_some(),
             // v7.7 ticket 188: idle while running is wanted too, for the resting effect.
             keyboard.filter(|_| running).map(|p| {
-                let effect = crate::status::keyboard_rgb(&states, p);
-                (effect, p.rgb_brightness, p.rgb_rest)
+                let set = p.rgb_set(0);
+                (
+                    crate::status::rgb_for(&states, &set),
+                    p.rgb_brightness,
+                    set.rest,
+                )
             }),
             |rest| RgbKeyboards::open(std::path::Path::new(crate::keyboard::RAZER), rest),
             "RGB keyboard",
         );
         for (i, (_, label, model)) in crate::status::ACCESSORIES.iter().enumerate() {
-            let accessory = lights.as_ref().map(|p| p.accessories[i]).filter(|a| a.on);
+            let accessory = lights
+                .as_ref()
+                .filter(|p| p.rgb_devices[1 + i].on)
+                .map(|p| p.rgb_set(1 + i));
             drive_rgb(
                 (
                     &mut self.accessories[i],
@@ -3801,10 +3809,9 @@ impl Terminal {
                 ),
                 accessory.is_some(),
                 // Brightness is left alone on accessories (RgbKeyboards::open_accessory).
-                accessory.filter(|_| running).map(|a| {
-                    let effect = crate::status::accessory_rgb(&states, &a.effects);
-                    (effect, 255, a.rest)
-                }),
+                accessory
+                    .filter(|_| running)
+                    .map(|set| (crate::status::rgb_for(&states, &set), 255, set.rest)),
                 |rest| {
                     let driver = std::path::Path::new(crate::keyboard::RAZER_ACCESSORY);
                     RgbKeyboards::open_accessory(driver, rest, label, model)
@@ -3820,13 +3827,13 @@ impl Terminal {
     /// ponytail: logirgb runs on this thread (a few ms per change); move it off if it stalls.
     fn show_mouse(&mut self, states: &[&str], running: bool) {
         const LABEL: &str = "Mouse light (Logitech G502)";
-        let switched = self.device_lights.as_ref().filter(|p| p.mouse_on);
+        let switched = self.device_lights.as_ref().filter(|p| p.rgb_devices[3].on);
         if switched.is_none() {
             self.mouse_failed = false;
         }
         let wanted = switched
             .filter(|_| running)
-            .and_then(|p| crate::status::accessory_rgb(states, &p.mouse));
+            .and_then(|p| crate::status::rgb_for(states, &p.rgb_set(3)));
         let Some(effect) = wanted else {
             if let Some(mouse) = &mut self.mouse {
                 mouse.restore();
@@ -8770,6 +8777,328 @@ fn edit_octave(ui: &mut impl Ui, title: &str, octave: i8) -> Result<Option<i8>> 
 
 /// Ticket 17: Settings -> Status light patterns. Per busy state, the tempo light (off, slow,
 /// fast) and the octave light (off, steady, blink, alternate ±); plus the two tempos.
+/// v7.7 ticket 199: a row of Status light patterns' RGB part.
+#[derive(Clone, Copy)]
+enum RgbRow {
+    /// A state's shared effect, or (None) the shared resting effect.
+    Shared(Option<usize>),
+    /// An RGB device's switch (`status::RGB_DEVICES` order).
+    Switch(usize),
+    /// The keyboard's brightness while it shows a state.
+    Brightness,
+    /// A device's Per device row: its own effects on or off.
+    Own(usize),
+    /// A device's own effect for a state, or (None) its own resting effect.
+    OwnEffect(usize, Option<usize>),
+}
+fn rgb_rows(d: &crate::status::DevicePatterns, names: &[&str; 4]) -> Vec<(String, RgbRow)> {
+    use crate::status::{RGB_DEVICES, rgb_word};
+    let short = |name: &str| name.split(" (").next().unwrap_or(name).to_owned();
+    let on = |b: bool| if b { "On" } else { "Off" };
+    let mut rows = Vec::new();
+    for (i, effect) in d.rgb_shared.states.iter().enumerate() {
+        rows.push((
+            format!(
+                "RGB, all lights · {}: {}",
+                short(names[i]),
+                rgb_word(*effect)
+            ),
+            RgbRow::Shared(Some(i)),
+        ));
+    }
+    rows.push((
+        format!(
+            "RGB, all lights · resting effect (idle, paused, after quit; the mouse rests on its own): {}",
+            rgb_word(d.rgb_shared.rest)
+        ),
+        RgbRow::Shared(None),
+    ));
+    for (j, (_, label, _)) in RGB_DEVICES.iter().enumerate() {
+        let device = d.rgb_devices[j];
+        rows.push((format!("{label}: {}", on(device.on)), RgbRow::Switch(j)));
+        if j == 0 {
+            rows.push((
+                format!(
+                    "Keyboard RGB brightness while it shows a state: {} of 255",
+                    d.rgb_brightness
+                ),
+                RgbRow::Brightness,
+            ));
+        }
+        let name = short(label);
+        let follows = match device.own {
+            Some(_) => "its own effects (below)",
+            None => "follows all lights",
+        };
+        rows.push((format!("{name} · Per device: {follows}"), RgbRow::Own(j)));
+        if let Some(own) = device.own {
+            for (i, effect) in own.states.iter().enumerate() {
+                rows.push((
+                    format!("{name} own · {}: {}", short(names[i]), rgb_word(*effect)),
+                    RgbRow::OwnEffect(j, Some(i)),
+                ));
+            }
+            if j != 3 {
+                rows.push((
+                    format!("{name} own · resting effect: {}", rgb_word(own.rest)),
+                    RgbRow::OwnEffect(j, None),
+                ));
+            }
+        }
+    }
+    rows
+}
+/// v7.7 ticket 199: act on an RGB row: a switch flips, Per device turns a device's own
+/// effects on (starting from the shared ones) or off, an effect row picks effect, settings,
+/// colour from what the device (or every switched-on device, for the shared set) shows.
+fn rgb_row(
+    ui: &mut impl Ui,
+    d: &mut crate::status::DevicePatterns,
+    row: RgbRow,
+    names: &[&str; 4],
+) -> Result<()> {
+    use crate::status::RGB_DEVICES;
+    let short = |name: &str| name.split(" (").next().unwrap_or(name).to_owned();
+    match row {
+        RgbRow::Switch(j) => d.rgb_devices[j].on = !d.rgb_devices[j].on,
+        RgbRow::Own(j) => {
+            d.rgb_devices[j].own = match d.rgb_devices[j].own {
+                Some(_) => None,
+                None => Some(d.rgb_shared),
+            }
+        }
+        RgbRow::Brightness => {
+            if let Some(level) = number(
+                ui,
+                "Keyboard RGB brightness while it shows a state (0–255; yours comes back after)",
+                d.rgb_brightness.into(),
+                0,
+                255,
+            )? {
+                d.rgb_brightness = u8::try_from(level)?;
+            }
+        }
+        RgbRow::Shared(state) => {
+            let kinds = crate::status::shared_kinds(&d.rgb_devices);
+            let what = state.map_or("resting effect".to_owned(), |i| short(names[i]));
+            let current = state.map_or(d.rgb_shared.rest, |i| d.rgb_shared.states[i]);
+            let title =
+                format!("RGB, all lights · {what} (only effects every light that is on shows)");
+            if let Some(effect) = pick_rgb(ui, &title, &kinds, current, d.rgb_devices[3].on)? {
+                match state {
+                    Some(i) => d.rgb_shared.states[i] = effect,
+                    None => d.rgb_shared.rest = effect,
+                }
+            }
+        }
+        RgbRow::OwnEffect(j, state) => {
+            let (_, label, kinds) = RGB_DEVICES[j];
+            let Some(own) = d.rgb_devices[j].own.as_mut() else {
+                return Ok(());
+            };
+            let what = state.map_or("resting effect".to_owned(), |i| short(names[i]));
+            let current = state.map_or(own.rest, |i| own.states[i]);
+            let title = format!("{} own · {what}", short(label));
+            if let Some(effect) = pick_rgb(ui, &title, kinds, current, j == 3)? {
+                match state {
+                    Some(i) => own.states[i] = effect,
+                    None => own.rest = effect,
+                }
+            }
+        }
+    }
+    Ok(())
+}
+/// v7.7 ticket 199: pick an effect from `kinds`, then its settings, then its colour(s).
+/// `logo`: the G502 logo shows it, so breath and spectrum offer its timing too.
+fn pick_rgb(
+    ui: &mut impl Ui,
+    title: &str,
+    kinds: &[crate::status::RgbKind],
+    current: crate::status::Rgb,
+    logo: bool,
+) -> Result<Option<crate::status::Rgb>> {
+    use crate::status::{RGB_KINDS, Rgb, RgbKind, Timing, rgb_kind};
+    let labels = kinds
+        .iter()
+        .map(|k| {
+            RGB_KINDS
+                .iter()
+                .find(|(_, _, x)| x == k)
+                .map_or(String::new(), |(_, label, _)| (*label).to_owned())
+        })
+        .collect::<Vec<_>>();
+    let start = kinds
+        .iter()
+        .position(|k| *k == rgb_kind(current))
+        .unwrap_or(0);
+    let Some(k) = choose_at(ui, &format!("{title}: effect"), &labels, start)? else {
+        return Ok(None);
+    };
+    let (colour, second, timing, speed, direction) = match current {
+        Rgb::Static(c) => (Some(c), None, Timing::default(), None, None),
+        Rgb::Breath(c, t) => (Some(c), None, t, None, None),
+        Rgb::BreathTwo(a, b) => (Some(a), Some(b), Timing::default(), None, None),
+        Rgb::Reactive(c, s) => (Some(c), None, Timing::default(), s, None),
+        Rgb::Wave(d) => (None, None, Timing::default(), None, d),
+        Rgb::Spectrum(t) => (None, None, t, None, None),
+        Rgb::Off | Rgb::BreathRandom => (None, None, Timing::default(), None, None),
+    };
+    let white = crate::status::rgb_bytes("white");
+    let colour = colour.unwrap_or(white);
+    let effect = match kinds[k] {
+        RgbKind::Off => Rgb::Off,
+        RgbKind::BreathRandom => Rgb::BreathRandom,
+        RgbKind::Static => match pick_colour(ui, title, colour)? {
+            Some(c) => Rgb::Static(c),
+            None => return Ok(None),
+        },
+        RgbKind::Breath => {
+            let Some(t) = pick_timing(ui, title, timing, logo, true)? else {
+                return Ok(None);
+            };
+            match pick_colour(ui, title, colour)? {
+                Some(c) => Rgb::Breath(c, t),
+                None => return Ok(None),
+            }
+        }
+        RgbKind::BreathTwo => {
+            let Some(a) = pick_colour(ui, &format!("{title} · first"), colour)? else {
+                return Ok(None);
+            };
+            let Some(b) = pick_colour(ui, &format!("{title} · second"), second.unwrap_or(white))?
+            else {
+                return Ok(None);
+            };
+            Rgb::BreathTwo(a, b)
+        }
+        RgbKind::Reactive => {
+            let Some(s) = pick_number(
+                ui,
+                &format!("{title}: how long a key stays lit"),
+                &["as before (2)", "1, short", "2", "3", "4, long"],
+                speed,
+            )?
+            else {
+                return Ok(None);
+            };
+            match pick_colour(ui, title, colour)? {
+                Some(c) => Rgb::Reactive(c, s),
+                None => return Ok(None),
+            }
+        }
+        RgbKind::Wave => match pick_number(
+            ui,
+            &format!("{title}: direction"),
+            &["as before (1)", "1", "2"],
+            direction,
+        )? {
+            Some(d) => Rgb::Wave(d),
+            None => return Ok(None),
+        },
+        RgbKind::Spectrum => match pick_timing(ui, title, timing, logo, false)? {
+            Some(t) => Rgb::Spectrum(t),
+            None => return Ok(None),
+        },
+    };
+    Ok(Some(effect))
+}
+/// A setting from 1 up, or "as before" (None); Esc is None outside.
+fn pick_number(
+    ui: &mut impl Ui,
+    title: &str,
+    rows: &[&str],
+    current: Option<u8>,
+) -> Result<Option<Option<u8>>> {
+    let start = current.map_or(0, usize::from).min(rows.len() - 1);
+    Ok(choose_at(ui, title, &options(rows), start)?
+        .map(|i| (i > 0).then(|| u8::try_from(i).unwrap_or(1))))
+}
+/// v7.7 ticket 199: the G502 logo's breathe or cycle timing; each "as the mouse has it"
+/// (None) or a value logirgb takes. Without the logo there is nothing to ask.
+fn pick_timing(
+    ui: &mut impl Ui,
+    title: &str,
+    current: crate::status::Timing,
+    logo: bool,
+    form: bool,
+) -> Result<Option<crate::status::Timing>> {
+    use crate::status::FORMS;
+    if !logo {
+        return Ok(Some(current));
+    }
+    const KEEP: &str = "as the mouse has it";
+    let periods = [1000u16, 2000, 3000, 5000, 8000, 12000, 20000];
+    let mut rows = vec![KEEP.to_owned()];
+    rows.extend(periods.iter().map(|p| format!("{p} ms")));
+    let start = current
+        .period
+        .and_then(|p| periods.iter().position(|x| *x == p))
+        .map_or(0, |i| i + 1);
+    let Some(p) = choose_at(ui, &format!("{title}: mouse logo period"), &rows, start)? else {
+        return Ok(None);
+    };
+    let mut timing = crate::status::Timing {
+        period: (p > 0).then(|| periods[p - 1]),
+        ..current
+    };
+    if form {
+        let mut rows = vec![KEEP.to_owned()];
+        rows.extend(FORMS.iter().map(|f| f.to_string()));
+        let start = current.form.map_or(0, |f| usize::from(f) + 1);
+        let Some(f) = choose_at(ui, &format!("{title}: mouse logo waveform"), &rows, start)? else {
+            return Ok(None);
+        };
+        timing.form = (f > 0).then(|| (f - 1) as u8);
+    }
+    let levels = [25u8, 50, 75, 100];
+    let mut rows = vec![KEEP.to_owned()];
+    rows.extend(levels.iter().map(|l| format!("{l} %")));
+    let start = current
+        .intensity
+        .and_then(|i| levels.iter().position(|x| *x == i))
+        .map_or(0, |i| i + 1);
+    let Some(i) = choose_at(ui, &format!("{title}: mouse logo intensity"), &rows, start)? else {
+        return Ok(None);
+    };
+    timing.intensity = (i > 0).then(|| levels[i - 1]);
+    Ok(Some(timing))
+}
+/// v7.7 ticket 199: a named colour, or "Your own RGB…" typed as `#rrggbb` or `r,g,b`; a
+/// wrong one is refused with the reason and asked again.
+fn pick_colour(
+    ui: &mut impl Ui,
+    title: &str,
+    current: crate::status::Colour,
+) -> Result<Option<crate::status::Colour>> {
+    use crate::status::{COLOURS, colour_word, parse_colour, rgb_bytes};
+    let mut rows = COLOURS.map(String::from).to_vec();
+    rows.push("Your own RGB…".into());
+    let start = COLOURS
+        .iter()
+        .position(|c| rgb_bytes(c) == current)
+        .unwrap_or(COLOURS.len());
+    let Some(i) = choose_at(ui, &format!("{title}: colour"), &rows, start)? else {
+        return Ok(None);
+    };
+    if i < COLOURS.len() {
+        return Ok(Some(rgb_bytes(COLOURS[i])));
+    }
+    let mut prompt = format!("{title}: your own colour, #rrggbb or r,g,b (each 0–255)");
+    let mut text = colour_word(current);
+    loop {
+        let Some(entry) = text_entry(ui, &prompt, &text)? else {
+            return Ok(None);
+        };
+        match parse_colour(&entry) {
+            Ok(colour) => return Ok(Some(colour)),
+            Err(error) => {
+                prompt = format!("{error}. Type #rrggbb or r,g,b (each 0–255)");
+                text = entry;
+            }
+        }
+    }
+}
 fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
     const NAMES: [&str; 4] = [
         "Needs a decision (Claude asks a multiple-choice question)",
@@ -8825,57 +9154,10 @@ fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
             "Keyboard lights that show it: {}",
             keyboard_leds_text(devices.keyboard_leds)
         ));
-        // v7 ticket 128: the Razer keyboard's RGB, its effect per state, resting effect and
-        // brightness.
-        rows.push(format!(
-            "Keyboard RGB (Razer, needs OpenRazer's driver): {}",
-            on(devices.rgb_on)
-        ));
-        for (name, effect) in NAMES.iter().zip(devices.rgb) {
-            rows.push(format!(
-                "Keyboard RGB · {}: {}",
-                name.split(" (").next().unwrap_or(name),
-                crate::status::rgb_word(effect)
-            ));
-        }
-        rows.push(format!(
-            "Keyboard RGB resting effect (shown when idle, paused and after quit): {}",
-            crate::status::rgb_word(devices.rgb_rest)
-        ));
-        rows.push(format!(
-            "Keyboard RGB brightness while it shows a state: {} of 255",
-            devices.rgb_brightness
-        ));
-        // v7.7 ticket 189: each Razer accessory's switch, effect per state and resting effect,
-        // six rows each from 25. Their own brightness stays as it is.
-        for ((_, label, _), a) in crate::status::ACCESSORIES.iter().zip(devices.accessories) {
-            rows.push(format!("{label}: {}", on(a.on)));
-            let short = label.split(" (").next().unwrap_or(label);
-            for (name, effect) in NAMES.iter().zip(a.effects) {
-                rows.push(format!(
-                    "{short} · {}: {}",
-                    name.split(" (").next().unwrap_or(name),
-                    crate::status::rgb_word(effect)
-                ));
-            }
-            rows.push(format!(
-                "{short} resting effect (shown when idle, paused and after quit): {}",
-                crate::status::rgb_word(a.rest)
-            ));
-        }
-        // v7.7 ticket 190: the G502 logo's switch and effect per state, rows 37–41; its
-        // resting effect is the mouse's own stored lighting.
-        rows.push(format!(
-            "Mouse light (Logitech G502 logo, needs logirgb): {}",
-            on(devices.mouse_on)
-        ));
-        for (name, effect) in NAMES.iter().zip(devices.mouse) {
-            rows.push(format!(
-                "Mouse light · {}: {}",
-                name.split(" (").next().unwrap_or(name),
-                crate::status::rgb_word(effect)
-            ));
-        }
+        // v7.7 ticket 199: the RGB lights from row 18: the shared set first, then each
+        // device's switch and its Per device row (and its own effects while it has them).
+        let rgb_rows = rgb_rows(&devices, &NAMES);
+        rows.extend(rgb_rows.iter().map(|(text, _)| text.clone()));
         let blind = NAMES
             .iter()
             .zip(patterns.states)
@@ -8933,125 +9215,13 @@ fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 config.device_lights.on[index - 6] = !devices.on[index - 6];
             } else if index == 12 {
                 config.device_lights.keyboard_on = !devices.keyboard_on;
-            } else if index == 18 {
-                config.device_lights.rgb_on = !devices.rgb_on;
-            } else if index == 37 {
-                config.device_lights.mouse_on = !devices.mouse_on;
-            } else if index > 37 {
-                // v7.7 ticket 190: only what the G502 logo can show.
-                let effects = crate::status::rgb_effects()
-                    .into_iter()
-                    .filter(|e| {
-                        !matches!(
-                            e,
-                            crate::status::Rgb::Wave | crate::status::Rgb::Reactive(_)
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                let words = effects
-                    .iter()
-                    .map(|e| crate::status::rgb_word(*e))
-                    .collect::<Vec<_>>();
-                let state = index - 38;
-                let current = devices.mouse[state];
-                let Some(e) = choose_at(
+            } else if index >= 18 {
+                rgb_row(
                     ui,
-                    &format!(
-                        "Mouse light · {}: effect (the G502 logo shows off, static, breathe and spectrum as its colour cycle)",
-                        NAMES[state]
-                    ),
-                    &words,
-                    effects.iter().position(|e| *e == current).unwrap_or(0),
-                )?
-                else {
-                    return Ok(());
-                };
-                config.device_lights.mouse[state] = effects[e];
-            } else if index > 24 {
-                // v7.7 ticket 189: an accessory's switch, a state's effect, or its resting one.
-                let (i, row) = ((index - 25) / 6, (index - 25) % 6);
-                let (_, label, _) = crate::status::ACCESSORIES[i];
-                let a = &mut config.device_lights.accessories[i];
-                if row == 0 {
-                    a.on = !a.on;
-                } else {
-                    let effects = crate::status::rgb_effects();
-                    let words = effects
-                        .iter()
-                        .map(|e| crate::status::rgb_word(*e))
-                        .collect::<Vec<_>>();
-                    let (title, current) = if row == 5 {
-                        (
-                            format!(
-                                "{label} resting effect: what VibeConsole puts back when idle, paused and on quit"
-                            ),
-                            a.rest,
-                        )
-                    } else {
-                        (
-                            format!("{label} · {}: effect", NAMES[row - 1]),
-                            a.effects[row - 1],
-                        )
-                    };
-                    let Some(e) = choose_at(
-                        ui,
-                        &title,
-                        &words,
-                        effects.iter().position(|e| *e == current).unwrap_or(0),
-                    )?
-                    else {
-                        return Ok(());
-                    };
-                    if row == 5 {
-                        a.rest = effects[e];
-                    } else {
-                        a.effects[row - 1] = effects[e];
-                    }
-                }
-            } else if index == 24 {
-                let Some(level) = number(
-                    ui,
-                    "Keyboard RGB brightness while it shows a state (0–255; yours comes back after)",
-                    devices.rgb_brightness.into(),
-                    0,
-                    255,
-                )?
-                else {
-                    return Ok(());
-                };
-                config.device_lights.rgb_brightness = u8::try_from(level)?;
-            } else if index > 18 {
-                let effects = crate::status::rgb_effects();
-                let words = effects
-                    .iter()
-                    .map(|e| crate::status::rgb_word(*e))
-                    .collect::<Vec<_>>();
-                let (title, current) = if index == 23 {
-                    (
-                        "Keyboard RGB resting effect: what VibeConsole puts back when idle, paused and on quit (it can't read your own effect back)".to_owned(),
-                        devices.rgb_rest,
-                    )
-                } else {
-                    let state = index - 19;
-                    (
-                        format!("Keyboard RGB · {}: effect", NAMES[state]),
-                        devices.rgb[state],
-                    )
-                };
-                let Some(e) = choose_at(
-                    ui,
-                    &title,
-                    &words,
-                    effects.iter().position(|e| *e == current).unwrap_or(0),
-                )?
-                else {
-                    return Ok(());
-                };
-                if index == 23 {
-                    config.device_lights.rgb_rest = effects[e];
-                } else {
-                    config.device_lights.rgb[index - 19] = effects[e];
-                }
+                    &mut config.device_lights,
+                    rgb_rows[index - 18].1,
+                    &NAMES,
+                )?;
             } else if index == 17 {
                 keyboard_leds_menu(ui, &mut config.device_lights.keyboard_leds)?;
             } else if index > 12 {
@@ -18794,7 +18964,7 @@ mod tests {
         let before = files();
         // One save that changes a light and a mapping: one step.
         let mut both = base.clone();
-        both.device_lights.rgb_on = true;
+        both.device_lights.rgb_devices[0].on = true;
         let pad = Mapping::new(Control::from_note(10, 36).unwrap(), "F1", "hold").unwrap();
         both.mappings.push(pad.clone());
         mappings::save_config(&path, &both).unwrap();
@@ -19712,10 +19882,10 @@ mod tests {
         mappings::save(&path, &[]).unwrap();
         let mut ui = Terminal::open_mode(&path, true).unwrap();
         ui.rgb = Some(
-            crate::keyboard::RgbKeyboards::open(&dir.join("razerkbd"), Rgb::Spectrum).unwrap(),
+            crate::keyboard::RgbKeyboards::open(&dir.join("razerkbd"), Rgb::SPECTRUM).unwrap(),
         );
         let mut patterns = crate::status::DevicePatterns::default();
-        patterns.rgb_on = true;
+        patterns.rgb_devices[0].on = true;
         patterns.rgb_brightness = 120;
         ui.device_lights = Some(patterns);
         ui.agent_states = vec![("claude".into(), "claude".into(), "needs-input")];
@@ -19795,12 +19965,12 @@ mod tests {
         mappings::save(&path, &[]).unwrap();
         let mut ui = Terminal::open_mode(&path, true).unwrap();
         ui.rgb = Some(
-            crate::keyboard::RgbKeyboards::open(&dir.join("razerkbd"), Rgb::Spectrum).unwrap(),
+            crate::keyboard::RgbKeyboards::open(&dir.join("razerkbd"), Rgb::SPECTRUM).unwrap(),
         );
         let mut patterns = crate::status::DevicePatterns::default();
-        patterns.rgb_on = true;
+        patterns.rgb_devices[0].on = true;
         patterns.rgb_brightness = 120;
-        patterns.rgb_rest = Rgb::Static("white");
+        patterns.rgb_shared.rest = Rgb::Static([255, 255, 255]);
         ui.device_lights = Some(patterns.clone());
         ui.agent_states = vec![("claude".into(), "claude".into(), "idle")];
         ui.output = Some(crate::keyboard::Output::recording(&[]).unwrap());
@@ -19815,7 +19985,7 @@ mod tests {
         clear();
         ui.show_rgb();
         assert!(read("matrix_effect_static").is_empty(), "not sent twice");
-        patterns.rgb_rest = Rgb::Static("red");
+        patterns.rgb_shared.rest = Rgb::Static([255, 0, 0]);
         ui.device_lights = Some(patterns);
         ui.show_rgb();
         assert_eq!(
@@ -21204,99 +21374,6 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// v7 ticket 128: Status light patterns turns Keyboard RGB on, picks a state's effect and
-    /// the resting effect, and saves them.
-    #[test]
-    fn keyboard_rgb_rows_pick_effects_and_the_resting_effect() {
-        use crate::status::Rgb;
-        use Key::*;
-        let dir = std::env::temp_dir().join(format!("vibeconsole-rgb-menu-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("mappings.tsv");
-        mappings::save(&path, &[]).unwrap();
-        let mut keys = vec![Down; 18];
-        keys.push(Enter); // Keyboard RGB: Off -> On
-        keys.extend(vec![Down; 20]);
-        keys.push(Enter); // Keyboard RGB · Needs input: static-orange
-        keys.extend([Up, Up, Up, Enter]); // spectrum
-        keys.extend(vec![Down; 23]);
-        keys.push(Enter); // resting effect: spectrum
-        keys.extend([Down, Enter]); // wave
-        keys.push(Escape);
-        let mut ui = Script {
-            keys: keys.into(),
-            ..Default::default()
-        };
-        light_patterns_menu(&mut ui, &path).unwrap();
-        assert!(ui.keys.is_empty(), "keys left: {:?}", ui.keys);
-        assert!(
-            ui.screens
-                .iter()
-                .any(|s| s.contains("Keyboard RGB (Razer, needs OpenRazer's driver): On"))
-        );
-        assert!(
-            ui.screens
-                .iter()
-                .any(|s| s.contains("it can't read your own effect back"))
-        );
-        let lights = mappings::load_config(&path).unwrap().device_lights;
-        assert!(lights.rgb_on);
-        assert_eq!(lights.rgb[1], Rgb::Spectrum);
-        assert_eq!(lights.rgb_rest, Rgb::Wave);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// v7.7 ticket 189: Status light patterns turns the speakers' RGB on, picks the
-    /// mousepad's effect for a state and the speakers' resting effect, and saves them.
-    #[test]
-    fn accessory_rgb_rows_pick_effects_and_the_resting_effect() {
-        use crate::status::Rgb;
-        use Key::*;
-        let dir = std::env::temp_dir().join(format!("vibeconsole-acc-menu-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("mappings.tsv");
-        mappings::save(&path, &[]).unwrap();
-        let mut keys = vec![Down; 25];
-        keys.push(Enter); // Speakers RGB: Off -> On
-        keys.extend(vec![Down; 33]);
-        keys.push(Enter); // Mousepad RGB · Needs input: static-orange
-        keys.extend([Up, Up, Enter]); // wave
-        keys.extend(vec![Down; 30]);
-        keys.push(Enter); // Speakers RGB resting effect: spectrum
-        keys.extend([Down, Enter]); // wave
-        keys.push(Escape);
-        let mut ui = Script {
-            keys: keys.into(),
-            ..Default::default()
-        };
-        light_patterns_menu(&mut ui, &path).unwrap();
-        assert!(ui.keys.is_empty(), "keys left: {:?}", ui.keys);
-        assert!(
-            ui.screens
-                .iter()
-                .any(|s| s.contains("Speakers RGB (Razer Nommo): On"))
-        );
-        assert!(
-            ui.screens
-                .iter()
-                .any(|s| s.contains("Mousepad RGB (Razer Firefly): Off"))
-        );
-        assert!(ui.screens.iter().any(|s| {
-            s.contains("Mousepad RGB (Razer Firefly) · Needs input (permission or form): effect")
-        }));
-        let lights = mappings::load_config(&path).unwrap().device_lights;
-        assert!(lights.accessories[0].on && !lights.accessories[1].on);
-        assert_eq!(lights.accessories[1].effects[1], Rgb::Wave);
-        assert_eq!(lights.accessories[0].rest, Rgb::Wave);
-        assert_eq!(
-            lights.accessories[0].effects,
-            crate::status::DevicePatterns::default().accessories[0].effects
-        );
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
     /// v7.7 ticket 189: while running, the speakers (fake `razeraccessory` files) show the
     /// most urgent state's own effect and, idle, their resting effect; an effect they lack is
     /// named, not written; the switched-off mousepad gets nothing; brightness is never
@@ -21334,16 +21411,18 @@ mod tests {
         ui.accessories[0] = Some(
             crate::keyboard::RgbKeyboards::open_accessory(
                 &dir,
-                Rgb::Spectrum,
+                Rgb::SPECTRUM,
                 "Speakers RGB",
                 "Nommo",
             )
             .unwrap(),
         );
         let mut patterns = crate::status::DevicePatterns::default();
-        patterns.accessories[0].on = true;
-        patterns.accessories[0].rest = Rgb::Static("white");
-        patterns.accessories[0].effects[2] = Rgb::Reactive("red");
+        patterns.rgb_devices[1].on = true;
+        let mut own = patterns.rgb_shared;
+        own.rest = Rgb::Static([255, 255, 255]);
+        own.states[2] = Rgb::Reactive([255, 0, 0], None);
+        patterns.rgb_devices[1].own = Some(own);
         ui.device_lights = Some(patterns);
         ui.agent_states = vec![("claude".into(), "claude".into(), "needs-input")];
         ui.output = Some(crate::keyboard::Output::recording(&[]).unwrap());
@@ -21362,7 +21441,7 @@ mod tests {
         ui.show_rgb();
         assert!(
             ui.notice
-                .contains("reactive-red unavailable on Razer Nommo Chroma"),
+                .contains("reactive #ff0000 unavailable on Razer Nommo Chroma"),
             "{}",
             ui.notice
         );
@@ -21424,8 +21503,10 @@ mod tests {
             "switched off: nothing opened"
         );
         ui.mouse = Some(crate::keyboard::MouseLight::open(run).unwrap());
-        patterns.mouse_on = true;
-        patterns.mouse[2] = Rgb::Wave;
+        patterns.rgb_devices[3].on = true;
+        let mut own = patterns.rgb_shared;
+        own.states[2] = Rgb::Wave(None);
+        patterns.rgb_devices[3].own = Some(own);
         ui.device_lights = Some(patterns);
         ui.show_rgb();
         ui.show_rgb();
@@ -21453,23 +21534,40 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// v7.7 ticket 190: Status light patterns turns the mouse light on and offers only the
-    /// effects the G502 logo shows.
+    /// v7.7 ticket 199: Status light patterns: a shared state picks its effect from what
+    /// every light shows, then its colour; Your own RGB… refuses `#12345g` and `300,0,0` with
+    /// the reason and takes `18,52,86`; Per device gives the keyboard its own effects (from
+    /// the shared ones), where reactive and its speed are offered.
     #[test]
-    fn mouse_light_rows_offer_only_what_the_logo_shows() {
+    fn rgb_rows_pick_effect_settings_then_colour_and_a_per_device_override() {
         use crate::status::Rgb;
         use Key::*;
-        let dir =
-            std::env::temp_dir().join(format!("vibeconsole-g502-menu-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("vibeconsole-rgb-menu-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mappings.tsv");
         mappings::save(&path, &[]).unwrap();
-        let mut keys = vec![Down; 37];
-        keys.push(Enter); // Mouse light: Off -> On
-        keys.extend(vec![Down; 41]);
-        keys.push(Enter); // Mouse light · Finished: static-green
-        keys.extend([Up, Enter]); // the one before it
+        let typed = |text: &str| {
+            let mut keys = vec![Backspace; 7];
+            keys.extend(text.bytes().map(Character));
+            keys.push(Enter);
+            keys
+        };
+        let mut keys = vec![Down; 19];
+        keys.push(Enter); // RGB, all lights · Needs input: static #ff8000
+        keys.extend([Down, Enter]); // breath: one colour
+        keys.extend(vec![Down; 5]);
+        keys.push(Enter); // Your own RGB…
+        keys.extend(typed("#12345g"));
+        keys.extend(typed("300,0,0"));
+        keys.extend(typed("18,52,86"));
+        keys.extend(vec![Down; 25]);
+        keys.push(Enter); // Keyboard RGB · Per device: follows all lights -> its own
+        keys.extend(vec![Down; 27]);
+        keys.push(Enter); // Keyboard RGB own · Needs input
+        keys.extend([Down, Down, Down, Enter]); // reactive
+        keys.extend([Down, Down, Down, Down, Enter]); // 4, long
+        keys.extend([Up, Enter]); // white
         keys.push(Escape);
         let mut ui = Script {
             keys: keys.into(),
@@ -21477,23 +21575,206 @@ mod tests {
         };
         light_patterns_menu(&mut ui, &path).unwrap();
         assert!(ui.keys.is_empty(), "keys left: {:?}", ui.keys);
-        assert!(
+        let screen = |text: &str| {
             ui.screens
                 .iter()
-                .any(|s| s.contains("Mouse light (Logitech G502 logo, needs logirgb): On"))
+                .find(|s| s.contains(text))
+                .unwrap_or_else(|| panic!("no screen with {text}"))
+                .clone()
+        };
+        let shared = screen(
+            "RGB, all lights · Needs input (only effects every light that is on shows): effect",
         );
-        let menu = ui
+        assert!(
+            !shared.contains("wave") && !shared.contains("reactive"),
+            "{shared}"
+        );
+        screen("#12345g isn't a colour: #rrggbb takes six hex digits");
+        screen("300,0,0 isn't a colour: each of r,g,b is 0–255, not 300");
+        let own = screen("Keyboard RGB own · Needs input: effect");
+        assert!(own.contains("reactive: lights on each key press"), "{own}");
+        screen("Keyboard RGB · Per device: its own effects (below)");
+        let lights = mappings::load_config(&path).unwrap().device_lights;
+        let custom = Rgb::Breath([18, 52, 86], Default::default());
+        assert_eq!(lights.rgb_shared.states[1], custom);
+        let keyboard = lights.rgb_devices[0].own.unwrap();
+        assert_eq!(keyboard.states[1], Rgb::Reactive([255, 255, 255], Some(4)));
+        assert_eq!(
+            keyboard.states[0], lights.rgb_shared.states[0],
+            "started from the shared set"
+        );
+        assert!(lights.rgb_devices[1..].iter().all(|d| d.own.is_none()));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 199: with the mouse logo on, the shared list holds only what the logo
+    /// shows too, and breath asks the logo's period, waveform and intensity; the mouse's own
+    /// effects offer only the logo's.
+    #[test]
+    fn rgb_shared_list_follows_the_lights_that_are_on_and_the_logo_settings() {
+        use crate::status::{Rgb, RgbDevice, RgbKind, Timing, shared_kinds};
+        use Key::*;
+        let on = |which: [bool; 4]| which.map(|on| RgbDevice { on, own: None });
+        assert_eq!(shared_kinds(&on([true, false, false, false])).len(), 8);
+        let two = shared_kinds(&on([true, true, false, false]));
+        assert!(!two.contains(&RgbKind::Reactive) && two.contains(&RgbKind::Wave));
+        assert_eq!(
+            shared_kinds(&on([true, false, false, true])),
+            [
+                RgbKind::Off,
+                RgbKind::Static,
+                RgbKind::Breath,
+                RgbKind::Spectrum
+            ]
+        );
+        let dir = std::env::temp_dir().join(format!("vibeconsole-rgb-logo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut keys = vec![Down; 30];
+        keys.push(Enter); // Mouse light: Off -> On
+        keys.extend(vec![Down; 20]);
+        keys.push(Enter); // RGB, all lights · Thinking: breath #0000ff
+        keys.push(Enter); // breath: one colour
+        keys.extend([Down, Down, Enter]); // 2000 ms
+        keys.extend([Down, Down, Enter]); // sine
+        keys.extend([Down, Down, Enter]); // 50 %
+        keys.push(Enter); // blue
+        keys.extend(vec![Down; 31]);
+        keys.push(Enter); // Mouse light · Per device -> its own
+        keys.extend(vec![Down; 32]);
+        keys.extend([Enter, Escape]); // Mouse light own · Needs a decision -> back
+        keys.push(Escape);
+        let mut ui = Script {
+            keys: keys.into(),
+            ..Default::default()
+        };
+        light_patterns_menu(&mut ui, &path).unwrap();
+        assert!(ui.keys.is_empty(), "keys left: {:?}", ui.keys);
+        let shared = ui
             .screens
             .iter()
-            .find(|s| s.contains("Mouse light · Finished (answered, waiting for you): effect"))
+            .find(|s| s.contains("RGB, all lights · Thinking (only effects every light that is on shows): effect"))
             .unwrap();
         assert!(
-            !menu.contains("wave") && !menu.contains("reactive-"),
-            "{menu}"
+            !shared.contains("two colours") && !shared.contains("wave"),
+            "{shared}"
+        );
+        assert!(ui.screens.iter().any(|s| s.contains("mouse logo waveform")));
+        let own = ui
+            .screens
+            .iter()
+            .find(|s| s.contains("Mouse light own · Needs a decision: effect"))
+            .unwrap();
+        assert!(
+            !own.contains("reactive:") && !own.contains("wave:"),
+            "{own}"
         );
         let lights = mappings::load_config(&path).unwrap().device_lights;
-        assert!(lights.mouse_on);
-        assert_eq!(lights.mouse[3], Rgb::Static("red"));
+        assert!(lights.rgb_devices[3].on && lights.rgb_devices[3].own.is_some());
+        let timing = Timing {
+            period: Some(2000),
+            form: Some(1),
+            intensity: Some(50),
+        };
+        assert_eq!(
+            lights.rgb_shared.states[2],
+            Rgb::Breath([0, 0, 255], timing)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 199: while running, the shared set reaches every switched-on light (fake
+    /// razerkbd and razeraccessory files, a fake logirgb), a custom RGB as each device's
+    /// bytes or arguments; the mousepad's own effect wins for it alone.
+    #[test]
+    fn rgb_shared_set_reaches_every_light_and_an_override_wins_for_its_own() {
+        use crate::status::Rgb;
+        use std::sync::{Arc, Mutex};
+        let dir = std::env::temp_dir().join(format!("vibeconsole-rgb-all-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let effects = ["none", "spectrum", "wave", "static", "breath", "reactive"];
+        let device = |path: PathBuf, name: &str| {
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("device_type"), format!("{name}\n")).unwrap();
+            std::fs::write(path.join("matrix_brightness"), "200\n").unwrap();
+            for f in effects {
+                std::fs::write(path.join(format!("matrix_effect_{f}")), "").unwrap();
+            }
+            path
+        };
+        let kbd = device(
+            dir.join("razerkbd/0003:1532:021A.0001"),
+            "Razer BlackWidow X Chroma",
+        );
+        let nommo = device(dir.join("acc/0003:1532:0517.000A"), "Razer Nommo Chroma");
+        let firefly = device(dir.join("acc/0003:1532:0C04.0001"), "Razer Firefly V2");
+        let read = |d: &Path| std::fs::read(d.join("matrix_effect_static")).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log = calls.clone();
+        let run: crate::gamepad::Runner = Box::new(move |args: &[&str]| {
+            log.lock().unwrap().push(args.join(" "));
+            Ok(match args[1] {
+                "profiles" => "G502 HERO Gaming Mouse profiles: 1 on (active)\n".into(),
+                "list" => {
+                    "   zone 1 (logo): G logo\n     profile 1: cycle period=8000ms intensity=100%\n"
+                        .into()
+                }
+                _ => String::new(),
+            })
+        });
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        use crate::keyboard::RgbKeyboards;
+        ui.rgb = Some(RgbKeyboards::open(&dir.join("razerkbd"), Rgb::SPECTRUM).unwrap());
+        let acc = dir.join("acc");
+        ui.accessories[0] = Some(
+            RgbKeyboards::open_accessory(&acc, Rgb::SPECTRUM, "Speakers RGB", "Nommo").unwrap(),
+        );
+        ui.accessories[1] = Some(
+            RgbKeyboards::open_accessory(&acc, Rgb::SPECTRUM, "Mousepad RGB", "Firefly").unwrap(),
+        );
+        ui.mouse = Some(crate::keyboard::MouseLight::open(run).unwrap());
+        let mut patterns = crate::status::DevicePatterns::default();
+        for d in &mut patterns.rgb_devices {
+            d.on = true;
+        }
+        patterns.rgb_shared.states[1] = Rgb::Static([18, 52, 86]);
+        let mut own = patterns.rgb_shared;
+        own.states[1] = Rgb::Static([1, 2, 3]);
+        patterns.rgb_devices[2].own = Some(own);
+        ui.device_lights = Some(patterns);
+        ui.agent_states = vec![("claude".into(), "claude".into(), "needs-input")];
+        ui.output = Some(crate::keyboard::Output::recording(&[]).unwrap());
+        ui.suspended = false;
+        ui.show_rgb();
+        assert_eq!(
+            read(&kbd),
+            [18, 52, 86],
+            "keyboard: the shared custom colour"
+        );
+        assert_eq!(read(&nommo), [18, 52, 86], "speakers: the same");
+        assert_eq!(read(&firefly), [1, 2, 3], "mousepad: its own wins");
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c == "logirgb set -d g502 -z 1 static --color #123456 --preview"),
+            "{:?}",
+            calls.lock().unwrap()
+        );
+        ui.agent_states[0].2 = "thinking";
+        ui.show_rgb();
+        for d in [&kbd, &nommo, &firefly] {
+            assert_eq!(
+                std::fs::read(d.join("matrix_effect_breath")).unwrap(),
+                [0, 0, 255]
+            );
+        }
+        drop(ui);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

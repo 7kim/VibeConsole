@@ -697,17 +697,29 @@ const EFFECT_FILES: [&str; 6] = [
     "matrix_effect_breath",
     "matrix_effect_reactive",
 ];
-/// The effect file and the bytes OpenRazer's driver takes for an effect.
+/// The effect file and the bytes OpenRazer's driver takes for an effect (v7.7 ticket 193's
+/// table: OpenRazer 3.12.4). A colour is 3 raw bytes; breath takes 3 (one colour), 6 (two)
+/// or 1 (random) bytes; reactive a speed byte (1–4, clamped by the driver) then RGB; wave
+/// its direction as text.
 fn rgb_write(effect: crate::status::Rgb) -> (&'static str, Vec<u8>) {
-    use crate::status::{Rgb, rgb_bytes};
+    use crate::status::Rgb;
     match effect {
         Rgb::Off => ("matrix_effect_none", b"1".to_vec()),
-        Rgb::Spectrum => ("matrix_effect_spectrum", b"1".to_vec()),
-        Rgb::Wave => ("matrix_effect_wave", b"1".to_vec()),
-        Rgb::Static(c) => ("matrix_effect_static", rgb_bytes(c).to_vec()),
-        Rgb::Breath(c) => ("matrix_effect_breath", rgb_bytes(c).to_vec()),
-        // Speed 2 of 1–4 (`razer_chroma_standard_matrix_effect_reactive` clamps it).
-        Rgb::Reactive(c) => ("matrix_effect_reactive", [&[2][..], &rgb_bytes(c)].concat()),
+        Rgb::Spectrum(_) => ("matrix_effect_spectrum", b"1".to_vec()),
+        // Direction 1 unless one was picked, as before ticket 199.
+        Rgb::Wave(d) => (
+            "matrix_effect_wave",
+            d.unwrap_or(1).to_string().into_bytes(),
+        ),
+        Rgb::Static(c) => ("matrix_effect_static", c.to_vec()),
+        Rgb::Breath(c, _) => ("matrix_effect_breath", c.to_vec()),
+        Rgb::BreathTwo(a, b) => ("matrix_effect_breath", [a, b].concat()),
+        Rgb::BreathRandom => ("matrix_effect_breath", b"1".to_vec()),
+        // Speed 2 unless one was picked, as before ticket 199.
+        Rgb::Reactive(c, speed) => (
+            "matrix_effect_reactive",
+            [&[speed.unwrap_or(2)][..], &c].concat(),
+        ),
     }
 }
 impl RgbBoard {
@@ -950,24 +962,38 @@ impl MouseLight {
             unavailable: None,
         })
     }
-    /// The logo's effect for a state; nothing is sent when it already shows it.
+    /// The logo's effect for a state; nothing is sent when it already shows it. Its own
+    /// breathe and cycle settings go along when set (v7.7 ticket 199).
     pub fn show(&mut self, effect: crate::status::Rgb) -> Result<()> {
-        use crate::status::{Rgb, rgb_bytes};
+        use crate::status::{FORMS, Rgb, Timing, colour_word};
         if self.shown == Some(effect) {
             return Ok(());
         }
-        let hex = |c: &str| {
-            let [r, g, b] = rgb_bytes(c);
-            format!("#{r:02x}{g:02x}{b:02x}")
+        let timing = |t: Timing, form: bool| {
+            let mut out = Vec::new();
+            if let Some(p) = t.period {
+                out.extend(["--period".to_owned(), p.to_string()]);
+            }
+            if let Some(f) = t.form.filter(|_| form) {
+                out.extend(["--form".to_owned(), FORMS[usize::from(f)].to_owned()]);
+            }
+            if let Some(i) = t.intensity {
+                out.extend(["--intensity".to_owned(), i.to_string()]);
+            }
+            out
         };
         let words: Vec<String> = match effect {
             Rgb::Off => vec!["off".into()],
-            Rgb::Static(c) => vec!["static".into(), "--color".into(), hex(c)],
-            Rgb::Breath(c) => vec!["breathe".into(), "--color".into(), hex(c)],
-            Rgb::Spectrum => vec!["cycle".into()],
-            Rgb::Wave | Rgb::Reactive(_) => {
+            Rgb::Static(c) => vec!["static".into(), "--color".into(), colour_word(c)],
+            Rgb::Breath(c, t) => [
+                vec!["breathe".into(), "--color".into(), colour_word(c)],
+                timing(t, true),
+            ]
+            .concat(),
+            Rgb::Spectrum(t) => [vec!["cycle".into()], timing(t, false)].concat(),
+            Rgb::BreathTwo(..) | Rgb::BreathRandom | Rgb::Wave(_) | Rgb::Reactive(..) => {
                 self.unavailable = Some(format!(
-                    "{} unavailable on the G502 logo: it shows off, static, breathe and cycle only",
+                    "{} unavailable on the G502 logo: it shows off, static, breath with one colour and spectrum only",
                     crate::status::rgb_word(effect)
                 ));
                 return Ok(());
@@ -2070,7 +2096,7 @@ mod tests {
         use crate::status::Rgb;
         let dir = std::env::temp_dir().join(format!("vibeconsole-rgb-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let error = RgbKeyboards::open(&dir, Rgb::Spectrum)
+        let error = RgbKeyboards::open(&dir, Rgb::SPECTRUM)
             .err()
             .unwrap()
             .to_string();
@@ -2091,27 +2117,28 @@ mod tests {
         let one = board("0003:1532:021A.0001");
         let two = board("0003:1532:021A.0002");
         let read = |kbd: &Path, f: &str| std::fs::read(kbd.join(f)).unwrap();
-        let mut rgb = RgbKeyboards::open(&dir, Rgb::Wave).unwrap();
+        let mut rgb = RgbKeyboards::open(&dir, Rgb::Wave(None)).unwrap();
         assert_eq!(rgb.names().len(), 2);
         assert!(
             read(&one, "matrix_effect_static").is_empty(),
             "nothing before show"
         );
-        rgb.show(Rgb::Static("red"), 255).unwrap();
+        rgb.show(Rgb::Static([255, 0, 0]), 255).unwrap();
         assert_eq!(read(&one, "matrix_effect_static"), [255, 0, 0]);
         assert_eq!(read(&two, "matrix_brightness"), b"255");
         std::fs::write(one.join("matrix_effect_static"), "").unwrap();
-        rgb.show(Rgb::Static("red"), 255).unwrap();
+        rgb.show(Rgb::Static([255, 0, 0]), 255).unwrap();
         assert!(
             read(&one, "matrix_effect_static").is_empty(),
             "not sent twice"
         );
-        rgb.show(Rgb::Breath("blue"), 255).unwrap();
+        rgb.show(Rgb::Breath([0, 0, 255], Default::default()), 255)
+            .unwrap();
         assert_eq!(read(&one, "matrix_effect_breath"), [0, 0, 255]);
-        rgb.show(Rgb::Reactive("green"), 100).unwrap();
+        rgb.show(Rgb::Reactive([0, 255, 0], None), 100).unwrap();
         assert_eq!(read(&one, "matrix_effect_reactive"), [2, 0, 255, 0]);
         assert_eq!(read(&one, "matrix_brightness"), b"100");
-        rgb.show(Rgb::Spectrum, 100).unwrap();
+        rgb.show(Rgb::SPECTRUM, 100).unwrap();
         assert_eq!(read(&one, "matrix_effect_spectrum"), b"1");
         rgb.show(Rgb::Off, 100).unwrap();
         assert_eq!(read(&one, "matrix_effect_none"), b"1");
@@ -2128,7 +2155,7 @@ mod tests {
         assert!(read(&one, "matrix_effect_wave").is_empty());
         // One keyboard unplugged: the other keeps showing; quitting (drop) restores it.
         std::fs::remove_dir_all(&two).unwrap();
-        rgb.show(Rgb::Static("white"), 50).unwrap();
+        rgb.show(Rgb::Static([255, 255, 255]), 50).unwrap();
         assert_eq!(rgb.names().len(), 1);
         assert_eq!(read(&one, "matrix_effect_static"), [255, 255, 255]);
         drop(rgb);
@@ -2161,17 +2188,18 @@ mod tests {
         let firefly = device("0003:1532:0C04.0001", "Razer Firefly V2", &all);
         let read = |d: &Path, f: &str| std::fs::read(d.join(f)).unwrap();
         let mut speakers =
-            RgbKeyboards::open_accessory(&dir, Rgb::Wave, "Speakers RGB", "Nommo").unwrap();
+            RgbKeyboards::open_accessory(&dir, Rgb::Wave(None), "Speakers RGB", "Nommo").unwrap();
         let mut pad =
-            RgbKeyboards::open_accessory(&dir, Rgb::Spectrum, "Mousepad RGB", "Firefly").unwrap();
+            RgbKeyboards::open_accessory(&dir, Rgb::SPECTRUM, "Mousepad RGB", "Firefly").unwrap();
         assert_eq!(speakers.names(), ["Razer Nommo Chroma"]);
         assert_eq!(pad.names(), ["Razer Firefly V2"]);
         assert_eq!(
             speakers.abilities(),
             ["Razer Nommo Chroma: off, spectrum, wave, static, breath"]
         );
-        speakers.show(Rgb::Static("white"), 90).unwrap();
-        pad.show(Rgb::Breath("blue"), 90).unwrap();
+        speakers.show(Rgb::Static([255, 255, 255]), 90).unwrap();
+        pad.show(Rgb::Breath([0, 0, 255], Default::default()), 90)
+            .unwrap();
         assert_eq!(read(&nommo, "matrix_effect_static"), [255, 255, 255]);
         assert_eq!(read(&firefly, "matrix_effect_breath"), [0, 0, 255]);
         assert!(
@@ -2184,16 +2212,16 @@ mod tests {
             "brightness left alone"
         );
         assert_eq!(speakers.unavailable, None);
-        speakers.show(Rgb::Reactive("red"), 90).unwrap();
+        speakers.show(Rgb::Reactive([255, 0, 0], None), 90).unwrap();
         assert_eq!(
             speakers.unavailable.take().as_deref(),
-            Some("reactive-red unavailable on Razer Nommo Chroma: it has no reactive effect")
+            Some("reactive #ff0000 unavailable on Razer Nommo Chroma: it has no reactive effect")
         );
         assert!(
             !nommo.join("matrix_effect_reactive").exists(),
             "never written"
         );
-        pad.show(Rgb::Reactive("red"), 90).unwrap();
+        pad.show(Rgb::Reactive([255, 0, 0], None), 90).unwrap();
         assert_eq!(read(&firefly, "matrix_effect_reactive"), [2, 255, 0, 0]);
         speakers.restore();
         assert_eq!(
@@ -2239,14 +2267,18 @@ mod tests {
             })
         });
         let mut mouse = MouseLight::open(run).unwrap();
-        mouse.show(Rgb::Static("orange")).unwrap();
-        mouse.show(Rgb::Static("orange")).unwrap();
-        mouse.show(Rgb::Breath("blue")).unwrap();
-        mouse.show(Rgb::Spectrum).unwrap();
-        mouse.show(Rgb::Wave).unwrap();
+        mouse.show(Rgb::Static([255, 128, 0])).unwrap();
+        mouse.show(Rgb::Static([255, 128, 0])).unwrap();
+        mouse
+            .show(Rgb::Breath([0, 0, 255], Default::default()))
+            .unwrap();
+        mouse.show(Rgb::SPECTRUM).unwrap();
+        mouse.show(Rgb::Wave(None)).unwrap();
         assert_eq!(
             mouse.unavailable.take().as_deref(),
-            Some("wave unavailable on the G502 logo: it shows off, static, breathe and cycle only")
+            Some(
+                "wave unavailable on the G502 logo: it shows off, static, breath with one colour and spectrum only"
+            )
         );
         drop(mouse);
         assert_eq!(
