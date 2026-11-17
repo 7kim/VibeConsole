@@ -119,13 +119,17 @@ def pick(master, label, limit=20):
     os.write(master, b"\r")
 
 
-for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_settings", "contexts", "default_running", "run_subcommand", "toggle_run_pause", "modified_navigation", "flow_setting", "panes", "narrow_resize", "toggle_panel", "idle_no_device", "unverified_run"):
+# v7.7 ticket 213: what the shell may leave queued when VibeConsole starts: the Enter that
+# started it, a CRLF, a kitty key-release report, or a held Enter's repeats (31 ms apart).
+STARTUP = {"startup_cr": b"\r", "startup_crlf": b"\r\n", "startup_kitty_release": b"\x1b[13;1:3u",
+           "startup_enter_held": b"\r" * 10}
+for ending in (*STARTUP, "quit", "sigint", "sigterm", "configuration_error", "current_settings", "contexts", "default_running", "run_subcommand", "toggle_run_pause", "modified_navigation", "flow_setting", "panes", "narrow_resize", "toggle_panel", "idle_no_device", "unverified_run"):
     with tempfile.TemporaryDirectory(prefix="vibeconsole-pty-") as directory:
         config = Path(directory) / "vibeconsole"
         config.mkdir()
         path = config / "mappings.tsv"
         contents = b"vibeconsole-mappings-v1\n09e8:1049\tnote\t10\t36\thold\tShift\n"
-        if ending == "default_running":
+        if ending == "default_running" or ending in STARTUP:
             contents = b"vibeconsole-mappings-v4\nidle\t-\t-\t-\n"
         if ending == "current_settings":
             contents = b"vibeconsole-mappings-v2\nidle\t0\t240\ton\n09e8:1049\tnote\t10\t36\ttoggle\tShift\tabsolute:1\t240\ton\n"
@@ -147,19 +151,40 @@ for ending in ("quit", "sigint", "sigterm", "configuration_error", "current_sett
                 (config / f"{name}.json.tmp").write_text("occupied")
         master, slave = pty.openpty()
         original = termios.tcgetattr(slave)
+        os.write(master, STARTUP.get(ending, b""))  # typed before the first frame
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
         child = subprocess.Popen(
-            [*HIDE_INPUT, binary, *(["run"] if ending == "run_subcommand" else [] if ending in ("default_running", "toggle_run_pause", "idle_no_device") else ["--paused"])], stdin=slave, stdout=slave, stderr=slave,
+            [*HIDE_INPUT, binary, *(["run"] if ending == "run_subcommand" else [] if ending in ("default_running", "toggle_run_pause", "idle_no_device", *STARTUP) else ["--paused"])], stdin=slave, stdout=slave, stderr=slave,
             env=dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ["PATH"], XDG_CONFIG_HOME=directory, XDG_RUNTIME_DIR=directory, XDG_DATA_HOME=directory, XDG_DATA_DIRS=directory, XDG_STATE_HOME=directory, TERM="xterm-256color", **({"NO_COLOR": "1"} if ending == "narrow_resize" else {})),
         )
         try:
             # v7.7 ticket 155: these configs are older than 7.7, so What moved shows first; Esc
             # closes it and marks it seen.
             initial_screen = read_until_any(master, [MENU, b"What moved in 7.7"])
+            if ending in STARTUP:
+                if ending == "startup_enter_held":  # still held after the first frame
+                    for _ in range(32):
+                        os.write(master, b"\r")
+                        time.sleep(0.031)
+                # Nothing queued reached a screen: What moved is still open, nothing paused.
+                time.sleep(0.3)
+                while select.select([master], [], [], 0.2)[0]:
+                    initial_screen += os.read(master, 65536)
+                assert b"What moved in 7.7" in initial_screen, initial_screen[-300:]
+                assert b"PAUSED" not in initial_screen, initial_screen[-300:]
             if b"What moved in 7.7" in initial_screen:
                 os.write(master, b"\x1b")
                 initial_screen += read_until(master, MENU)
-            if ending == "unverified_run":
+            if ending in STARTUP:
+                assert PAUSE in initial_screen and b"RUNNING" in initial_screen
+                assert b"PAUSED" not in initial_screen
+                # Idle on Live: nothing changes, so nothing is written between ticks.
+                time.sleep(1)
+                while select.select([master], [], [], 0)[0]:
+                    os.read(master, 65536)
+                assert not select.select([master], [], [], 2)[0], "wrote while idle"
+                go(master, "Pause", "/quit")
+            elif ending == "unverified_run":
                 go(master, "Run", "Run")
                 notice = read_until(master, b"Select /prog-select before running")
                 assert b"Operation failed" not in notice

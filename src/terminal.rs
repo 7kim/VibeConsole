@@ -458,6 +458,11 @@ struct Terminal {
     tab_rows: [usize; 10],
     rendered: String,
     rendered_size: (usize, usize),
+    /// v7.7 ticket 213: the first frame is drawn; input typed before it was dropped.
+    drawn: bool,
+    /// An Enter that was held when the first frame came: its repeats are dropped while they
+    /// keep coming, the last one at this time.
+    held_enter: Option<Instant>,
 }
 
 impl Terminal {
@@ -1092,6 +1097,8 @@ impl Terminal {
             tab_rows: [0; 10],
             rendered: String::new(),
             rendered_size: (0, 0),
+            drawn: false,
+            held_enter: None,
         };
         for signal in [
             signal_hook::consts::SIGINT,
@@ -5564,6 +5571,18 @@ impl Ui for Terminal {
     }
     fn draw(&mut self, text: &str) -> Result<()> {
         self.tick()?;
+        // v7.7 ticket 213: what the shell left queued (the Enter that started VibeConsole, its
+        // repeats, a CRLF) is not a key for the first screen. Dropped once, as queued MIDI is.
+        if !self.drawn && self.original.is_some() {
+            for _ in 0..4096 {
+                match self.byte(0)? {
+                    Some(b'\r' | b'\n') => self.held_enter = Some(Instant::now()),
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+        }
+        self.drawn = true;
         let size = self.size();
         let screen = self.screen(text).render(
             size.0,
@@ -5631,6 +5650,15 @@ impl Ui for Terminal {
             Some(_) => Some(Key::InvalidInput),
             None => None,
         };
+        // A held starting Enter repeats every 30-ish ms; a gap or another key ends it.
+        if key.is_some() {
+            let repeat = key == Some(Key::Enter)
+                && (self.held_enter).is_some_and(|at| at.elapsed() < HELD_REPEAT);
+            self.held_enter = repeat.then(Instant::now);
+            if repeat {
+                return Ok(None);
+            }
+        }
         // Never confirm an action whose menu cannot be displayed.
         Ok(
             if (self.size().0 < 40 || self.size().1 < 16) && key != Some(Key::Escape) {
@@ -6068,6 +6096,8 @@ fn window_name(name: &str) -> String {
     }
 }
 
+/// The longest gap between a held key's repeats (GNOME's default interval is 30 ms).
+const HELD_REPEAT: Duration = Duration::from_millis(150);
 const STATUS_EVERY: Duration = Duration::from_millis(500);
 
 /// What a status pad's last press did: sent until the worker answers, then done or failed.
@@ -13165,6 +13195,11 @@ mod tests {
         }
         assert_eq!(csi_key(b"65;2u"), Key::Other); // printable text is not rewritten
         assert_eq!(csi_key(b"1;9A"), Key::Other);
+        // v7.7 ticket 213: kitty keyboard protocol repeat (`:2`) and release (`:3`) reports
+        // are never an Enter press, nor is a bare `13u` or `13;1u`.
+        for sequence in [&b"13;1:2u"[..], b"13;1:3u", b"13;5:3u", b"13u", b"13;1u"] {
+            assert_eq!(csi_key(sequence), Key::Other, "{sequence:?}");
+        }
     }
     #[derive(Default)]
     struct Script {
