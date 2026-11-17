@@ -189,6 +189,201 @@ pub fn login(request: Login) -> Result<bool> {
         }
     }
 }
+/// v7.7 ticket 187: one environment VibeConsole runs in: its PATH and the variables it
+/// relies on, as `NAME=value` pairs (a terminal: this process; the service: the user
+/// manager's `systemctl --user show-environment`).
+#[derive(Clone, Debug, Default)]
+pub struct ModeEnv {
+    pub path: String,
+    pub vars: Vec<(String, String)>,
+}
+impl ModeEnv {
+    /// `systemctl --user show-environment`'s `NAME=value` lines.
+    pub fn parse(text: &str) -> Self {
+        let vars = text
+            .lines()
+            .filter_map(|l| l.split_once('='))
+            .map(|(n, v)| (n.to_owned(), v.to_owned()))
+            .collect::<Vec<_>>();
+        let path = vars
+            .iter()
+            .find(|(n, _)| n == "PATH")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        Self { path, vars }
+    }
+    pub fn here() -> Self {
+        let vars = std::env::vars().collect::<Vec<_>>();
+        Self {
+            path: std::env::var("PATH").unwrap_or_default(),
+            vars,
+        }
+    }
+    fn has(&self, name: &str) -> bool {
+        self.vars.iter().any(|(n, v)| n == name && !v.is_empty())
+    }
+}
+/// v7.7 ticket 187: one feature as each mode has it, why they differ, and how it should be.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModeRow {
+    pub feature: String,
+    pub terminal: String,
+    pub service: String,
+    pub why: String,
+    pub should: String,
+}
+impl ModeRow {
+    pub fn differs(&self) -> bool {
+        self.terminal != self.service
+    }
+}
+/// v7.7 ticket 187: the variables VibeConsole needs, and what each serves.
+const MODE_VARS: [(&str, &str); 4] = [
+    ("HOME", "config, Orca's CLI and status file, skills"),
+    ("XDG_RUNTIME_DIR", "agent status hooks"),
+    ("WAYLAND_DISPLAY", "the focused app and window control"),
+    (
+        "DBUS_SESSION_BUS_ADDRESS",
+        "the window extension and app launchers",
+    ),
+];
+/// v7.7 ticket 187: the programs VibeConsole runs by name, and what each serves.
+const MODE_TOOLS: [(&str, &str); 8] = [
+    ("tmux", "tmux agents, terminal commands, tmux jumps"),
+    ("herdr", "herdr agents and their lights"),
+    ("gio", "app launchers"),
+    ("gdbus", "the window extension (focus, minimize)"),
+    ("wpctl", "volume and mute"),
+    ("pw-dump", "the Xbox headset"),
+    ("timeout", "Ask <agent> (3 minutes at most)"),
+    ("git", "Ask how to improve VibeConsole"),
+];
+/// v7.7 ticket 187: the same probe list for the terminal and the service: what differs by
+/// design, then every variable and program VibeConsole relies on, found or not in each
+/// environment. Read-only: nothing is written, started or sent.
+pub fn compare_modes(terminal: &ModeEnv, service: &ModeEnv, agent: (&str, &str)) -> Vec<ModeRow> {
+    let row = |feature: String, terminal: &str, service: &str, why: &str, should: &str| ModeRow {
+        feature,
+        terminal: terminal.into(),
+        service: service.into(),
+        why: why.into(),
+        should: should.into(),
+    };
+    let mut rows = vec![
+        row(
+            "Screen: tabs, menus, Find, AI asks, $EDITOR".into(),
+            "works",
+            "no screen",
+            "the service has no terminal",
+            "by design: run `vibeconsole` in a terminal; the service pauses for that session",
+        ),
+        row(
+            "Piano mappings".into(),
+            "after Run is confirmed",
+            "inactive",
+            "their safety confirmation needs someone at a terminal",
+            "by design: confirm Run in a terminal session",
+        ),
+        row(
+            "Akai agent status lights".into(),
+            "works",
+            "works",
+            "",
+            "the same in both (ticket 186)",
+        ),
+        row(
+            "Xbox button light and rumble for agents".into(),
+            "works",
+            "works",
+            "",
+            "the same in both: they follow running output, not the terminal",
+        ),
+        row(
+            "Keyboard lights for agents (lock LED, Razer RGB)".into(),
+            "works",
+            "works",
+            "",
+            "the same in both: they follow running output, not the terminal",
+        ),
+        row(
+            "App profiles follow the focused app".into(),
+            "works",
+            "works",
+            "",
+            "the same in both, when WAYLAND_DISPLAY and DBUS_SESSION_BUS_ADDRESS are set (below)",
+        ),
+    ];
+    let found = |env: &ModeEnv, tool: &str| {
+        if crate::mappings::executable_on_path(&env.path, tool) {
+            "found"
+        } else {
+            "not on PATH"
+        }
+    };
+    let set = |env: &ModeEnv, var: &str| if env.has(var) { "set" } else { "not set" };
+    for (var, serves) in MODE_VARS {
+        let (t, s) = (set(terminal, var), set(service, var));
+        rows.push(row(
+            format!("{var} ({serves})"),
+            t,
+            s,
+            if t == s { "" } else { "the service's environment differs from the terminal's" },
+            if t == s {
+                "the same in both"
+            } else {
+                "the same in both: set it for the user manager (`systemctl --user import-environment`, or `~/.config/environment.d/`), then restart the service"
+            },
+        ));
+    }
+    let tools = MODE_TOOLS
+        .iter()
+        .map(|(tool, serves)| (tool.to_string(), serves.to_string()))
+        .chain([(
+            agent.1.to_string(),
+            format!("the AI tab's default agent, {}", agent.0),
+        )]);
+    for (tool, serves) in tools {
+        let (t, s) = (found(terminal, &tool), found(service, &tool));
+        rows.push(row(
+            format!("{tool} ({serves})"),
+            t,
+            s,
+            &if t == s {
+                String::new()
+            } else {
+                format!("{tool} isn't on the PATH of the mode that lacks it")
+            },
+            &if t == s {
+                "the same in both".to_string()
+            } else {
+                format!("the same in both: put {tool}'s folder on the service's PATH (`~/.config/environment.d/`), then restart the service")
+            },
+        ));
+    }
+    rows
+}
+/// v7.7 ticket 187: the comparison as `vibeconsole compare-modes` prints it; `≠` marks a
+/// row that differs.
+pub fn compare_text(rows: &[ModeRow]) -> String {
+    let mut text = String::from(
+        "Terminal session vs login service (read-only; nothing was started or written)\n\n",
+    );
+    for r in rows {
+        text += &format!(
+            "{} {}\n    terminal: {} · service: {}\n",
+            if r.differs() { "≠" } else { " " },
+            r.feature,
+            r.terminal,
+            r.service
+        );
+        if r.differs() {
+            text += &format!("    why: {}\n    should: {}\n", r.why, r.should);
+        }
+    }
+    let n = rows.iter().filter(|r| r.differs()).count();
+    text += &format!("\n{n} differences.\n");
+    text
+}
 /// v7.7 ticket 158: the VibeConsole skills (ten, and since ticket 184 one per Ask), embedded at build time: (path under
 /// `~/.claude/skills`, text). A test keeps this list equal to the repo's `.claude/skills`.
 pub const SKILLS: [(&str, &str); 29] = [
@@ -777,6 +972,54 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// v7.7 ticket 187: the same probes for both modes; a program missing from the
+    /// service's PATH is a differing row with its cause and how it should be; the by-design
+    /// rows are there; reading the service's environment parses `show-environment`.
+    #[test]
+    fn compare_modes_names_each_difference_and_its_cause() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-modes-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (both, extra) = (dir.join("both"), dir.join("extra"));
+        for (d, names) in [
+            (&both, &["tmux", "gio", "claude"][..]),
+            (&extra, &["herdr"][..]),
+        ] {
+            fs::create_dir_all(d).unwrap();
+            for n in names {
+                fs::write(d.join(n), "").unwrap();
+                fs::set_permissions(d.join(n), fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        let terminal = ModeEnv {
+            path: format!("{}:{}", both.display(), extra.display()),
+            vars: vec![
+                ("HOME".into(), "/h".into()),
+                ("WAYLAND_DISPLAY".into(), "wayland-0".into()),
+            ],
+        };
+        let service = ModeEnv::parse(&format!("HOME=/h\nPATH={}\n", both.display()));
+        assert_eq!(service.path, both.display().to_string());
+        let rows = compare_modes(&terminal, &service, ("Claude Code", "claude"));
+        let row = |f: &str| {
+            rows.iter()
+                .find(|r| r.feature.starts_with(f))
+                .unwrap_or_else(|| panic!("{f}"))
+        };
+        let herdr = row("herdr ");
+        assert_eq!(
+            (herdr.terminal.as_str(), herdr.service.as_str()),
+            ("found", "not on PATH")
+        );
+        assert!(herdr.why.contains("PATH") && herdr.should.contains("environment.d"));
+        assert!(!row("tmux ").differs() && !row("claude ").differs());
+        assert!(row("WAYLAND_DISPLAY").differs());
+        assert!(row("Screen").differs() && row("Piano").differs());
+        assert!(!row("Akai agent status lights").differs());
+        let text = compare_text(&rows);
+        assert!(text.contains("≠ herdr (herdr agents and their lights)\n    terminal: found · service: not on PATH\n    why: "));
+        fs::remove_dir_all(dir).unwrap();
+    }
     /// v7.7 ticket 158: Install /skills writes the missing files into a home, backs up a
     /// differing one before replacing it, deletes nothing, and reports installed only when
     /// every file is there and equal; the embedded list is the repo's `.claude/skills`.

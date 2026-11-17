@@ -112,6 +112,11 @@ fn help(color: bool) -> String {
                     "describe",
                     "List each device's controls by name and every action (read-only)".into(),
                 ),
+                (
+                    "compare-modes",
+                    "What works in a terminal session vs the login service, and why (read-only)"
+                        .into(),
+                ),
             ],
         ),
         (
@@ -189,6 +194,32 @@ fn main() -> Result<()> {
     if args == ["--help"] || args == ["-h"] || args == ["help"] {
         plain_output();
         print!("{}", help(color()));
+        return Ok(());
+    }
+    // v7.7 ticket 187: read-only; the service's environment through systemctl, nothing else.
+    if args == ["compare-modes"] {
+        plain_output();
+        let service = std::process::Command::new("systemctl")
+            .args(["--user", "show-environment"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let look = mappings::config_path()
+            .and_then(|path| mappings::load_config(&path))
+            .unwrap_or_default()
+            .look;
+        let binary = mappings::one_shot(&look, "")
+            .ok()
+            .and_then(|argv| argv.first().cloned())
+            .unwrap_or_else(|| "claude".into());
+        print!(
+            "{}",
+            runtime::compare_text(&runtime::compare_modes(
+                &runtime::ModeEnv::here(),
+                &runtime::ModeEnv::parse(&service),
+                (&look.agent_label(), &binary),
+            ))
+        );
         return Ok(());
     }
     // v7 ticket 141: read-only, no session, no owner lock, nothing opened for writing.
