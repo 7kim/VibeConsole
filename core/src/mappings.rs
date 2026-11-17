@@ -2004,6 +2004,8 @@ impl Tuning {
 }
 impl Default for Config {
     fn default() -> Self {
+        // v7.7 ticket 195: the light parts come from the shipped `lights.json`.
+        let lights = crate::config::shipped_lights();
         Self {
             mappings: Vec::new(),
             agents: vec![
@@ -2016,13 +2018,13 @@ impl Default for Config {
             agent_dir: None,
             env: Vec::new(),
             vars: Vec::new(),
-            status_lights: true,
-            light_folders: Vec::new(),
-            light_other: 2,
-            light_other_on: false,
-            light_patterns: crate::status::Patterns::default(),
+            status_lights: lights.status_lights,
+            light_folders: lights.folders.clone(),
+            light_other: lights.other,
+            light_other_on: lights.other_on,
+            light_patterns: lights.patterns,
             tuning: Tuning::default(),
-            device_lights: Default::default(),
+            device_lights: lights.devices.clone(),
             midi_devices: Vec::new(),
             midi_active: None,
             xbox_names: Default::default(),

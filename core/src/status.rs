@@ -716,56 +716,9 @@ pub fn accessory_rgb(states: &[&str], effects: &[Rgb; 4]) -> Option<Rgb> {
 /// keyboard's M (macro) light through OpenRazer's driver.
 pub const KEY_LEDS: [&str; 4] = ["scroll", "caps", "num", "macro"];
 impl Default for DevicePatterns {
-    /// The design board's (version 34).
+    /// v7.7 ticket 195: the shipped `lights.json` (`core/defaults/`), not code.
     fn default() -> Self {
-        use Light::{Blink, FastBlink, SlowPulse};
-        use Rumble::Short;
-        let quiet = Rumble::Off;
-        Self {
-            on: [true; 3],
-            xbox: [
-                (FastBlink, Short),
-                (FastBlink, quiet),
-                (SlowPulse, quiet),
-                (Blink, Short),
-            ],
-            ps5: [
-                ("red", FastBlink, Short),
-                ("orange", FastBlink, quiet),
-                ("blue", SlowPulse, quiet),
-                ("green", Blink, Short),
-            ],
-            keyboard_on: false,
-            keyboard: [FastBlink, FastBlink, SlowPulse, Blink],
-            keyboard_leds: [false; 4],
-            xbox_brightness: [XBOX_BRIGHTNESS; 4],
-            rgb_on: false,
-            rgb: [
-                Rgb::Static("red"),
-                Rgb::Static("orange"),
-                Rgb::Breath("blue"),
-                Rgb::Static("green"),
-            ],
-            rgb_rest: Rgb::Spectrum,
-            rgb_brightness: 255,
-            accessories: [AccessoryRgb {
-                on: false,
-                rest: Rgb::Spectrum,
-                effects: [
-                    Rgb::Static("red"),
-                    Rgb::Static("orange"),
-                    Rgb::Breath("blue"),
-                    Rgb::Static("green"),
-                ],
-            }; 2],
-            mouse_on: false,
-            mouse: [
-                Rgb::Static("red"),
-                Rgb::Static("orange"),
-                Rgb::Breath("blue"),
-                Rgb::Static("green"),
-            ],
-        }
+        crate::config::shipped_lights().devices.clone()
     }
 }
 /// xone's Xbox button light brightness at start-up, and its maximum (`GIP_LED_BRIGHTNESS_MAX`).
@@ -886,17 +839,9 @@ pub struct Patterns {
     pub states: [(Tempo, Octave); 4],
 }
 impl Default for Patterns {
+    /// v7.7 ticket 195: the shipped `lights.json` (`core/defaults/`), not code.
     fn default() -> Self {
-        Self {
-            slow: 50,
-            fast: 240,
-            states: [
-                (Tempo::Fast, Octave::Alternate), // needs a decision
-                (Tempo::Fast, Octave::Steady),    // needs input (permission)
-                (Tempo::Slow, Octave::Off),       // thinking
-                (Tempo::Off, Octave::Blink),      // finished
-            ],
-        }
+        crate::config::shipped_lights().patterns
     }
 }
 impl Patterns {

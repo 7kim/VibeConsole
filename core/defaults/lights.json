@@ -1,0 +1,134 @@
+{
+  "version": 1,
+  "status_lights": true,
+  "folders": [],
+  "other": {
+    "on": false,
+    "octave": 2
+  },
+  "mpk": {
+    "on": true,
+    "tempos": {
+      "slow": 50,
+      "fast": 240
+    },
+    "states": {
+      "needs-decision": {
+        "tempo": "fast",
+        "octave": "alternate"
+      },
+      "needs-input": {
+        "tempo": "fast",
+        "octave": "steady"
+      },
+      "thinking": {
+        "tempo": "slow",
+        "octave": "off"
+      },
+      "finished": {
+        "tempo": "off",
+        "octave": "blink"
+      }
+    }
+  },
+  "xbox": {
+    "on": true,
+    "states": {
+      "needs-decision": {
+        "light": "fast-blink",
+        "rumble": "short",
+        "brightness": 20
+      },
+      "needs-input": {
+        "light": "fast-blink",
+        "rumble": "off",
+        "brightness": 20
+      },
+      "thinking": {
+        "light": "slow-pulse",
+        "rumble": "off",
+        "brightness": 20
+      },
+      "finished": {
+        "light": "blink",
+        "rumble": "short",
+        "brightness": 20
+      }
+    }
+  },
+  "ps5": {
+    "on": true,
+    "states": {
+      "needs-decision": {
+        "colour": "red",
+        "light": "fast-blink",
+        "rumble": "short"
+      },
+      "needs-input": {
+        "colour": "orange",
+        "light": "fast-blink",
+        "rumble": "off"
+      },
+      "thinking": {
+        "colour": "blue",
+        "light": "slow-pulse",
+        "rumble": "off"
+      },
+      "finished": {
+        "colour": "green",
+        "light": "blink",
+        "rumble": "short"
+      }
+    }
+  },
+  "keyboard_leds": {
+    "on": false,
+    "leds": [],
+    "states": {
+      "needs-decision": "fast-blink",
+      "needs-input": "fast-blink",
+      "thinking": "slow-pulse",
+      "finished": "blink"
+    }
+  },
+  "keyboard_rgb": {
+    "on": false,
+    "brightness": 255,
+    "rest": "spectrum",
+    "states": {
+      "needs-decision": "static-red",
+      "needs-input": "static-orange",
+      "thinking": "breath-blue",
+      "finished": "static-green"
+    }
+  },
+  "speakers_rgb": {
+    "on": false,
+    "rest": "spectrum",
+    "states": {
+      "needs-decision": "static-red",
+      "needs-input": "static-orange",
+      "thinking": "breath-blue",
+      "finished": "static-green"
+    }
+  },
+  "mousepad_rgb": {
+    "on": false,
+    "rest": "spectrum",
+    "states": {
+      "needs-decision": "static-red",
+      "needs-input": "static-orange",
+      "thinking": "breath-blue",
+      "finished": "static-green"
+    }
+  },
+  "mouse_rgb": {
+    "on": false,
+    "states": {
+      "needs-decision": "static-red",
+      "needs-input": "static-orange",
+      "thinking": "breath-blue",
+      "finished": "static-green"
+    }
+  }
+}

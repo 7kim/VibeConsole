@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 pub const VERSION: u64 = 1;
 /// The files, in the order they are applied: each one's references (variables, MIDI
 /// devices, idle settings) are in place before it is checked.
-pub const FILES: [&str; 1] = ["settings.json"];
+pub const FILES: [&str; 2] = ["settings.json", "lights.json"];
 
 /// The config folder of the main config path (`…/vibeconsole/mappings.tsv`).
 fn folder(path: &Path) -> Result<&Path> {
@@ -160,6 +160,7 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
 pub fn text(file: &str, config: &Config) -> Result<String> {
     let value = match file {
         "settings.json" => settings(config),
+        "lights.json" => lights(config),
         _ => return Err(format!("unknown config file {file}").into()),
     };
     Ok(serde_json::to_string_pretty(&value)? + "\n")
@@ -169,6 +170,16 @@ fn apply(file: &str, value: &Value, config: &mut Config) -> Result<()> {
     let at = Obj::top(value)?;
     match file {
         "settings.json" => apply_settings(&at, config),
+        "lights.json" => {
+            let lights = Lights::read(&at)?;
+            config.status_lights = lights.status_lights;
+            config.light_patterns = lights.patterns;
+            config.light_folders = lights.folders;
+            config.light_other = lights.other;
+            config.light_other_on = lights.other_on;
+            config.device_lights = lights.devices;
+            Ok(())
+        }
         _ => Err(format!("unknown config file {file}").into()),
     }
 }
@@ -237,6 +248,40 @@ impl<'a> Obj<'a> {
             .enumerate()
             .map(|(i, v)| Obj::new(v, &format!("{}[{i}].", self.name(key))))
             .collect()
+    }
+    /// An object field, with its path.
+    fn obj(&self, key: &str) -> Result<Obj<'a>> {
+        Obj::new(self.get(key)?, &format!("{}.", self.name(key)))
+    }
+    /// A whole number in the range of `T`.
+    fn int<T: TryFrom<i64>>(&self, key: &str) -> Result<T> {
+        self.get(key)?
+            .as_i64()
+            .and_then(|n| T::try_from(n).ok())
+            .ok_or_else(|| self.err(key, "must be a whole number in range"))
+    }
+    /// One of a list's words, as its value.
+    fn pick<T: Copy>(&self, key: &str, list: &[(&'static str, T)]) -> Result<T> {
+        let word = self.str(key)?;
+        list.iter()
+            .find(|(w, _)| *w == word)
+            .map(|(_, v)| *v)
+            .ok_or_else(|| {
+                let words = list.iter().map(|(w, _)| *w).collect::<Vec<_>>();
+                self.err(
+                    key,
+                    &format!("must be one of {}, not {word:?}", words.join(", ")),
+                )
+            })
+    }
+    /// An object with exactly the four busy states as keys, in `status::BUSY` order.
+    fn states(&self, key: &str) -> Result<Obj<'a>> {
+        let states = self.obj(key)?;
+        states.only(&crate::status::BUSY)?;
+        for state in crate::status::BUSY {
+            states.get(state)?;
+        }
+        Ok(states)
     }
     /// Run a check whose error is about this field.
     fn check<T>(&self, key: &str, result: Result<T>) -> Result<T> {
@@ -314,6 +359,240 @@ fn apply_settings(at: &Obj, config: &mut Config) -> Result<()> {
     config.start_flow = at.bool("start_flow")?;
     config.env = env;
     Ok(())
+}
+
+// ---- lights.json (ticket 195): status lights switch, the MPK's tempos and patterns, light
+// folders and other, the Xbox, DualSense and keyboard LED patterns, and the RGB devices.
+
+/// The light parts of the config; the shipped defaults are one of these.
+pub struct Lights {
+    pub status_lights: bool,
+    pub patterns: crate::status::Patterns,
+    pub folders: Vec<(String, i8)>,
+    pub other: i8,
+    pub other_on: bool,
+    pub devices: crate::status::DevicePatterns,
+}
+/// The shipped light defaults (`core/defaults/lights.json`, built in): every default light
+/// colour and effect; no code literal holds one.
+pub fn shipped_lights() -> &'static Lights {
+    static SHIPPED: std::sync::OnceLock<Lights> = std::sync::OnceLock::new();
+    SHIPPED.get_or_init(|| {
+        let value = serde_json::from_str(include_str!("../defaults/lights.json"))
+            .expect("shipped lights.json is JSON (checked by a test)");
+        Obj::top(&value)
+            .and_then(|at| Lights::read(&at))
+            .expect("shipped lights.json is valid (checked by a test)")
+    })
+}
+
+fn lights(config: &Config) -> Value {
+    use crate::status::{BUSY, KEY_LEDS, LIGHTS, RUMBLES, octave_word, rgb_word, tempo_word, word};
+    let d = &config.device_lights;
+    let p = &config.light_patterns;
+    let by_state = |values: Vec<Value>| -> Value {
+        BUSY.iter()
+            .map(|s| s.to_string())
+            .zip(values)
+            .collect::<Map<_, _>>()
+            .into()
+    };
+    let rgb_states = |effects: &[crate::status::Rgb; 4]| {
+        by_state(effects.iter().map(|e| rgb_word(*e).into()).collect())
+    };
+    let leds = KEY_LEDS
+        .iter()
+        .zip(d.keyboard_leds)
+        .filter(|(_, on)| *on)
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>();
+    let [speakers, mousepad] = &d.accessories;
+    let accessory = |a: &crate::status::AccessoryRgb| json!({"on": a.on, "rest": rgb_word(a.rest), "states": rgb_states(&a.effects)});
+    json!({
+        "version": VERSION,
+        "status_lights": config.status_lights,
+        "folders": config.light_folders.iter()
+            .map(|(folder, octave)| json!({"folder": folder, "octave": octave}))
+            .collect::<Vec<_>>(),
+        "other": {"on": config.light_other_on, "octave": config.light_other},
+        "mpk": {
+            "on": d.on[0],
+            "tempos": {"slow": p.slow, "fast": p.fast},
+            "states": by_state(p.states.iter().map(|(t, o)| {
+                json!({"tempo": tempo_word(*t), "octave": octave_word(*o)})
+            }).collect()),
+        },
+        "xbox": {
+            "on": d.on[1],
+            "states": by_state(d.xbox.iter().zip(d.xbox_brightness).map(|((l, r), b)| {
+                json!({"light": word(&LIGHTS, *l), "rumble": word(&RUMBLES, *r), "brightness": b})
+            }).collect()),
+        },
+        "ps5": {
+            "on": d.on[2],
+            "states": by_state(d.ps5.iter().map(|(c, l, r)| {
+                json!({"colour": c, "light": word(&LIGHTS, *l), "rumble": word(&RUMBLES, *r)})
+            }).collect()),
+        },
+        "keyboard_leds": {
+            "on": d.keyboard_on,
+            "leds": leds,
+            "states": by_state(d.keyboard.iter().map(|l| word(&LIGHTS, *l).into()).collect()),
+        },
+        "keyboard_rgb": {
+            "on": d.rgb_on,
+            "brightness": d.rgb_brightness,
+            "rest": rgb_word(d.rgb_rest),
+            "states": rgb_states(&d.rgb),
+        },
+        "speakers_rgb": accessory(speakers),
+        "mousepad_rgb": accessory(mousepad),
+        "mouse_rgb": {"on": d.mouse_on, "states": rgb_states(&d.mouse)},
+    })
+}
+
+impl Lights {
+    fn read(at: &Obj) -> Result<Self> {
+        use crate::status::{BUSY, COLOURS, KEY_LEDS, LIGHTS, OCTAVES, RUMBLES, TEMPOS};
+        at.only(&[
+            "version",
+            "status_lights",
+            "folders",
+            "other",
+            "mpk",
+            "xbox",
+            "ps5",
+            "keyboard_leds",
+            "keyboard_rgb",
+            "speakers_rgb",
+            "mousepad_rgb",
+            "mouse_rgb",
+        ])?;
+        let rgb = |at: &Obj, key: &str| at.check(key, crate::status::parse_rgb(at.str(key)?));
+        let rgb_states = |at: &Obj| -> Result<[crate::status::Rgb; 4]> {
+            let states = at.states("states")?;
+            let mut out = [crate::status::Rgb::Off; 4];
+            for (slot, state) in out.iter_mut().zip(BUSY) {
+                *slot = rgb(&states, state)?;
+            }
+            Ok(out)
+        };
+        let folders = at
+            .objects("folders")?
+            .iter()
+            .map(|f| {
+                f.only(&["folder", "octave"])?;
+                Ok((f.str("folder")?.to_owned(), f.int("octave")?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        at.check("folders", mappings::validate_light_folders(&folders))?;
+        let other = at.obj("other")?;
+        other.only(&["on", "octave"])?;
+        let other_octave = other.int("octave")?;
+        other.check("octave", crate::status::valid_octave(other_octave))?;
+
+        let mpk = at.obj("mpk")?;
+        mpk.only(&["on", "tempos", "states"])?;
+        let tempos = mpk.obj("tempos")?;
+        tempos.only(&["slow", "fast"])?;
+        let mpk_states = mpk.states("states")?;
+        let mut states = [(crate::status::Tempo::Off, crate::status::Octave::Off); 4];
+        for (slot, state) in states.iter_mut().zip(BUSY) {
+            let s = mpk_states.obj(state)?;
+            s.only(&["tempo", "octave"])?;
+            *slot = (s.pick("tempo", &TEMPOS)?, s.pick("octave", &OCTAVES)?);
+        }
+        let patterns = crate::status::Patterns {
+            slow: tempos.int("slow")?,
+            fast: tempos.int("fast")?,
+            states,
+        };
+        let patterns = mpk.check("tempos", patterns.validate())?;
+
+        let xbox = at.obj("xbox")?;
+        xbox.only(&["on", "states"])?;
+        let xbox_states = xbox.states("states")?;
+        let ps5 = at.obj("ps5")?;
+        ps5.only(&["on", "states"])?;
+        let ps5_states = ps5.states("states")?;
+        let keys = at.obj("keyboard_leds")?;
+        keys.only(&["on", "leds", "states"])?;
+        let key_states = keys.states("states")?;
+        let keyboard_rgb = at.obj("keyboard_rgb")?;
+        keyboard_rgb.only(&["on", "brightness", "rest", "states"])?;
+        let mouse = at.obj("mouse_rgb")?;
+        mouse.only(&["on", "states"])?;
+
+        let mut xbox_patterns = [(crate::status::Light::Off, crate::status::Rumble::Off); 4];
+        let mut brightness = [0u8; 4];
+        let mut ps5_patterns = [("", crate::status::Light::Off, crate::status::Rumble::Off); 4];
+        let mut keyboard = [crate::status::Light::Off; 4];
+        for (i, state) in BUSY.iter().enumerate() {
+            let x = xbox_states.obj(state)?;
+            x.only(&["light", "rumble", "brightness"])?;
+            xbox_patterns[i] = (x.pick("light", &LIGHTS)?, x.pick("rumble", &RUMBLES)?);
+            brightness[i] = x.int("brightness")?;
+            let p = ps5_states.obj(state)?;
+            p.only(&["colour", "light", "rumble"])?;
+            let colours = COLOURS.map(|c| (c, c));
+            ps5_patterns[i] = (
+                p.pick("colour", &colours)?,
+                p.pick("light", &LIGHTS)?,
+                p.pick("rumble", &RUMBLES)?,
+            );
+            keyboard[i] = key_states.pick(state, &crate::status::KEYBOARD_LIGHTS)?;
+        }
+        let mut keyboard_leds = [false; 4];
+        for (i, led) in keys.list("leds")?.iter().enumerate() {
+            let name = led.as_str().unwrap_or_default();
+            let index = KEY_LEDS.iter().position(|k| *k == name).ok_or_else(|| {
+                keys.err(
+                    &format!("leds[{i}]"),
+                    &format!("must be one of {}", KEY_LEDS.join(", ")),
+                )
+            })?;
+            keyboard_leds[index] = true;
+        }
+        let mut accessories = [crate::status::AccessoryRgb {
+            on: false,
+            rest: crate::status::Rgb::Off,
+            effects: [crate::status::Rgb::Off; 4],
+        }; 2];
+        for (slot, key) in accessories.iter_mut().zip(["speakers_rgb", "mousepad_rgb"]) {
+            let a = at.obj(key)?;
+            a.only(&["on", "rest", "states"])?;
+            *slot = crate::status::AccessoryRgb {
+                on: a.bool("on")?,
+                rest: rgb(&a, "rest")?,
+                effects: rgb_states(&a)?,
+            };
+        }
+        let devices = crate::status::DevicePatterns {
+            on: [mpk.bool("on")?, xbox.bool("on")?, ps5.bool("on")?],
+            xbox: xbox_patterns,
+            ps5: ps5_patterns,
+            keyboard_on: keys.bool("on")?,
+            keyboard,
+            keyboard_leds,
+            xbox_brightness: brightness,
+            rgb_on: keyboard_rgb.bool("on")?,
+            rgb: rgb_states(&keyboard_rgb)?,
+            rgb_rest: rgb(&keyboard_rgb, "rest")?,
+            rgb_brightness: keyboard_rgb.int("brightness")?,
+            accessories,
+            mouse_on: mouse.bool("on")?,
+            mouse: rgb_states(&mouse)?,
+        };
+        at.check("xbox", devices.validate())?;
+        Ok(Self {
+            status_lights: at.bool("status_lights")?,
+            patterns,
+            folders,
+            other: other_octave,
+            other_on: other.bool("on")?,
+            devices,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -462,5 +741,115 @@ mod tests {
         let error = result.unwrap_err().to_string();
         assert!(error.contains("config move from mappings.tsv"), "{error}");
         assert_eq!(fs::read_dir(&dir).unwrap().count(), before);
+    }
+
+    /// Lights that differ from the shipped ones in every part.
+    fn lit() -> Config {
+        use crate::status::{Light, Octave, Rgb, Rumble, Tempo};
+        let mut config = Config::default();
+        config.status_lights = false;
+        config.light_folders = vec![("/home/me/work".into(), -3)];
+        config.light_other = 4;
+        config.light_other_on = true;
+        config.light_patterns.slow = 33;
+        config.light_patterns.states[2] = (Tempo::Fast, Octave::Alternate);
+        let d = &mut config.device_lights;
+        d.on = [false, true, false];
+        d.xbox[0] = (Light::TempoSlow, Rumble::Long);
+        d.xbox_brightness = [1, 2, 3, 50];
+        d.ps5[3] = ("purple", Light::Steady, Rumble::Off);
+        d.keyboard_on = true;
+        d.keyboard = [Light::Steady; 4];
+        d.keyboard_leds = [true, false, false, true];
+        d.rgb_on = true;
+        d.rgb = [
+            Rgb::Wave,
+            Rgb::Reactive("blue"),
+            Rgb::Breath("white"),
+            Rgb::Off,
+        ];
+        d.rgb_rest = Rgb::Static("purple");
+        d.rgb_brightness = 128;
+        d.accessories[0].on = true;
+        d.accessories[1].rest = Rgb::Reactive("white");
+        d.mouse_on = true;
+        d.mouse[3] = Rgb::Static("white");
+        config
+    }
+
+    /// Ticket 195: lights.json round-trips every light part, moves from a v34 and an older
+    /// `mappings.tsv` (leaving it byte for byte), and a broken one is refused by file and
+    /// field without being rewritten.
+    #[test]
+    fn lights_json_round_trips_moves_and_refuses() {
+        let dir = folder("lights");
+        let path = dir.join("mappings.tsv");
+        mappings::save_config(&path, &lit()).unwrap();
+        assert_eq!(mappings::load_config(&path).unwrap(), lit());
+        let file = dir.join("lights.json");
+        let good = fs::read_to_string(&file).unwrap();
+        assert!(good.contains("\"reactive-blue\""), "{good}");
+        for (bad, field) in [
+            (
+                good.replace("\"reactive-blue\"", "\"reactive-pink\""),
+                "keyboard_rgb.states.needs-input",
+            ),
+            (
+                good.replace("\"brightness\": 50", "\"brightness\": 51"),
+                "xbox",
+            ),
+            (
+                good.replace("\"brightness\": 128", "\"brightness\": 300"),
+                "keyboard_rgb.brightness",
+            ),
+            (good.replace("\"slow\": 33", "\"slow\": 0"), "mpk.tempos"),
+            (good.replace("\"octave\": -3", "\"octave\": 7"), "folders"),
+            (good.replace("\"finished\"", "\"done\""), "mpk.states.done"),
+            (
+                good.replace("\"tempo\": \"fast\"", "\"tempo\": \"quick\""),
+                "mpk.states.needs-decision.tempo",
+            ),
+        ] {
+            fs::write(&file, &bad).unwrap();
+            let error = mappings::load_config(&path).unwrap_err().to_string();
+            assert!(
+                error.contains("lights.json") && error.contains(&format!("`{field}")),
+                "{field}: {error}"
+            );
+            assert_eq!(fs::read_to_string(&file).unwrap(), bad);
+        }
+
+        let v34 = mappings::serialize_config(&lit()).unwrap();
+        for (name, tsv) in [("v34", v34.as_str()), ("v15", OLDER)] {
+            let dir = folder(&format!("lights-move-{name}"));
+            let path = dir.join("mappings.tsv");
+            fs::write(&path, tsv).unwrap();
+            let from_tsv = mappings::load_tsv(&path).unwrap();
+            assert_eq!(mappings::load_config(&path).unwrap(), from_tsv, "{name}");
+            assert!(dir.join("lights.json").exists());
+            assert_eq!(mappings::load_config(&path).unwrap(), from_tsv, "{name}");
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                tsv,
+                "{name}: TSV untouched"
+            );
+        }
+    }
+
+    /// Ticket 195: the shipped light defaults parse and validate, and are what a fresh
+    /// config has.
+    #[test]
+    fn shipped_light_defaults_parse_and_validate() {
+        let value: Value = serde_json::from_str(include_str!("../defaults/lights.json")).unwrap();
+        let lights = Lights::read(&Obj::top(&value).unwrap()).unwrap();
+        let config = Config::default();
+        assert_eq!(config.device_lights, lights.devices);
+        assert_eq!(config.light_patterns, lights.patterns);
+        mappings::serialize_config(&config).unwrap();
+        assert_eq!(
+            text("lights.json", &config).unwrap(),
+            include_str!("../defaults/lights.json"),
+            "the shipped file is in the saved format"
+        );
     }
 }

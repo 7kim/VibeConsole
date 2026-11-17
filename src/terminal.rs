@@ -12880,6 +12880,13 @@ Running/paused mode is retained; held keys and toggles start inactive.",
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// An install from before v7.7 ticket 194: this `mappings.tsv` and no JSON files yet.
+    fn old_install(path: &Path, text: impl AsRef<[u8]>) {
+        for file in vibeconsole_core::config::FILES {
+            let _ = std::fs::remove_file(path.with_file_name(file));
+        }
+        std::fs::write(path, text).unwrap();
+    }
 
     #[test]
     fn captured_relative_knob_requires_one_source_and_both_signed_directions() {
@@ -16243,11 +16250,7 @@ mod tests {
             })
             .map(|l| format!("{l}\n"))
             .collect::<String>();
-        // An upgrade from v32 has no JSON files yet (ticket 194): they are moved from it.
-        for file in vibeconsole_core::config::FILES {
-            let _ = std::fs::remove_file(path.with_file_name(file));
-        }
-        std::fs::write(&path, v32).unwrap();
+        old_install(&path, v32);
         let mut script = Script {
             keys: [Key::Enter].into(),
             ..Default::default()
@@ -21523,7 +21526,7 @@ mod tests {
         }
         old.push_str("start-flow\ton\nagent-dir\t-\nenv\t0\nvars\t0\nagents\t1\n");
         old.push_str("agent\tcodex\tcodex\tcodex\t-\n");
-        std::fs::write(&path, old).unwrap();
+        old_install(&path, old);
         let config = mappings::load_config(&path).unwrap();
         assert!(config.status_lights);
         assert_eq!(config.agents[0].octave, -1);
@@ -21559,7 +21562,7 @@ mod tests {
             )
             .replace("light-other\toff\t2\n", "light-other\toff\t2\t50\t240\n")
             .replace("agent\tcodex\tcodex\tcodex\t-\t-1\ttmux\n", "agent\tcodex\tcodex\tcodex\t-\t-1\t120\t300\n");
-        std::fs::write(&path, v14).unwrap();
+        old_install(&path, v14);
         let migrated = mappings::load_config(&path).unwrap();
         assert_eq!(
             (migrated.light_patterns.slow, migrated.light_patterns.fast),
