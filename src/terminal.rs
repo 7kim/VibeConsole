@@ -1862,7 +1862,7 @@ impl Terminal {
         match &problem.fix {
             Fix::Run { args, ask } => {
                 let text = format!("{}\n\n{ask}", problem.message);
-                if choose(self, &text, &options(&["Cancel", "Fix"]))? == Some(1) {
+                if question(self, &text, &options(&["Cancel", "Fix"]))? == Some(1) {
                     let args = args.iter().map(String::as_str).collect::<Vec<_>>();
                     Ui::run(self, &args).map_err(|e| format!("{}: {e}", problem.stage))?;
                     self.notice = format!("{}: fix run", problem.stage);
@@ -1881,7 +1881,7 @@ impl Terminal {
                     "{}\n\nStart or repair Wispr Flow: held keys are released and output pauses while it runs.",
                     problem.message
                 );
-                if choose(
+                if question(
                     self,
                     &text,
                     &options(&["Cancel", "Start or repair Wispr Flow"]),
@@ -4731,7 +4731,7 @@ impl Terminal {
             let Some(name) = program_name_prompt(ui, &names[context])? else {
                 return Ok(None);
             };
-            let sure = choose(
+            let sure = question(
                 ui,
                 &format!(
                     "Rename {} to {name:?}?\nOnly the stored name changes. Reselect via /prog-select to refresh current RAM.",
@@ -4762,7 +4762,7 @@ impl Terminal {
         self.retry = None;
         self.connecting = false;
         self.resolver = None;
-        if choose(
+        if question(
             self,
             "Program 1 hardware check. Changes musical settings, not independent LEDs.\nSelect the trial's Program 1/current note-mode setup on the controller.\nProgram queries cannot establish physical program selection.",
             &options(&["Cancel", "Use this intended Program 1 setup"]),
@@ -5566,7 +5566,7 @@ impl Terminal {
             if feedback {
                 return Err("piano mappings cannot run with octave/arpeggiator/tempo feedback or configured idle feedback; leave these unchanged".into());
             }
-            if choose(
+            if question(
                 self,
                 "Piano mappings use emitted notes, not fixed physical positions.
 Arpeggiator must be OFF. Transposing requires pausing and relearning.
@@ -5759,7 +5759,7 @@ Changing musical settings while running is unsupported.",
                 // A rejected movement is not an operation failure: nothing changed, so offer a retry.
                 match calibrate_motion(self, samples, knob) {
                     Err(error) => {
-                        if choose(
+                        if question(
                             self,
                             &format!(
                                 "Not saved: {error}\nNothing changed. Move the control again?"
@@ -5797,7 +5797,7 @@ Changing musical settings while running is unsupported.",
         if payload[0x54 + 20 * index] > 1 {
             return Err("unknown knob mode; no controller write attempted".into());
         }
-        if choose(
+        if question(
             self,
             &format!(
                 "Switch Program {} Knob {knob} (CC {cc}) to Relative?",
@@ -7086,7 +7086,7 @@ fn agent_choice(ui: &mut impl Ui, path: &Path, index: usize) -> Result<()> {
             "{}\nInstall merges only the missing entries, after a backup. Hooks report only for agents VibeConsole started in tmux; `vibeconsole` must be on PATH.\n\n{hooks}",
             crate::status::hooks_status(codex)
         );
-        match choose(
+        match question(
             ui,
             &text,
             &options(&["Install (merge, with backup)", "Copy with wl-copy", "Back"]),
@@ -7120,7 +7120,7 @@ fn agent_choice(ui: &mut impl Ui, path: &Path, index: usize) -> Result<()> {
         Some(0)
     };
     if operation == Some(1) {
-        if choose(
+        if question(
             ui,
             "Remove this agent? Its prompt mappings become invalid.",
             &options(&["Cancel", "Remove"]),
@@ -7802,7 +7802,7 @@ fn usage_counts(dir: &Path) -> String {
 fn ask_recommendations(ui: &mut impl Ui, path: &Path) -> Result<()> {
     let mut config = mappings::load_config(path)?;
     if !config.look.share_usage {
-        let consent = choose(
+        let consent = question(
             ui,
             &format!("Share usage counts?\n\n{SHARE_TEXT}"),
             &options(&["No, send nothing", "Yes, share the counts"]),
@@ -7952,7 +7952,7 @@ fn review_recommendation(
     if words.is_empty() {
         return Ok(false);
     }
-    if choose(
+    if question(
         ui,
         &format!(
             "{}\n{}\n\n{}",
@@ -7983,7 +7983,7 @@ fn install_agent(ui: &mut impl Ui, index: usize) -> Result<()> {
         )?;
         return Ok(());
     }
-    if choose(
+    if question(
         ui,
         &format!(
             "Install {name}?\n\nThis runs in a visible terminal, where you see every line and answer any password prompt:\n  {install}"
@@ -8231,7 +8231,7 @@ fn ask_mappings(ui: &mut impl Ui, path: &Path, kind: AskKind) -> Result<()> {
         .map(|d| d.name)
         .collect::<Vec<_>>()
         .join(" and ");
-    if choose(
+    if question(
         ui,
         &format!(
             "{} suggests:\n{}\n\nSent: the controls of the {sent} and what each does now{}. {}",
@@ -8275,7 +8275,7 @@ fn merge_default(
             Some(old) => {
                 let change = format!("{}: {} → {}", m.label, old.action_label(), m.action_label());
                 if ask
-                    && choose(
+                    && question(
                         ui,
                         &format!("Replace?\n{change}"),
                         &options(&["Keep what it does now", "Replace it"]),
@@ -8312,7 +8312,7 @@ fn ask_setup_agents(ui: &mut impl Ui, path: &Path) -> Result<()> {
     let reply = ask(ui, path, AskKind::SetupAgents, &request)?;
     let (new, words) = mappings::agent_setup_from_reply(&reply, &clis, &folders, &config)
         .map_err(|e| format!("the reply: {e}; nothing saved"))?;
-    if choose(
+    if question(
         ui,
         &format!(
             "{} suggests:\n{}\n\nSent: the names of the agent CLIs found on PATH ({}) and the paths of {} project folders under your home folder. Nothing was run. {}",
@@ -8474,7 +8474,7 @@ fn ask_sequence(ui: &mut impl Ui, path: &Path) -> Result<()> {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    if choose(
+    if question(
         ui,
         &format!(
             "{} suggests sequence {name}:\n{words}\n\nSent: your skills' names and descriptions and your saved prompts' names with how often each was sent; never their text. {}",
@@ -8600,7 +8600,7 @@ fn ask_family(ui: &mut impl Ui, path: &Path) -> Result<()> {
         .map(|m| format!("  {}: {}", m.label, m.action_label()))
         .collect::<Vec<_>>()
         .join("\n");
-    if choose(
+    if question(
         ui,
         &format!(
             "{} suggests family {}:\n{words}\n\nSaved under {}; pick it in /configure › Action family. {}",
@@ -8764,7 +8764,7 @@ fn review_profile(
         mappings::profile_in_words(&profile),
         sent_skill(kind)
     );
-    if choose(
+    if question(
         ui,
         &format!(
             "Claude suggests profile {} for {}:\n{summary}",
@@ -8829,7 +8829,7 @@ fn profile_menu(ui: &mut impl Ui, path: &Path, name: &str) -> Result<()> {
             mappings::save_config(path, &config)
         }
         Some(2) => {
-            if choose(
+            if question(
                 ui,
                 &format!("Delete profile {name}? Its apps go back to Default."),
                 &options(&["Cancel", "Delete profile"]),
@@ -8910,7 +8910,7 @@ fn driver_menu(ui: &mut impl Ui) -> Result<()> {
         "Switch the Xbox driver to {driver}? {warning} You're asked for your password; the choice stays after a reboot."
     );
     let yes = format!("Yes, switch to {driver}");
-    if choose(
+    if question(
         ui,
         &confirm,
         &options(&[&yes, "Back (discard: nothing changes)"]),
@@ -8967,7 +8967,7 @@ fn light_rule_menu(ui: &mut impl Ui) -> Result<()> {
         "Remove"
     };
     let yes = format!("Yes, {}", verb.to_lowercase());
-    if choose(
+    if question(
         ui,
         &format!("{what}{note}"),
         &options(&[&yes, "Back (discard: nothing changes)"]),
@@ -9874,7 +9874,7 @@ fn test_lights(ui: &mut impl Ui, d: &crate::status::DevicePatterns) -> Result<()
     // v7.7 ticket 236: paused, the lights show nothing: offer Run first (its own gates).
     if ui.paused() {
         let ask = "Paused: lights show only while running. Run now?";
-        if choose(ui, ask, &options(&["Cancel", "Run"]))? != Some(1) {
+        if question(ui, ask, &options(&["Cancel", "Run"]))? != Some(1) {
             return Ok(());
         }
         if let Err(error) = ui.run_now() {
@@ -10446,7 +10446,7 @@ fn prompt_choice(ui: &mut impl Ui, path: &Path, index: usize) -> Result<()> {
                         users.join(", ")
                     )
                 };
-                if choose(
+                if question(
                     ui,
                     &format!("Delete prompt {name}?\n{warning}"),
                     &options(&["Cancel", "Delete"]),
@@ -10504,7 +10504,7 @@ fn prompt_action(
         files[index].clone()
     };
     if index == files.len() - 1
-        || choose(
+        || question(
             ui,
             "Edit prompt in external editor?",
             &options(&["Use existing", "Edit"]),
@@ -10651,15 +10651,41 @@ fn choose_at(
     options: &[String],
     initial: usize,
 ) -> Result<Option<usize>> {
+    pick(ui, title, options, initial, true)
+}
+/// v7.7 ticket 229: `question`: a confirmation (Cancel / Delete, Yes / Back, Keep / Replace …): it never
+/// opens on a remembered row: on its first row, or, when that is a risky "Yes …", on its
+/// safe answer (Cancel, Back, No, Keep). Its caller says it is one.
+fn question(ui: &mut impl Ui, title: &str, options: &[String]) -> Result<Option<usize>> {
+    // A risky "Yes …" first opens on the safe row instead; otherwise the first row.
+    let safe = match options.first() {
+        Some(first) if first.starts_with("Yes") => options
+            .iter()
+            .position(|o| {
+                ["Cancel", "Back", "No", "Keep"]
+                    .iter()
+                    .any(|w| o.starts_with(w))
+            })
+            .unwrap_or(0),
+        _ => 0,
+    };
+    pick(ui, title, options, safe, false)
+}
+fn pick(
+    ui: &mut impl Ui,
+    title: &str,
+    options: &[String],
+    initial: usize,
+    remembers: bool,
+) -> Result<Option<usize>> {
     if options.is_empty() {
         return Ok(None);
     }
     // v7.7 ticket 206: a menu opens on the row last opened in it, so coming back from a
     // submenu lands where you were: the same row by its text, else the same place (a row
-    // removed or renamed). Only menus of four rows or more: a short list is a question,
-    // and a stray Enter must never land on its answer. Never on a destructive row.
+    // removed or renamed). Ticket 229: every menu but a question (`ask`), whatever its
+    // length; no guessing from row counts or words.
     let name = list_name(title);
-    let remembers = options.len() >= 4;
     let left = (initial == 0 && remembers)
         .then(|| ui.rows_left().and_then(|rows| rows.get(&name).cloned()))
         .flatten();
@@ -10673,7 +10699,7 @@ fn choose_at(
                     .position(|o| *o == text)
                     .unwrap_or(at.min(options.len() - 1))
             };
-            if destructive(&options[row]) { 0 } else { row }
+            row
         }
         None => initial,
     };
@@ -10735,13 +10761,6 @@ fn list_name(title: &str) -> String {
         .unwrap_or(line)
         .trim()
         .to_owned()
-}
-/// A row a stray Enter must never land on when a list reopens.
-fn destructive(row: &str) -> bool {
-    let row = row.trim_start();
-    ["Remove", "Delete", "Reset", "Replace", "Quit", "Yes", "⚠"]
-        .iter()
-        .any(|word| row.starts_with(word))
 }
 /// Appends `[x] (saved)` to the saved option; the mark stays put while the cursor moves.
 fn mark_saved(mut options: Vec<String>, saved: Option<usize>) -> Vec<String> {
@@ -10865,7 +10884,7 @@ fn shortcut(ui: &mut impl Ui, saved: &[String]) -> Result<Option<Vec<String>>> {
                         break;
                     }
                 };
-                match choose(
+                match question(
                     ui,
                     &format!("Captured: {}{saved_line}", keys.join("+")),
                     &options(&["Use", "Record again", "Cancel"]),
@@ -11107,7 +11126,7 @@ fn calibrate_motion(
         if !values.windows(2).any(|v| v[1] > v[0]) || !values.windows(2).any(|v| v[1] < v[0]) {
             return Err("observe both knob directions before saving".into());
         }
-        if choose(
+        if question(
             ui,
             &format!(
                 "Observed CC{id} channel {channel}, values {min}..{max}.\nOnly non-wrapping ABSOLUTE knobs are supported.\nConfirm values track position and stop rather than wrap; relative encodings are unsupported."
@@ -11148,7 +11167,7 @@ fn calibrate_motion(
             ),
         )));
     }
-    if choose(
+    if question(
         ui,
         &format!(
             "Observed {} channel {channel} id {id}: {min}..{max}, final {center}.\nConfirm BOTH endpoints were reached and the FINAL value is released neutral.\nAxes act independently: diagonals hold both mapped axes.\nA one-sided CC axis cannot distinguish physical Up from Down.",
@@ -11835,7 +11854,7 @@ fn sequence_choice(ui: &mut impl Ui, path: &Path, index: usize) -> Result<()> {
                 if !used.is_empty() {
                     return Err(format!("validation: sequence {name} is used by {}; map those to something else first", used.join(", ")).into());
                 }
-                if choose(
+                if question(
                     ui,
                     &format!("Delete sequence {name}? No pad uses it."),
                     &options(&["Cancel", "Delete"]),
@@ -11948,7 +11967,7 @@ fn prompt_sequence_action(
                     }
                 }
                 Some("Discard sequence edit") => {
-                    let confirm = choose(
+                    let confirm = question(
                         ui,
                         &format!(
                             "Drop this step's own text? The step then sends the saved prompt {file}."
@@ -11960,7 +11979,7 @@ fn prompt_sequence_action(
                     }
                 }
                 Some("Update prompt to match") if let Some(text) = &own_text => {
-                    let confirm = choose(
+                    let confirm = question(
                         ui,
                         &format!(
                             "Write this step's text to the saved prompt {file}? Every pad using {file} then sends it."
@@ -12215,7 +12234,7 @@ fn t3_action(ui: &mut impl Ui) -> Result<Option<crate::actions::Action>> {
         let key = crate::actions::free_t3_key(&file)?;
         let shown = crate::actions::t3_keys(&format!(r#"[{{"key":"{key}","command":"c"}}]"#), "c")?
             .join("+");
-        if choose(
+        if question(
             ui,
             &format!(
                 "T3 has no key for {name}. Add the free {shown} to T3's key file? A backup is made first; your own keys stay."
@@ -12691,7 +12710,7 @@ fn configure_steps(
                 Some(d) => format!("Reset to default ({})", d.action_label()),
                 None => "Remove assignment".into(),
             };
-            if choose(
+            if question(
                 ui,
                 &format!("Remove {existing}?"),
                 &options(&["Cancel", remove.as_str()]),
@@ -12754,7 +12773,7 @@ fn configure_steps(
         // Learning an assigned control replaces it only after an explicit choice (ticket 05).
         if action != 5 // editing asks nothing; learning an assigned control asks first
             && saved.is_some()
-            && choose(
+            && question(
                 ui,
                 &format!(
                     "Already assigned: {existing}\nReplace it? Nothing changes until you save."
@@ -13042,7 +13061,7 @@ fn configure_steps(
         for (_, dir) in mapping.action.commands() {
             mappings::absolute_directory(dir, &config).map_err(stage("validation"))?;
         }
-        match choose(
+        match question(
             ui,
             &format!(
                 "Review: {}",
@@ -13798,7 +13817,7 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
                 }
                 .validate()?;
                 if ui.menu_fires(true, |ui| {
-                    choose(
+                    question(
                         ui,
                         &format!("Save idle feedback: {feedback}?"),
                         &options(&["Cancel", "Save"]),
@@ -18799,7 +18818,7 @@ mod tests {
             keys
         };
         let mut ui = Script {
-            keys: tuning(8, &[Down, Enter, Enter, Enter]).into(), // xone, Switch, Back
+            keys: tuning(8, &[Down, Enter, Up, Enter, Enter]).into(), // xone, up to Switch (ticket 229: it opens on Back), Back
             driver: Some("xpad"),
             ..Default::default()
         };
@@ -18832,7 +18851,7 @@ mod tests {
 
         // Cancelled password prompt.
         let mut ui = Script {
-            keys: tuning(8, &[Down, Enter, Enter, Enter]).into(),
+            keys: tuning(8, &[Down, Enter, Up, Enter, Enter]).into(),
             driver: Some("xpad"),
             run_error: Some(
                 "pkexec: Error executing command as another user: Request dismissed".into(),
@@ -18861,9 +18880,9 @@ mod tests {
                 .any(|s| s.contains("xone: unavailable: it isn't installed"))
         );
 
-        // Back at the confirm step: only the install check ran.
+        // Back at the confirm step (it opens there, ticket 229): only the install check ran.
         let mut ui = Script {
-            keys: tuning(8, &[Down, Enter, Down, Enter]).into(),
+            keys: tuning(8, &[Down, Enter, Enter]).into(),
             driver: Some("xpad"),
             ..Default::default()
         };
@@ -18908,8 +18927,9 @@ mod tests {
                 .any(|s| s.contains("unavailable: needs xone"))
         );
         // v7 ticket 130: the light rule item asks first, then runs exactly the pkexec command.
+        // Ticket 229: the question opens on Back, so Up to "Yes, install".
         let mut ui = Script {
-            keys: tuning(11, &[Enter, Enter]).into(),
+            keys: tuning(11, &[Up, Enter, Enter]).into(),
             driver: Some("xone"),
             ..Default::default()
         };
@@ -18925,7 +18945,7 @@ mod tests {
             [format!("pkexec {} xbox-light-rule install", exe.display())]
         );
         let mut ui = Script {
-            keys: tuning(11, &[Enter, Enter]).into(),
+            keys: tuning(11, &[Up, Enter, Enter]).into(), // Up to "Yes, remove" (ticket 229)
             driver: Some("xone"),
             rule: true,
             ..Default::default()
@@ -18936,7 +18956,7 @@ mod tests {
             [format!("pkexec {} xbox-light-rule remove", exe.display())]
         );
         let mut ui = Script {
-            keys: tuning(11, &[Down, Enter]).into(), // Back at the confirm
+            keys: tuning(11, &[Enter]).into(), // Back at the confirm: it opens there (ticket 229)
             driver: Some("xone"),
             ..Default::default()
         };
@@ -23219,10 +23239,11 @@ mod tests {
     }
 
     /// v7.7 ticket 206: a menu reopens on the row last opened by its text; a row removed
-    /// while you were away puts the cursor at the same place; a question (under four rows)
-    /// and a destructive row never get a remembered cursor.
+    /// while you were away puts the cursor at the same place. Ticket 229: a question
+    /// (`question`) never gets a remembered cursor, whatever its length; every other menu,
+    /// a three-row one too, does; a risky "Yes …" question opens on its safe row.
     #[test]
-    fn a_menu_reopens_by_text_else_at_the_same_place_never_on_a_risky_row() {
+    fn a_menu_reopens_by_text_else_at_the_same_place_and_a_question_never_does() {
         let (dir, mut ui, _ran, _) = configure_session("rows-left-list");
         let pick = |ui: &mut Terminal, title: &str, rows: &[&str], keys: Vec<Key>| {
             ui.script = Some(Play {
@@ -23251,28 +23272,79 @@ mod tests {
             pick(&mut ui, "Things", &["a", "b", "c", "d"], vec![Key::Enter]),
             Some(3)
         );
-        // A question: never remembered.
+        let ask = |ui: &mut Terminal, title: &str, rows: &[&str], keys: Vec<Key>| {
+            ui.script = Some(Play {
+                steps: keys.into_iter().map(Step::Key).collect(),
+                ..Play::default()
+            });
+            question(ui, title, &options(rows)).unwrap()
+        };
+        // A question: never remembered, at any length.
+        let sure = ["Cancel", "Delete", "Delete all", "Delete and quit"];
         assert_eq!(
-            pick(
-                &mut ui,
-                "Sure?",
-                &["Cancel", "Delete"],
-                vec![Key::Down, Key::Enter]
-            ),
-            Some(1)
-        );
-        assert_eq!(
-            pick(&mut ui, "Sure?", &["Cancel", "Delete"], vec![Key::Enter]),
-            Some(0)
-        );
-        // A destructive row opened last: the list opens at its top.
-        let rows = ["Edit", "Rename", "Move", "Remove"];
-        assert_eq!(
-            pick(&mut ui, "Item", &rows, vec![Key::Up, Key::Enter]),
+            ask(&mut ui, "Sure?", &sure, vec![Key::Up, Key::Enter]),
             Some(3)
         );
-        assert_eq!(pick(&mut ui, "Item", &rows, vec![Key::Enter]), Some(0));
+        assert_eq!(ask(&mut ui, "Sure?", &sure, vec![Key::Enter]), Some(0));
+        // A risky "Yes" first: it opens on Back.
+        let yes = ["Yes, switch", "Back (discard: nothing changes)"];
+        assert_eq!(ask(&mut ui, "Switch?", &yes, vec![Key::Enter]), Some(1));
+        // A three-row navigation menu remembers, whatever its words.
+        let rows = ["Edit", "Remove", "Back"];
+        assert_eq!(
+            pick(&mut ui, "Item", &rows, vec![Key::Down, Key::Enter]),
+            Some(1)
+        );
+        assert_eq!(pick(&mut ui, "Item", &rows, vec![Key::Enter]), Some(1));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 229: every confirmation goes through `question`, none missed: no
+    /// `choose`/`choose_at` call in this file (outside its tests) has options that start
+    /// with a question's answer (Cancel, No, Keep, Yes, Retry, Install, Use, Save and …);
+    /// and the old guess (a row count, risky words) is gone from the picker.
+    #[test]
+    fn every_confirmation_goes_through_question() {
+        let source = include_str!("terminal.rs");
+        let code = &source[..source.find("#[cfg(test)]\nmod tests").unwrap()];
+        let answers = [
+            "\"Cancel",
+            "\"No",
+            "\"Keep",
+            "\"Yes",
+            "&yes",
+            "\"Retry",
+            "\"Install (merge",
+            "\"Use\"",
+            "\"Save and configure another",
+        ];
+        let mut missed = Vec::new();
+        let mut asked = 0;
+        for (at, _) in code
+            .match_indices("choose(")
+            .chain(code.match_indices("choose_at("))
+        {
+            let call = &code[at..(at + 700).min(code.len())];
+            let call = &call[..call.find(")?").unwrap_or(call.len())];
+            if let Some(list) = call.find("options(&[") {
+                let first = call[list + 10..].trim_start();
+                let rows = call[list..].matches(',').count();
+                if rows >= 1 && answers.iter().any(|a| first.starts_with(a)) {
+                    missed.push(code[..at].lines().count());
+                }
+            }
+        }
+        for (at, _) in code.match_indices("question(") {
+            asked += usize::from(!code[..at].ends_with("fn "));
+        }
+        assert!(
+            missed.is_empty(),
+            "confirmations not through question, at lines {missed:?}"
+        );
+        assert!(asked >= 34, "{asked} questions");
+        let pick = &code[code.find("\nfn pick(").unwrap()..];
+        let pick = &pick[..pick.find("\n}\n").unwrap()];
+        assert!(!pick.contains("options.len() >= 4") && !code.contains("fn destructive("));
     }
 
     /// v7.7 ticket 191: a fake logirgb that logs each call, takes `delay` per `set`, and
