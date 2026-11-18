@@ -120,6 +120,16 @@ enum Learned {
 trait Ui {
     fn draw(&mut self, text: &str) -> Result<()>;
     fn key(&mut self) -> Result<Option<Key>>;
+    /// v7.7 ticket 211: time since the program started; tests pass a clock.
+    fn clock(&mut self) -> Duration {
+        static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        START.get_or_init(Instant::now).elapsed()
+    }
+    /// v7.7 ticket 211: every light shows `state` as an agent in it would (None: the agents'
+    /// own states again). Returns what can't show it, or None once a transition stopped it.
+    fn light_test(&mut self, _state: Option<&'static str>) -> Result<Option<Vec<String>>> {
+        Ok(Some(vec!["No lights are driven from this screen.".into()]))
+    }
     /// v7.7 ticket 206: the row last opened in each list, by the list's name, in memory only.
     fn rows_left(&mut self) -> Option<&mut BTreeMap<String, (usize, String)>> {
         None
@@ -353,6 +363,10 @@ struct Terminal {
     flow_resume: bool,
     /// (agent, tmux window, state), refreshed every `STATUS_EVERY`.
     agent_states: Vec<(String, String, &'static str)>,
+    /// v7.7 ticket 211: Test the lights: the state every light shows instead of the agents'.
+    light_test: Option<&'static str>,
+    /// A transition stopped the test; its screen ends at its next step.
+    light_test_stopped: bool,
     /// v7.7 ticket 151: each agent's host and folder, in `agent_states` order.
     agent_places: Vec<(mappings::Host, Option<String>)>,
     /// v7.7 ticket 151: folder → project (its git top-level folder's name), found in the
@@ -1076,6 +1090,8 @@ impl Terminal {
             xbox_status: Vec::new(),
             probe: None,
             agent_states: Vec::new(),
+            light_test: None,
+            light_test_stopped: false,
             agent_places: Vec::new(),
             projects: BTreeMap::new(),
             agent_cards: false,
@@ -2946,14 +2962,17 @@ impl Terminal {
             self.flush_usage(); // v7.7 ticket 164
         }
         self.read_contexts();
-        // v7 tickets 11 and 86: rumble as a source newly enters a state whose Xbox pattern
-        // rumbles, under the Status lights and Xbox switches.
+        self.rumble_since(&before);
+    }
+    /// v7 tickets 11 and 86: rumble as a source newly enters a state whose Xbox pattern
+    /// rumbles, under the Status lights and Xbox switches.
+    fn rumble_since(&mut self, before: &[(String, &'static str)]) {
         let rumble = self
             .device_lights
             .as_ref()
             .filter(|p| p.on[1])
             .map_or(crate::status::Rumble::Off, |p| {
-                crate::status::rumble_for(&before, &self.alert_states(), p)
+                crate::status::rumble_for(before, &self.alert_states(), p)
             });
         if let Some(pad) = &mut self.gamepad {
             if let Err(error) = pad.rumble(rumble) {
@@ -2961,8 +2980,61 @@ impl Terminal {
             }
         }
     }
+    /// v7.7 ticket 211: each light that won't show Test the lights, and why. Never guessed:
+    /// a device is named only from what VibeConsole knows of it.
+    fn light_test_notes(&self) -> Vec<String> {
+        let Some(d) = &self.device_lights else {
+            return vec!["Status lights are off, so no light shows the test.".into()];
+        };
+        let mut notes = Vec::new();
+        if !(self.output.is_some() && !self.suspended) {
+            notes.push("Paused: the lights show states only while running.".into());
+        }
+        let piano = (self.run_mappings.iter()).any(|m| m.input == mappings::Input::Piano);
+        let no_octave = self.light_agents.as_ref().is_none_or(Vec::is_empty);
+        notes.extend(
+            match () {
+                _ if !d.on[0] => Some("MPK lights: off."),
+                _ if self.controller.is_none() => Some("MPK: not connected."),
+                _ if !(self.context_verified && self.feedback_allowed) => {
+                    Some("MPK: no verified program, so nothing shows on it.")
+                }
+                _ if piano => Some("MPK: a piano program keeps its own lights."),
+                _ if no_octave => Some("MPK: no agents, so no octave to light."),
+                _ => None,
+            }
+            .map(String::from),
+        );
+        if !d.on[1] {
+            notes.push("Xbox lights and rumble: off.".into());
+        } else if !self.xbox_connected() {
+            notes.push("Xbox: not connected.".into());
+        }
+        if !d.keyboard_on {
+            notes.push("Keyboard light: off.".into());
+        } else if self.lock_failed {
+            notes.push("Keyboard light: unavailable.".into());
+        }
+        for (j, (_, label, _)) in crate::status::RGB_DEVICES.iter().enumerate() {
+            let label = label.split(" (").next().unwrap_or(label);
+            let missing = match j {
+                0 => self.rgb_failed,
+                1 | 2 => self.accessories_failed[j - 1],
+                _ => self.mouse.as_ref().is_some_and(|m| m.unavailable()),
+            };
+            if !d.rgb_devices[j].on {
+                notes.push(format!("{label}: off."));
+            } else if missing {
+                notes.push(format!("{label}: not found."));
+            }
+        }
+        notes
+    }
     /// Every agent and outside-folder source with its state, for rumble alerts.
     fn alert_states(&self) -> Vec<(String, &'static str)> {
+        if let Some(state) = self.light_test {
+            return vec![("light test".into(), state)]; // v7.7 ticket 211
+        }
         self.agent_states
             .iter()
             .map(|(name, _, state)| (name.clone(), *state))
@@ -3003,6 +3075,15 @@ impl Terminal {
                 .any(|m| m.input == mappings::Input::Piano)
         {
             return None;
+        }
+        if let Some(state) = self.light_test {
+            // v7.7 ticket 211: every agent's octave shows the tested state.
+            let states = agents.iter().map(|a| (state, a.octave)).collect::<Vec<_>>();
+            return crate::status::lights(
+                &states,
+                &self.light_patterns,
+                self.lights_since.elapsed().as_millis(),
+            );
         }
         let states = self
             .agent_states
@@ -3089,6 +3170,10 @@ impl Terminal {
     }
     fn suspend(&mut self) -> Result<()> {
         self.suspended = true;
+        // v7.7 ticket 211: a transition ends Test the lights; the lights rest below.
+        if self.light_test.take().is_some() {
+            self.light_test_stopped = true;
+        }
         self.guide.cancel();
         self.program_keys.cancel();
         if let Some(lights) = &mut self.lock_lights {
@@ -5608,6 +5693,28 @@ impl Drop for Terminal {
 }
 
 impl Ui for Terminal {
+    fn light_test(&mut self, state: Option<&'static str>) -> Result<Option<Vec<String>>> {
+        if state.is_some() && self.light_test_stopped {
+            return Ok(None);
+        }
+        self.light_test_stopped = false;
+        if self.light_test != state {
+            let before = self.alert_states();
+            self.light_test = state;
+            if state.is_some() {
+                self.rumble_since(&before);
+            }
+            // At once, not at the next tick: the step's light, or the agents' again.
+            self.show_button_light();
+            self.show_lock_light();
+            self.show_rgb();
+            if let Err(error) = self.status_lights() {
+                self.pause()?;
+                self.error = format!("Status lights failed: {error}; paused");
+            }
+        }
+        Ok(Some(self.light_test_notes()))
+    }
     fn rows_left(&mut self) -> Option<&mut BTreeMap<String, (usize, String)>> {
         Some(&mut self.rows_left)
     }
@@ -9298,6 +9405,50 @@ fn pick_colour(
         }
     }
 }
+/// v7.7 ticket 211: Test the lights: each state, then idle, for 10 seconds on every light,
+/// with your saved settings; Esc, the end, or a transition gives the lights back to the
+/// agents. The line names the state, the seconds left, the shared effect in words, and
+/// each light that can't show it.
+fn test_lights(ui: &mut impl Ui, d: &crate::status::DevicePatterns) -> Result<()> {
+    const STEPS: [(&str, &str); 5] = [
+        ("needs-decision", "Needs a decision"),
+        ("needs-input", "Needs input"),
+        ("thinking", "Thinking"),
+        ("finished", "Finished"),
+        ("idle", "Idle (no agents running)"),
+    ];
+    let start = ui.clock();
+    let result = (|| -> Result<()> {
+        loop {
+            let secs = ui.clock().saturating_sub(start).as_secs();
+            let Some(&(state, name)) = STEPS.get(usize::try_from(secs / 10).unwrap_or(usize::MAX))
+            else {
+                return Ok(());
+            };
+            let effect = crate::status::BUSY
+                .iter()
+                .position(|s| *s == state)
+                .map_or(d.rgb_shared.rest, |i| d.rgb_shared.states[i]);
+            let Some(notes) = ui.light_test(Some(state))? else {
+                return Ok(()); // a transition stopped it
+            };
+            let mut text = format!(
+                "Test the lights · Esc stops\n\nTesting: {name} · {} s left · {}",
+                10 - secs % 10,
+                crate::status::rgb_name(effect)
+            );
+            for note in notes {
+                text += &format!("\n{note}");
+            }
+            ui.draw(&text)?;
+            if ui.key()? == Some(Key::Escape) {
+                return Ok(());
+            }
+        }
+    })();
+    ui.light_test(None)?;
+    result
+}
 fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
     const NAMES: [&str; 4] = [
         "Needs a decision (Claude asks a multiple-choice question)",
@@ -9357,6 +9508,7 @@ fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
         // device's switch and its Per device row (and its own effects while it has them).
         let rgb_rows = rgb_rows(&devices, &NAMES);
         rows.extend(rgb_rows.iter().map(|(text, _)| text.clone()));
+        rows.push("Test the lights: each state for 10 seconds on every light".into());
         let blind = NAMES
             .iter()
             .zip(patterns.states)
@@ -9376,6 +9528,10 @@ fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
         let Some(index) = choose(ui, &title, &rows)? else {
             return Ok(());
         };
+        if index == 18 + rgb_rows.len() {
+            test_lights(ui, &devices)?; // changes nothing saved
+            continue;
+        }
         let result = (|| -> Result<()> {
             if index < 4 {
                 let (tempo, octave) = patterns.states[index];
@@ -13468,6 +13624,10 @@ mod tests {
         agent_argv: Vec<Vec<String>>,
         /// v7.7 ticket 182: a taller screen than the default 24 rows, when set.
         rows: Option<usize>,
+        /// v7.7 ticket 211: a fake clock, one second on per key read.
+        clock: Duration,
+        /// Each state Test the lights asked for, in order (None: back to the agents).
+        light_tests: Vec<Option<&'static str>>,
         /// The verified program, when a test needs its pad and knob table (v7 ticket 45).
         program: Option<(u8, crate::feedback::Payload)>,
         /// An Xbox controller is connected (v7 ticket 111).
@@ -13584,7 +13744,15 @@ mod tests {
             self.screens.push(text.into());
             Ok(())
         }
+        fn clock(&mut self) -> Duration {
+            self.clock
+        }
+        fn light_test(&mut self, state: Option<&'static str>) -> Result<Option<Vec<String>>> {
+            self.light_tests.push(state);
+            Ok(Some(Vec::new()))
+        }
         fn key(&mut self) -> Result<Option<Key>> {
+            self.clock += Duration::from_secs(1);
             Ok(Some(self.keys.pop_front().unwrap_or_else(|| {
                 panic!(
                     "script exhausted at:\n{}",
@@ -22396,6 +22564,194 @@ mod tests {
             "started from the shared set"
         );
         assert!(lights.rgb_devices[1..].iter().all(|d| d.own.is_none()));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 211: Test the lights shows the five states in order, 10 s each, the line
+    /// naming each with its seconds left and its effect in words, then gives the lights
+    /// back; Esc at 15 s stops it in Needs input and gives them back at once.
+    #[test]
+    fn test_the_lights_runs_each_state_ten_seconds_and_esc_stops_it() {
+        use Key::*;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-light-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let lights = std::fs::read(dir.join("lights.json")).unwrap();
+        let mut keys = vec![Up, Enter]; // the last row: Test the lights
+        keys.extend(vec![Other; 50]); // nothing pressed for 50 s (one second a read)
+        keys.extend([Up, Enter]);
+        keys.extend(vec![Other; 15]);
+        keys.extend([Escape, Escape]); // Esc at 15 s, then leave
+        let mut ui = Script {
+            keys: keys.into(),
+            ..Default::default()
+        };
+        light_patterns_menu(&mut ui, &path).unwrap();
+        assert!(ui.keys.is_empty(), "keys left: {:?}", ui.keys);
+        let mut steps = ui.light_tests.clone();
+        steps.dedup();
+        let order = [
+            Some("needs-decision"),
+            Some("needs-input"),
+            Some("thinking"),
+            Some("finished"),
+            Some("idle"),
+            None,
+        ];
+        assert_eq!(steps[..6], order, "{steps:?}");
+        assert_eq!(
+            steps[6..],
+            [Some("needs-decision"), Some("needs-input"), None]
+        );
+        assert_eq!(
+            ui.light_tests
+                .iter()
+                .filter(|s| **s == Some("thinking"))
+                .count(),
+            10
+        );
+        let lines = ui
+            .screens
+            .iter()
+            .filter_map(|s| s.lines().find(|l| l.starts_with("Testing: ")))
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 50 + 16, "{lines:?}");
+        assert!(
+            lines[0].starts_with("Testing: Needs a decision · 10 s left · "),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[9].starts_with("Testing: Needs a decision · 1 s left · "),
+            "{}",
+            lines[9]
+        );
+        assert!(
+            lines[25].starts_with("Testing: Thinking · 5 s left · "),
+            "{}",
+            lines[25]
+        );
+        assert!(lines[49].starts_with("Testing: Idle (no agents running) · 1 s left · "));
+        assert!(
+            lines[65].starts_with("Testing: Needs input · 5 s left · "),
+            "{}",
+            lines[65]
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|l| !l.contains('#') || l.contains("custom #"))
+        );
+        assert_eq!(
+            std::fs::read(dir.join("lights.json")).unwrap(),
+            lights,
+            "nothing saved"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 211, with fake devices: a test step shows on the keyboard at once, a real
+    /// agent change meanwhile doesn't interrupt it and shows once the test ends; stopping
+    /// with the agents idle writes the resting effect back; an unverified Akai program gets
+    /// no write, and the line says why; a transition ends the test.
+    #[test]
+    fn test_the_lights_shows_over_the_agents_and_gives_the_lights_back() {
+        use crate::status::Rgb;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-light-test-dev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let kbd = dir.join("razerkbd/0003:1532:021A.0001");
+        std::fs::create_dir_all(&kbd).unwrap();
+        std::fs::write(kbd.join("matrix_brightness"), "200\n").unwrap();
+        for f in ["none", "spectrum", "wave", "static", "breath", "reactive"] {
+            std::fs::write(kbd.join(format!("matrix_effect_{f}")), "").unwrap();
+        }
+        let shown = || std::fs::read(kbd.join("matrix_effect_static")).unwrap();
+        let clear = || std::fs::write(kbd.join("matrix_effect_static"), "").unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        ui.rgb = Some(
+            crate::keyboard::RgbKeyboards::open(&dir.join("razerkbd"), Rgb::SPECTRUM).unwrap(),
+        );
+        let (red, orange, blue, green, white) = (
+            [255, 0, 0],
+            [255, 128, 0],
+            [0, 0, 255],
+            [0, 255, 0],
+            [255, 255, 255],
+        );
+        let mut patterns = crate::status::DevicePatterns::default();
+        patterns.keyboard_on = false; // no real lock-key LED in a test
+        for (j, device) in patterns.rgb_devices.iter_mut().enumerate() {
+            device.on = j == 0;
+            device.own = None;
+        }
+        patterns.rgb_shared.states = [red, orange, blue, green].map(Rgb::Static);
+        patterns.rgb_shared.rest = Rgb::Static(white);
+        ui.device_lights = Some(patterns);
+        ui.agent_states = vec![("claude".into(), "claude".into(), "thinking")];
+        ui.output = Some(crate::keyboard::Output::recording(&[]).unwrap());
+        ui.suspended = false;
+        ui.show_rgb();
+        assert_eq!(shown(), blue, "the agent: thinking");
+        clear();
+        ui.light_test(Some("needs-decision")).unwrap().unwrap();
+        assert_eq!(shown(), red, "the test step, at once");
+        clear();
+        ui.agent_states[0].2 = "needs-input";
+        ui.show_rgb();
+        assert!(
+            shown().is_empty(),
+            "a real change doesn't interrupt the test"
+        );
+        ui.light_test(Some("idle")).unwrap().unwrap();
+        assert_eq!(shown(), white, "idle: the resting effect");
+        ui.light_test(None).unwrap();
+        assert_eq!(shown(), orange, "ended: the agent's own needs input shows");
+        ui.agent_states[0].2 = "idle";
+        ui.show_rgb();
+        ui.light_test(Some("thinking")).unwrap().unwrap();
+        assert_eq!(shown(), blue);
+        ui.light_test(None).unwrap(); // Esc
+        assert_eq!(shown(), white, "stopped: the resting effect back");
+        // An unverified Akai program: no write, and the line says why.
+        let writes = Arc::new(std::sync::Mutex::new(0));
+        ui.controller = Some(crate::feedback::Controller::fake_for_reset(Arc::clone(
+            &writes,
+        )));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while ui.controller.as_ref().unwrap().baseline.is_none() {
+            ui.controller.as_mut().unwrap().poll().unwrap();
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        ui.light_agents = Some(vec![
+            mappings::Agent::new("claude", "claude", "claude").unwrap(),
+        ]);
+        ui.device_lights.as_mut().unwrap().on[0] = true;
+        ui.context_verified = false;
+        let notes = ui.light_test(Some("needs-input")).unwrap().unwrap();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n == "MPK: no verified program, so nothing shows on it."),
+            "{notes:?}"
+        );
+        assert_eq!(*writes.lock().unwrap(), 0, "nothing written to the Akai");
+        // A transition ends the test: its next step is refused, the agents show again.
+        ui.suspend().unwrap();
+        assert_eq!(ui.light_test(Some("thinking")).unwrap(), None);
+        ui.light_test(None).unwrap();
+        assert!(
+            ui.light_test(Some("thinking")).unwrap().is_some(),
+            "a new test runs"
+        );
+        ui.light_test(None).unwrap();
+        drop(ui);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
