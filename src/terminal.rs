@@ -9419,7 +9419,7 @@ fn rgb_rows(d: &crate::status::DevicePatterns, names: &[&str; 4]) -> Vec<(String
     }
     rows.push((
         format!(
-            "RGB, all lights · resting effect: {} (idle, paused, after quit; the mouse rests on its own)",
+            "RGB, all lights · resting effect: {}",
             rgb_name(d.rgb_shared.rest)
         ),
         RgbRow::Shared(None),
@@ -9873,7 +9873,11 @@ fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
             )
         };
         // v7 ticket 86: the Xbox rows do nothing without xone's light; say so, never guess.
-        let title = format!("{title}\n{}", crate::gamepad::ButtonLight::status());
+        // v7.7 ticket 233: the resting effect's note, out of its row.
+        let title = format!(
+            "{title}\n{}\nResting effect: shown while idle, paused and after quit; the mouse rests on its own lighting.",
+            crate::gamepad::ButtonLight::status()
+        );
         let Some(index) = choose(ui, &title, &rows)? else {
             return Ok(());
         };
@@ -23582,6 +23586,35 @@ mod tests {
             std::fs::read(&lights).unwrap(),
             before,
             "lights.json untouched"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 233: the resting row is short (its value fits 80 columns) and the screen
+    /// title says when the resting effect shows.
+    #[test]
+    fn the_resting_row_is_short_and_the_title_holds_its_note() {
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-resting-row-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut ui = Script {
+            keys: [Key::Escape].into(),
+            rows: Some(80),
+            ..Default::default()
+        };
+        light_patterns_menu(&mut ui, &path).unwrap();
+        let screen = &ui.screens[0];
+        let row = (screen.lines())
+            .find(|l| l.contains("RGB, all lights · resting effect: "))
+            .expect("the resting row");
+        assert!(row.trim().chars().count() <= 80, "{row}");
+        assert!(row.trim_end().ends_with("Spectrum"), "{row}");
+        assert!(
+            screen.contains("Resting effect: shown while idle, paused and after quit; the mouse rests on its own lighting."),
+            "{screen}"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
