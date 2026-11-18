@@ -95,6 +95,45 @@ const EXTENSION_FILES: [(&str, &str); 2] = [
     ("metadata.json", include_str!("../extension/metadata.json")),
     ("extension.js", include_str!("../extension/extension.js")),
 ];
+/// v7.7 ticket 230: the window extension's version installed on disk (its metadata.json);
+/// None when it isn't installed or has no version.
+pub fn installed_extension_version() -> Option<u32> {
+    let text = fs::read_to_string(extension_dir().ok()?.join("metadata.json")).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    u32::try_from(json.get("version")?.as_u64()?).ok()
+}
+/// v7.7 ticket 230: doctor's line and System's problem when GNOME Shell runs an older copy
+/// of the window extension than the one installed (it loads the new one only at login).
+/// Equal, or not installed: nothing beyond today's lines. Not answering: unavailable.
+pub fn extension_age(
+    installed: Option<u32>,
+    running: Result<Option<u32>>,
+) -> Option<(String, Option<Problem>)> {
+    let installed = installed?;
+    let running = match running {
+        Ok(running) => running,
+        Err(e) => {
+            return Some((format!("Window extension version: unavailable ({e})"), None));
+        }
+    };
+    if running.is_some_and(|r| r >= installed) {
+        return None;
+    }
+    let which = running.map_or("an older copy without a version".to_owned(), |r| {
+        format!("version {r}")
+    });
+    let line = format!(
+        "Window extension: GNOME Shell runs {which}, older than the installed version {installed}; log out and log in once to load it"
+    );
+    let problem = Problem {
+        stage: "window extension",
+        message: format!(
+            "Window extension: the running copy is older than the installed version {installed}"
+        ),
+        fix: Fix::Show("Log out and log in once to load it.".into()),
+    };
+    Some((line, Some(problem)))
+}
 /// The window-control Shell extension that launcher pads use for minimize/close/restore.
 fn extension_dir() -> Result<PathBuf> {
     let base = std::env::var_os("XDG_DATA_HOME")
@@ -1171,6 +1210,13 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                 ])
                 .output()
                 .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("true"));
+            // v7.7 ticket 230: an older copy still running after an install.
+            if let Some((line, _)) = extension_age(
+                installed_extension_version(),
+                crate::actions::running_extension_version(crate::actions::gdbus_output),
+            ) {
+                println!("{line}");
+            }
             println!(
                 "Window control extension: {}",
                 if answering {
@@ -1527,6 +1573,57 @@ mod tests {
         assert_eq!(line(true, true), "Login service: enabled (starts at login)");
         let missing = line(false, false);
         assert!(!missing.contains("WARNING"), "{missing}");
+    }
+
+    /// v7.7 ticket 230: with a fake gdbus, installed 2 against a running 1, or a running
+    /// copy without `Version`, is older (a line and a problem with its fix); a running
+    /// extension that doesn't answer is unavailable, not older; equal says nothing more.
+    #[test]
+    fn doctor_says_when_the_running_window_extension_is_older() {
+        let running = |reply: std::result::Result<&str, &str>| {
+            crate::actions::running_extension_version(|args: &[String]| {
+                assert!(args.iter().any(|a| a == "org.vibeconsole.Windows.Version"));
+                reply.map(str::to_owned).map_err(Into::into)
+            })
+        };
+        assert_eq!(running(Ok("(uint32 2,)\n")).unwrap(), Some(2));
+        let unknown =
+            "GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: No such method “Version”";
+        assert_eq!(running(Err(unknown)).unwrap(), None);
+        let (line, problem) = extension_age(Some(2), running(Ok("(uint32 1,)"))).unwrap();
+        assert!(
+            line.contains(
+                "runs version 1, older than the installed version 2; log out and log in once"
+            ),
+            "{line}"
+        );
+        let problem = problem.unwrap();
+        assert_eq!(
+            problem.fix,
+            Fix::Show("Log out and log in once to load it.".into())
+        );
+        let (line, problem) = extension_age(Some(2), running(Err(unknown))).unwrap();
+        assert!(
+            line.contains("an older copy without a version") && problem.is_some(),
+            "{line}"
+        );
+        let off = "Error: GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown: The name is not activatable";
+        let (line, problem) = extension_age(Some(2), running(Err(off))).unwrap();
+        assert!(
+            line.starts_with("Window extension version: unavailable") && problem.is_none(),
+            "{line}"
+        );
+        assert!(
+            extension_age(Some(2), running(Ok("(uint32 2,)"))).is_none(),
+            "equal: nothing"
+        );
+        assert!(
+            extension_age(None, running(Ok("(uint32 1,)"))).is_none(),
+            "not installed: nothing"
+        );
+        // What install writes carries the version and the method.
+        assert!(EXTENSION_FILES[0].1.contains("\"version\": 2"));
+        assert!(EXTENSION_FILES[1].1.contains("<method name=\"Version\">"));
     }
 
     /// v7.7 ticket 247: doctor shows the run state while the service is active (from its

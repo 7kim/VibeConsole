@@ -1800,6 +1800,16 @@ impl Terminal {
                 }
             }
         }
+        // v7.7 ticket 230: GNOME Shell still runs an older window extension than installed.
+        let running = crate::actions::running_extension_version(|args| {
+            let mut argv = vec!["gdbus"];
+            argv.extend(args.iter().map(String::as_str));
+            Ui::run(self, &argv)
+        });
+        let installed = crate::runtime::installed_extension_version();
+        if let Some((_, Some(problem))) = crate::runtime::extension_age(installed, running) {
+            self.problems.push(problem);
+        }
         // v7.7 ticket 250: this run's Xbox watcher couldn't start: presses show within 50 ms.
         if let Some(why) = crate::wake::watcher_error() {
             self.problems.push(crate::runtime::Problem {

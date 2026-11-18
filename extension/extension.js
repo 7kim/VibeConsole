@@ -17,6 +17,9 @@ const IFACE = `<node>
     <method name="FocusedTitle">
       <arg type="s" direction="out" name="title"/>
     </method>
+    <method name="Version">
+      <arg type="u" direction="out" name="version"/>
+    </method>
     <method name="Apply">
       <arg type="s" direction="in" name="app"/>
       <arg type="s" direction="in" name="action"/>
@@ -26,6 +29,16 @@ const IFACE = `<node>
 </node>`;
 
 class Windows {
+    constructor(version) {
+        this._version = version;
+    }
+
+    // v7.7 ticket 230: metadata.json's version, so doctor can tell this running copy is
+    // older than the one installed on disk (GNOME Shell loads a new one only at login).
+    Version() {
+        return this._version;
+    }
+
     // Windows the Shell attributes to the desktop entry `app` (e.g. org.gnome.Ptyxis.desktop).
     _windows(app) {
         const shellApp = Shell.AppSystem.get_default().lookup_app(app);
@@ -77,7 +90,8 @@ class Windows {
 
 export default class VibeConsoleWindows extends Extension {
     enable() {
-        this._object = Gio.DBusExportedObject.wrapJSObject(IFACE, new Windows());
+        this._object = Gio.DBusExportedObject.wrapJSObject(IFACE,
+            new Windows(this.metadata.version ?? 0));
         this._object.export(Gio.DBus.session, '/org/vibeconsole/Windows');
         this._owner = Gio.bus_own_name(Gio.BusType.SESSION, 'org.vibeconsole.Windows',
             Gio.BusNameOwnerFlags.NONE, null, null, null);

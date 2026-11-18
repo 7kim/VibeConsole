@@ -1239,6 +1239,22 @@ pub fn focused_title(mut gdbus: impl FnMut(&[String]) -> Result<String>) -> Resu
         .map(str::to_owned)
         .ok_or_else(|| "own terminal focus unavailable: unexpected reply".into())
 }
+/// v7.7 ticket 230: the running window extension's version. `Ok(None)`: it runs but is too
+/// old to have `Version` (an older copy); `Err`: it doesn't answer (off, no session bus),
+/// so unknown, never "older".
+pub fn running_extension_version(
+    mut gdbus: impl FnMut(&[String]) -> Result<String>,
+) -> Result<Option<u32>> {
+    match gdbus(&windows_call("Version", &[])) {
+        Ok(reply) => (reply.trim().strip_prefix("(uint32 "))
+            .and_then(|r| r.strip_suffix(",)"))
+            .and_then(|n| n.parse().ok())
+            .map(Some)
+            .ok_or_else(|| format!("unexpected reply {:?}", reply.trim()).into()),
+        Err(e) if e.to_string().contains("UnknownMethod") => Ok(None),
+        Err(e) => Err(e),
+    }
+}
 pub fn gdbus_output(argv: &[String]) -> Result<String> {
     let output = Command::new("gdbus").args(argv).output()?;
     if !output.status.success() {
