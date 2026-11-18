@@ -814,7 +814,16 @@ fn run_state_line(file: std::result::Result<&Path, String>) -> String {
         .and_then(|at| std::time::SystemTime::now().duration_since(at).ok());
     let read =
         file.and_then(|f| fs::read_to_string(f).map_err(|e| format!("{}: {e}", f.display())));
+    // v7.7 ticket 246 (215's rule): only a state the service writes is shown; anything else
+    // (another format, control characters that could reach the terminal) is refused.
+    let parsed = |state: &str| {
+        (state.starts_with("running (") || state.starts_with("paused: "))
+            && !state.chars().any(char::is_control)
+    };
     match read.as_deref().map(str::trim) {
+        Ok(state) if !state.is_empty() && !parsed(state) => {
+            "Run state: run state unavailable: the state file isn't one the service writes".into()
+        }
         Ok(state) if !state.is_empty() => match (state.strip_prefix("paused:"), since) {
             (Some(why), Some(since)) => format!("Run state: paused for {}:{why}", how_long(since)),
             _ => format!("Run state: {state}"),
@@ -1466,6 +1475,15 @@ mod tests {
         );
         fs::write(&file, "").unwrap();
         assert!(run_state_line(Ok(&file)).ends_with("the service wrote an empty state"));
+        // v7.7 ticket 246: a file the service didn't write is refused, never echoed.
+        for bad in ["rm -rf ~", "running (x)\u{1b}[2J", "paused: a\u{7}b"] {
+            fs::write(&file, bad).unwrap();
+            assert_eq!(
+                run_state_line(Ok(&file)),
+                "Run state: run state unavailable: the state file isn't one the service writes",
+                "{bad:?}"
+            );
+        }
         fs::remove_file(&file).unwrap();
         let missing = run_state_line(Ok(&file));
         assert!(

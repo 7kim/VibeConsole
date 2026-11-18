@@ -9189,6 +9189,11 @@ fn quit_login(ui: &mut impl Ui, until_next_login: bool) -> Result<()> {
     ui.login(Login::SetRunOnQuit(start)).map(drop)
 }
 
+/// v7.7 ticket 224: the run state, saved atomically (a reader never sees half a line).
+fn write_run_state(file: &Path, state: &str) -> Result<()> {
+    std::fs::create_dir_all(file.parent().unwrap_or(file))?;
+    crate::actions::write_atomic(file, &format!("{state}\n"))
+}
 /// v7.7 ticket 224: the service's run state, in `status::state_dir()`, for `startup-status`.
 pub const RUN_STATE: &str = "run-state";
 /// v7.7 ticket 214: the note `doctor` reads from the service, in `status::state_dir()`.
@@ -12872,10 +12877,7 @@ pub fn daemon(path: &Path, current: Vec<Mapping>) -> Result<()> {
         let state = ui.run_state();
         if state != stated {
             if let Ok(file) = &state_file {
-                let written = std::fs::create_dir_all(file.parent().unwrap_or(file))
-                    .map_err(Into::into)
-                    .and_then(|()| crate::actions::write_atomic(file, &format!("{state}\n")));
-                if let Err(error) = written {
+                if let Err(error) = write_run_state(file, &state) {
                     eprintln!("run state not written for startup-status: {error}");
                 }
             }
@@ -21805,6 +21807,29 @@ mod tests {
         .unwrap();
         assert!(ui.context_verified, "{} {}", ui.notice, ui.error);
         assert_eq!(ui.run_state(), "running (Program 1 verified)");
+        drop(ui);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 246 (215's box 1): a pause and a resume each rewrite the run-state file,
+    /// atomically, with the cause; the file holds exactly the state the session reports.
+    #[test]
+    fn pause_and_resume_rewrite_the_run_state_file_with_the_cause() {
+        let (dir, mut ui, _ran, _) = configure_session("run-state-file");
+        let file = dir.join("state").join(RUN_STATE);
+        let read = || std::fs::read_to_string(&file).unwrap();
+        write_run_state(&file, &ui.run_state()).unwrap();
+        assert_eq!(read(), "running (Program 1 verified)\n");
+        ui.pause().unwrap();
+        ui.error = "Status lights failed: test; paused".into();
+        write_run_state(&file, &ui.run_state()).unwrap();
+        assert_eq!(read(), "paused: Status lights failed: test; paused\n");
+        let leftovers = std::fs::read_dir(file.parent().unwrap()).unwrap().count();
+        assert_eq!(leftovers, 1, "no staging file left behind");
+        ui.wanted_run = true;
+        ui.suspended = false;
+        write_run_state(&file, &ui.run_state()).unwrap();
+        assert_eq!(read(), "running (Program 1 verified)\n");
         drop(ui);
         std::fs::remove_dir_all(dir).unwrap();
     }
