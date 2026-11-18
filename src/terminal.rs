@@ -1800,12 +1800,46 @@ impl Terminal {
                 .submit(Action::HerdrFocus(row.name.clone()), None)?,
             Some(mappings::Host::Tmux) => {
                 let target = format!("vibe:{}", row.window);
-                Ui::run(self, &["tmux", "select-window", "-t", &target])?;
+                if let Err(error) = Ui::run(self, &["tmux", "select-window", "-t", &target]) {
+                    // v7.7 ticket 257: no tmux server, no `vibe` session or no window of its
+                    // own: say so and offer its start (Ensure agent); any other error as is.
+                    let list = [
+                        "tmux",
+                        "list-windows",
+                        "-t",
+                        "=vibe",
+                        "-F",
+                        "#{window_name}",
+                    ];
+                    if Ui::run(self, &list).is_ok_and(|out| out.lines().any(|w| w == row.window)) {
+                        return Err(error);
+                    }
+                    return self.offer_agent_start(&row.name);
+                }
             }
             None => return Err("a session VibeConsole didn't start; open it where it runs".into()),
         }
         self.clear_finished(std::slice::from_ref(&row.name));
         self.notice = format!("Went to {}.", row.name);
+        Ok(())
+    }
+    /// v7.7 ticket 257: the agent isn't running in tmux: start it through its Ensure agent
+    /// step (its own launch, identifiers only) once asked; Cancel and Esc start nothing.
+    fn offer_agent_start(&mut self, name: &str) -> Result<()> {
+        use crate::actions::{Action, Step};
+        let asked = format!("{name} isn't running in tmux yet: start it?");
+        let start = format!("Start {name}");
+        // A dialog over the command list shows only with the list closed (as Problem rows).
+        let at_menu = std::mem::replace(&mut self.at_menu, false);
+        let picked = question(self, &asked, &["Cancel".into(), start]);
+        self.at_menu = at_menu;
+        if picked? != Some(1) {
+            self.notice = format!("{name} isn't running in tmux yet; nothing started.");
+            return Ok(());
+        }
+        let ensure = Action::Sequence(vec![Step::Agent(name.into())]);
+        self.actions.submit(ensure, None)?;
+        self.notice = format!("Starting {name} in tmux.");
         Ok(())
     }
     /// v7.7 ticket 157: doctor's problems, probed now (the extension through the runner).
@@ -6178,6 +6212,11 @@ impl Ui for Terminal {
                 return Err(format!("{}: not started in tests", args[0]).into());
             };
             play.ran.push(args.join(" "));
+            if play.tmux_down && args[0] == "tmux" {
+                return Err(
+                    "error connecting to /tmp/tmux-1000/default (No such file or directory)".into(),
+                );
+            }
             return Ok(String::new());
         }
         #[cfg(not(test))]
@@ -23188,6 +23227,57 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7.7 ticket 257: Enter on a tmux agent with no tmux server says so plainly and asks,
+    /// opening on Cancel; Cancel starts nothing; Start submits the agent's Ensure agent step
+    /// to the (fake) dispatcher. No tmux or agent is started.
+    #[test]
+    fn going_to_an_agent_not_in_tmux_offers_to_start_it() {
+        use crate::actions::Action;
+        let (dir, mut ui, ran, _) = configure_session("agent-not-in-tmux");
+        ui.status_at = Instant::now() + Duration::from_secs(3600); // keep the fake agent
+        ui.agent_states = vec![("asker".into(), "w5".into(), "needs-input")];
+        let folder = dir.to_string_lossy().into_owned();
+        ui.agent_places = vec![(mappings::Host::Tmux, Some(folder))];
+        ui.at_menu = true;
+        let asked = "asker isn't running in tmux yet: start it?";
+        let go = |ui: &mut Terminal, keys: &[Key]| {
+            ui.script = Some(Play {
+                steps: keys.iter().map(|k| Step::Key(*k)).collect(),
+                tmux_down: true,
+                ..Play::default()
+            });
+            assert_eq!(command_menu(ui).unwrap(), None);
+            ui.script.take().unwrap()
+        };
+        // Enter on the agent, Enter on Cancel, Esc leaves Live.
+        let play = go(&mut ui, &[Key::Enter, Key::Enter, Key::Escape]);
+        let question = (play.screens.iter())
+            .map(|s| plain_rows(s).join("\n"))
+            .find(|s| s.contains(asked))
+            .expect("the plain question shows");
+        assert!(question.contains("> Cancel"), "opens on Cancel");
+        assert!(!question.contains("error connecting"), "no raw tmux error");
+        assert_eq!(
+            play.ran,
+            [
+                "tmux select-window -t vibe:w5",
+                "tmux list-windows -t =vibe -F #{window_name}"
+            ]
+        );
+        assert!(ui.notice.contains("nothing started"), "{}", ui.notice);
+        assert!(
+            ran.recv_timeout(Duration::from_millis(300)).is_err(),
+            "Cancel runs nothing"
+        );
+        ui.live_start = true;
+        go(&mut ui, &[Key::Enter, Key::Down, Key::Enter, Key::Escape]);
+        assert_eq!(
+            ran.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Action::Sequence(vec![crate::actions::Step::Agent("asker".into())])
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// v7.7 ticket 256: Quit until next login asks first, opening on Cancel; Cancel and Esc
     /// stay in the session with nothing asked of the login service; confirming quits and
     /// leaves it stopped. Plain Quit doesn't ask.
@@ -25106,6 +25196,8 @@ mod tests {
         pub(super) journal: Vec<String>,
         /// v7.7 ticket 208: the focused window's title; None: focus can't be told.
         pub(super) focus: Option<String>,
+        /// v7.7 ticket 257: tmux has no server: every tmux command fails.
+        pub(super) tmux_down: bool,
     }
     impl Terminal {
         pub(super) fn scripted_key(&mut self) -> Result<Option<Key>> {
