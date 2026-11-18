@@ -23227,6 +23227,28 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7.7 ticket 258: resuming with saved mappings in a test never opens the real Akai: the
+    /// run waits for MIDI with the stage named, and no input is open.
+    #[test]
+    fn resuming_in_a_test_never_opens_real_midi() {
+        let (dir, mut ui, _ran, _) = configure_session("no-real-midi");
+        ui.context_verified = true;
+        ui.wanted_run = false;
+        ui.input = None;
+        let current = mappings::load_config(&dir.join("mappings.tsv")).unwrap();
+        ui.run_mode(&current.mappings, false).unwrap();
+        assert!(ui.input.is_none(), "no MIDI port opened");
+        assert!(
+            ui.error.starts_with(
+                "Waiting for MIDI (retry every second): MIDI: real MIDI is not opened in tests"
+            ),
+            "{}",
+            ui.error
+        );
+        drop(ui);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// v7.7 ticket 257: Enter on a tmux agent with no tmux server says so plainly and asks,
     /// opening on Cancel; Cancel starts nothing; Start submits the agent's Ensure agent step
     /// to the (fake) dispatcher. No tmux or agent is started.

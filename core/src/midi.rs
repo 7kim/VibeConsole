@@ -105,6 +105,21 @@ pub fn messages(reader: impl Read) -> impl Iterator<Item = io::Result<[u8; 3]>> 
 mod tests {
     use super::*;
 
+    /// v7.7 ticket 258: in a test build the Akai's USB check, its input, another device's
+    /// input and the device list never reach real MIDI.
+    #[test]
+    fn tests_never_open_real_midi() {
+        let refused = |r: crate::Result<()>| {
+            let e = r.unwrap_err().to_string();
+            assert!(e.contains("real MIDI is not opened in tests"), "{e}");
+        };
+        refused(crate::akai_connected());
+        refused(Input::open_device(None).map(drop));
+        refused(Input::open_device(Some("Other")).map(drop));
+        refused(other_devices().map(drop));
+        refused(crate::input_port().map(drop));
+    }
+
     /// v7 ticket 06: a device is named without its sequencer id (which changes on replug);
     /// only the Akai counts as the Akai, and system ports are never offered.
     #[test]
@@ -311,8 +326,20 @@ pub fn akai_only(akai: bool) -> crate::Result<()> {
         Err("device-specific messages go only to the Akai MPK mini 3; this device gets none".into())
     }
 }
+/// v7.7 ticket 258: every real MIDI open and the Akai's USB check pass through here. A test
+/// build (core's own tests, or the cli's, which turn on `fakes`) never reaches the hardware:
+/// it reads as an Akai that isn't connected, so a run waits for MIDI as it would without one.
+pub fn real_midi() -> crate::Result<()> {
+    if cfg!(any(test, feature = "fakes")) {
+        return Err(
+            "MIDI: real MIDI is not opened in tests (the Akai is not connected here)".into(),
+        );
+    }
+    Ok(())
+}
 /// Connected other MIDI devices, by device name.
 pub fn other_devices() -> crate::Result<Vec<String>> {
+    real_midi()?;
     let midi = midir::MidiInput::new("VibeConsole probe")
         .map_err(|e| format!("MIDI input unavailable: {e}"))?;
     let mut names = midi
@@ -377,6 +404,7 @@ impl Input {
     }
     /// The Akai (`None`) or another MIDI device by its device name.
     pub fn open_device(device: Option<&str>) -> crate::Result<Self> {
+        real_midi()?;
         if device.is_none() {
             crate::akai_connected()?;
         }

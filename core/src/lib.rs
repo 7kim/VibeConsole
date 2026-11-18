@@ -183,6 +183,7 @@ impl Detector {
 
 /// The Akai is on USB (`lsusb -d 09e8:1049`), checked before any MIDI port is opened.
 pub fn akai_connected() -> Result<()> {
+    midi::real_midi()?; // v7.7 ticket 258: not even lsusb in tests
     let usb = Command::new("lsusb").args(["-d", DEVICE]).output()?;
     if !usb.status.success() {
         return Err("AKAI MPK mini 3 (USB 09e8:1049) is unavailable; check lsusb".into());
