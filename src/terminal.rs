@@ -380,6 +380,12 @@ struct Terminal {
     /// Where the service notes for `doctor` that Flow can't hear the keyboard (tests: a
     /// temporary folder, or None).
     flow_marker: Option<PathBuf>,
+    /// v7.7 ticket 241: after a service resume where Flow can't hear the keyboard, one Flow
+    /// repair is due; `flow_auto_repaired` stops a second one until Flow is started by hand.
+    flow_repair_due: bool,
+    flow_auto_repaired: bool,
+    /// Whether Wispr Flow is installed (`actions::flow_installed`; tests fake it).
+    flow_installed: fn() -> Result<bool>,
     /// Tests: act as a terminal run, though opened headless.
     #[cfg(test)]
     terminal_run: bool,
@@ -1153,6 +1159,12 @@ impl Terminal {
             flow_marker: crate::status::state_dir().ok().map(|d| d.join(FLOW_MARKER)),
             #[cfg(test)]
             flow_marker: None,
+            flow_repair_due: false,
+            flow_auto_repaired: false,
+            #[cfg(not(test))]
+            flow_installed: crate::actions::flow_installed,
+            #[cfg(test)]
+            flow_installed: || Ok(false),
             #[cfg(test)]
             terminal_run: false,
             agent_places: Vec::new(),
@@ -3219,6 +3231,14 @@ impl Terminal {
                 format!(" ({cause})")
             }
         );
+        // v7.7 ticket 241: one automatic repair, only when Flow is installed and the check
+        // said it can't hear (never when the check failed), and not after an automatic one.
+        if matches!(hears, Ok(false))
+            && !self.flow_auto_repaired
+            && (self.flow_installed)().unwrap_or(false)
+        {
+            self.flow_repair_due = true;
+        }
         match hears {
             Ok(false) => self.mark_flow(Some(&format!(
                 "{FLOW_DEAF} (the login service, after: {why}); select Start or repair Wispr Flow"
@@ -3467,6 +3487,8 @@ impl Terminal {
     /// Keys are released and output stays paused until capture is confirmed; a confirmed
     /// capture returns to running if the session was running (see `tick`).
     fn begin_flow(&mut self, node: Option<PathBuf>) -> Result<()> {
+        // v7.7 ticket 241: a repair started by hand allows one automatic repair again.
+        self.flow_auto_repaired = false;
         let resume = self.wanted_run;
         self.pause()?;
         self.retry = None;
@@ -5061,6 +5083,25 @@ impl Terminal {
         }
         self.take_results();
         // Resume only on the command list: a menu that suspended output must find it paused.
+        // v7.7 ticket 241: the one automatic repair, once output has resumed. It goes through
+        // the normal path: held keys released, output paused while it runs.
+        if self.flow_repair_due
+            && self.service()
+            && self.at_menu
+            && self.wanted_run
+            && !self.flow_pending
+            && !self.actions.busy()
+        {
+            self.flow_repair_due = false;
+            match self.start_flow() {
+                Ok(()) => {
+                    self.notice =
+                        "Flow can't hear VibeConsole's keyboard: trying one Flow repair".into()
+                }
+                Err(error) => self.error = format!("Flow repair not started: {error}"),
+            }
+            self.flow_auto_repaired = true;
+        }
         if self.flow_resume && !self.flow_pending && self.at_menu && !self.actions.busy() {
             self.flow_resume = false;
             let mut notice = std::mem::take(&mut self.notice);
@@ -21830,6 +21871,76 @@ mod tests {
         ui.suspended = false;
         write_run_state(&file, &ui.run_state()).unwrap();
         assert_eq!(read(), "running (Program 1 verified)\n");
+        drop(ui);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 241, as the service: Flow can't hear after a resume → one repair starts
+    /// through the normal path; it fails too → resumed again, the note kept, no second
+    /// repair; a later success clears the note. A failed check (unknown) starts none.
+    #[test]
+    fn the_service_tries_one_flow_repair_when_flow_cant_hear() {
+        let (dir, mut ui, _ran, _) = configure_session("flow-once");
+        let tries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ok_on = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        let (t, o) = (Arc::clone(&tries), Arc::clone(&ok_on));
+        ui.actions = crate::actions::Dispatcher::with(move |_, _, _| {
+            if t.fetch_add(1, Ordering::SeqCst) + 1 >= o.load(Ordering::SeqCst) {
+                Ok("Flow helper opened the current keyboard".into())
+            } else {
+                Err("Flow current keyboard capture: timed out".into())
+            }
+        });
+        ui.flow_hears = |_| Ok(false);
+        ui.flow_installed = || Ok(true);
+        ui.flow_marker = Some(dir.join(FLOW_MARKER));
+        ui.at_menu = true;
+        let settle = |ui: &mut Terminal| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                ui.tick().unwrap();
+                if ui.wanted_run && !ui.flow_pending && !ui.flow_repair_due && !ui.actions.busy() {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "{} | {}", ui.notice, ui.error);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        ui.begin_flow(None).unwrap(); // by hand (a pad): fails
+        settle(&mut ui);
+        assert_eq!(
+            tries.load(Ordering::SeqCst),
+            2,
+            "the hand repair, then one automatic"
+        );
+        assert!(ui.flow_auto_repaired);
+        assert!(dir.join(FLOW_MARKER).exists(), "the note is kept");
+        for _ in 0..20 {
+            ui.tick().unwrap();
+        }
+        assert_eq!(
+            tries.load(Ordering::SeqCst),
+            2,
+            "no second automatic repair"
+        );
+        // By hand again: it fails, one automatic repair follows and succeeds.
+        ok_on.store(4, Ordering::SeqCst);
+        ui.begin_flow(None).unwrap();
+        settle(&mut ui);
+        assert_eq!(tries.load(Ordering::SeqCst), 4);
+        assert!(
+            !dir.join(FLOW_MARKER).exists(),
+            "Flow hears it: the note is cleared"
+        );
+        // A failed check is unknown: no repair.
+        ui.flow_hears = |_| Err("ps unavailable".into());
+        ok_on.store(usize::MAX, Ordering::SeqCst);
+        ui.begin_flow(None).unwrap();
+        settle(&mut ui);
+        for _ in 0..20 {
+            ui.tick().unwrap();
+        }
+        assert_eq!(tries.load(Ordering::SeqCst), 5, "the hand repair only");
         drop(ui);
         std::fs::remove_dir_all(dir).unwrap();
     }
