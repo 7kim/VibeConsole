@@ -32,9 +32,11 @@ TABS = {
 # the session and send real shortcuts. bwrap hides /dev/input from the app (v7.7 ticket 150).
 # v7.7 ticket 178: without bwrap nothing runs, unless the user opts out on a machine with no
 # input devices and takes the risk.
+# v7.7 ticket 252: its own network namespace, so its copies (which never open a device:
+# fake lsusb below) don't meet the login service's per-user lock and run while it does.
 # v7.7 ticket 203: nor the real journal: every scenario runs with no journal socket, so each
 # also checks that a run without a journal starts and shows no error.
-HIDE_INPUT = ["bwrap", "--dev-bind", "/", "/", "--tmpfs", "/dev/input", "--tmpfs", "/run/systemd/journal"] if shutil.which("bwrap") else []
+HIDE_INPUT = ["bwrap", "--dev-bind", "/", "/", "--unshare-net", "--tmpfs", "/dev/input", "--tmpfs", "/run/systemd/journal"] if shutil.which("bwrap") else []
 if not HIDE_INPUT:
     if os.environ.get("VIBECONSOLE_PTY_NO_BWRAP") != "1":
         raise SystemExit(
