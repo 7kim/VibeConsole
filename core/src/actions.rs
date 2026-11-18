@@ -2300,6 +2300,8 @@ pub struct Dispatcher {
     sequences: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     epoch: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
+    /// v7.7 ticket 214: an action is running on the worker (a cancelled one until it returns).
+    busy: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
 impl Dispatcher {
@@ -2316,6 +2318,8 @@ impl Dispatcher {
         let e = epoch.clone();
         let s = stop.clone();
         let running = sequences.clone();
+        let busy = Arc::new(AtomicBool::new(false));
+        let working = busy.clone();
         let worker = thread::spawn(move || {
             while !s.load(Ordering::Acquire) {
                 let job = match receiver.recv_timeout(Duration::from_millis(20)) {
@@ -2328,7 +2332,10 @@ impl Dispatcher {
                 let result = if cancelled() {
                     None
                 } else {
-                    Some(run(&job.action, job.node.as_deref(), &cancelled))
+                    working.store(true, Ordering::Release);
+                    let result = run(&job.action, job.node.as_deref(), &cancelled);
+                    working.store(false, Ordering::Release);
+                    Some(result)
                 };
                 if matches!(job.action, Action::Sequence(_)) {
                     running.lock().unwrap().remove(&job.action.encode());
@@ -2351,8 +2358,13 @@ impl Dispatcher {
             sequences,
             epoch,
             stop,
+            busy,
             worker: Some(worker),
         }
+    }
+    /// v7.7 ticket 214: whether an action (a cancelled one too) is still running.
+    pub fn busy(&self) -> bool {
+        self.busy.load(Ordering::Acquire)
     }
     pub fn new() -> Self {
         let (taps, tap_requests) = mpsc::sync_channel::<TapRequest>(4);
@@ -2678,6 +2690,12 @@ fn capture(node: &Path, helpers: &[PathBuf]) -> Result<bool> {
         }
     }
     Ok(false)
+}
+/// v7.7 ticket 214: whether Flow's helper has `node` (VibeConsole's keyboard) open now,
+/// read from /proc only; Flow is never started or stopped.
+pub fn flow_hears(node: &Path) -> Result<bool> {
+    let (_, helpers) = flow_processes()?;
+    capture(node, &helpers)
 }
 fn wait_until(
     cancelled: &impl Fn() -> bool,

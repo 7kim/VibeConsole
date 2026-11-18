@@ -940,6 +940,15 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                 Err(e) => println!("Xbox controllers: {e}"),
             }
             println!("{}", crate::gamepad::headset());
+            // v7.7 ticket 214: the login service's note that Flow can't hear its keyboard.
+            let flow = crate::status::state_dir().and_then(|d| {
+                Ok(std::fs::read_to_string(
+                    d.join(crate::terminal::FLOW_MARKER),
+                )?)
+            });
+            if let Ok(text) = flow {
+                println!("Flow: {}", text.trim());
+            }
             // v7.7 ticket 192: each light's probe, then its switch in Status light patterns.
             let mut found: Vec<std::result::Result<String, String>> = Vec::new();
             found.push(

@@ -370,6 +370,17 @@ struct Terminal {
     /// v7.7 ticket 212: the busy state the RGB lights show and when it began: in-step frames
     /// count their cycle from then.
     rgb_step: (Option<usize>, Instant),
+    /// v7.7 ticket 214: under the login service, Flow work that was running ended without
+    /// the keyboard (cancelled or failed): why. Output resumes once the work has stopped.
+    flow_rescue: Option<String>,
+    /// Whether Flow's helper has this keyboard node open (`actions::flow_hears`; tests fake it).
+    flow_hears: fn(&Path) -> Result<bool>,
+    /// Where the service notes for `doctor` that Flow can't hear the keyboard (tests: a
+    /// temporary folder, or None).
+    flow_marker: Option<PathBuf>,
+    /// Tests: act as a terminal run, though opened headless.
+    #[cfg(test)]
+    terminal_run: bool,
     /// v7.7 ticket 151: each agent's host and folder, in `agent_states` order.
     agent_places: Vec<(mappings::Host, Option<String>)>,
     /// v7.7 ticket 151: folder → project (its git top-level folder's name), found in the
@@ -1096,6 +1107,17 @@ impl Terminal {
             light_test: None,
             light_test_stopped: false,
             rgb_step: (None, Instant::now()),
+            flow_rescue: None,
+            #[cfg(not(test))]
+            flow_hears: crate::actions::flow_hears,
+            #[cfg(test)]
+            flow_hears: |_| Err("not checked in tests".into()),
+            #[cfg(not(test))]
+            flow_marker: crate::status::state_dir().ok().map(|d| d.join(FLOW_MARKER)),
+            #[cfg(test)]
+            flow_marker: None,
+            #[cfg(test)]
+            terminal_run: false,
             agent_places: Vec::new(),
             projects: BTreeMap::new(),
             agent_cards: false,
@@ -3138,13 +3160,65 @@ impl Terminal {
             .ok_or("virtual keyboard unavailable")?
             .tap(keys)
     }
+    /// v7.7 ticket 214: the line for a service resume after Flow work ended without the
+    /// keyboard: why, what paused it, and whether Flow's helper has the keyboard open now
+    /// (asked, never assumed). A "can't hear" is kept for `doctor` until Flow hears it.
+    fn flow_rescued(&mut self, why: &str) -> String {
+        let cause = std::mem::take(&mut self.error);
+        let node = self.output.as_ref().map(|o| o.node.clone());
+        let hears = node
+            .as_deref()
+            .map_or(Err("no keyboard yet".into()), |n| (self.flow_hears)(n));
+        let flow = match &hears {
+            Ok(true) => "Flow has VibeConsole's keyboard".to_owned(),
+            Ok(false) => FLOW_DEAF.to_owned(),
+            Err(e) => format!("Whether Flow hears VibeConsole's keyboard is unknown: {e}"),
+        };
+        let line = format!(
+            "{why}{}; held keys released, queued presses dropped; output resumed. {flow}.",
+            if cause.is_empty() {
+                String::new()
+            } else {
+                format!(" ({cause})")
+            }
+        );
+        match hears {
+            Ok(false) => self.mark_flow(Some(&format!(
+                "{FLOW_DEAF} (the login service, after: {why}); select Start or repair Wispr Flow"
+            ))),
+            Ok(true) => self.mark_flow(None),
+            Err(_) => {}
+        }
+        line
+    }
+    /// Keep (Some) or clear the note `doctor` shows about Flow.
+    fn mark_flow(&self, text: Option<&str>) {
+        if let Some(marker) = &self.flow_marker {
+            let _ = match text {
+                Some(text) => crate::actions::write_atomic(marker, &format!("{text}\n")),
+                None => std::fs::remove_file(marker).or(Ok(())),
+            };
+        }
+    }
+    /// The login service: no terminal, so no one to select Run.
+    fn service(&self) -> bool {
+        #[cfg(test)]
+        if self.terminal_run {
+            return false;
+        }
+        self.original.is_none()
+    }
     fn cancel_actions(&mut self) {
         self.actions.cancel();
-        if self.flow_pending {
+        // v7.7 ticket 214: the service has no Run: it resumes once the work has stopped.
+        let rescue = self.flow_pending && self.flow_resume && self.service();
+        if rescue {
+            self.flow_rescue = Some("Flow work cancelled".into());
+        } else if self.flow_pending {
             self.error = "Flow work cancelled; output remains paused. If Flow was already quit, reopen it manually after VibeConsole's keyboard is ready, test physical Shift, then Run.".into();
         }
         self.flow_pending = false;
-        self.flow_resume = false;
+        self.flow_resume &= rescue;
         // Cancelled work never answers: let the derived state show instead of a stale "sent".
         self.phases.retain(|_, phase| *phase != Phase::Sent);
     }
@@ -3319,7 +3393,12 @@ impl Terminal {
     }
 
     fn release_all(&mut self) -> Result<()> {
-        self.cancel_actions();
+        // v7.7 ticket 214: running Flow work isn't cancelled by a release (letting go of LB
+        // after its 1 s hold changed the layer and cancelled the repair it had started);
+        // pause and Esc still cancel it. Output is paused meanwhile, so nothing else is queued.
+        if !self.flow_pending {
+            self.cancel_actions();
+        }
         self.holds.clear();
         self.guide.cancel();
         self.motion = crate::motion::Motion::new(&self.run_mappings)?;
@@ -4866,7 +4945,15 @@ impl Terminal {
             if action.flow() {
                 self.flow_pending = false;
                 self.flow_failed = !ok;
-                self.flow_resume &= ok;
+                if ok {
+                    self.mark_flow(None); // ticket 214: Flow hears the keyboard again
+                }
+                if !ok && self.flow_resume && self.service() {
+                    // v7.7 ticket 214: resume anyway; the failure is kept as the error.
+                    self.flow_rescue = Some("Flow repair failed".into());
+                } else {
+                    self.flow_resume &= ok;
+                }
             }
             // v7 ticket 103: a result ("Restored …", "Launched …") is a notice and clears an
             // old error; only a failure is an error.
@@ -4931,9 +5018,12 @@ impl Terminal {
         }
         self.take_results();
         // Resume only on the command list: a menu that suspended output must find it paused.
-        if self.flow_resume && !self.flow_pending && self.at_menu {
+        if self.flow_resume && !self.flow_pending && self.at_menu && !self.actions.busy() {
             self.flow_resume = false;
-            let notice = std::mem::take(&mut self.notice);
+            let mut notice = std::mem::take(&mut self.notice);
+            if let Some(why) = self.flow_rescue.take() {
+                notice = self.flow_rescued(&why);
+            }
             // Piano mappings need an explicit Run confirmation; never prompt from tick.
             if self
                 .run_mappings
@@ -9027,6 +9117,9 @@ fn quit_login(ui: &mut impl Ui, until_next_login: bool) -> Result<()> {
     ui.login(Login::SetRunOnQuit(start)).map(drop)
 }
 
+/// v7.7 ticket 214: the note `doctor` reads from the service, in `status::state_dir()`.
+pub const FLOW_MARKER: &str = "flow-deaf";
+const FLOW_DEAF: &str = "Flow can't hear VibeConsole's keyboard";
 /// v7.7 ticket 212: a frame write that took longer than the main loop's 50 ms can't keep
 /// the device in step with the others: say so.
 fn slow_frame(notice: &mut String, framed: bool, began: Instant, label: &str) {
@@ -21390,8 +21483,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mappings.tsv");
         mappings::save(&path, &[]).unwrap();
-        for (ok, was_running) in [(true, true), (true, false), (false, true)] {
+        // v7.7 ticket 214: a failure stays paused in a terminal run; the service resumes.
+        for (ok, was_running, terminal) in [
+            (true, true, false),
+            (true, false, false),
+            (false, true, true),
+            (false, true, false),
+        ] {
             let mut ui = Terminal::open_mode(&path, true).unwrap();
+            ui.terminal_run = terminal;
             ui.actions = crate::actions::Dispatcher::with(move |_, _, _| {
                 if ok {
                     Ok("Flow helper opened the current keyboard".into())
@@ -21417,8 +21517,8 @@ mod tests {
             ui.tick().unwrap();
             assert_eq!(
                 ui.wanted_run,
-                ok && was_running,
-                "ok {ok}, running {was_running}"
+                was_running && (ok || !terminal),
+                "ok {ok}, running {was_running}, terminal {terminal}"
             );
             if ok {
                 assert!(
@@ -21427,12 +21527,147 @@ mod tests {
                     ui.notice
                 );
             }
-            if !ok {
+            if !ok && terminal {
                 assert!(
                     ui.error.contains("keyboard capture") && ui.error.contains("Manual recovery")
                 );
             }
+            if !ok && !terminal {
+                assert!(
+                    ui.notice.starts_with(
+                        "Flow repair failed (Action failed: Flow current keyboard capture"
+                    ),
+                    "{}",
+                    ui.notice
+                );
+                assert!(ui.notice.contains("output resumed"), "{}", ui.notice);
+            }
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 214: a slow fake Flow: it runs until cancelled (or `done` is set, then
+    /// succeeds), and takes 150 ms to stop after a cancel, as a real stage would.
+    fn slow_flow(done: Arc<AtomicBool>) -> crate::actions::Dispatcher {
+        crate::actions::Dispatcher::with(move |_, _, cancelled| {
+            loop {
+                if done.load(Ordering::SeqCst) {
+                    return Ok("Flow helper opened the current keyboard".into());
+                }
+                if cancelled() {
+                    std::thread::sleep(Duration::from_millis(150));
+                    return Err("Flow operation cancelled; output remains paused".into());
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+    }
+
+    /// v7.7 ticket 214, as the login service: a Flow repair cancelled by a pause waits for
+    /// the Flow work to stop, then resumes: Shift (held before) was released, a press queued
+    /// while paused is dropped, and the line names the cause and that Flow can't hear the
+    /// keyboard, which `doctor` reads from the marker.
+    #[test]
+    fn service_resumes_after_a_cancelled_flow_repair_and_names_the_cause() {
+        let (dir, mut ui, _ran, [_, down, _, shift]) = configure_session("flow-rescue");
+        ui.handle_events(vec![Event::Press(shift)]).unwrap();
+        let held = |ui: &Terminal| {
+            let recorded = &ui.output.as_ref().unwrap().recorded;
+            (recorded.iter().rev())
+                .find(|(k, _)| *k == evdev::KeyCode::KEY_LEFTSHIFT)
+                .is_some_and(|(_, down)| *down)
+        };
+        assert!(held(&ui), "Shift held");
+        ui.actions = slow_flow(Arc::new(AtomicBool::new(false)));
+        ui.flow_hears = |_| Ok(false);
+        ui.flow_marker = Some(dir.join(FLOW_MARKER));
+        ui.at_menu = true;
+        ui.begin_flow(None).unwrap();
+        assert!(!held(&ui), "held keys released when Flow work began");
+        std::thread::sleep(Duration::from_millis(30));
+        ui.pause().unwrap(); // the cancel
+        ui.error = "Status lights failed: test; paused".into();
+        let before = ui.output.as_ref().unwrap().recorded.len();
+        ui.handle_events(vec![Event::Press(down)]).unwrap(); // queued while paused
+        ui.tick().unwrap();
+        assert!(!ui.wanted_run, "not while the Flow work is still stopping");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !ui.wanted_run {
+            ui.tick().unwrap();
+            assert!(Instant::now() < deadline, "never resumed: {}", ui.error);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!ui.suspended);
+        assert_eq!(
+            ui.notice,
+            "Flow work cancelled (Status lights failed: test; paused); held keys released, queued presses dropped; output resumed. Flow can't hear VibeConsole's keyboard."
+        );
+        let recorded = &ui.output.as_ref().unwrap().recorded;
+        assert!(
+            !recorded[before..]
+                .iter()
+                .any(|(k, d)| *k == evdev::KeyCode::KEY_DOWN && *d),
+            "the queued press never fires: {recorded:?}"
+        );
+        let note = std::fs::read_to_string(dir.join(FLOW_MARKER)).unwrap();
+        assert!(note.starts_with("Flow can't hear VibeConsole's keyboard (the login service"));
+        drop(ui);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 214: a terminal run keeps today's behaviour: a cancelled Flow repair stays
+    /// paused with the message, because someone is there to select Run.
+    #[test]
+    fn terminal_run_stays_paused_after_a_cancelled_flow_repair() {
+        let (dir, mut ui, _ran, _) = configure_session("flow-cancel-terminal");
+        ui.terminal_run = true;
+        ui.actions = slow_flow(Arc::new(AtomicBool::new(false)));
+        ui.at_menu = true;
+        ui.begin_flow(None).unwrap();
+        ui.pause().unwrap();
+        assert!(
+            ui.error
+                .starts_with("Flow work cancelled; output remains paused."),
+            "{}",
+            ui.error
+        );
+        let until = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < until {
+            ui.tick().unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!ui.wanted_run && ui.suspended);
+        drop(ui);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 214, the cause seen 17 Nov 2026: letting go of LB after its 1 s hold
+    /// started a Flow repair changed the layer, and the layer change cancelled the repair.
+    /// Now the repair runs on and the session resumes once Flow has the keyboard.
+    #[test]
+    fn releasing_lb_after_the_hold_keeps_the_flow_repair() {
+        let (dir, mut ui, _ran, _) = configure_session("flow-layer");
+        let done = Arc::new(AtomicBool::new(false));
+        ui.actions = slow_flow(Arc::clone(&done));
+        ui.at_menu = true;
+        ui.set_layer(true).unwrap(); // LB held for the 1 s hold
+        ui.begin_flow(None).unwrap(); // the risky hold fired
+        ui.set_layer(false).unwrap(); // LB let go
+        assert!(ui.flow_pending, "{}", ui.error);
+        assert!(!ui.error.contains("cancelled"), "{}", ui.error);
+        done.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !ui.wanted_run {
+            ui.tick().unwrap();
+            assert!(Instant::now() < deadline, "{}", ui.error);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            ui.notice.contains("opened the current keyboard"),
+            "{}",
+            ui.notice
+        );
+        drop(ui);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
