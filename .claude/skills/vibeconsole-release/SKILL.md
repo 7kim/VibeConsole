@@ -12,4 +12,4 @@ description: Use when closing a VibeConsole ticket or finishing a version: the c
 ## At a version's end
 
 - `tickets check` prints nothing: no built ticket still says ready-for-agent, no box is ticked only in your head, and every test file exists. Where `tickets` isn't installed, confirm it by reading the tickets.
-- `scripts/install.sh` builds, stops the login service and any terminal session cleanly, installs, and starts the service again. `vibeconsole --version` names the spec version, last ticket and commit that were built: check it matches before testing.
+- `mise run install` (it runs `scripts/install.sh`) builds, stops the login service and any terminal session cleanly, installs, and starts the service again. A running VibeConsole is no reason to skip it. `vibeconsole --version` names the spec version, last ticket and commit that were built: check it matches before testing.

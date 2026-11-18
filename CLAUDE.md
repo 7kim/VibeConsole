@@ -76,7 +76,7 @@ Specs, tickets and tests are markdown under `docs/<version>/` (git-ignored: the 
 ### Order of work
 
 1. After `approved`, implement the working version's `ready-for-agent` tickets in the order `tickets next` gives (number order, blockers first), without stopping between them. A ticket's own acceptance tests (TDD, `cargo test`) belong to implementing it. Still stop before any controller write or real keyboard output the spec gates.
-2. Only when all are implemented, test: run the agent tests, write the developer tests and their run order, record results. Then `cargo build --release --locked && ./target/release/vibeconsole install`, unless VibeConsole is running.
+2. Only when all are implemented, test: run the agent tests, write the developer tests and their run order, record results. Then `mise run install`: it builds, stops VibeConsole (the login service and any terminal session), installs, and starts the service again. A running VibeConsole is no reason to skip it.
 
 ### Closing a ticket (before the next ticket and before committing)
 
