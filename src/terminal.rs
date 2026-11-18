@@ -9698,8 +9698,11 @@ fn pick_colour(
     title: &str,
     current: crate::status::Colour,
 ) -> Result<Option<crate::status::Colour>> {
-    use crate::status::{COLOURS, colour_word, parse_channel, parse_colour, rgb_bytes};
-    let mut rows = COLOURS.map(String::from).to_vec();
+    use crate::status::{
+        COLOURS, colour_name, colour_word, parse_channel, parse_colour, rgb_bytes,
+    };
+    // v7.7 ticket 232: the names as the rows show them (`White`, not `white`).
+    let mut rows = COLOURS.map(|c| colour_name(rgb_bytes(c))).to_vec();
     rows.push("Your own colour: Red, Green, Blue…".into());
     rows.push("Hex code (#rrggbb)…".into());
     let start = COLOURS
@@ -23580,6 +23583,45 @@ mod tests {
             before,
             "lights.json untouched"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 232: the colour list names its colours as the rows do (`White`, not
+    /// `white`), and picking White still saves #ffffff.
+    #[test]
+    fn the_colour_list_shows_names_like_the_rows() {
+        use crate::status::Rgb;
+        use Key::*;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-colour-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut keys = vec![Down; 19];
+        keys.push(Enter); // RGB, all lights · Needs input: Static · Orange
+        keys.push(Enter); // static, as it is
+        keys.extend([Down, Down, Down, Down, Enter]); // Orange -> White
+        keys.push(Escape);
+        let mut ui = Script {
+            keys: keys.into(),
+            rows: Some(80),
+            ..Default::default()
+        };
+        light_patterns_menu(&mut ui, &path).unwrap();
+        assert!(ui.keys.is_empty(), "keys left: {:?}", ui.keys);
+        let list = (ui.screens.iter())
+            .find(|s| s.contains("Needs input") && s.contains(": colour"))
+            .expect("the colour list");
+        for name in ["Blue", "Orange", "Red", "Green", "Purple", "White"] {
+            assert!(list.contains(name), "{name}: {list}");
+        }
+        assert!(
+            !list.lines().any(|l| l.trim_end().ends_with("white")),
+            "a lowercase row: {list}"
+        );
+        let lights = mappings::load_config(&path).unwrap().device_lights;
+        assert_eq!(lights.rgb_shared.states[1], Rgb::Static([255, 255, 255]));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
