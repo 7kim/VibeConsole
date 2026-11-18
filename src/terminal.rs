@@ -9786,6 +9786,15 @@ fn test_lights(ui: &mut impl Ui, d: &crate::status::DevicePatterns) -> Result<()
                 10 - secs % 10,
                 crate::status::rgb_name(effect)
             );
+            // v7.7 ticket 235: a switched-on device with its own effects shows its own.
+            let step = crate::status::BUSY.iter().position(|s| *s == state);
+            for (device, (_, label, _)) in d.rgb_devices.iter().zip(crate::status::RGB_DEVICES) {
+                if let Some(own) = device.own.filter(|_| device.on) {
+                    let own = step.map_or(own.rest, |i| own.states[i]);
+                    let label = label.split(" (").next().unwrap_or(label);
+                    text += &format!(" · {label}: {}", crate::status::rgb_name(own));
+                }
+            }
             for note in notes {
                 text += &format!("\n{note}");
             }
@@ -23436,6 +23445,46 @@ mod tests {
             lights,
             "nothing saved"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 235: the test line names a switched-on device's own effect after the
+    /// shared one; a switched-off device's own isn't named.
+    #[test]
+    fn the_test_line_names_each_devices_own_effect() {
+        use crate::status::Rgb;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-test-own-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let mut config = mappings::Config::default();
+        let d = &mut config.device_lights;
+        d.rgb_shared.states[2] = Rgb::Breath([0, 0, 255], Default::default());
+        let mut own = d.rgb_shared;
+        own.states[2] = Rgb::Static([255, 0, 0]);
+        d.rgb_devices[0].on = true; // keyboard: on, its own Thinking
+        d.rgb_devices[0].own = Some(own);
+        d.rgb_devices[2].on = false; // mousepad: off, its own not named
+        d.rgb_devices[2].own = Some(own);
+        mappings::save_config(&path, &config).unwrap();
+        let mut keys = vec![Key::Up, Key::Enter];
+        keys.extend(vec![Key::Other; 25]);
+        keys.extend([Key::Escape, Key::Escape]);
+        let mut ui = Script {
+            keys: keys.into(),
+            ..Default::default()
+        };
+        light_patterns_menu(&mut ui, &path).unwrap();
+        let thinking = (ui.screens.iter())
+            .filter_map(|s| s.lines().find(|l| l.starts_with("Testing: Thinking")))
+            .next()
+            .expect("a Thinking line")
+            .to_owned();
+        assert!(
+            thinking.ends_with("· Breath · Blue · Keyboard RGB: Static · Red"),
+            "{thinking}"
+        );
+        assert!(!thinking.contains("Mousepad"), "{thinking}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
