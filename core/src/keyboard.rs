@@ -1054,6 +1054,8 @@ pub struct MouseWorker {
     sent: Option<MouseWant>,
     /// v7.7 ticket 192: logirgb couldn't open the mouse (until switched off).
     failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// v7.7 ticket 239: the last effect logirgb finished setting, and when it returned.
+    done: std::sync::Arc<std::sync::Mutex<Option<(MouseWant, std::time::Instant)>>>,
 }
 impl MouseWorker {
     /// `runner` makes a fresh logirgb runner for each open (again after a failed `set`).
@@ -1062,6 +1064,8 @@ impl MouseWorker {
         let (notify, notices) = std::sync::mpsc::channel();
         let unavailable = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let seen = unavailable.clone();
+        let done = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let finished = done.clone();
         let thread = std::thread::spawn(move || {
             let mut mouse: Option<MouseLight> = None;
             let mut failed = false;
@@ -1089,6 +1093,9 @@ impl MouseWorker {
                 }
                 let Some(open) = &mut mouse else { continue };
                 let shown = open.show(effect);
+                if shown.is_ok() {
+                    *finished.lock().unwrap() = Some((want, std::time::Instant::now()));
+                }
                 if let Some(missing) = open.unavailable.take() {
                     let _ = notify.send(format!("Mouse light (Logitech G502): {missing}"));
                 }
@@ -1105,6 +1112,15 @@ impl MouseWorker {
             thread: Some(thread),
             sent: None,
             failed: unavailable,
+            done,
+        }
+    }
+    /// v7.7 ticket 239: when logirgb finished setting the latest want (None until it has),
+    /// so the other lights can start their cycle with the mouse's. No logirgb call is added.
+    pub fn shown_since(&self) -> Option<std::time::Instant> {
+        match (*self.done.lock().unwrap(), self.sent) {
+            (Some((want, at)), Some(sent)) if want == sent => Some(at),
+            _ => None,
         }
     }
     /// Whether logirgb couldn't open the mouse, as far as the worker has got.

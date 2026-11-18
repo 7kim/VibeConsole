@@ -4214,8 +4214,22 @@ impl Terminal {
         if busy != self.rgb_step.0 {
             self.rgb_step = (busy, now);
         }
-        let ms = now.saturating_duration_since(self.rgb_step.1).as_millis();
         let in_step = lights.as_ref().is_some_and(|p| p.rgb_in_step);
+        // v7.7 ticket 239: with the G502 in step, the cycle starts when logirgb finished its
+        // set (the mouse's own start); until then the first frame holds, for at most 1 s.
+        let mouse_waits = in_step
+            && busy.is_some()
+            && lights.as_ref().is_some_and(|p| p.rgb_devices[3].on)
+            && !self.mouse.as_ref().is_some_and(|m| m.unavailable());
+        let began = self.rgb_step.1;
+        let origin = match (self.mouse.as_ref()).and_then(|m| m.shown_since()) {
+            Some(at) if mouse_waits && at >= began => Some(at),
+            _ if mouse_waits && now.saturating_duration_since(began) < Duration::from_secs(1) => {
+                None
+            }
+            _ => Some(began),
+        };
+        let ms = origin.map_or(0, |o| now.saturating_duration_since(o).as_millis());
         let period = lights
             .as_ref()
             .map_or(crate::status::STEP_PERIOD_MS, |p| p.rgb_step_period);
@@ -24046,6 +24060,10 @@ mod tests {
             let breath = std::fs::read(d.join("matrix_effect_breath")).unwrap();
             assert!(breath.is_empty(), "no firmware breath: {d:?}");
         }
+        // v7.7 ticket 239: the cycle counts from when the mouse's set returned.
+        until(|| ui.mouse.as_ref().unwrap().shown_since().is_some());
+        let mouse = ui.mouse.as_ref().unwrap().shown_since().unwrap();
+        let at = |ms: u64| mouse + Duration::from_millis(ms);
         ui.show_rgb_at(at(500));
         let quarter = crate::status::rgb_frame(thinking, 500, 4000).unwrap();
         assert_eq!(quarter, Rgb::Static([0, 0, 127]));
@@ -24075,6 +24093,78 @@ mod tests {
         assert!(frames().iter().all(Vec::is_empty), "paused: no more frames");
         drop(ui);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 239: with the G502 in step, the Razer cycle holds its first frame until
+    /// logirgb's set returns (a 300 ms fake), then counts from that moment; a mouse that
+    /// doesn't answer within 1 s doesn't hold it longer.
+    #[test]
+    fn the_in_step_cycle_starts_when_the_mouse_confirms() {
+        use crate::status::{Rgb, Timing};
+        use std::sync::{Arc, Mutex};
+        for delay in [300, 1400] {
+            let dir = std::env::temp_dir().join(format!(
+                "vibeconsole-step-mouse-{delay}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let kbd = dir.join("razerkbd/0003:1532:021A.0001");
+            std::fs::create_dir_all(&kbd).unwrap();
+            std::fs::write(kbd.join("matrix_brightness"), "200\n").unwrap();
+            for f in ["none", "spectrum", "wave", "static", "breath", "reactive"] {
+                std::fs::write(kbd.join(format!("matrix_effect_{f}")), "").unwrap();
+            }
+            let frame = || std::fs::read(kbd.join("matrix_effect_static")).unwrap();
+            let path = dir.join("mappings.tsv");
+            mappings::save(&path, &[]).unwrap();
+            let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+            let mut ui = Terminal::open_mode(&path, true).unwrap();
+            ui.rgb = Some(
+                crate::keyboard::RgbKeyboards::open(&dir.join("razerkbd"), Rgb::SPECTRUM).unwrap(),
+            );
+            let fake = fake_logirgb(&calls, Duration::from_millis(delay));
+            ui.mouse = Some(crate::keyboard::MouseWorker::start(fake));
+            let mut patterns = crate::status::DevicePatterns::default();
+            patterns.keyboard_on = false; // no real lock-key LED in a test
+            for (j, device) in patterns.rgb_devices.iter_mut().enumerate() {
+                device.on = j == 0 || j == 3;
+                device.own = None;
+            }
+            let period = Timing {
+                period: Some(2000),
+                ..Default::default()
+            };
+            let thinking = Rgb::Breath([0, 0, 255], period);
+            patterns.rgb_shared.states[2] = thinking;
+            ui.device_lights = Some(patterns);
+            ui.agent_states = vec![("claude".into(), "claude".into(), "thinking")];
+            ui.output = Some(crate::keyboard::Output::recording(&[]).unwrap());
+            ui.suspended = false;
+            let start = Instant::now();
+            ui.show_rgb_at(start);
+            ui.show_rgb_at(start + Duration::from_millis(200)); // before the mouse answers
+            assert_eq!(frame(), [0, 0, 0], "{delay} ms: the first frame holds");
+            if delay == 300 {
+                until(|| ui.mouse.as_ref().unwrap().shown_since().is_some());
+                let mouse = ui.mouse.as_ref().unwrap().shown_since().unwrap();
+                assert!(mouse >= start + Duration::from_millis(300));
+                ui.show_rgb_at(mouse + Duration::from_millis(1000));
+                assert_eq!(
+                    frame(),
+                    [0, 0, 255],
+                    "counted from the mouse: the peak at 1000"
+                );
+            } else {
+                ui.show_rgb_at(start + Duration::from_millis(1100)); // no answer within 1 s
+                let expected = crate::status::rgb_frame(thinking, 1100, 4000).unwrap();
+                let Rgb::Static(bytes) = expected else {
+                    unreachable!()
+                };
+                assert_eq!(frame(), bytes, "started anyway, counted from the state");
+            }
+            drop(ui);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     /// v7.7 ticket 237: the in-step period row (the last) saves 6 s; a breath that sets no
