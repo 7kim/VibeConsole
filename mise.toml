@@ -27,3 +27,12 @@ run = [
   "if command -v cargo-gate >/dev/null; then cargo-gate; else cargo fmt --check && cargo check --locked && cargo test --locked; fi",
   "mise run pty",
 ]
+
+[tasks.idle]
+description = "Release build, then its idle CPU and terminal bytes over 10 s (name two binaries to compare)"
+# mise ticket 04. Arguments go to the last entry: `mise run idle <before> <after>`.
+run = [
+  "scripts/needs-bwrap.sh",
+  "cargo build --release --locked",
+  "uv run scripts/check-idle.py",
+]
