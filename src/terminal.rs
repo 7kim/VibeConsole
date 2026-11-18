@@ -7299,10 +7299,16 @@ fn favourites_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
     let mut cursor = 0;
     loop {
         let mut config = mappings::load_config(path)?;
+        let agents = config.agents.clone();
         let mut keys = config
             .mappings
             .iter()
-            .map(|m| (mappings::favourite_key(m), mapping_label(m, None)))
+            .map(|m| {
+                (
+                    mappings::favourite_key(m),
+                    mapping_label(m, None, Some(&agents)),
+                )
+            })
             .collect::<Vec<_>>();
         keys.extend(config.profiles.iter().map(|p| {
             (
@@ -11067,14 +11073,18 @@ Requires wpctl in your desktop session. Brightness/media/lock and absolute volum
     }
 }
 
-fn mapping_label(mapping: &Mapping, program: Option<&(u8, crate::feedback::Payload)>) -> String {
+/// v7.7 ticket 243: `agents` are the saved agents the caller already has (None: unknown,
+/// so nothing is marked); a label never reads a file itself.
+fn mapping_label(
+    mapping: &Mapping,
+    program: Option<&(u8, crate::feedback::Payload)>,
+    agents: Option<&[mappings::Agent]>,
+) -> String {
     let invalid = match &mapping.action {
         crate::actions::Action::Prompt {
             target: crate::actions::Target::Agent(agent),
             ..
-        } => mappings::config_path()
-            .and_then(|p| mappings::read_config(&p))
-            .is_ok_and(|c| !c.agents.iter().any(|a| &a.name == agent)),
+        } => agents.is_some_and(|all| !all.iter().any(|a| &a.name == agent)),
         _ => false,
     };
     format!(
@@ -11318,7 +11328,12 @@ fn favourite_mapping(
         "Favourites: give this control the same action",
         &starred
             .iter()
-            .map(|m| format!("★ {}", mapping_label(m, program.as_ref())))
+            .map(|m| {
+                format!(
+                    "★ {}",
+                    mapping_label(m, program.as_ref(), Some(&config.agents))
+                )
+            })
             .collect::<Vec<_>>(),
     )?
     else {
@@ -11330,7 +11345,7 @@ fn favourite_mapping(
         let name = mappings::control_name(pad, Some(input), ui.context(), program.as_ref());
         return Err(format!(
             "validation: {} is a \"{}\" action, which {name} can't take",
-            mapping_label(favourite, program.as_ref()),
+            mapping_label(favourite, program.as_ref(), Some(&config.agents)),
             FAMILIES[family]
         )
         .into());
@@ -12159,6 +12174,8 @@ fn configure_steps(
     profile: Option<&str>,
 ) -> Result<()> {
     loop {
+        // v7.7 ticket 243: this config's agents, for the labels (read-only peek).
+        let agents = mappings::read_config(path).ok().map(|c| c.agents);
         let Some(action) = configure_choice(ui)? else {
             return Ok(());
         };
@@ -12294,7 +12311,7 @@ fn configure_steps(
                             "{}{}{}",
                             if *star { "★ " } else { "" },
                             if *default { "(default) " } else { "" },
-                            mapping_label(m, ui.program().as_ref())
+                            mapping_label(m, ui.program().as_ref(), agents.as_deref())
                         )
                     })
                     .collect::<Vec<_>>(),
@@ -12309,7 +12326,7 @@ fn configure_steps(
         let existing = current
             .iter()
             .find(|m| m.context == pad_context && m.control == pad)
-            .map(|m| mapping_label(m, ui.program().as_ref()))
+            .map(|m| mapping_label(m, ui.program().as_ref(), agents.as_deref()))
             .unwrap_or_else(|| {
                 let name = mappings::control_name(pad, None, ui.context(), ui.program().as_ref());
                 format!("{name}: unassigned")
@@ -12708,7 +12725,10 @@ fn configure_steps(
         }
         match choose(
             ui,
-            &format!("Review: {}", mapping_label(&mapping, ui.program().as_ref())),
+            &format!(
+                "Review: {}",
+                mapping_label(&mapping, ui.program().as_ref(), Some(&config.agents))
+            ),
             &options(&["Save and configure another", "Save and finish", "Cancel"]),
         )? {
             Some(choice @ (0 | 1)) => {
@@ -13373,6 +13393,8 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
         }
         ui.at_menu = false;
         let was_running = ui.wanted_run;
+        // v7.7 ticket 243: this config's agents, for the labels (read-only peek).
+        let agents = mappings::read_config(path).ok().map(|c| c.agents);
         let result = match command {
             0 => ui.configure(path, &mut current),
             1 if ui.wanted_run => ui.pause(),
@@ -13388,7 +13410,7 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
                 let labels = current
                     .iter()
                     .map(|mapping| {
-                        let label = mapping_label(mapping, ui.program().as_ref());
+                        let label = mapping_label(mapping, ui.program().as_ref(), agents.as_deref());
                         if mapping.behavior == mappings::Behavior::Toggle {
                             let active = mapping.context == ui.context
                                 && ui
@@ -13410,7 +13432,7 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
                     let text = current
                         .iter()
                         .find(|m| m.context == ui.context() && m.control == pad)
-                        .map(|m| mapping_label(m, ui.program().as_ref()))
+                        .map(|m| mapping_label(m, ui.program().as_ref(), agents.as_deref()))
                         .unwrap_or_else(|| "Unassigned".into());
                     choose(&mut ui, &text, &options(&["Back"]))?;
                 }
@@ -20301,6 +20323,24 @@ mod tests {
             std::fs::read_to_string(dir.join("prompts/review")).unwrap(),
             "Review this change.\n"
         );
+        // v7.7 ticket 243: with claude removed from this temporary config, pad A's prompt
+        // is marked; the mark comes from this config, never from yours.
+        let saved = mappings::load_config(&path).unwrap();
+        let mut gone = saved.clone();
+        gone.agents.retain(|agent| agent.name != "claude");
+        mappings::save_config(&path, &gone).unwrap();
+        let screens = ui.screens.len();
+        ui.keys = [Enter, Escape, Escape, Escape, Escape, Escape].into();
+        ui.pads = [a].into();
+        let _ = configure(&mut ui, &path, &mut current);
+        assert!(
+            ui.screens[screens..]
+                .iter()
+                .any(|s| s.contains("[INVALID: agent removed]")),
+            "{:?}",
+            &ui.screens[screens..]
+        );
+        mappings::save_config(&path, &saved).unwrap();
         let before = config_bytes(&path);
         block_saves(&path);
         ui.keys = [
