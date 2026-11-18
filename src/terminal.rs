@@ -320,6 +320,10 @@ struct Terminal {
     /// v7 ticket 128: Razer keyboards' RGB backlight, opened when an effect is first due.
     rgb: Option<crate::keyboard::RgbKeyboards>,
     rgb_failed: bool,
+    /// v7.7 ticket 228: the Xbox button light failed a write this run (until it reopens on a
+    /// connection or is switched off), and the M light was chosen but couldn't be opened.
+    button_light_failed: bool,
+    macro_missing: bool,
     /// v7.7 ticket 189: the Razer speakers and mousepad, in `status::ACCESSORIES` order.
     accessories: [Option<crate::keyboard::RgbKeyboards>; 2],
     accessories_failed: [bool; 2],
@@ -1124,6 +1128,8 @@ impl Terminal {
             lock_choice: [false; 4],
             rgb: None,
             rgb_failed: false,
+            button_light_failed: false,
+            macro_missing: false,
             accessories: [None, None],
             accessories_failed: [false; 2],
             mouse: None,
@@ -1774,9 +1780,9 @@ impl Terminal {
         if let Some(lights) = &self.device_lights {
             let mouse = self.mouse.as_ref().is_some_and(|m| m.unavailable());
             let failed = [
-                false,
+                self.button_light_failed,
                 self.lock_failed,
-                false,
+                self.macro_missing,
                 self.rgb_failed,
                 self.accessories_failed[0],
                 self.accessories_failed[1],
@@ -4103,6 +4109,9 @@ impl Terminal {
             self.button_light.take(),
             std::path::Path::new(crate::gamepad::LEDS),
         );
+        if self.button_light.is_some() {
+            self.button_light_failed = false; // ticket 228: it works again
+        }
     }
     /// The Xbox button light (v7 tickets 64 and 86): paused shows paused; running shows the
     /// most urgent busy agent state's Xbox pattern, or the plain running light when nothing is
@@ -4132,9 +4141,13 @@ impl Terminal {
             ),
             None => Light::Running,
         };
+        if !self.device_lights.as_ref().is_some_and(|p| p.on[1]) {
+            self.button_light_failed = false; // ticket 228: switched off is never a problem
+        }
         let result = self.button_light.as_mut().map(|l| l.show(light));
         if let Some(Err(error)) = result {
             self.button_light = None;
+            self.button_light_failed = true; // ticket 228: for System
             self.notice = error.to_string();
         }
     }
@@ -4164,6 +4177,7 @@ impl Terminal {
         if chosen != self.lock_choice {
             self.lock_lights = None;
             self.lock_failed = false;
+            self.macro_missing = false;
             self.lock_choice = chosen;
         }
         if self.lock_lights.is_none() && !self.lock_failed {
@@ -4173,10 +4187,12 @@ impl Terminal {
                     if !lights.missing.is_empty() {
                         self.notice = lights.missing.join("; ");
                     }
+                    self.macro_missing = macro_missing(chosen, &lights.missing);
                     self.lock_lights = Some(lights);
                 }
                 Err(error) => {
                     self.lock_failed = true;
+                    self.macro_missing = macro_missing(chosen, &[error.to_string()]);
                     self.notice = error.to_string();
                 }
             }
@@ -9337,6 +9353,11 @@ fn write_run_state(file: &Path, state: &str) -> Result<()> {
 }
 /// v7.7 ticket 224: the service's run state, in `status::state_dir()`, for `startup-status`.
 pub const RUN_STATE: &str = "run-state";
+/// v7.7 ticket 228: the M light was chosen and what opening the keyboard lights said names it
+/// as unavailable (`LockLights`' own words).
+fn macro_missing(chosen: [bool; 4], said: &[String]) -> bool {
+    chosen[3] && said.iter().any(|s| s.contains("M light: unavailable"))
+}
 /// v7.7 ticket 214: the note `doctor` reads from the service, in `status::state_dir()`.
 pub const FLOW_MARKER: &str = "flow-deaf";
 const FLOW_DEAF: &str = "Flow can't hear VibeConsole's keyboard";
@@ -23522,6 +23543,49 @@ mod tests {
             lights,
             "nothing saved"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 228: an Xbox button light write that fails while it is switched on is a
+    /// System problem named "Xbox button light" (fake LED folder); an M light the run
+    /// couldn't open while chosen is "Keyboard M light"; switched off, neither is.
+    #[test]
+    fn failed_xbox_and_m_lights_show_in_system() {
+        let (dir, mut ui, _ran, _) = configure_session("light-failures");
+        ui.status_at = Instant::now() + Duration::from_secs(3600);
+        let gip = dir.join("leds/gip0.0");
+        std::fs::create_dir_all(&gip).unwrap();
+        std::fs::write(gip.join("mode"), "3\n").unwrap();
+        std::fs::write(gip.join("brightness"), "20\n").unwrap();
+        ui.button_light = Some(crate::gamepad::ButtonLight::open(&dir.join("leds")).unwrap());
+        let mut patterns = crate::status::DevicePatterns::default();
+        patterns.on[1] = true;
+        patterns.keyboard_on = true;
+        patterns.keyboard_leds = [false, false, false, true];
+        ui.device_lights = Some(patterns.clone());
+        std::fs::remove_dir_all(&gip).unwrap(); // unplugged: the write fails
+        ui.show_button_light_at(0);
+        assert!(ui.button_light.is_none(), "given up");
+        // The M light as LockLights reports it when its driver file is missing.
+        let said = ["M light: unavailable: OpenRazer's razerkbd driver isn't loaded".to_owned()];
+        assert!(macro_missing([false, false, false, true], &said));
+        assert!(
+            !macro_missing([true, false, false, false], &said),
+            "not chosen"
+        );
+        ui.macro_missing = macro_missing(patterns.keyboard_leds, &said);
+        ui.read_problems();
+        let named =
+            |ui: &Terminal, label: &str| ui.problems.iter().any(|p| p.message.starts_with(label));
+        assert!(named(&ui, "Xbox button light"), "{:?}", ui.problems);
+        assert!(named(&ui, "Keyboard M light"), "{:?}", ui.problems);
+        patterns.on[1] = false;
+        patterns.keyboard_leds = [false; 4];
+        ui.device_lights = Some(patterns);
+        ui.show_button_light_at(10);
+        ui.read_problems();
+        assert!(!named(&ui, "Xbox button light") && !named(&ui, "Keyboard M light"));
+        drop(ui);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
