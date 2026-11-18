@@ -540,6 +540,12 @@ impl Terminal {
         );
         match self.run_label().strip_prefix("RUNNING") {
             Some("") => format!("running ({program})"),
+            // v7.7 ticket 253: unverified, the notice says why and how to recover.
+            Some(more) if !self.context_verified && !self.notice.is_empty() => format!(
+                "running ({program}; {}): {}",
+                more.trim().trim_matches(['(', ')']),
+                self.notice
+            ),
             Some(more) => format!(
                 "running ({program}; {})",
                 more.trim().trim_matches(['(', ')'])
@@ -4881,10 +4887,12 @@ impl Terminal {
                     self.context_verified = false;
                     self.feedback_allowed = false;
                     self.program_snapshot = None;
+                    // v7.7 ticket 253: say how to recover. A program picked on the Akai changes
+                    // its RAM; the controller watch sees that and detects again (no replug).
                     self.notice = if self.original.is_none() {
-                        "Current RAM has no unique stored-program match; service output stays inactive."
+                        "Current RAM matches no single stored program, so output stays inactive. To fix it: select Program 1 on the Akai (Prog Select), or unplug and replug it."
                     } else {
-                        "Current RAM has no unique stored-program match. Select /prog-select; output stays inactive."
+                        "Current RAM matches no single stored program, so output stays inactive. To fix it: select Program 1 on the Akai (Prog Select), or use /prog-select."
                     }.into();
                     return Ok(());
                 };
@@ -13803,7 +13811,10 @@ mod tests {
         assert!(ui.context_verified && ui.feedback_allowed && ui.wanted_run);
         ui.observe_program(observation(None)).unwrap();
         assert!(!ui.context_verified && !ui.feedback_allowed);
-        assert!(ui.notice.contains("service output stays inactive"));
+        assert!(
+            ui.notice
+                .contains("so output stays inactive. To fix it: select Program 1 on the Akai")
+        );
 
         let mut piano = Mapping::new(Control::note(1, 60).unwrap(), "Shift", "hold").unwrap();
         piano.context = 1;
@@ -14078,7 +14089,7 @@ mod tests {
         assert!(ui.context_verified && !ui.wanted_run && ui.suspended);
         ui.observe_program(observation(None)).unwrap();
         assert!(!ui.context_verified && !ui.feedback_allowed);
-        assert!(ui.notice.contains("no unique"));
+        assert!(ui.notice.contains("matches no single stored program"));
         ui.at_menu = false;
         assert!(ui.observe_program(observation(Some(0))).is_err()); // interrupt a configuration menu
         assert!(!ui.context_verified);
@@ -21757,6 +21768,43 @@ mod tests {
             ui.run_state(),
             "running (Program 1 unverified; detecting program; actions inactive)"
         );
+        drop(ui);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 253, as the service: RAM matching no stored program leaves it unverified
+    /// with the recovery in the notice and the run state; the next observation after a
+    /// program picked on the Akai (Changed, then Detected as Program 1) verifies it again.
+    #[test]
+    fn a_program_mismatch_says_prog_select_and_a_device_pick_recovers() {
+        use crate::feedback::ProgramObservation::{Changed, Detected};
+        let (dir, mut ui, _ran, _) = configure_session("prog-mismatch");
+        ui.at_menu = true;
+        let payload = [0u8; 245];
+        ui.observe_program(Detected {
+            context: None,
+            payload,
+            names: Vec::new(),
+        })
+        .unwrap();
+        assert!(!ui.context_verified);
+        let fix = "To fix it: select Program 1 on the Akai (Prog Select), or unplug and replug it.";
+        assert!(ui.notice.ends_with(fix), "{}", ui.notice);
+        let state = ui.run_state();
+        assert!(
+            state.starts_with("running (Program 1 unverified; detecting program; actions inactive): Current RAM matches no single stored program")
+                && state.ends_with(fix),
+            "{state}"
+        );
+        ui.observe_program(Changed).unwrap(); // Prog Select on the device changed the RAM
+        ui.observe_program(Detected {
+            context: Some(0),
+            payload,
+            names: Vec::new(),
+        })
+        .unwrap();
+        assert!(ui.context_verified, "{} {}", ui.notice, ui.error);
+        assert_eq!(ui.run_state(), "running (Program 1 verified)");
         drop(ui);
         std::fs::remove_dir_all(dir).unwrap();
     }

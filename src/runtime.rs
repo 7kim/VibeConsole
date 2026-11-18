@@ -1387,7 +1387,7 @@ mod tests {
     #[test]
     fn startup_status_reads_the_run_state_or_says_why_not() {
         let dir =
-            std::env::temp_dir().join(format!("vibeconsole-run-state-{}", std::process::id()));
+            std::env::temp_dir().join(format!("vibeconsole-startup-status-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let file = dir.join(crate::terminal::RUN_STATE);
