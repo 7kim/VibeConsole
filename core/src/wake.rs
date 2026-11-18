@@ -4,6 +4,11 @@
 
 use std::os::fd::RawFd;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// v7.7 ticket 249: a byte is already waiting, so more wakes (a held stick reports at its own
+/// rate) write nothing until the terminal drains it: at most one wake per drain.
+static PENDING: AtomicBool = AtomicBool::new(false);
 
 /// The pipe's read and write ends, made non-blocking; None if the pipe couldn't be made.
 static PIPE: OnceLock<Option<[RawFd; 2]>> = OnceLock::new();
@@ -38,6 +43,9 @@ pub fn fd() -> Option<RawFd> {
 /// One byte into the pipe, if a terminal asked for it. A full pipe already wakes it.
 pub fn wake() {
     if let Some(Some([_, write])) = PIPE.get() {
+        if PENDING.swap(true, Ordering::AcqRel) {
+            return;
+        }
         // SAFETY: one byte from valid storage into our own non-blocking pipe.
         let _ = unsafe { libc::write(*write, [1u8].as_ptr().cast(), 1) };
     }
@@ -49,6 +57,10 @@ pub fn drain() {
         let mut buffer = [0u8; 256];
         // SAFETY: reads into valid storage from our own non-blocking pipe; stops at empty.
         while unsafe { libc::read(*read, buffer.as_mut_ptr().cast(), buffer.len()) } > 0 {}
+        // ponytail: cleared after the read, so a wake landing between the two is dropped and
+        // that event waits for the 50 ms timeout at worst; clearing first could lose every
+        // later wake (the flag set, the pipe empty).
+        PENDING.store(false, Ordering::Release);
     }
 }
 
@@ -73,5 +85,18 @@ mod tests {
         assert!(ready(0), "woken at once");
         super::drain();
         assert!(!ready(0), "drained");
+        // v7.7 ticket 249: a burst of wakes (a held stick) leaves one byte, and the next
+        // wake after a drain writes again.
+        for _ in 0..500 {
+            super::wake();
+        }
+        let mut buffer = [0u8; 1024];
+        // SAFETY: reads into valid storage from the test's own pipe.
+        let bytes = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+        assert_eq!(bytes, 1, "one byte for 500 wakes");
+        super::drain();
+        super::wake();
+        assert!(ready(0), "woken again after the drain");
+        super::drain();
     }
 }
