@@ -25,12 +25,14 @@ impl<O, F: FnMut(&[&str]) -> Result<()>> Drop for Session<O, F> {
     fn drop(&mut self) {
         self.owner.take();
         if self.restart.swap(false, Ordering::SeqCst) {
-            match (self.systemctl)(&["start", UNIT]) {
-                Ok(()) => eprintln!("Login service started again."),
-                Err(e) => {
-                    eprintln!("Login service not started: {e}; run vibeconsole startup-start")
-                }
-            }
+            // v7.7 ticket 255: what systemctl said, on the terminal and in the journal.
+            let line = match (self.systemctl)(&["start", UNIT]) {
+                Ok(()) => "Login service: started again".to_owned(),
+                Err(e) => format!("Login service: not started: {e}; run vibeconsole startup-start"),
+            };
+            eprintln!("{line}");
+            #[cfg(not(test))]
+            journal(&line);
         }
     }
 }

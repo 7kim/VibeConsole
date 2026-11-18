@@ -212,6 +212,9 @@ trait Ui {
     fn login(&mut self, _request: crate::runtime::Login) -> Result<bool> {
         Err("login service unavailable".into())
     }
+    /// v7.7 ticket 255: what Quit did about the login service, and why: to the journal now,
+    /// and on the terminal once its screen is restored.
+    fn quit_note(&mut self, _line: &str) {}
     /// v7 ticket 26: the user's own `claude -p` (their login, no key stored), 3 minutes at
     /// most. Tests answer with a fake reply.
     /// v7.7 ticket 146: where the usage log lives (None: nothing counted).
@@ -390,6 +393,8 @@ struct Terminal {
     pointer_moving: bool,
     /// v7.7 ticket 204: why output was last paused (a key, a click, an event; never prompt text).
     pause_cause: String,
+    /// v7.7 ticket 255: what Quit did about the login service, printed once the screen is back.
+    quit_note: String,
     /// How the last Live row was opened: "Enter", "click", or "Find" (it put the cursor there).
     opened_by: &'static str,
     /// v7.7 ticket 214: under the login service, Flow work that was running ended without
@@ -1188,6 +1193,7 @@ impl Terminal {
             rgb_step: (None, Instant::now()),
             pointer_moving: false,
             pause_cause: String::new(),
+            quit_note: String::new(),
             opened_by: "Enter",
             flow_rescue: None,
             #[cfg(not(test))]
@@ -6104,6 +6110,9 @@ impl Drop for Terminal {
             );
         }
         let _ = io::stdout().flush();
+        if !self.quit_note.is_empty() {
+            eprintln!("{}", self.quit_note); // v7.7 ticket 255: on the restored terminal
+        }
     }
 }
 
@@ -6190,6 +6199,10 @@ impl Ui for Terminal {
                 .ok_or_else(|| "login service: not asked in tests".into());
         }
         crate::runtime::login(request)
+    }
+    fn quit_note(&mut self, line: &str) {
+        self.journal(line);
+        self.quit_note = line.to_owned();
     }
     fn edit_file(&mut self, path: &Path) -> Result<()> {
         self.suspend()?;
@@ -9406,12 +9419,29 @@ fn login_menu(ui: &mut impl Ui) -> Result<()> {
 /// at login is On, or when this session paused it on opening (ticket 20); Quit until next
 /// login never does. A login service that can't be asked counts as Off: nothing is started
 /// on a guess.
+/// v7.7 ticket 255: the decision is also written down with its reason (`quit_note`); the
+/// start itself is reported by `runtime::Session` when it runs systemctl.
 fn quit_login(ui: &mut impl Ui, until_next_login: bool) -> Result<()> {
     use crate::runtime::Login;
-    let start = !until_next_login
-        && (ui.login(Login::Enabled).unwrap_or(false)
-            || ui.login(Login::RunOnQuit).unwrap_or(false));
-    ui.login(Login::SetRunOnQuit(start)).map(drop)
+    let enabled = ui.login(Login::Enabled);
+    let handed_over = ui.login(Login::RunOnQuit).unwrap_or(false);
+    let (start, why) = match (&enabled, handed_over) {
+        _ if until_next_login => (false, "left stopped: Quit until next login".to_owned()),
+        (Ok(true), _) => (true, "starting it again (Start at login is On)".into()),
+        (_, true) => (true, "starting it again (this run paused it)".into()),
+        (Ok(false), _) => (false, "left stopped: Start at login is Off".into()),
+        (Err(error), _) => (
+            false,
+            format!("left stopped: Start at login can't be read ({error})"),
+        ),
+    };
+    let set = ui.login(Login::SetRunOnQuit(start));
+    let why = match &set {
+        Err(error) if start => format!("not started: {error}"),
+        _ => why,
+    };
+    ui.quit_note(&format!("Login service: {why}"));
+    set.map(drop)
 }
 
 /// v7.7 ticket 224: the run state, saved atomically (a reader never sees half a line).
@@ -14189,6 +14219,8 @@ mod tests {
         login: (bool, bool),
         login_calls: Vec<crate::runtime::Login>,
         login_fails: bool,
+        /// v7.7 ticket 255: the journal lines written (`quit_note`), never sent.
+        journal: Vec<String>,
         /// Connected other MIDI devices and the session's context (v7 ticket 06).
         midi_devices: Vec<String>,
         context: u8,
@@ -14319,6 +14351,9 @@ mod tests {
                     Ok(on)
                 }
             }
+        }
+        fn quit_note(&mut self, line: &str) {
+            self.journal.push(line.into());
         }
         fn applications(&self) -> Result<Vec<(String, String)>> {
             if !self.apps.is_empty() {
@@ -23132,6 +23167,43 @@ mod tests {
         assert!(!ui.wanted_run);
         drop(ui);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 255: each way Quit leaves the login service writes its own line with the
+    /// reason, from the decision made and what the (fake) service answered.
+    #[test]
+    fn quit_says_what_it_did_about_the_login_service() {
+        let quit = |login: (bool, bool), fails: bool, until_next_login: bool| {
+            let mut ui = Script {
+                login,
+                login_fails: fails,
+                ..Default::default()
+            };
+            let result = quit_login(&mut ui, until_next_login);
+            assert_eq!(result.is_err(), fails);
+            (ui.journal, ui.login.1)
+        };
+        let line = |why: &str| vec![format!("Login service: {why}")];
+        assert_eq!(
+            quit((true, false), false, false),
+            (line("starting it again (Start at login is On)"), true)
+        );
+        assert_eq!(
+            quit((false, true), false, false),
+            (line("starting it again (this run paused it)"), true)
+        );
+        assert_eq!(
+            quit((true, true), false, true),
+            (line("left stopped: Quit until next login"), false)
+        );
+        assert_eq!(
+            quit((false, false), false, false),
+            (line("left stopped: Start at login is Off"), false)
+        );
+        assert_eq!(
+            quit((true, false), true, false),
+            (line("not started: systemctl --user enable failed"), false)
+        );
     }
 
     /// v7.7 ticket 204: Enter on Live's ❚❚ Pause, a click on it, and Find's /pause each
