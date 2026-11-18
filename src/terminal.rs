@@ -9419,6 +9419,21 @@ fn login_menu(ui: &mut impl Ui) -> Result<()> {
 /// at login is On, or when this session paused it on opening (ticket 20); Quit until next
 /// login never does. A login service that can't be asked counts as Off: nothing is started
 /// on a guess.
+/// v7.7 ticket 256: Live's Quit, or Quit until next login once confirmed (the question opens
+/// on Cancel; Esc is Cancel). True when the session should end.
+fn quit_command(ui: &mut impl Ui, until_next_login: bool) -> Result<bool> {
+    if until_next_login {
+        let sure = question(
+            ui,
+            "Quit and leave the login service stopped until you log in again?",
+            &["Cancel".into(), "Quit until next login".into()],
+        )?;
+        if sure != Some(1) {
+            return Ok(false);
+        }
+    }
+    quit_login(ui, until_next_login).map(|()| true)
+}
 /// v7.7 ticket 255: the decision is also written down with its reason (`quit_note`); the
 /// start itself is reported by `runtime::Session` when it runs systemctl.
 fn quit_login(ui: &mut impl Ui, until_next_login: bool) -> Result<()> {
@@ -13820,7 +13835,11 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
         // v7.7 ticket 204: how this command was opened, used once.
         let opened_by = std::mem::replace(&mut ui.opened_by, "Enter");
         if matches!(command, 11 | 21) {
-            return quit_login(&mut ui, command == 21);
+            ui.at_menu = false; // Quit until next login's question is a dialog
+            if quit_command(&mut ui, command == 21)? {
+                return Ok(());
+            }
+            continue;
         }
         ui.at_menu = false;
         let was_running = ui.wanted_run;
@@ -23167,6 +23186,48 @@ mod tests {
         assert!(!ui.wanted_run);
         drop(ui);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 256: Quit until next login asks first, opening on Cancel; Cancel and Esc
+    /// stay in the session with nothing asked of the login service; confirming quits and
+    /// leaves it stopped. Plain Quit doesn't ask.
+    #[test]
+    fn quit_until_next_login_asks_first() {
+        use Key::*;
+        let title = "Quit and leave the login service stopped until you log in again?";
+        for keys in [vec![Enter], vec![Escape]] {
+            let mut ui = Script {
+                keys: keys.into(),
+                login: (true, true),
+                ..Default::default()
+            };
+            assert!(
+                !quit_command(&mut ui, true).unwrap(),
+                "stays in the session"
+            );
+            assert!(ui.keys.is_empty());
+            assert!(ui.screens.iter().any(|s| s.contains(title)));
+            assert!(ui.screens.last().unwrap().contains("> Cancel"));
+            assert!(ui.login_calls.is_empty() && ui.journal.is_empty());
+        }
+        let mut ui = Script {
+            keys: [Down, Enter].into(),
+            login: (true, true),
+            ..Default::default()
+        };
+        assert!(quit_command(&mut ui, true).unwrap(), "quits");
+        assert_eq!(ui.login, (true, false), "the service is left stopped");
+        assert_eq!(
+            ui.journal,
+            ["Login service: left stopped: Quit until next login"]
+        );
+        let mut ui = Script {
+            login: (true, false),
+            ..Default::default()
+        };
+        assert!(quit_command(&mut ui, false).unwrap());
+        assert!(ui.screens.is_empty(), "plain Quit doesn't ask");
+        assert_eq!(ui.login, (true, true));
     }
 
     /// v7.7 ticket 255: each way Quit leaves the login service writes its own line with the
