@@ -790,6 +790,18 @@ fn login_doctor(installed: bool, mut systemctl: impl FnMut(&[&str]) -> Result<()
         "Login service: WARNING installed but disabled, so VibeConsole won't start at login; turn it on with: vibeconsole startup-enable".into()
     }
 }
+/// v7.7 ticket 247: doctor's run-state line: the service's own run state while it is active
+/// (as `startup-status` shows it), else that it isn't running. Read only.
+fn run_doctor(
+    mut systemctl: impl FnMut(&[&str]) -> Result<()>,
+    file: std::result::Result<&Path, String>,
+) -> String {
+    if systemctl(&["is-active", "--quiet", UNIT]).is_ok() {
+        run_state_line(file)
+    } else {
+        "Run state: the login service isn't running".into()
+    }
+}
 /// v7.7 ticket 224: the service's run state from the file it writes on each change; read
 /// only. A file that can't be read says why, never guessed.
 fn run_state_line(file: std::result::Result<&Path, String>) -> String {
@@ -1079,6 +1091,12 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                 println!("{line}");
             }
             println!("{}", login_doctor(unit()?.is_file(), systemctl));
+            // v7.7 ticket 247: running or paused, and why, as the service reports it.
+            let file = crate::status::state_dir().map(|d| d.join(crate::terminal::RUN_STATE));
+            println!(
+                "{}",
+                run_doctor(systemctl, file.as_deref().map_err(|e| e.to_string()))
+            );
             // v7.7 ticket 203: where status lines go (checked, nothing written).
             println!(
                 "{}",
@@ -1439,6 +1457,47 @@ mod tests {
         assert_eq!(line(true, true), "Login service: enabled (starts at login)");
         let missing = line(false, false);
         assert!(!missing.contains("WARNING"), "{missing}");
+    }
+
+    /// v7.7 ticket 247: doctor shows the run state while the service is active (from its
+    /// file, or unavailable with why), and says so when it isn't running; it only asks
+    /// `is-active` through the runner.
+    #[test]
+    fn doctor_shows_the_run_state_or_that_the_service_is_not_running() {
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-doctor-state-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(crate::terminal::RUN_STATE);
+        fs::write(
+            &file,
+            "paused: Flow work cancelled; output resumes once it has stopped\n",
+        )
+        .unwrap();
+        let line = |active: bool, file| {
+            run_doctor(
+                |args: &[&str]| {
+                    assert_eq!(args, ["is-active", "--quiet", UNIT]);
+                    if active {
+                        Ok(())
+                    } else {
+                        Err("inactive".into())
+                    }
+                },
+                file,
+            )
+        };
+        assert_eq!(
+            line(true, Ok(&file)),
+            "Run state: paused: Flow work cancelled; output resumes once it has stopped"
+        );
+        assert_eq!(
+            line(false, Ok(&file)),
+            "Run state: the login service isn't running"
+        );
+        fs::remove_file(&file).unwrap();
+        assert!(line(true, Ok(&file)).starts_with("Run state: run state unavailable: "));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
