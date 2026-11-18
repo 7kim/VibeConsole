@@ -1,6 +1,10 @@
+# /// script
+# requires-python = ">=3.12"
+# dependencies = []
+# ///
 """Idle cost of a VibeConsole build: CPU and bytes written to the terminal in 10 s on its first
 screen, with nothing pressed (v7.7 ticket 251, the method of ticket 225).
-Run after a release build: python3 scripts/check-idle.py [binary ...]
+Run after a release build: uv run scripts/check-idle.py [binary ...]
 (default target/release/vibeconsole; give two to compare a before and an after build).
 
 Isolated like scripts/check-terminal.py: bwrap hides /dev/input and the journal and gives the

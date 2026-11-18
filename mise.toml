@@ -1,0 +1,28 @@
+# VibeConsole's tools and tasks (v7.7 ticket 263).
+# `mise install` installs only the tools below: nothing builds, installs or restarts
+# VibeConsole until you run a task (`mise run install`, `mise run check`, `mise run pty`).
+
+[tools]
+# mise installs Rust through rustup (~/.rustup, ~/.cargo) and pins this toolchain here.
+rust = { version = "1.98.1", components = "rustfmt,clippy" }
+# uv runs the Python checks; each script names its Python in a PEP 723 header.
+uv = "0.13.8"
+
+[tasks.install]
+description = "Build the release binary, stop VibeConsole, install it, start the login service again"
+run = "scripts/install.sh"
+
+[tasks.pty]
+description = "Debug build, then the isolated PTY and installation checks (Python through uv)"
+run = [
+  "cargo build --locked",
+  "uv run scripts/check-terminal.py",
+  "uv run scripts/check-installation.py",
+]
+
+[tasks.check]
+description = "cargo-gate when it is installed (else fmt, check and test), then the PTY checks"
+run = [
+  "if command -v cargo-gate >/dev/null; then cargo-gate; else cargo fmt --check && cargo check --locked && cargo test --locked; fi",
+  "mise run pty",
+]

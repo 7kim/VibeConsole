@@ -54,12 +54,13 @@ Use a MIDI controller and an Xbox controller at the same time if you like.
 
 ## 🚀 Quick start
 
-VibeConsole runs on Linux and needs [Rust](https://rustup.rs). It's tested on Fedora with GNOME on Wayland.
+VibeConsole runs on Linux and needs [mise](https://mise.jdx.dev), which installs the Rust and uv versions pinned in `mise.toml`. It's tested on Fedora with GNOME on Wayland.
 
 ```bash
 sudo dnf install alsa-lib-devel systemd-devel alsa-utils usbutils acl tmux wl-clipboard
 git clone https://github.com/7kim/VibeConsole.git && cd VibeConsole
-scripts/install.sh       # builds and installs to ~/.local/bin
+mise install             # the pinned Rust and uv; builds nothing
+mise run install         # builds and installs to ~/.local/bin
 vibeconsole doctor       # checks your setup
 vibeconsole              # plug in your controller and go
 ```

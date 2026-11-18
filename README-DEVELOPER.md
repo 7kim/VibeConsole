@@ -61,10 +61,11 @@ Implemented features and user-approved hardware/application behavior are disting
 
 ## 🚀 Build and start
 
-Use a Rust toolchain supporting the 2024 edition. Connect the controller by USB, then run from the repository:
+`mise install` installs the tools pinned in `mise.toml` (Rust 1.98.1 with rustfmt and clippy, through rustup; uv for the Python checks) and builds nothing. Connect the controller by USB, then run from the repository:
 
 ```bash
 sudo dnf install alsa-lib-devel systemd-devel alsa-utils usbutils acl tmux wl-clipboard
+mise install
 cargo build --locked
 ./target/debug/vibeconsole doctor
 ./target/debug/vibeconsole
@@ -378,7 +379,7 @@ Use `./target/debug/vibeconsole` for the current local build. After installation
 | `vibeconsole --help` / `-h` / `help` | Show grouped CLI help (colored in a terminal; plain when piped or with `NO_COLOR`) |
 | `vibeconsole --version` / `-V` / `-v` / `version` | Show the version, spec version, last ticket and commit |
 
-`scripts/install.sh` does a full update in one step: it builds the release binary, stops the login service and any terminal session cleanly, installs, and starts the service again if it was running.
+`mise run install` (it runs `scripts/install.sh`) does a full update in one step: it builds the release binary, stops the login service and any terminal session cleanly, installs, and starts the service again if it was running.
 
 Install/update after quitting the running VibeConsole session:
 
@@ -451,16 +452,18 @@ Suspend/resume, forced-kill recovery, real output-backend failure recovery, and 
 
 ## ✅ Verification and acceptance
 
-Latest recorded software checks (2026-11-13): **238 Rust tests, installation checks, formatting and check pass**. The PTY terminal check (`check-terminal.py`) currently fails at its configure-menu step (it expects `Remove assignment`). Reproduce with:
+Latest recorded software checks (2026-11-13): **238 Rust tests, installation checks, formatting and check pass**. The PTY terminal check (`check-terminal.py`) currently fails at its configure-menu step (it expects `Remove assignment`). Reproduce with `mise run check` (cargo-gate, or `cargo fmt --check`, `cargo check --locked` and `cargo test --locked`, then `mise run pty`), or step by step:
 
 ```bash
 cargo fmt --check
 cargo check --locked
 cargo test --locked
 cargo build --locked
-python3 scripts/check-terminal.py
-python3 scripts/check-installation.py
+uv run scripts/check-terminal.py
+uv run scripts/check-installation.py
 ```
+
+The mise tasks: `install` (build, stop, install, restart the login service), `check`, and `pty` (debug build, then the PTY and installation checks through uv). A git-ignored `mise.local.toml` can add personal tasks.
 
 Rust checks use recorded/simulated MIDI, keyboard, feedback, application/audio, and Flow operations. PTY checks isolate configuration/runtime paths and block access to real MIDI. Installation checks use isolated paths/fake service requests. These checks do not establish physical indicator changes, actual desktop effects, or working dictation. The release-timing check needs local Unix socket support.
 

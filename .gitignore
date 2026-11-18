@@ -20,3 +20,6 @@ v6-testedissues.md
 assets/devices/split/mpk-mini-blend-split.glb
 docs/claude-scripts/
 docs/.working-version
+
+# Personal mise tasks (v7.7 ticket 263)
+mise.local.toml

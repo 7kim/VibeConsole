@@ -1,5 +1,9 @@
+# /// script
+# requires-python = ">=3.12"
+# dependencies = []
+# ///
 """Check real terminal navigation/restoration with isolated files and no desktop output.
-Run after cargo build --locked: python3 scripts/check-terminal.py
+Run after cargo build --locked: uv run scripts/check-terminal.py (or mise run pty)
 """
 import fcntl
 import os

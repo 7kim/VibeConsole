@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.12"
+# dependencies = []
+# ///
 """Isolated installation/service-command checks. No real systemctl, output, MIDI or apps."""
 import fcntl
 import os
