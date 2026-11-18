@@ -31,6 +31,9 @@ fi
 if active; then restart=1; systemctl --user stop "$unit"; fi
 
 ./target/release/vibeconsole install
+# mise ticket 10: the installed build's skills into ~/.claude/skills (System → Install /skills).
+# A failure is reported and doesn't stop the login service from starting again.
+"$HOME/.local/bin/vibeconsole" install-skills || echo "install: skills not updated (see above); the program is installed" >&2
 if [ "$restart" = 1 ]; then
     systemctl --user start "$unit"
     sleep 2

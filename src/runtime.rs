@@ -899,8 +899,9 @@ fn status_outcome(code: Option<i32>) -> Result<()> {
     }
 }
 /// Setup and login-service commands `main` hands to `command`.
-pub const COMMANDS: [&str; 8] = [
+pub const COMMANDS: [&str; 9] = [
     "install",
+    "install-skills",
     "uninstall",
     "doctor",
     "startup-enable",
@@ -919,6 +920,14 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
     }
     let binary = binary()?;
     match command {
+        // mise ticket 10: what System → Install /skills does, for `scripts/install.sh`.
+        "install-skills" => {
+            let done = install_skills(&home()?).map_err(|e| match e.to_string() {
+                text if text.starts_with("install skills") => text,
+                text => format!("install skills: {text}"),
+            })?;
+            println!("{done}");
+        }
         "install" => {
             let _owner = Owner::acquire("installer")?;
             fs::create_dir_all(binary.parent().unwrap())?;

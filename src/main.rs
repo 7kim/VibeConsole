@@ -101,6 +101,10 @@ fn help(color: bool) -> String {
                     "Copy to ~/.local/bin and install the window extension".into(),
                 ),
                 (
+                    "install-skills",
+                    "Copy VibeConsole's Claude Code skills to ~/.claude/skills (changed ones backed up)".into(),
+                ),
+                (
                     "uninstall",
                     "Remove the program, service and extension (mappings kept)".into(),
                 ),

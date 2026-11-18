@@ -58,6 +58,19 @@ with tempfile.TemporaryDirectory(prefix="vibeconsole-install-") as directory:
     assert installed.is_file() and installed.stat().st_mode & 0o111
     assert not unit.exists() and not log.exists()
     subprocess.run([installed, "--help"], env=env, check=True, stdout=subprocess.DEVNULL)
+    # mise ticket 10: install-skills writes every skill once, then nothing; a changed one is
+    # backed up, then replaced.
+    skills = root / ".claude/skills"
+    first = run("install-skills").stdout.decode()
+    assert "files written into" in first and (skills / "vibeconsole/SKILL.md").is_file(), first
+    assert b"already installed; nothing changed" in run("install-skills").stdout
+    release = skills / "vibeconsole-release/SKILL.md"
+    shipped = release.read_bytes()
+    release.write_text("an older copy\n")
+    run("install-skills")
+    assert release.read_bytes() == shipped
+    backups = list(release.parent.glob("SKILL.md.bak-vibeconsole-*"))
+    assert len(backups) == 1 and backups[0].read_text() == "an older copy\n", backups
     staging = installed.with_suffix(".new")
     staging.write_text("occupied by another install")
     run("install", ok=False)
