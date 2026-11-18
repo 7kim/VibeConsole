@@ -2,6 +2,9 @@
 # `mise install` installs only the tools below: nothing builds, installs or restarts
 # VibeConsole until you run a task (`mise run install`, `mise run check`, `mise run pty`).
 
+# mise ticket 09: the mise these tasks were built and tested with; an older one warns.
+min_version = { soft = "2026.8.10" }
+
 [tools]
 # mise installs Rust through rustup (~/.rustup, ~/.cargo) and pins this toolchain here.
 rust = { version = "1.98.1", components = "rustfmt,clippy" }
@@ -36,3 +39,29 @@ run = [
   "cargo build --release --locked",
   "uv run scripts/check-idle.py",
 ]
+
+[tasks.config-isolation]
+description = "The test suite against a sentinel config: reports reads and any write (--each: each test alone)"
+# mise ticket 05. `mise run config-isolation --each` passes --each to the script.
+run = "scripts/check-config-isolation.sh"
+
+[tasks.logs]
+description = "Today's VibeConsole journal: the login service, its Started/Stopped lines and every terminal run (extra arguments go to journalctl)"
+# mise ticket 06. -t and -u together would be ANDed and drop terminal-run and systemd lines;
+# the + makes the two matches an OR.
+run = "journalctl --user --since today SYSLOG_IDENTIFIER=vibeconsole + USER_UNIT=vibeconsole.service"
+
+[tasks.doctor]
+description = "Read-only: vibeconsole doctor, startup-status and the login service's run state, in one call"
+# mise ticket 07. Each part runs even when one fails; the exit status is the first failure's.
+shell = "bash -c"
+run = '''
+first=0
+part() { echo "== $1"; shift; s=0; "$@" || s=$?; if [ "$first" = 0 ]; then first=$s; fi; echo; }
+part "vibeconsole doctor" vibeconsole doctor
+part "vibeconsole startup-status" vibeconsole startup-status
+echo "== login service run state"
+state="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/vibeconsole/run-state"
+if [ -f "$state" ]; then cat "$state"; else echo "no run state: the login service isn't running"; fi
+exit "$first"
+'''

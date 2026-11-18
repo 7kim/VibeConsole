@@ -51,7 +51,7 @@ if [ "$each" = 1 ] && [ "$atime" = yes ]; then
             fi
         done
     done < <(cargo test --locked -q --workspace --no-run --message-format=json 2>/dev/null |
-        python3 -I -c 'import sys, json
+        uv run --no-project python -I -c 'import sys, json
 for line in sys.stdin:
     try: m = json.loads(line)
     except ValueError: continue
