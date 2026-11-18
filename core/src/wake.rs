@@ -13,6 +13,19 @@ static PENDING: AtomicBool = AtomicBool::new(false);
 /// The pipe's read and write ends, made non-blocking; None if the pipe couldn't be made.
 static PIPE: OnceLock<Option<[RawFd; 2]>> = OnceLock::new();
 
+/// v7.7 ticket 250: why the Xbox watcher couldn't start, once it has tried.
+static WATCHER: OnceLock<String> = OnceLock::new();
+/// Why Xbox presses can't wake the wait (they then show within 50 ms), if the watcher failed.
+pub fn watcher_error() -> Option<&'static str> {
+    WATCHER.get().map(String::as_str)
+}
+/// v7.7 ticket 250: the line doctor and System show: `Ok` if gilrs opened, else why not.
+pub fn line(opened: std::result::Result<(), String>) -> String {
+    match opened {
+        Ok(()) => "Xbox event wake: available (a terminal run shows presses at once)".into(),
+        Err(why) => format!("Xbox presses show within 50 ms (event wake unavailable: {why})"),
+    }
+}
 /// The read end to poll beside stdin. The first call makes the pipe and starts the Xbox
 /// watcher: a thread with its own read-only gilrs that blocks until any controller event
 /// (none while idle, so no busy loop) and wakes the wait.
@@ -26,8 +39,13 @@ pub fn fd() -> Option<RawFd> {
         #[cfg(not(test))]
         std::thread::spawn(|| {
             // Its own instance: the session's Pad keeps reading every event itself.
-            let Ok(mut gilrs) = gilrs::Gilrs::new() else {
-                return;
+            let mut gilrs = match gilrs::Gilrs::new() {
+                Ok(gilrs) => gilrs,
+                Err(error) => {
+                    // v7.7 ticket 250: kept for System, never guessed.
+                    let _ = WATCHER.set(error.to_string());
+                    return;
+                }
             };
             loop {
                 if gilrs.next_event_blocking(None).is_some() {
@@ -66,6 +84,15 @@ pub fn drain() {
 
 #[cfg(test)]
 mod tests {
+    /// v7.7 ticket 250: the line names a failed open's reason.
+    #[test]
+    fn the_wake_line_names_why_it_is_unavailable() {
+        assert_eq!(
+            super::line(Err("udev unavailable".into())),
+            "Xbox presses show within 50 ms (event wake unavailable: udev unavailable)"
+        );
+        assert!(super::line(Ok(())).starts_with("Xbox event wake: available"));
+    }
     /// A wake makes the read end readable at once; draining makes it wait again.
     #[test]
     fn a_wake_ends_the_wait_and_a_drain_resets_it() {

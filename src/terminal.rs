@@ -1786,6 +1786,16 @@ impl Terminal {
                 }
             }
         }
+        // v7.7 ticket 250: this run's Xbox watcher couldn't start: presses show within 50 ms.
+        if let Some(why) = crate::wake::watcher_error() {
+            self.problems.push(crate::runtime::Problem {
+                stage: "Xbox wake",
+                message: crate::wake::line(Err(why.to_owned())),
+                fix: crate::runtime::Fix::Show(
+                    "vibeconsole doctor shows the Xbox controllers line and why".into(),
+                ),
+            });
+        }
         // v7.7 ticket 242: the login service's note that Flow can't hear its keyboard, from
         // the file doctor reads; no file, nothing listed.
         let flow = (self.flow_marker.as_ref()).and_then(|m| std::fs::read_to_string(m).ok());

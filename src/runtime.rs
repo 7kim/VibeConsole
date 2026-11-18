@@ -994,13 +994,21 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                 Ok(p) => println!("MIDI identity: {p} (no input opened)"),
                 Err(e) => println!("MIDI unavailable: {e}"),
             }
-            match crate::gamepad::Pad::open() {
-                Ok(pad) => match pad.connections().as_slice() {
-                    [] => println!("Xbox controllers: none connected (USB or Bluetooth)"),
-                    names => println!("Xbox controllers: {}", names.join(", ")),
-                },
-                Err(e) => println!("Xbox controllers: {e}"),
-            }
+            // v7.7 ticket 250: the same open says whether a terminal run's Xbox wake works.
+            let opened = match crate::gamepad::Pad::open() {
+                Ok(pad) => {
+                    match pad.connections().as_slice() {
+                        [] => println!("Xbox controllers: none connected (USB or Bluetooth)"),
+                        names => println!("Xbox controllers: {}", names.join(", ")),
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    println!("Xbox controllers: {e}");
+                    Err(e.to_string())
+                }
+            };
+            println!("{}", crate::wake::line(opened));
             println!("{}", crate::gamepad::headset());
             // v7.7 ticket 214: the login service's note that Flow can't hear its keyboard.
             let flow = crate::status::state_dir().and_then(|d| {
