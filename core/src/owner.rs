@@ -30,7 +30,7 @@ impl Owner {
         Self::at_named(path, &user_lock(), who)
     }
     /// `at`, with the per-user lock's name given (tests use their own, never the real one).
-    fn at_named(path: &Path, name: &str, who: &str) -> Result<Self> {
+    pub fn at_named(path: &Path, name: &str, who: &str) -> Result<Self> {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)

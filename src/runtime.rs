@@ -1444,10 +1444,12 @@ mod tests {
     #[test]
     fn one_owner_and_opt_in_unit_do_not_mutate_desktop() {
         let path = std::env::temp_dir().join(format!("vibeconsole-owner-{}", std::process::id()));
-        let owner = Owner::at(&path, "test").unwrap();
-        assert!(Owner::at(&path, "test").is_err());
+        // v7.7 ticket 252: a test name, never the real per-user lock.
+        let name = format!("vibeconsole-test-runtime-{}", std::process::id());
+        let owner = Owner::at_named(&path, &name, "test").unwrap();
+        assert!(Owner::at_named(&path, &name, "test").is_err());
         drop(owner);
-        drop(Owner::at(&path, "test").unwrap());
+        drop(Owner::at_named(&path, &name, "test").unwrap());
         fs::remove_file(path).unwrap();
         assert!(service().contains("\" daemon\n"));
         assert!(!service().contains("--feedback") && !service().contains("--start-flow"));
