@@ -13,6 +13,7 @@ pub mod recording;
 pub mod screen;
 pub mod status;
 pub mod usage;
+pub mod wake;
 
 use std::{collections::HashSet, process::Command};
 

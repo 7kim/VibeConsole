@@ -346,6 +346,7 @@ fn deliver(senders: &mut Senders, message: &[u8]) {
             }
         }
     }
+    crate::wake::wake(); // v7.7 ticket 225: the terminal handles it now, not in 50 ms
 }
 
 /// Bounded queues fed by the midir callback. A full queue drops both senders, so `next`

@@ -370,6 +370,8 @@ struct Terminal {
     /// v7.7 ticket 212: the busy state the RGB lights show and when it began: in-step frames
     /// count their cycle from then.
     rgb_step: (Option<usize>, Instant),
+    /// v7.7 ticket 225: the pointer stick is off centre, so the wait for a key is short.
+    pointer_moving: bool,
     /// v7.7 ticket 214: under the login service, Flow work that was running ended without
     /// the keyboard (cancelled or failed): why. Output resumes once the work has stopped.
     flow_rescue: Option<String>,
@@ -1135,6 +1137,7 @@ impl Terminal {
             light_test: None,
             light_test_stopped: false,
             rgb_step: (None, Instant::now()),
+            pointer_moving: false,
             flow_rescue: None,
             #[cfg(not(test))]
             flow_hears: crate::actions::flow_hears,
@@ -4402,6 +4405,7 @@ impl Terminal {
     fn move_pointer(&mut self) {
         let dt = self.pointer_at.elapsed().as_secs_f32().min(0.1);
         self.pointer_at = Instant::now();
+        self.pointer_moving = false; // set again below only while it moves
         let Some(pad) = &self.gamepad else {
             return;
         };
@@ -4415,6 +4419,7 @@ impl Terminal {
             return;
         }
         let step = crate::gamepad::pointer_step(stick, &pad.tuning, dt, &mut self.pointer_carry);
+        self.pointer_moving = stick != Default::default(); // v7.7 ticket 225
         if step == (0, 0) {
             return;
         }
@@ -5789,16 +5794,36 @@ Changing musical settings while running is unsupported.",
     }
 
     fn byte(&self, timeout: i32) -> Result<Option<u8>> {
+        self.byte_or_wake(timeout, false)
+    }
+    /// v7.7 ticket 225: with `wake`, a MIDI or Xbox event (`vibeconsole_core::wake`) also ends
+    /// the wait, with no byte, so `tick` handles it at once. Only a key's first byte waits so:
+    /// an escape sequence's later bytes never end early.
+    fn byte_or_wake(&self, timeout: i32, wake: bool) -> Result<Option<u8>> {
         if self.stop.load(Ordering::Relaxed) {
             return Err(STOPPED.into());
         }
-        let mut fd = libc::pollfd {
-            fd: 0,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one valid pollfd; no ownership transfer.
-        let ready = unsafe { libc::poll(&mut fd, 1, timeout) };
+        let woken = wake.then(crate::wake::fd).flatten();
+        let mut fds = [
+            libc::pollfd {
+                fd: 0,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: woken.unwrap_or(-1), // a negative fd is ignored by poll
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: two valid pollfds; no ownership transfer.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout) };
+        if fds[1].revents & libc::POLLIN != 0 {
+            crate::wake::drain();
+        }
+        if ready > 0 && fds[0].revents == 0 {
+            return Ok(None); // woken by an event, no key
+        }
         if ready < 0 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
@@ -6032,7 +6057,10 @@ impl Ui for Terminal {
         if self.script.is_some() {
             return self.scripted_key();
         }
-        let key = match self.byte(50)? {
+        // v7.7 ticket 225: an event ends the wait at once; a moving stick pointer ticks
+        // about every 16 ms (the login service's loop is 20 ms), else 50 ms when idle.
+        let wait = if self.pointer_moving { 16 } else { 50 };
+        let key = match self.byte_or_wake(wait, true)? {
             Some(b'\n' | b'\r') => Some(Key::Enter),
             Some(b' ') => Some(Key::Space),
             Some(b'\t') => Some(Key::Tab),

@@ -3,7 +3,7 @@ mod terminal;
 use mappings::{config_path, load};
 use vibeconsole_core::{
     Control, Detector, Event, Message, ReleaseType, actions, feedback, gamepad, input_port,
-    keyboard, mappings, midi, motion, recording, screen, status, usage,
+    keyboard, mappings, midi, motion, recording, screen, status, usage, wake,
 };
 
 pub use vibeconsole_core::Result;
