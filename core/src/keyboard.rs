@@ -849,8 +849,10 @@ impl RgbKeyboards {
     fn send(&mut self, effect: crate::status::Rgb, brightness: Option<u8>) -> io::Result<()> {
         let mut failed = None;
         let mut lacking = Vec::new();
+        // v7.7 ticket 212: an in-step frame keeps the brightness already written.
+        let written = self.shown.map(|(_, level)| level);
         self.boards.retain(|board| {
-            let level = brightness.filter(|_| board.brightness.is_some());
+            let level = brightness.filter(|l| board.brightness.is_some() && written != Some(*l));
             let sent = level
                 .map_or(Ok(()), |l| {
                     std::fs::write(board.dir.join("matrix_brightness"), l.to_string())

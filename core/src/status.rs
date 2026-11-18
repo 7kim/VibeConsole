@@ -627,6 +627,66 @@ pub struct DevicePatterns {
     /// back after). v7.7 ticket 209: one per state, in `BUSY` order. The accessories' and the
     /// mouse's brightness are left alone (ticket 189).
     pub rgb_brightness: [u8; 4],
+    /// v7.7 ticket 212 (lights.json v3): breath and spectrum run from VibeConsole's one
+    /// clock on every RGB device, so they pulse together; off: each device's own firmware
+    /// effect, as before.
+    pub rgb_in_step: bool,
+}
+/// v7.7 ticket 212: the cycle of an in-step breath or spectrum that sets none, so the
+/// Razer frames and the G502 run at the same speed.
+/// ponytail: one fixed default; a setting for it when someone wants another.
+pub const STEP_PERIOD_MS: u16 = 4000;
+/// v7.7 ticket 212: an in-step effect at `ms` into its cycle, as the static colour to write
+/// now. Breath fades its colour by its form (sine, square, triangle, sawtooth; shark-fin and
+/// exponential as sine) up to its intensity; two colours take a cycle each; spectrum turns
+/// the hue once a period. None: an effect that isn't stepped (it stays the firmware's).
+pub fn rgb_frame(effect: Rgb, ms: u128) -> Option<Rgb> {
+    let period = |t: Timing| u128::from(t.period.unwrap_or(STEP_PERIOD_MS).max(1));
+    let peak = |t: Timing| f64::from(t.intensity.unwrap_or(100).min(100)) / 100.0;
+    let scale = |c: Colour, level: f64| c.map(|v| (f64::from(v) * level).round() as u8);
+    let fade = |x: f64, form: Option<u8>| match form.map(|f| FORMS[usize::from(f) % FORMS.len()]) {
+        Some("square") => f64::from(u8::from(x < 0.5)),
+        Some("triangle") => 1.0 - (2.0 * x - 1.0).abs(),
+        Some("sawtooth") => x,
+        _ => (1.0 - (std::f64::consts::TAU * x).cos()) / 2.0,
+    };
+    let phase = |p: u128| (ms % p) as f64 / p as f64;
+    Some(Rgb::Static(match effect {
+        Rgb::Breath(c, t) => scale(c, fade(phase(period(t)), t.form) * peak(t)),
+        Rgb::BreathTwo(a, b) => {
+            let p = period(Timing::default());
+            let c = if ms % (2 * p) < p { a } else { b };
+            scale(c, fade(phase(p), None))
+        }
+        Rgb::Spectrum(t) => {
+            let h = phase(period(t)) * 6.0;
+            let x = 1.0 - (h % 2.0 - 1.0).abs();
+            let (r, g, b) = match h as u8 {
+                0 => (1.0, x, 0.0),
+                1 => (x, 1.0, 0.0),
+                2 => (0.0, 1.0, x),
+                3 => (0.0, x, 1.0),
+                4 => (x, 0.0, 1.0),
+                _ => (1.0, 0.0, x),
+            };
+            let k = peak(t) * 255.0;
+            [r, g, b].map(|v: f64| (v * k).round() as u8)
+        }
+        _ => return None,
+    }))
+}
+/// v7.7 ticket 212: what the G502 is sent for an in-step effect: breath and spectrum get the
+/// period the Razer frames use, so it pulses at their speed.
+pub fn in_step_mouse(effect: Rgb) -> Rgb {
+    let fill = |t: Timing| Timing {
+        period: Some(t.period.unwrap_or(STEP_PERIOD_MS)),
+        ..t
+    };
+    match effect {
+        Rgb::Breath(c, t) => Rgb::Breath(c, fill(t)),
+        Rgb::Spectrum(t) => Rgb::Spectrum(fill(t)),
+        other => other,
+    }
 }
 /// v7.7 ticket 199: an effect per busy state (`BUSY` order) and the resting effect shown
 /// when idle, paused and after quit. The G502 logo rests on its own stored lighting instead.
@@ -1586,6 +1646,65 @@ fn hooks(events: &[(&str, Option<&str>, &str)]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// v7.7 ticket 212: in-step frames: breath fades from dark to its colour at half the
+    /// period, scaled by its intensity, by its form; spectrum turns the hue once a period;
+    /// static and the firmware-only effects aren't stepped; the G502 gets the same period.
+    #[test]
+    fn in_step_frames_follow_one_clock() {
+        use super::*;
+        let frame = |w: &str, ms| rgb_frame(parse_rgb(w).unwrap(), ms);
+        let blue = |b| Some(Rgb::Static([0, 0, b]));
+        let w = "breath #0000ff period=5000 form=sine intensity=25";
+        assert_eq!(frame(w, 0), blue(0));
+        assert_eq!(frame(w, 2500), blue(64), "the peak at 25%");
+        assert_eq!(frame(w, 5000), blue(0), "one cycle");
+        assert_eq!(
+            frame("breath #0000ff", 2000),
+            blue(255),
+            "default period 4000"
+        );
+        assert_eq!(
+            frame("breath #0000ff period=1000 form=square", 400),
+            blue(255)
+        );
+        assert_eq!(
+            frame("breath #0000ff period=1000 form=square", 600),
+            blue(0)
+        );
+        assert_eq!(
+            frame("breath #0000ff period=1000 form=triangle", 250),
+            blue(128)
+        );
+        assert_eq!(
+            frame("spectrum period=6000", 0),
+            Some(Rgb::Static([255, 0, 0]))
+        );
+        assert_eq!(
+            frame("spectrum period=6000", 2000),
+            Some(Rgb::Static([0, 255, 0]))
+        );
+        assert_eq!(
+            frame("spectrum period=6000", 4000),
+            Some(Rgb::Static([0, 0, 255]))
+        );
+        for w in [
+            "static #ff0000",
+            "off",
+            "breath random",
+            "wave",
+            "reactive #ffffff",
+        ] {
+            assert_eq!(frame(w, 1234), None, "{w}");
+        }
+        let mouse = |w: &str| rgb_word(in_step_mouse(parse_rgb(w).unwrap()));
+        assert_eq!(mouse("breath #0000ff"), "breath #0000ff period=4000");
+        assert_eq!(
+            mouse("breath #0000ff period=5000"),
+            "breath #0000ff period=5000"
+        );
+        assert_eq!(mouse("spectrum"), "spectrum period=4000");
+        assert_eq!(mouse("static #ff0000"), "static #ff0000");
+    }
     /// v7.7 ticket 210: effects show words; only a colour off the named list shows its code.
     #[test]
     fn effects_show_their_names() {

@@ -12,8 +12,9 @@ use std::path::{Path, PathBuf};
 /// Every file's format version.
 pub const VERSION: u64 = 1;
 /// v7.7 ticket 209: lights.json's own version: 2 holds the keyboard RGB brightness per
-/// state; a version 1 file's single brightness loads into all four.
-pub const LIGHTS_VERSION: u64 = 2;
+/// state; a version 1 file's single brightness loads into all four. Ticket 212: 3 holds
+/// `rgb_in_step`; older files load it on (the shipped default).
+pub const LIGHTS_VERSION: u64 = 3;
 /// The files, in the order they are applied: each one's references (variables, MIDI
 /// devices, idle settings) are in place before it is checked.
 pub const FILES: [&str; 5] = [
@@ -1061,6 +1062,7 @@ fn lights(config: &Config) -> Value {
             "states": by_state(d.keyboard.iter().map(|l| word(&LIGHTS, *l).into()).collect()),
         },
         "rgb_shared": set(&d.rgb_shared),
+        "rgb_in_step": d.rgb_in_step,
         "keyboard_rgb": device(0),
         "speakers_rgb": device(1),
         "mousepad_rgb": device(2),
@@ -1081,6 +1083,7 @@ impl Lights {
             "ps5",
             "keyboard_leds",
             "rgb_shared",
+            "rgb_in_step",
             "keyboard_rgb",
             "speakers_rgb",
             "mousepad_rgb",
@@ -1222,6 +1225,8 @@ impl Lights {
             rgb_shared,
             rgb_devices,
             rgb_brightness,
+            // v7.7 ticket 212: versions 1 and 2 had none: on, as shipped.
+            rgb_in_step: at.int::<u64>("version")? < 3 || at.bool("rgb_in_step")?,
         };
         at.check("xbox", devices.validate())?;
         Ok(Self {
@@ -1418,6 +1423,7 @@ mod tests {
             ],
         };
         d.rgb_brightness = [200, 120, 60, 20];
+        d.rgb_in_step = false; // not the default, so the round trip shows it (ticket 212)
         for device in &mut d.rgb_devices {
             device.on = true;
         }
@@ -1476,7 +1482,9 @@ mod tests {
 
         // v7.7 ticket 209: a version 1 file's one keyboard brightness loads into all four
         // states, and the next save writes version 2 with one per state.
-        let v1 = good.replace("\"version\": 2", "\"version\": 1");
+        let v1 = good
+            .replace("\"version\": 3", "\"version\": 1")
+            .replace("  \"rgb_in_step\": false,\n", "");
         let at = v1.find("\"brightness\": {").unwrap();
         let end = at + v1[at..].find('}').unwrap() + 1;
         let v1 = format!("{}\"brightness\": 77{}", &v1[..at], &v1[end..]);
@@ -1486,8 +1494,33 @@ mod tests {
         mappings::save_config(&path, &old).unwrap();
         let saved = fs::read_to_string(&file).unwrap();
         assert!(
-            saved.contains("\"version\": 2") && saved.contains("\"thinking\": 77"),
+            saved.contains("\"version\": 3") && saved.contains("\"thinking\": 77"),
             "{saved}"
+        );
+        // v7.7 ticket 212: a version 2 file (no rgb_in_step) loads it on, and the next save
+        // writes version 3 with it; a version 3 file without it is refused, naming the field.
+        assert!(
+            good.contains("  \"rgb_in_step\": false,\n"),
+            "the test's own value"
+        );
+        let v2 = good
+            .replace("\"version\": 3", "\"version\": 2")
+            .replace("  \"rgb_in_step\": false,\n", "");
+        fs::write(&file, &v2).unwrap();
+        let old = mappings::load_config(&path).unwrap();
+        assert!(old.device_lights.rgb_in_step);
+        mappings::save_config(&path, &old).unwrap();
+        let saved = fs::read_to_string(&file).unwrap();
+        assert!(
+            saved.contains("\"version\": 3") && saved.contains("\"rgb_in_step\": true"),
+            "{saved}"
+        );
+        let missing = good.replace("  \"rgb_in_step\": false,\n", "");
+        fs::write(&file, &missing).unwrap();
+        let error = mappings::load_config(&path).unwrap_err().to_string();
+        assert!(
+            error.contains("lights.json") && error.contains("rgb_in_step"),
+            "{error}"
         );
         fs::write(&file, &good).unwrap();
 
@@ -1767,6 +1800,8 @@ mod tests {
         all.device_lights = lights.device_lights;
         // The TSV holds one keyboard brightness for every state (ticket 209).
         all.device_lights.rgb_brightness = [200; 4];
+        // It has no Keep effects in step: on, as shipped (ticket 212).
+        all.device_lights.rgb_in_step = true;
         all.look.theme = settings.look.theme;
         all.look.agent_cards = true;
         all.start_flow = false;
