@@ -846,6 +846,14 @@ fn run_doctor(
         "Run state: the login service isn't running".into()
     }
 }
+/// v7.7 ticket 215: `startup-status`'s run-state line from systemctl's answer (0 running,
+/// 3 not running; other codes already failed in `status_outcome`).
+fn startup_run_line(code: Option<i32>, file: std::result::Result<&Path, String>) -> String {
+    match code {
+        Some(0) => run_state_line(file),
+        _ => "Run state: the login service isn't running".into(),
+    }
+}
 /// v7.7 ticket 224: the service's run state from the file it writes on each change; read
 /// only. A file that can't be read says why, never guessed.
 fn run_state_line(file: std::result::Result<&Path, String>) -> String {
@@ -988,14 +996,13 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                 .status()
                 .map_err(|e| format!("startup-status: systemctl unavailable: {e}"))?;
             status_outcome(status.code())?;
-            // v7.7 ticket 224: whether output runs or is paused, as the service reports it.
-            if status.code() == Some(0) {
-                let file = crate::status::state_dir().map(|d| d.join(crate::terminal::RUN_STATE));
-                println!(
-                    "{}",
-                    run_state_line(file.as_deref().map_err(|e| e.to_string()))
-                );
-            }
+            // v7.7 ticket 224: whether output runs or is paused, as the service reports it;
+            // ticket 215: and when it isn't running, that it isn't (doctor's words).
+            let file = crate::status::state_dir().map(|d| d.join(crate::terminal::RUN_STATE));
+            println!(
+                "{}",
+                startup_run_line(status.code(), file.as_deref().map_err(|e| e.to_string()))
+            );
         }
         "startup-disable" => {
             systemctl(&["disable", "--now", "vibeconsole.service"])?;
@@ -1635,6 +1642,29 @@ mod tests {
         // What install writes carries the version and the method.
         assert!(EXTENSION_FILES[0].1.contains("\"version\": 2"));
         assert!(EXTENSION_FILES[1].1.contains("<method name=\"Version\">"));
+    }
+
+    /// v7.7 ticket 215: `startup-status` shows the service's run state while it runs, and says
+    /// it isn't running when systemctl says so.
+    #[test]
+    fn startup_status_says_the_run_state_or_that_the_service_is_not_running() {
+        // v7.7 ticket 215: running → the service's own state; not running → said, never guessed
+        // from a file a stopped service left behind.
+        let dir = std::env::temp_dir().join(format!("vibeconsole-215-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(crate::terminal::RUN_STATE);
+        fs::write(&file, "paused: Enter on Live ❚❚ Pause\n").unwrap();
+        assert!(
+            startup_run_line(Some(0), Ok(&file)).starts_with("Run state: paused for "),
+            "{}",
+            startup_run_line(Some(0), Ok(&file))
+        );
+        assert!(startup_run_line(Some(0), Ok(&file)).ends_with(": Enter on Live ❚❚ Pause"));
+        assert_eq!(
+            startup_run_line(Some(3), Ok(&file)),
+            "Run state: the login service isn't running"
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     /// v7.7 ticket 247: doctor shows the run state while the service is active (from its
