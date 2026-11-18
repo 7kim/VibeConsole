@@ -345,6 +345,10 @@ struct Terminal {
     original: Option<libc::termios>,
     stop: Arc<AtomicBool>,
     signals: Vec<signal_hook::SigId>,
+    /// v7.7 ticket 226: which signal set `stop` (0: none, or a stop from inside).
+    stopped_by: Arc<std::sync::atomic::AtomicUsize>,
+    /// The stop line is written once.
+    stop_journaled: bool,
     input: Option<midi::Input>,
     detector: Detector,
     motion: crate::motion::Motion,
@@ -1132,6 +1136,8 @@ impl Terminal {
             program_snapshot: None,
             original,
             stop: Arc::new(AtomicBool::new(false)),
+            stopped_by: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            stop_journaled: false,
             signals: Vec::new(),
             input: None,
             detector: Detector::default(),
@@ -1262,6 +1268,12 @@ impl Terminal {
             terminal.signals.push(signal_hook::flag::register(
                 signal,
                 Arc::clone(&terminal.stop),
+            )?);
+            // v7.7 ticket 226: and which one it was, for the journal.
+            terminal.signals.push(signal_hook::flag::register_usize(
+                signal,
+                Arc::clone(&terminal.stopped_by),
+                signal as usize,
             )?);
         }
         let Some(original) = original else {
@@ -5062,6 +5074,22 @@ impl Terminal {
     fn tick(&mut self) -> Result<()> {
         if self.stop.load(Ordering::Relaxed) {
             self.pause()?;
+            // v7.7 ticket 226: held keys are released (above); then the journal gets the
+            // pause and which signal stopped the run, once, before Drop's quit line.
+            if self.drawn && !self.stop_journaled {
+                self.stop_journaled = true;
+                self.journal_status();
+                let signal = match self.stopped_by.load(Ordering::Relaxed) as i32 {
+                    signal_hook::consts::SIGINT => "SIGINT (Ctrl+C)",
+                    signal_hook::consts::SIGTERM => "SIGTERM",
+                    signal_hook::consts::SIGHUP => "SIGHUP (terminal closed)",
+                    signal_hook::consts::SIGQUIT => "SIGQUIT",
+                    _ => "a stop request",
+                };
+                self.journal(&format!(
+                    "Terminal run | stopped by {signal} | held keys released"
+                ));
+            }
             return Err(STOPPED.into());
         }
         if let Err(error) = self.follow_controller() {
@@ -16784,6 +16812,43 @@ mod tests {
         let paused = play.journal.pop().unwrap();
         assert_eq!(play.journal, expected);
         assert!(paused.starts_with(&format!("{run} | PAUSED")), "{paused}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 226: a run stopped by a signal journals the pause and one line naming the
+    /// signal, after held keys are released and before quit; a second tick adds nothing.
+    #[test]
+    fn a_signal_stop_journals_the_pause_and_the_signal_before_quit() {
+        let (dir, mut ui, _ran, [.., shift]) = configure_session("signal-stop");
+        ui.context_verified = true;
+        ui.at_menu = true;
+        ui.script = Some(Play::default());
+        ui.draw("").unwrap();
+        ui.handle_events(vec![Event::Press(shift)]).unwrap();
+        ui.stopped_by
+            .store(signal_hook::consts::SIGTERM as usize, Ordering::SeqCst);
+        ui.stop.store(true, Ordering::SeqCst);
+        assert!(ui.tick().unwrap_err().to_string() == STOPPED);
+        let recorded = &ui.output.as_ref().unwrap().recorded;
+        assert!(
+            (recorded.iter().rev())
+                .find(|(k, _)| *k == evdev::KeyCode::KEY_LEFTSHIFT)
+                .is_some_and(|(_, down)| !down),
+            "Shift released before the line"
+        );
+        let _ = ui.tick();
+        let play = ui.script.as_ref().unwrap();
+        let n = play.journal.len();
+        assert!(
+            play.journal[n - 2].contains("| PAUSED"),
+            "{:?}",
+            play.journal
+        );
+        assert_eq!(
+            play.journal[n - 1],
+            "Terminal run | stopped by SIGTERM | held keys released"
+        );
+        drop(ui); // Drop writes the quit line after it
         std::fs::remove_dir_all(dir).unwrap();
     }
 
