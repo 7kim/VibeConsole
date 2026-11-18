@@ -1390,6 +1390,26 @@ impl Terminal {
             })
             .collect()
     }
+    /// v7.7 ticket 231: what the lights show and who sets it, from the same `alert_states`
+    /// the lights use: `Lights: finished · session /home/me/other`, or that they rest.
+    fn lights_holder(&self) -> String {
+        let sources = self.alert_states();
+        let states = sources.iter().map(|(_, s)| *s).collect::<Vec<_>>();
+        let Some(i) = crate::status::busy_index(&states) else {
+            return "Lights: resting (every agent and session idle)".into();
+        };
+        let state = crate::status::BUSY[i];
+        let who = (sources.iter())
+            .find(|(_, s)| *s == state)
+            .map_or("", |(who, _)| who.as_str());
+        if self.light_test.is_some() {
+            format!("Lights: {state} · Test the lights")
+        } else if self.agent_states.iter().any(|(name, _, _)| name == who) {
+            format!("Lights: {state} · agent {who}")
+        } else {
+            format!("Lights: {state} · session {who}")
+        }
+    }
     /// v7.7 ticket 151: every agent and outside session, most urgent first: needs input,
     /// decision, working, idle, finished (stable within a state).
     fn agent_rows(&self) -> Vec<AgentRow> {
@@ -2899,7 +2919,12 @@ impl Terminal {
         let mut panes = vec![
             ("Live".to_owned(), buttons),
             (
-                "Agents · most urgent first · Enter: go to the agent".to_owned(),
+                // v7.7 ticket 231: what holds the lights, in the title (one line, cut when
+                // narrow; it adds no row, so the selection is unchanged).
+                format!(
+                    "Agents · most urgent first · Enter: go to the agent · {}",
+                    self.lights_holder()
+                ),
                 agents,
             ),
         ];
@@ -23553,6 +23578,41 @@ mod tests {
             lights,
             "nothing saved"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 231: Live's Agents pane names what holds the lights: a finished outside
+    /// session while claude is idle; the most urgent of two busy states; resting when idle.
+    #[test]
+    fn live_names_what_holds_the_lights() {
+        let (dir, mut ui, _ran, _) = configure_session("light-holder");
+        let title = |ui: &Terminal| {
+            (ui.live_panes(240, 0).into_iter())
+                .map(|(title, _)| title)
+                .find(|t| t.starts_with("Agents"))
+                .unwrap()
+        };
+        ui.agent_states = vec![("claude".into(), "claude".into(), "idle")];
+        ui.light_sessions = vec![("/home/me/other".into(), "finished", 0)];
+        assert!(
+            title(&ui).ends_with("Lights: finished · session /home/me/other"),
+            "{}",
+            title(&ui)
+        );
+        ui.agent_states[0].2 = "thinking"; // thinking is more urgent than finished
+        assert!(
+            title(&ui).ends_with("Lights: thinking · agent claude"),
+            "{}",
+            title(&ui)
+        );
+        ui.agent_states[0].2 = "idle";
+        ui.light_sessions[0].1 = "idle";
+        assert!(
+            title(&ui).ends_with("Lights: resting (every agent and session idle)"),
+            "{}",
+            title(&ui)
+        );
+        drop(ui);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
