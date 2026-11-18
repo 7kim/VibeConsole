@@ -631,17 +631,20 @@ pub struct DevicePatterns {
     /// clock on every RGB device, so they pulse together; off: each device's own firmware
     /// effect, as before.
     pub rgb_in_step: bool,
+    /// v7.7 ticket 237 (lights.json v4): the in-step cycle, in ms (1000–20000), for a breath
+    /// or spectrum that sets none.
+    pub rgb_step_period: u16,
 }
 /// v7.7 ticket 212: the cycle of an in-step breath or spectrum that sets none, so the
-/// Razer frames and the G502 run at the same speed.
-/// ponytail: one fixed default; a setting for it when someone wants another.
+/// Razer frames and the G502 run at the same speed. Ticket 237: the shipped default of the
+/// Status light patterns setting, and what older lights.json files load.
 pub const STEP_PERIOD_MS: u16 = 4000;
 /// v7.7 ticket 212: an in-step effect at `ms` into its cycle, as the static colour to write
 /// now. Breath fades its colour by its form (sine, square, triangle, sawtooth; shark-fin and
 /// exponential as sine) up to its intensity; two colours take a cycle each; spectrum turns
 /// the hue once a period. None: an effect that isn't stepped (it stays the firmware's).
-pub fn rgb_frame(effect: Rgb, ms: u128) -> Option<Rgb> {
-    let period = |t: Timing| u128::from(t.period.unwrap_or(STEP_PERIOD_MS).max(1));
+pub fn rgb_frame(effect: Rgb, ms: u128, default: u16) -> Option<Rgb> {
+    let period = |t: Timing| u128::from(t.period.unwrap_or(default).max(1));
     let peak = |t: Timing| f64::from(t.intensity.unwrap_or(100).min(100)) / 100.0;
     let scale = |c: Colour, level: f64| c.map(|v| (f64::from(v) * level).round() as u8);
     let fade = |x: f64, form: Option<u8>| match form.map(|f| FORMS[usize::from(f) % FORMS.len()]) {
@@ -677,9 +680,9 @@ pub fn rgb_frame(effect: Rgb, ms: u128) -> Option<Rgb> {
 }
 /// v7.7 ticket 212: what the G502 is sent for an in-step effect: breath and spectrum get the
 /// period the Razer frames use, so it pulses at their speed.
-pub fn in_step_mouse(effect: Rgb) -> Rgb {
+pub fn in_step_mouse(effect: Rgb, default: u16) -> Rgb {
     let fill = |t: Timing| Timing {
-        period: Some(t.period.unwrap_or(STEP_PERIOD_MS)),
+        period: Some(t.period.unwrap_or(default)),
         ..t
     };
     match effect {
@@ -1652,7 +1655,7 @@ mod tests {
     #[test]
     fn in_step_frames_follow_one_clock() {
         use super::*;
-        let frame = |w: &str, ms| rgb_frame(parse_rgb(w).unwrap(), ms);
+        let frame = |w: &str, ms| rgb_frame(parse_rgb(w).unwrap(), ms, STEP_PERIOD_MS);
         let blue = |b| Some(Rgb::Static([0, 0, b]));
         let w = "breath #0000ff period=5000 form=sine intensity=25";
         assert_eq!(frame(w, 0), blue(0));
@@ -1696,7 +1699,18 @@ mod tests {
         ] {
             assert_eq!(frame(w, 1234), None, "{w}");
         }
-        let mouse = |w: &str| rgb_word(in_step_mouse(parse_rgb(w).unwrap()));
+        let mouse = |w: &str| rgb_word(in_step_mouse(parse_rgb(w).unwrap(), STEP_PERIOD_MS));
+        // v7.7 ticket 237: a set default period is used by both.
+        assert_eq!(
+            rgb_word(in_step_mouse(parse_rgb("breath #0000ff").unwrap(), 6000)),
+            "breath #0000ff period=6000"
+        );
+        assert_eq!(frame("breath #0000ff", 2000), blue(255));
+        assert_eq!(
+            rgb_frame(parse_rgb("breath #0000ff").unwrap(), 3000, 6000),
+            blue(255),
+            "the peak at half of 6000"
+        );
         assert_eq!(mouse("breath #0000ff"), "breath #0000ff period=4000");
         assert_eq!(
             mouse("breath #0000ff period=5000"),

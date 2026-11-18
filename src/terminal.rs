@@ -4216,16 +4216,19 @@ impl Terminal {
         }
         let ms = now.saturating_duration_since(self.rgb_step.1).as_millis();
         let in_step = lights.as_ref().is_some_and(|p| p.rgb_in_step);
+        let period = lights
+            .as_ref()
+            .map_or(crate::status::STEP_PERIOD_MS, |p| p.rgb_step_period);
         let step = |effect: Option<crate::status::Rgb>| {
             effect.map(|e| {
                 (in_step)
-                    .then(|| crate::status::rgb_frame(e, ms))
+                    .then(|| crate::status::rgb_frame(e, ms, period))
                     .flatten()
                     .unwrap_or(e)
             })
         };
         let framed = |effect: Option<crate::status::Rgb>| {
-            in_step && effect.is_some_and(|e| crate::status::rgb_frame(e, 0).is_some())
+            in_step && effect.is_some_and(|e| crate::status::rgb_frame(e, 0, period).is_some())
         };
         // v7.7 ticket 199: each device shows its own set, else the shared one.
         let keyboard = lights.as_ref().filter(|p| p.rgb_devices[0].on);
@@ -4292,7 +4295,7 @@ impl Terminal {
                 .filter(|_| running)
                 // v7.7 ticket 212: in step, the period the Razer frames use.
                 .map(|e| match p.rgb_in_step {
-                    true => crate::status::in_step_mouse(e),
+                    true => crate::status::in_step_mouse(e, p.rgb_step_period),
                     false => e,
                 })
                 .map_or(MouseWant::Rest, MouseWant::Show),
@@ -9417,6 +9420,8 @@ enum RgbRow {
     OwnEffect(usize, Option<usize>),
     /// v7.7 ticket 212: Keep effects in step.
     InStep,
+    /// v7.7 ticket 237: its period for effects that set none.
+    StepPeriod,
 }
 fn rgb_rows(d: &crate::status::DevicePatterns, names: &[&str; 4]) -> Vec<(String, RgbRow)> {
     use crate::status::{RGB_DEVICES, rgb_name};
@@ -9484,6 +9489,13 @@ fn rgb_rows(d: &crate::status::DevicePatterns, names: &[&str; 4]) -> Vec<(String
         ),
         RgbRow::InStep,
     ));
+    rows.push((
+        format!(
+            "In-step period for breath and spectrum that set none: {} s",
+            f64::from(d.rgb_step_period) / 1000.0
+        ),
+        RgbRow::StepPeriod,
+    ));
     rows
 }
 /// v7.7 ticket 199: act on an RGB row: a switch flips, Per device turns a device's own
@@ -9500,6 +9512,13 @@ fn rgb_row(
     match row {
         RgbRow::Switch(j) => d.rgb_devices[j].on = !d.rgb_devices[j].on,
         RgbRow::InStep => d.rgb_in_step = !d.rgb_in_step,
+        RgbRow::StepPeriod => {
+            let secs = i32::from(d.rgb_step_period / 1000);
+            let title = "In-step period, seconds (1–20), for breath and spectrum that set none";
+            if let Some(secs) = number(ui, title, secs, 1, 20)? {
+                d.rgb_step_period = u16::try_from(secs * 1000)?;
+            }
+        }
         RgbRow::Own(j) => {
             d.rgb_devices[j].own = match d.rgb_devices[j].own {
                 Some(_) => None,
@@ -24028,7 +24047,7 @@ mod tests {
             assert!(breath.is_empty(), "no firmware breath: {d:?}");
         }
         ui.show_rgb_at(at(500));
-        let quarter = crate::status::rgb_frame(thinking, 500).unwrap();
+        let quarter = crate::status::rgb_frame(thinking, 500, 4000).unwrap();
         assert_eq!(quarter, Rgb::Static([0, 0, 127]));
         assert_eq!(
             frames(),
@@ -24054,6 +24073,82 @@ mod tests {
         }
         ui.show_rgb_at(at(3000));
         assert!(frames().iter().all(Vec::is_empty), "paused: no more frames");
+        drop(ui);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 237: the in-step period row (the last) saves 6 s; a breath that sets no
+    /// period then frames over 6000 ms on the keyboard and the fake logirgb gets
+    /// `--period 6000`.
+    #[test]
+    fn the_in_step_period_setting_reaches_frames_and_the_mouse() {
+        use crate::status::Rgb;
+        use std::sync::{Arc, Mutex};
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-step-period-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let kbd = dir.join("razerkbd/0003:1532:021A.0001");
+        std::fs::create_dir_all(&kbd).unwrap();
+        std::fs::write(kbd.join("matrix_brightness"), "200\n").unwrap();
+        for f in ["none", "spectrum", "wave", "static", "breath", "reactive"] {
+            std::fs::write(kbd.join(format!("matrix_effect_{f}")), "").unwrap();
+        }
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut script = Script {
+            keys: [
+                Key::Up,
+                Key::Enter,
+                Key::Up,
+                Key::Up,
+                Key::Enter,
+                Key::Escape,
+            ]
+            .into(),
+            rows: Some(80),
+            ..Default::default()
+        };
+        light_patterns_menu(&mut script, &path).unwrap();
+        assert!(script.keys.is_empty(), "keys left: {:?}", script.keys);
+        assert!(
+            (script.screens.iter())
+                .any(|s| s.contains("In-step period for breath and spectrum that set none: 4 s"))
+        );
+        let mut patterns = mappings::load_config(&path).unwrap().device_lights;
+        assert_eq!(patterns.rgb_step_period, 6000);
+
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        ui.rgb = Some(
+            crate::keyboard::RgbKeyboards::open(&dir.join("razerkbd"), Rgb::SPECTRUM).unwrap(),
+        );
+        ui.mouse = Some(crate::keyboard::MouseWorker::start(fake_logirgb(
+            &calls,
+            Duration::ZERO,
+        )));
+        patterns.keyboard_on = false; // no real lock-key LED in a test
+        for (j, device) in patterns.rgb_devices.iter_mut().enumerate() {
+            device.on = j == 0 || j == 3;
+            device.own = None;
+        }
+        patterns.rgb_shared.states[2] = Rgb::Breath([0, 0, 255], Default::default());
+        ui.device_lights = Some(patterns);
+        ui.agent_states = vec![("claude".into(), "claude".into(), "thinking")];
+        ui.output = Some(crate::keyboard::Output::recording(&[]).unwrap());
+        ui.suspended = false;
+        let start = Instant::now();
+        ui.show_rgb_at(start);
+        ui.show_rgb_at(start + Duration::from_millis(3000));
+        assert_eq!(
+            std::fs::read(kbd.join("matrix_effect_static")).unwrap(),
+            [0, 0, 255],
+            "the peak at half of 6000"
+        );
+        until(|| {
+            (calls.lock().unwrap().iter()).any(|c| {
+                c == "logirgb set -d g502 -z 1 breathe --color #0000ff --period 6000 --preview"
+            })
+        });
         drop(ui);
         std::fs::remove_dir_all(dir).unwrap();
     }

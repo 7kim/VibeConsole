@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "status_lights": true,
   "folders": [],
   "other": {
@@ -101,6 +101,7 @@
     }
   },
   "rgb_in_step": true,
+  "rgb_step_period": 4000,
   "keyboard_rgb": {
     "on": false,
     "own": null,
