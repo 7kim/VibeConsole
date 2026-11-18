@@ -130,6 +130,14 @@ trait Ui {
     fn light_test(&mut self, _state: Option<&'static str>) -> Result<Option<Vec<String>>> {
         Ok(Some(vec!["No lights are driven from this screen.".into()]))
     }
+    /// v7.7 ticket 236: output is paused (Run would start it).
+    fn paused(&self) -> bool {
+        false
+    }
+    /// Run, exactly as the Run command does (its gates and confirmations).
+    fn run_now(&mut self) -> Result<()> {
+        Ok(())
+    }
     /// v7.7 ticket 206: the row last opened in each list, by the list's name, in memory only.
     fn rows_left(&mut self) -> Option<&mut BTreeMap<String, (usize, String)>> {
         None
@@ -5999,6 +6007,14 @@ impl Drop for Terminal {
 }
 
 impl Ui for Terminal {
+    fn paused(&self) -> bool {
+        !self.wanted_run
+    }
+    fn run_now(&mut self) -> Result<()> {
+        let saved = mappings::load_config(&self.path)?.mappings;
+        let mappings = self.context_mappings(&saved);
+        self.run(&mappings)
+    }
     fn light_test(&mut self, state: Option<&'static str>) -> Result<Option<Vec<String>>> {
         if state.is_some() && self.light_test_stopped {
             return Ok(None);
@@ -9766,6 +9782,17 @@ fn test_lights(ui: &mut impl Ui, d: &crate::status::DevicePatterns) -> Result<()
         ("finished", "Finished"),
         ("idle", "Idle (no agents running)"),
     ];
+    // v7.7 ticket 236: paused, the lights show nothing: offer Run first (its own gates).
+    if ui.paused() {
+        let ask = "Paused: lights show only while running. Run now?";
+        if choose(ui, ask, &options(&["Cancel", "Run"]))? != Some(1) {
+            return Ok(());
+        }
+        if let Err(error) = ui.run_now() {
+            choose(ui, &format!("Run: {error}"), &options(&["Back"]))?;
+            return Ok(());
+        }
+    }
     let start = ui.clock();
     let result = (|| -> Result<()> {
         loop {
@@ -14024,6 +14051,9 @@ mod tests {
         clock: Duration,
         /// Each state Test the lights asked for, in order (None: back to the agents).
         light_tests: Vec<Option<&'static str>>,
+        /// v7.7 ticket 236: output paused, and how many times Run was asked for.
+        paused: bool,
+        runs: usize,
         /// The verified program, when a test needs its pad and knob table (v7 ticket 45).
         program: Option<(u8, crate::feedback::Payload)>,
         /// An Xbox controller is connected (v7 ticket 111).
@@ -14146,6 +14176,14 @@ mod tests {
         fn light_test(&mut self, state: Option<&'static str>) -> Result<Option<Vec<String>>> {
             self.light_tests.push(state);
             Ok(Some(Vec::new()))
+        }
+        fn paused(&self) -> bool {
+            self.paused
+        }
+        fn run_now(&mut self) -> Result<()> {
+            self.runs += 1;
+            self.paused = false;
+            Ok(())
         }
         fn key(&mut self) -> Result<Option<Key>> {
             self.clock += Duration::from_secs(1);
@@ -23445,6 +23483,44 @@ mod tests {
             lights,
             "nothing saved"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 236: paused, Test the lights asks first; Cancel runs no test and resumes
+    /// nothing; Run goes through Run, then the test starts.
+    #[test]
+    fn test_the_lights_offers_run_when_paused() {
+        use Key::*;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-test-paused-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut keys = vec![Up, Enter, Enter]; // Test the lights -> Cancel
+        keys.extend([Up, Enter, Down, Enter]); // Test the lights -> Run
+        keys.extend([Other, Other, Escape, Escape]); // two seconds of the test, stop, leave
+        let mut ui = Script {
+            keys: keys.into(),
+            paused: true,
+            ..Default::default()
+        };
+        light_patterns_menu(&mut ui, &path).unwrap();
+        assert!(ui.keys.is_empty(), "keys left: {:?}", ui.keys);
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains("Paused: lights show only while running. Run now?"))
+        );
+        assert_eq!(ui.runs, 1, "Cancel resumed nothing; Run ran once");
+        assert_eq!(
+            ui.light_tests.first(),
+            Some(&Some("needs-decision")),
+            "the test after Run"
+        );
+        assert_eq!(ui.light_tests.last(), Some(&None));
+        let ended = ui.light_tests.iter().filter(|s| s.is_none()).count();
+        assert_eq!(ended, 1, "Cancel ran no test: {:?}", ui.light_tests);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
