@@ -9893,7 +9893,12 @@ fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
         // device's switch and its Per device row (and its own effects while it has them).
         let rgb_rows = rgb_rows(&devices, &NAMES);
         rows.extend(rgb_rows.iter().map(|(text, _)| text.clone()));
-        rows.push("Test the lights: each state for 10 seconds on every light".into());
+        // v7.7 ticket 234: Test the lights first, where it's found; every other row keeps
+        // its number below (index - 1).
+        rows.insert(
+            0,
+            "Test the lights: each state for 10 seconds on every light".into(),
+        );
         let blind = NAMES
             .iter()
             .zip(patterns.states)
@@ -9917,10 +9922,11 @@ fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
         let Some(index) = choose(ui, &title, &rows)? else {
             return Ok(());
         };
-        if index == 18 + rgb_rows.len() {
+        if index == 0 {
             test_lights(ui, &devices)?; // changes nothing saved
             continue;
         }
+        let index = index - 1;
         let result = (|| -> Result<()> {
             if index < 4 {
                 let (tempo, octave) = patterns.states[index];
@@ -22615,9 +22621,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mappings.tsv");
         mappings::save(&path, &[]).unwrap();
-        let mut keys = vec![Down; 7];
+        let mut keys = vec![Down; 8];
         keys.push(Enter); // Xbox lights and rumble: On -> Off
-        keys.extend(vec![Down; 10]);
+        keys.extend(vec![Down; 11]);
         keys.extend([Enter, Down, Enter, Down, Down, Enter]); // Xbox thinking: fast-blink, long
         keys.extend(vec![Up; 40]); // v7 ticket 132: brightness 20 -> 50, and no further
         keys.push(Enter);
@@ -22663,11 +22669,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mappings.tsv");
         mappings::save(&path, &[]).unwrap();
-        let mut keys = vec![Down; 10];
+        let mut keys = vec![Down; 11];
         keys.push(Enter); // Xbox · Thinking
         keys.extend([Down, Down, Down, Enter]); // slow-pulse -> slow-blink
         keys.extend([Enter, Enter]); // rumble off, brightness 20
-        keys.extend(vec![Down; 15]);
+        keys.extend(vec![Down; 16]);
         keys.extend([Enter, Escape, Escape]); // Keyboard · Thinking: look, cancel, leave
         let mut ui = Script {
             keys: keys.into(),
@@ -22720,7 +22726,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mappings.tsv");
         mappings::save(&path, &[]).unwrap();
-        let mut keys = vec![Down; 17];
+        let mut keys = vec![Down; 18];
         keys.push(Enter); // Keyboard lights that show it
         keys.extend([Down, Enter]); // Caps Lock On
         keys.extend([Down, Down, Enter]); // M light On
@@ -23106,7 +23112,7 @@ mod tests {
                 .unwrap_or_default()
         };
         // Down to row 17, open it, Esc back: the parent shows, then Esc leaves.
-        let mut keys = vec![Key::Down; 17];
+        let mut keys = vec![Key::Down; 18];
         keys.extend([Key::Enter, Key::Escape, Key::Escape]);
         let screens = run(&mut ui, keys);
         let back = selected(screens.last().unwrap());
@@ -23348,16 +23354,16 @@ mod tests {
             keys.push(Enter);
             keys
         };
-        let mut keys = vec![Down; 19];
+        let mut keys = vec![Down; 20];
         keys.push(Enter); // RGB, all lights · Needs input: static #ff8000
         keys.extend([Down, Enter]); // breath: one colour
         keys.extend(vec![Down; 6]);
         keys.push(Enter); // Hex code (#rrggbb)…
         keys.extend(typed("#12345g"));
         keys.extend(typed("#123456"));
-        keys.extend(vec![Down; 28]); // past the four brightness rows (ticket 209)
+        keys.extend(vec![Down; 29]); // past the four brightness rows (ticket 209)
         keys.push(Enter); // Keyboard RGB · Per device: follows all lights -> its own
-        keys.extend(vec![Down; 30]);
+        keys.extend(vec![Down; 31]);
         keys.push(Enter); // Keyboard RGB own · Needs input
         keys.extend([Down, Down, Down, Enter]); // reactive
         keys.extend([Down, Down, Down, Down, Enter]); // 4, long
@@ -23413,9 +23419,9 @@ mod tests {
         let path = dir.join("mappings.tsv");
         mappings::save(&path, &[]).unwrap();
         let lights = std::fs::read(dir.join("lights.json")).unwrap();
-        let mut keys = vec![Up, Enter]; // the last row: Test the lights
+        let mut keys = vec![Enter]; // the first row: Test the lights (ticket 234)
         keys.extend(vec![Other; 50]); // nothing pressed for 50 s (one second a read)
-        keys.extend([Up, Enter]);
+        keys.push(Enter);
         keys.extend(vec![Other; 15]);
         keys.extend([Escape, Escape]); // Esc at 15 s, then leave
         let mut ui = Script {
@@ -23497,8 +23503,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mappings.tsv");
         mappings::save(&path, &[]).unwrap();
-        let mut keys = vec![Up, Enter, Enter]; // Test the lights -> Cancel
-        keys.extend([Up, Enter, Down, Enter]); // Test the lights -> Run
+        let mut keys = vec![Enter, Enter]; // Test the lights -> Cancel
+        keys.extend([Enter, Down, Enter]); // Test the lights -> Run
         keys.extend([Other, Other, Escape, Escape]); // two seconds of the test, stop, leave
         let mut ui = Script {
             keys: keys.into(),
@@ -23543,7 +23549,7 @@ mod tests {
         d.rgb_devices[2].on = false; // mousepad: off, its own not named
         d.rgb_devices[2].own = Some(own);
         mappings::save_config(&path, &config).unwrap();
-        let mut keys = vec![Key::Up, Key::Enter];
+        let mut keys = vec![Key::Enter];
         keys.extend(vec![Key::Other; 25]);
         keys.extend([Key::Escape, Key::Escape]);
         let mut ui = Script {
@@ -23756,7 +23762,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mappings.tsv");
         mappings::save(&path, &[]).unwrap();
-        let mut keys = vec![Down; 19];
+        let mut keys = vec![Down; 20];
         keys.push(Enter); // RGB, all lights · Needs input: Static · Orange
         keys.push(Enter); // static, as it is
         keys.extend([Down, Down, Down, Down, Enter]); // Orange -> White
@@ -23803,7 +23809,7 @@ mod tests {
         };
         // RGB, all lights · Needs input, breath, then a row of the colour list.
         let to_colour = |row: usize| {
-            let mut keys = vec![Down; 19];
+            let mut keys = vec![Down; 20];
             keys.extend([Enter, Down, Enter]);
             keys.extend(vec![Down; row]);
             keys.push(Enter);
@@ -23859,7 +23865,7 @@ mod tests {
         let at = (names.iter())
             .position(|c| crate::status::rgb_bytes(c) == [255, 128, 0])
             .unwrap_or(names.len());
-        let mut keys = vec![Down; 19];
+        let mut keys = vec![Down; 20];
         keys.extend([Enter, Enter]); // the row, breath again
         keys.extend(vec![Down; hex - at]);
         keys.push(Enter); // Hex code
@@ -23895,18 +23901,18 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mappings.tsv");
         mappings::save(&path, &[]).unwrap();
-        let mut keys = vec![Down; 33]; // past the four brightness rows (ticket 209)
+        let mut keys = vec![Down; 34]; // past the four brightness rows (ticket 209)
         keys.push(Enter); // Mouse light: Off -> On
-        keys.extend(vec![Down; 20]);
+        keys.extend(vec![Down; 21]);
         keys.push(Enter); // RGB, all lights · Thinking: breath #0000ff
         keys.push(Enter); // breath: one colour
         keys.extend([Down, Down, Enter]); // 2000 ms
         keys.extend([Down, Down, Enter]); // sine
         keys.extend([Down, Down, Enter]); // 50 %
         keys.push(Enter); // blue
-        keys.extend(vec![Down; 34]);
-        keys.push(Enter); // Mouse light · Per device -> its own
         keys.extend(vec![Down; 35]);
+        keys.push(Enter); // Mouse light · Per device -> its own
+        keys.extend(vec![Down; 36]);
         keys.extend([Enter, Escape]); // Mouse light own · Needs a decision -> back
         keys.push(Escape);
         let mut ui = Script {
