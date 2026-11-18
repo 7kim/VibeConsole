@@ -805,12 +805,31 @@ fn run_doctor(
 /// v7.7 ticket 224: the service's run state from the file it writes on each change; read
 /// only. A file that can't be read says why, never guessed.
 fn run_state_line(file: std::result::Result<&Path, String>) -> String {
+    // v7.7 ticket 248: the service rewrites the file only on a change, so its age is how
+    // long this state has lasted; an unreadable time means no duration, never a guess.
+    let since = file
+        .as_ref()
+        .ok()
+        .and_then(|f| fs::metadata(f).ok()?.modified().ok())
+        .and_then(|at| std::time::SystemTime::now().duration_since(at).ok());
     let read =
         file.and_then(|f| fs::read_to_string(f).map_err(|e| format!("{}: {e}", f.display())));
     match read.as_deref().map(str::trim) {
-        Ok(state) if !state.is_empty() => format!("Run state: {state}"),
+        Ok(state) if !state.is_empty() => match (state.strip_prefix("paused:"), since) {
+            (Some(why), Some(since)) => format!("Run state: paused for {}:{why}", how_long(since)),
+            _ => format!("Run state: {state}"),
+        },
         Ok(_) => "Run state: run state unavailable: the service wrote an empty state".into(),
         Err(why) => format!("Run state: run state unavailable: {why}"),
+    }
+}
+/// v7.7 ticket 248: `40 s`, `3 min`, `2 h 5 min`.
+fn how_long(time: std::time::Duration) -> String {
+    let secs = time.as_secs();
+    match secs {
+        0..60 => format!("{secs} s"),
+        60..3600 => format!("{} min", secs / 60),
+        _ => format!("{} h {} min", secs / 3600, secs % 3600 / 60),
     }
 }
 /// v7 ticket 95: what `systemctl --user status`'s exit code means. 0 (running) and 3 (not
@@ -1421,7 +1440,29 @@ mod tests {
         .unwrap();
         assert_eq!(
             run_state_line(Ok(&file)),
-            "Run state: paused: Flow work cancelled; output resumes once it has stopped"
+            "Run state: paused for 0 s: Flow work cancelled; output resumes once it has stopped"
+        );
+        // v7.7 ticket 248: paused 3 minutes ago (the file's time set by the test); running
+        // shows no time.
+        let three = std::time::SystemTime::now() - std::time::Duration::from_secs(185);
+        let age = |path: &Path| {
+            let file = fs::File::options().write(true).open(path).unwrap();
+            file.set_modified(three).unwrap();
+        };
+        age(&file);
+        assert_eq!(
+            run_state_line(Ok(&file)),
+            "Run state: paused for 3 min: Flow work cancelled; output resumes once it has stopped"
+        );
+        fs::write(&file, "running (Program 1 verified)\n").unwrap();
+        age(&file);
+        assert_eq!(
+            run_state_line(Ok(&file)),
+            "Run state: running (Program 1 verified)"
+        );
+        assert_eq!(
+            [40, 185, 7500].map(|s| how_long(std::time::Duration::from_secs(s))),
+            ["40 s", "3 min", "2 h 5 min"]
         );
         fs::write(&file, "").unwrap();
         assert!(run_state_line(Ok(&file)).ends_with("the service wrote an empty state"));
@@ -1489,7 +1530,7 @@ mod tests {
         };
         assert_eq!(
             line(true, Ok(&file)),
-            "Run state: paused: Flow work cancelled; output resumes once it has stopped"
+            "Run state: paused for 0 s: Flow work cancelled; output resumes once it has stopped"
         );
         assert_eq!(
             line(false, Ok(&file)),
