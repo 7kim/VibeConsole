@@ -452,7 +452,7 @@ Suspend/resume, forced-kill recovery, real output-backend failure recovery, and 
 
 ## ✅ Verification and acceptance
 
-Latest recorded software checks (2026-11-13): **238 Rust tests, installation checks, formatting and check pass**. The PTY terminal check (`check-terminal.py`) currently fails at its configure-menu step (it expects `Remove assignment`). Reproduce with `mise run check` (cargo-gate, or `cargo fmt --check`, `cargo check --locked` and `cargo test --locked`, then `mise run pty`), or step by step:
+Latest recorded software checks (2026-11-18, `mise run check`): **formatting, check, 190 + 173 Rust tests, the PTY terminal check and the installation check pass**, the last two under bwrap with the login service running. `mise run pty` refuses to start without bwrap (`scripts/needs-bwrap.sh`). Reproduce with `mise run check` (cargo-gate, or `cargo fmt --check`, `cargo check --locked` and `cargo test --locked`, then `mise run pty`), or step by step:
 
 ```bash
 cargo fmt --check

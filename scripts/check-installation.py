@@ -7,10 +7,25 @@
 import fcntl
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import signal
+import sys
 import tempfile
 import time
+
+# v7.7 ticket 265: the whole check runs under bwrap, like scripts/check-terminal.py: /dev/input
+# hidden (its daemon must not meet a connected controller), no journal, and its own network
+# namespace, so its copies don't meet the running login service's per-user lock.
+if os.environ.get("VIBECONSOLE_CHECK_IN_BWRAP") != "1":
+    if shutil.which("bwrap"):
+        os.environ["VIBECONSOLE_CHECK_IN_BWRAP"] = "1"
+        os.execvp("bwrap", ["bwrap", "--dev-bind", "/", "/", "--unshare-net", "--tmpfs", "/dev/input",
+                            "--tmpfs", "/run/systemd/journal", sys.executable, *sys.argv])
+    if os.environ.get("VIBECONSOLE_PTY_NO_BWRAP") != "1":
+        raise SystemExit("bwrap not found: a connected controller could reach this check's daemon, so "
+                         "nothing was run. Install it: sudo dnf install bubblewrap (or set "
+                         "VIBECONSOLE_PTY_NO_BWRAP=1 on a machine with no input devices).")
 
 binary = Path(__file__).resolve().parents[1] / "target/debug/vibeconsole"
 with tempfile.TemporaryDirectory(prefix="vibeconsole-install-") as directory:

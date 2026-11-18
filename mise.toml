@@ -15,6 +15,7 @@ run = "scripts/install.sh"
 [tasks.pty]
 description = "Debug build, then the isolated PTY and installation checks (Python through uv)"
 run = [
+  "scripts/needs-bwrap.sh",
   "cargo build --locked",
   "uv run scripts/check-terminal.py",
   "uv run scripts/check-installation.py",
