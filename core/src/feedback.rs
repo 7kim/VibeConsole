@@ -694,6 +694,20 @@ impl Controller {
         }
         Self::spawn(Fake(writes))
     }
+    /// v7.7 ticket 204: a controller that was unplugged: every read and write fails.
+    #[cfg(any(test, feature = "fakes"))]
+    pub fn fake_lost() -> Self {
+        struct Lost;
+        impl Transport for Lost {
+            fn read(&mut self) -> Result<Payload> {
+                Err("device unplugged".into())
+            }
+            fn write(&mut self, _: &Payload) -> Result<()> {
+                Err("device unplugged".into())
+            }
+        }
+        Self::spawn(Lost)
+    }
     fn spawn_verified(
         transport: impl Transport + Send + 'static,
         expected: Option<Payload>,

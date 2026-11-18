@@ -388,6 +388,10 @@ struct Terminal {
     rgb_step: (Option<usize>, Instant),
     /// v7.7 ticket 225: the pointer stick is off centre, so the wait for a key is short.
     pointer_moving: bool,
+    /// v7.7 ticket 204: why output was last paused (a key, a click, an event; never prompt text).
+    pause_cause: String,
+    /// How the last Live row was opened: "Enter", "click", or "Find" (it put the cursor there).
+    opened_by: &'static str,
     /// v7.7 ticket 214: under the login service, Flow work that was running ended without
     /// the keyboard (cancelled or failed): why. Output resumes once the work has stopped.
     flow_rescue: Option<String>,
@@ -533,17 +537,21 @@ struct Terminal {
 }
 
 impl Terminal {
-    fn run_label(&self) -> &'static str {
+    fn run_label(&self) -> String {
         if !self.wanted_run {
-            "PAUSED"
+            // v7.7 ticket 204: with its cause.
+            match self.pause_cause.as_str() {
+                "" => "PAUSED".into(),
+                cause => format!("PAUSED ({cause})"),
+            }
         } else if !self.context_verified {
-            "RUNNING (detecting program; actions inactive)"
+            "RUNNING (detecting program; actions inactive)".into()
         } else if self.suspended {
-            "RUNNING (menu open; actions suspended)"
+            "RUNNING (menu open; actions suspended)".into()
         } else if self.retry.is_some() || self.connecting {
-            "RUNNING (waiting for MIDI/readiness)"
+            "RUNNING (waiting for MIDI/readiness)".into()
         } else {
-            "RUNNING"
+            "RUNNING".into()
         }
     }
 
@@ -560,7 +568,8 @@ impl Terminal {
                 "unverified"
             }
         );
-        match self.run_label().strip_prefix("RUNNING") {
+        let label = self.run_label();
+        match label.strip_prefix("RUNNING") {
             Some("") => format!("running ({program})"),
             // v7.7 ticket 253: unverified, the notice says why and how to recover.
             Some(more) if !self.context_verified && !self.notice.is_empty() => format!(
@@ -573,10 +582,18 @@ impl Terminal {
                 more.trim().trim_matches(['(', ')'])
             ),
             None => {
-                let why = [&self.error, &self.notice]
+                // v7.7 ticket 204: the cause first, then what went wrong (the error, which
+                // names its stage), else the notice.
+                let why = [&self.pause_cause, &self.error]
                     .into_iter()
-                    .find(|t| !t.is_empty())
-                    .map_or("no reason recorded", |t| t.as_str());
+                    .filter(|t| !t.is_empty())
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                let why = match (why.is_empty(), self.notice.is_empty()) {
+                    (false, _) => why.join(" · "),
+                    (true, false) => self.notice.clone(),
+                    (true, true) => "no reason recorded".into(),
+                };
                 format!("paused: {why}")
             }
         }
@@ -597,7 +614,7 @@ impl Terminal {
         let line = [
             "Terminal run",
             &program,
-            self.run_label(),
+            &self.run_label(),
             &self.notice,
             &self.error,
         ]
@@ -638,7 +655,7 @@ impl Terminal {
             .as_ref()
             .map(|o| o.keyboard.status(|control| self.name(control)))
             .unwrap_or_else(|| format!("PAUSED | {} saved assignments", self.run_mappings.len()));
-        let state = state.replacen("PAUSED", self.run_label(), 1);
+        let state = state.replacen("PAUSED", &self.run_label(), 1);
         let feedback = if !self.feedback_allowed
             && (self.idle.enabled() || self.run_mappings.iter().any(|m| m.feedback.enabled()))
         {
@@ -1170,6 +1187,8 @@ impl Terminal {
             light_test_stopped: false,
             rgb_step: (None, Instant::now()),
             pointer_moving: false,
+            pause_cause: String::new(),
+            opened_by: "Enter",
             flow_rescue: None,
             #[cfg(not(test))]
             flow_hears: crate::actions::flow_hears,
@@ -2115,6 +2134,7 @@ impl Terminal {
         if let Some((tab, entry)) = picked {
             self.tab = tab;
             self.menu = entry;
+            self.opened_by = "Find"; // v7.7 ticket 204: Enter there pauses as /pause
             self.read_view(None);
         }
         Ok(())
@@ -3381,12 +3401,23 @@ impl Terminal {
         // Cancelled work never answers: let the derived state show instead of a stale "sent".
         self.phases.retain(|_, phase| *phase != Phase::Sent);
     }
-    fn pause(&mut self) -> Result<()> {
+    /// v7.7 ticket 204: every pause names its cause, kept for the screen, the journal line
+    /// (ticket 203) and the run state (ticket 224). Held keys are released (suspend) as before.
+    fn pause(&mut self, cause: &str) -> Result<()> {
+        self.pause_cause = cause.to_owned();
         self.wanted_run = false;
         self.suspend()
     }
+    /// v7.7 ticket 204: Live's ❚❚ Pause, named by the key, the click, or Find's /pause.
+    fn pause_by(&mut self, opened_by: &str) -> Result<()> {
+        self.pause(match opened_by {
+            "click" => "click on Live ❚❚ Pause",
+            "Find" => "/pause",
+            _ => "Enter on Live ❚❚ Pause",
+        })
+    }
     fn reset_confirmed(&mut self, current: &mut Vec<Mapping>) -> Result<PathBuf> {
-        self.pause()?;
+        self.pause("Reset settings")?;
         if let Some(mut controller) = self.controller.take() {
             self.resolver = None;
             controller.finish()?;
@@ -3590,7 +3621,7 @@ impl Terminal {
         // v7.7 ticket 241: a repair started by hand allows one automatic repair again.
         self.flow_auto_repaired = false;
         let resume = self.wanted_run;
-        self.pause()?;
+        self.pause("Start or repair Wispr Flow")?;
         self.retry = None;
         self.connecting = false;
         self.actions.submit(crate::actions::Action::Flow, node)?;
@@ -3666,12 +3697,12 @@ impl Terminal {
                     continue;
                 }
             }
-            self.pause()?;
+            self.pause("automatic Flow startup failed")?;
             self.error = format!("Automatic Flow startup failed after {tries} tries: {error}");
             eprintln!("{}", self.error);
             return Ok(false);
         }
-        self.pause()?;
+        self.pause("automatic Flow startup stopped")?;
         self.error = format!("Automatic Flow startup stopped after {tries} tries");
         eprintln!("{}", self.error);
         Ok(false)
@@ -4471,7 +4502,7 @@ impl Terminal {
                 match output.observe(event) {
                     Ok(Some((pad, active))) => {
                         if let Err(error) = self.transition(pad, active) {
-                            self.pause()?;
+                            self.pause("action or feedback rejected")?;
                             self.error = format!("Action/feedback rejected: {error}; paused");
                         }
                     }
@@ -4479,7 +4510,7 @@ impl Terminal {
                     Err(error) => {
                         self.error = format!("Keyboard output failed: {error}");
                         self.output = None;
-                        self.pause()?;
+                        self.pause("keyboard output failed")?;
                         break;
                     }
                 }
@@ -5065,6 +5096,8 @@ impl Terminal {
                 let service_piano = piano && self.original.is_none();
                 if piano && !service_piano {
                     self.wanted_run = false;
+                    // v7.7 ticket 204: this pause names its cause too (suspend follows).
+                    self.pause_cause = "piano keys need Run confirmation".into();
                 }
                 self.suspended = !self.wanted_run || service_piano;
                 let all = self.with_gamepad(&self.run_mappings)?;
@@ -5159,19 +5192,19 @@ impl Terminal {
     }
     fn tick(&mut self) -> Result<()> {
         if self.stop.load(Ordering::Relaxed) {
-            self.pause()?;
+            let signal = match self.stopped_by.load(Ordering::Relaxed) as i32 {
+                signal_hook::consts::SIGINT => "SIGINT (Ctrl+C)",
+                signal_hook::consts::SIGTERM => "SIGTERM",
+                signal_hook::consts::SIGHUP => "SIGHUP (terminal closed)",
+                signal_hook::consts::SIGQUIT => "SIGQUIT",
+                _ => "a stop request",
+            };
+            self.pause(&format!("stopped by {signal}"))?;
             // v7.7 ticket 226: held keys are released (above); then the journal gets the
             // pause and which signal stopped the run, once, before Drop's quit line.
             if self.drawn && !self.stop_journaled {
                 self.stop_journaled = true;
                 self.journal_status();
-                let signal = match self.stopped_by.load(Ordering::Relaxed) as i32 {
-                    signal_hook::consts::SIGINT => "SIGINT (Ctrl+C)",
-                    signal_hook::consts::SIGTERM => "SIGTERM",
-                    signal_hook::consts::SIGHUP => "SIGHUP (terminal closed)",
-                    signal_hook::consts::SIGQUIT => "SIGQUIT",
-                    _ => "a stop request",
-                };
                 self.journal(&format!(
                     "Terminal run | stopped by {signal} | held keys released"
                 ));
@@ -5180,7 +5213,7 @@ impl Terminal {
         }
         if let Err(error) = self.follow_controller() {
             self.abandon_program()?;
-            self.pause()?;
+            self.pause("controller lost")?;
             self.follow_retry = Instant::now() + Duration::from_secs(1);
             self.error = error.to_string();
             if !self.at_menu {
@@ -5188,7 +5221,7 @@ impl Terminal {
             }
         }
         if let Err(error) = self.retry_connection() {
-            self.pause()?;
+            self.pause("MIDI reconnection failed")?;
             self.retry = None;
             self.connecting = false;
             self.error = error.to_string();
@@ -5210,14 +5243,14 @@ impl Terminal {
             if self.follow_apps {
                 if let Ok(config) = mappings::load_config(&self.path) {
                     if let Err(error) = self.follow_focus(&config) {
-                        self.pause()?;
+                        self.pause("app profile change failed")?;
                         self.error = format!("Profile change failed: {error}; paused");
                     }
                 }
             }
         }
         if let Err(error) = self.status_lights() {
-            self.pause()?;
+            self.pause("status lights failed")?;
             self.error = format!("Status lights failed: {error}; paused");
         }
         // Prompt pastes and sequence shortcuts: the worker waits for each answer.
@@ -5267,7 +5300,7 @@ impl Terminal {
                 match self.prepare_connection() {
                     Ok(()) => self.notice = notice,
                     Err(error) => {
-                        self.pause()?;
+                        self.pause("resume after Flow failed")?;
                         self.connecting = false;
                         self.error = format!("Flow ready, but output stays paused: {error}");
                     }
@@ -5380,7 +5413,7 @@ impl Terminal {
             let mut events = match self.motion.observe(message) {
                 Ok(events) => events,
                 Err(error) => {
-                    self.pause()?;
+                    self.pause("knob or joystick event rejected")?;
                     self.error = error.to_string();
                     Vec::new()
                 }
@@ -5461,7 +5494,7 @@ impl Terminal {
             .as_ref()
             .is_some_and(|pad| !pad.connected().is_empty());
         if let Err(error) = self.gamepad_only(connected) {
-            self.pause()?;
+            self.pause("Xbox-only run failed")?;
             self.error = format!("Xbox-only run failed: {error}; paused");
         }
         self.quit_holds();
@@ -5482,7 +5515,7 @@ impl Terminal {
             Some(Ok(fired)) => {
                 for (pad, active) in fired {
                     if let Err(error) = self.transition(pad, active) {
-                        self.pause()?;
+                        self.pause("action or feedback rejected")?;
                         self.error = format!("Action/feedback rejected: {error}; paused");
                     }
                 }
@@ -5490,7 +5523,7 @@ impl Terminal {
             Some(Err(error)) => {
                 self.error = format!("Keyboard output failed: {error}");
                 self.output = None;
-                self.pause()?;
+                self.pause("keyboard output failed")?;
             }
             None => {}
         }
@@ -5500,7 +5533,7 @@ impl Terminal {
                 self.feedback_allowed = false;
                 self.program_snapshot = None;
                 self.resolver = None;
-                self.pause()?;
+                self.pause("controller lost")?;
                 self.error = error.to_string();
                 if let Some(mut controller) = self.controller.take() {
                     match controller.finish() {
@@ -5518,7 +5551,7 @@ impl Terminal {
         }
         if self.connecting {
             if let Err(error) = self.prepare_connection() {
-                self.pause()?;
+                self.pause("MIDI connection failed")?;
                 self.retry = None;
                 self.connecting = false;
                 self.error = format!("Connection remains paused: {error}");
@@ -6099,7 +6132,7 @@ impl Ui for Terminal {
             self.show_lock_light();
             self.show_rgb();
             if let Err(error) = self.status_lights() {
-                self.pause()?;
+                self.pause("status lights failed")?;
                 self.error = format!("Status lights failed: {error}; paused");
             }
         }
@@ -13153,7 +13186,7 @@ pub fn daemon(path: &Path, current: Vec<Mapping>) -> Result<()> {
     if let Ok(file) = &state_file {
         let _ = std::fs::remove_file(file); // stopped: nothing to report
     }
-    ui.pause()
+    ui.pause("the login service stopped")
 }
 
 // Command pane groups (SPEC-UI). Numbers are the command ids `start` dispatches on.
@@ -13566,16 +13599,29 @@ fn command_menu(ui: &mut Terminal) -> Result<Option<usize>> {
         let text = String::new();
         ui.draw(&text)?;
         // v7.7 ticket 159: a click on a tab switches to it; on a row it does what Enter does.
+        // v7.7 ticket 204: how the row is opened, for a pause's cause. Find leaves "Find"
+        // until the cursor moves; a click is a click.
         let key = match ui.key()? {
             Some(Key::Click(column, row)) => match ui.clicked(column, row) {
                 Some(Clicked::Tab(tab)) => Some(Key::Character(b"1234567890"[tab])),
                 Some(Clicked::Entry(entry)) => {
                     ui.menu = entry;
+                    ui.opened_by = "click";
                     Some(Key::Enter)
                 }
                 None => None,
             },
-            key => key,
+            Some(Key::Enter) if ui.opened_by != "Find" => {
+                ui.opened_by = "Enter";
+                Some(Key::Enter)
+            }
+            Some(Key::Enter) => Some(Key::Enter),
+            key => {
+                if key.is_some() {
+                    ui.opened_by = "Enter";
+                }
+                key
+            }
         };
         if ui.tab == 0 && key.is_some() {
             ui.live_start = false;
@@ -13712,7 +13758,7 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
     let flow_ready = match ui.startup_flow() {
         Ok(()) => true,
         Err(error) => {
-            ui.pause()?;
+            ui.pause("automatic Flow startup failed")?;
             ui.error = format!("Automatic Flow startup failed: {error}");
             false
         }
@@ -13741,6 +13787,8 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
         let Some(command) = command_menu(&mut ui)? else {
             return quit_login(&mut ui, false); // Esc quits like Quit
         };
+        // v7.7 ticket 204: how this command was opened, used once.
+        let opened_by = std::mem::replace(&mut ui.opened_by, "Enter");
         if matches!(command, 11 | 21) {
             return quit_login(&mut ui, command == 21);
         }
@@ -13750,7 +13798,8 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
         let agents = mappings::read_config(path).ok().map(|c| c.agents);
         let result = match command {
             0 => ui.configure(path, &mut current),
-            1 if ui.wanted_run => ui.pause(),
+            // v7.7 ticket 204: the key, the click, or Find's /pause that did it.
+            1 if ui.wanted_run => ui.pause_by(opened_by),
             1 if !ui.context_verified => choose(
                 &mut ui,
                 "Select /prog-select before running.\nChoose the matching hardware program, then select Run. No mapped actions are enabled yet.",
@@ -13778,7 +13827,7 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
                     .collect::<Vec<_>>();
                 choose(&mut ui, "Saved assignments", &labels).map(|_| ())
             }
-            3 => ui.pause(),
+            3 => ui.pause("pause command"),
             5 => ui.release_all(),
             6 => ui.learn().and_then(|pad| {
                 if let Some(pad) = pad {
@@ -13975,7 +14024,7 @@ Running/paused mode is retained; held keys and toggles start inactive.",
                 ui.feedback_allowed = false;
                 ui.program_snapshot = None;
             }
-            let cleanup = ui.pause();
+            let cleanup = ui.pause("MIDI input lost");
             if ui.stop.load(Ordering::Relaxed) {
                 return Err(error);
             }
@@ -14361,7 +14410,7 @@ mod tests {
         assert_eq!(ui.context, 0);
         assert!(ui.context_verified && ui.wanted_run && !ui.suspended);
         assert!(ui.output.is_none()); // no mappings means no virtual keyboard needed
-        ui.pause().unwrap();
+        ui.pause("test").unwrap();
         ui.observe_program(observation(Some(2))).unwrap();
         assert_eq!(ui.context, 2);
         assert!(ui.context_verified && !ui.wanted_run && ui.suspended);
@@ -15138,7 +15187,7 @@ mod tests {
         ui.context_verified = true;
         ui.run_mode(&[], false).unwrap();
         assert!(ui.wanted_run && !ui.suspended);
-        ui.pause().unwrap();
+        ui.pause("test").unwrap();
         assert!(!ui.wanted_run);
         ui.suspend().unwrap();
         assert!(!ui.wanted_run); // selector/configuration must not undo explicit pause
@@ -16975,7 +17024,7 @@ mod tests {
         ui.draw("").unwrap(); // nothing changed: no second line
         press(&mut ui);
         press(&mut ui);
-        ui.pause().unwrap(); // what Live's ❚❚ Pause does
+        ui.pause("test").unwrap(); // what Live's ❚❚ Pause does
         ui.draw("").unwrap();
         ui.draw("").unwrap();
         let mut play = ui.script.take().unwrap();
@@ -22073,7 +22122,7 @@ mod tests {
         ui.begin_flow(None).unwrap();
         assert!(!held(&ui), "held keys released when Flow work began");
         std::thread::sleep(Duration::from_millis(30));
-        ui.pause().unwrap(); // the cancel
+        ui.pause("test").unwrap(); // the cancel
         ui.error = "Status lights failed: test; paused".into();
         let before = ui.output.as_ref().unwrap().recorded.len();
         ui.handle_events(vec![Event::Press(down)]).unwrap(); // queued while paused
@@ -22112,13 +22161,21 @@ mod tests {
         ui.actions = slow_flow(Arc::new(AtomicBool::new(false)));
         ui.at_menu = true;
         ui.begin_flow(None).unwrap();
-        assert!(ui.run_state().starts_with("paused: Flow operation pending"));
-        ui.pause().unwrap();
+        // v7.7 ticket 204: the cause first, then the error.
+        assert!(
+            ui.run_state()
+                .starts_with("paused: Start or repair Wispr Flow · Flow operation pending"),
+            "{}",
+            ui.run_state()
+        );
+        ui.pause("Enter on Live ❚❚ Pause").unwrap();
         assert_eq!(
             ui.run_state(),
-            "paused: Flow work cancelled; output resumes once it has stopped"
+            "paused: Enter on Live ❚❚ Pause · Flow work cancelled; output resumes once it has stopped"
         );
         ui.error.clear();
+        assert_eq!(ui.run_state(), "paused: Enter on Live ❚❚ Pause");
+        ui.pause_cause.clear();
         ui.notice.clear();
         assert_eq!(ui.run_state(), "paused: no reason recorded");
         ui.wanted_run = true;
@@ -22177,10 +22234,13 @@ mod tests {
         let read = || std::fs::read_to_string(&file).unwrap();
         write_run_state(&file, &ui.run_state()).unwrap();
         assert_eq!(read(), "running (Program 1 verified)\n");
-        ui.pause().unwrap();
+        ui.pause("status lights failed").unwrap();
         ui.error = "Status lights failed: test; paused".into();
         write_run_state(&file, &ui.run_state()).unwrap();
-        assert_eq!(read(), "paused: Status lights failed: test; paused\n");
+        assert_eq!(
+            read(),
+            "paused: status lights failed · Status lights failed: test; paused\n"
+        );
         let leftovers = std::fs::read_dir(file.parent().unwrap()).unwrap().count();
         assert_eq!(leftovers, 1, "no staging file left behind");
         ui.wanted_run = true;
@@ -22270,7 +22330,7 @@ mod tests {
         ui.actions = slow_flow(Arc::new(AtomicBool::new(false)));
         ui.at_menu = true;
         ui.begin_flow(None).unwrap();
-        ui.pause().unwrap();
+        ui.pause("test").unwrap();
         assert!(
             ui.error
                 .starts_with("Flow work cancelled; output remains paused."),
@@ -23068,9 +23128,129 @@ mod tests {
             ..Play::default()
         });
         assert_eq!(command_menu(&mut ui).unwrap(), Some(1), "❚❚ Pause");
-        ui.pause().unwrap(); // what the session does with it while running
+        ui.pause("test").unwrap(); // what the session does with it while running
         assert!(!ui.wanted_run);
         drop(ui);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 204: Enter on Live's ❚❚ Pause, a click on it, and Find's /pause each
+    /// pause with their own cause, on screen and in the journal line; held keys go first.
+    #[test]
+    fn each_way_to_pause_shows_and_journals_its_cause() {
+        let (dir, mut ui, _ran, [.., shift]) = configure_session("pause-cause");
+        ui.status_at = Instant::now() + Duration::from_secs(3600); // no agents appear
+        ui.context_verified = true;
+        ui.at_menu = true;
+        // Draw Live once to find the Pause button.
+        ui.script = Some(Play {
+            steps: [Key::Escape].map(Step::Key).into(),
+            ..Play::default()
+        });
+        command_menu(&mut ui).unwrap();
+        let rows = plain_rows(&ui.rendered);
+        let (row, line) = (rows.iter().enumerate())
+            .find(|(_, l)| l.contains("❚❚ Pause"))
+            .unwrap();
+        let column = line[..line.find("❚❚ Pause").unwrap()].chars().count() + 2;
+        let click = Key::Click(column as u16, row as u16 + 1);
+        let mut find = vec![Key::Character(b'/')];
+        find.extend(typed("pause"));
+        find.extend([Key::Enter, Key::Enter]);
+        for (keys, cause) in [
+            (vec![Key::Enter], "Enter on Live ❚❚ Pause"),
+            (vec![click], "click on Live ❚❚ Pause"),
+            (find, "/pause"),
+        ] {
+            ui.handle_events(vec![Event::Press(shift)]).unwrap();
+            // Live as it reads now (❚❚ Pause again after a resume): what the click lands on.
+            ui.script = Some(Play {
+                steps: [Key::Escape].map(Step::Key).into(),
+                ..Play::default()
+            });
+            command_menu(&mut ui).unwrap();
+            ui.script = Some(Play {
+                steps: keys.into_iter().map(Step::Key).collect(),
+                ..Play::default()
+            });
+            ui.menu = 0; // ❚❚ Pause, Live's first row (the first Escape ended its start row)
+            assert_eq!(command_menu(&mut ui).unwrap(), Some(1), "{cause}");
+            // What the session does with it while running.
+            let opened_by = std::mem::replace(&mut ui.opened_by, "Enter");
+            ui.pause_by(opened_by).unwrap();
+            let recorded = &ui.output.as_ref().unwrap().recorded;
+            assert_eq!(
+                (recorded.iter().rev()).find(|(k, _)| *k == evdev::KeyCode::KEY_LEFTSHIFT),
+                Some(&(evdev::KeyCode::KEY_LEFTSHIFT, false)),
+                "held keys released"
+            );
+            ui.notice.clear();
+            ui.error.clear();
+            assert_eq!(ui.run_state(), format!("paused: {cause}"));
+            ui.draw("").unwrap();
+            assert!(
+                ui.rendered.contains(&format!("PAUSED ({cause})")),
+                "{cause}"
+            );
+            let play = ui.script.take().unwrap();
+            let logged = play.journal.last().unwrap();
+            assert!(logged.contains(&format!("| PAUSED ({cause})")), "{logged}");
+            resume(&mut ui);
+            ui.handle_events(vec![Event::Release(shift, crate::ReleaseType::NoteOff)])
+                .unwrap();
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 204: a rejected action and a lost controller pause with the cause and
+    /// the error that names its stage.
+    #[test]
+    fn a_rejected_action_and_a_lost_controller_name_their_stage() {
+        let (dir, mut ui, _ran, [.., shift]) = configure_session("pause-stage");
+        let pad = Control::from_note(10, 40).unwrap();
+        let gone = Mapping::new_action(
+            pad,
+            mappings::Input::Pad,
+            crate::actions::Action::SavedSequence("gone".into()),
+        )
+        .unwrap();
+        ui.run_mappings.push(gone);
+        let mut output = crate::keyboard::Output::recording(&ui.run_mappings).unwrap();
+        output.keyboard.resume();
+        ui.output = Some(output);
+        ui.context_verified = true;
+        ui.at_menu = true;
+        ui.handle_events(vec![Event::Press(shift)]).unwrap();
+        assert_eq!(shifts(&ui), 1);
+        ui.handle_events(vec![Event::Press(pad)]).unwrap();
+        assert!(!ui.wanted_run);
+        let recorded = &ui.output.as_ref().unwrap().recorded;
+        assert_eq!(
+            (recorded.iter().rev()).find(|(k, _)| *k == evdev::KeyCode::KEY_LEFTSHIFT),
+            Some(&(evdev::KeyCode::KEY_LEFTSHIFT, false)),
+            "held keys released"
+        );
+        assert_eq!(
+            ui.run_state(),
+            "paused: action or feedback rejected · Action/feedback rejected: validation: saved sequence gone is gone; paused"
+        );
+
+        resume(&mut ui);
+        ui.error.clear();
+        ui.controller = Some(crate::feedback::Controller::fake_lost());
+        for _ in 0..200 {
+            ui.tick().unwrap();
+            if !ui.wanted_run {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let state = ui.run_state();
+        assert!(
+            state.starts_with("paused: controller lost · Snapshot rejected: device unplugged"),
+            "{state}"
+        );
+        assert!(ui.controller.is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -24866,6 +25046,12 @@ mod tests {
         ui.wanted_run = true;
         ui.suspended = false;
         (dir, ui, ran, pads)
+    }
+    /// ▶ Resume as `configure_session` starts the run: `run_mode` would open the real MIDI.
+    fn resume(ui: &mut Terminal) {
+        ui.output.as_mut().unwrap().keyboard.resume();
+        ui.wanted_run = true;
+        ui.suspended = false;
     }
     fn tap(pad: Control) -> Step {
         Step::Events(vec![
