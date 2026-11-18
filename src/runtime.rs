@@ -790,6 +790,17 @@ fn login_doctor(installed: bool, mut systemctl: impl FnMut(&[&str]) -> Result<()
         "Login service: WARNING installed but disabled, so VibeConsole won't start at login; turn it on with: vibeconsole startup-enable".into()
     }
 }
+/// v7.7 ticket 224: the service's run state from the file it writes on each change; read
+/// only. A file that can't be read says why, never guessed.
+fn run_state_line(file: std::result::Result<&Path, String>) -> String {
+    let read =
+        file.and_then(|f| fs::read_to_string(f).map_err(|e| format!("{}: {e}", f.display())));
+    match read.as_deref().map(str::trim) {
+        Ok(state) if !state.is_empty() => format!("Run state: {state}"),
+        Ok(_) => "Run state: run state unavailable: the service wrote an empty state".into(),
+        Err(why) => format!("Run state: run state unavailable: {why}"),
+    }
+}
 /// v7 ticket 95: what `systemctl --user status`'s exit code means. 0 (running) and 3 (not
 /// running) are answers, already printed by systemctl; anything else (4: no such unit) or a
 /// kill by a signal is an error naming its stage.
@@ -884,6 +895,14 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                 .status()
                 .map_err(|e| format!("startup-status: systemctl unavailable: {e}"))?;
             status_outcome(status.code())?;
+            // v7.7 ticket 224: whether output runs or is paused, as the service reports it.
+            if status.code() == Some(0) {
+                let file = crate::status::state_dir().map(|d| d.join(crate::terminal::RUN_STATE));
+                println!(
+                    "{}",
+                    run_state_line(file.as_deref().map_err(|e| e.to_string()))
+                );
+            }
         }
         "startup-disable" => {
             systemctl(&["disable", "--now", "vibeconsole.service"])?;
@@ -1361,6 +1380,44 @@ mod tests {
         // No config: the line says so, and nothing is a problem.
         let (line, problem) = light_check("RGB keyboard", None, Err("RGB keyboard: x".into()));
         assert!(line.ends_with("switch unknown: the config didn't load") && problem.is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+    /// v7.7 ticket 224: startup-status shows the run state the service wrote, and says why
+    /// when it can't be read; it only reads.
+    #[test]
+    fn startup_status_reads_the_run_state_or_says_why_not() {
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-run-state-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(crate::terminal::RUN_STATE);
+        fs::write(&file, "running (Program 1 verified)\n").unwrap();
+        assert_eq!(
+            run_state_line(Ok(&file)),
+            "Run state: running (Program 1 verified)"
+        );
+        fs::write(
+            &file,
+            "paused: Flow work cancelled; output resumes once it has stopped\n",
+        )
+        .unwrap();
+        assert_eq!(
+            run_state_line(Ok(&file)),
+            "Run state: paused: Flow work cancelled; output resumes once it has stopped"
+        );
+        fs::write(&file, "").unwrap();
+        assert!(run_state_line(Ok(&file)).ends_with("the service wrote an empty state"));
+        fs::remove_file(&file).unwrap();
+        let missing = run_state_line(Ok(&file));
+        assert!(
+            missing.starts_with("Run state: run state unavailable: ")
+                && missing.contains("run-state"),
+            "{missing}"
+        );
+        assert_eq!(
+            run_state_line(Err("XDG_RUNTIME_DIR is not set".into())),
+            "Run state: run state unavailable: XDG_RUNTIME_DIR is not set"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
     /// v7 ticket 01: doctor warns when the unit is installed but won't start at login.

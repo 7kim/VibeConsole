@@ -88,7 +88,7 @@ fn help(color: bool) -> String {
                     "startup-stop",
                     "Stop it now (keys released, lights restored)".into(),
                 ),
-                ("startup-status", "Show whether it runs".into()),
+                ("startup-status", "Show whether it runs, and whether output is running or paused".into()),
                 ("startup-disable", "Stop starting at login".into()),
                 ("daemon", "Run as the service (the unit calls this)".into()),
             ],

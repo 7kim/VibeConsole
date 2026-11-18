@@ -369,7 +369,7 @@ Use `./target/debug/vibeconsole` for the current local build. After installation
 | `vibeconsole uninstall` | Remove managed installation/service; preserve mappings |
 | `vibeconsole startup-enable` | Opt into the managed user service without starting it immediately; old flags are accepted and ignored |
 | `vibeconsole startup-start` | Start the managed service |
-| `vibeconsole startup-status` | Show service status |
+| `vibeconsole startup-status` | Show service status, then `Run state:` running (with the program) or paused and why, as the service reports it |
 | `vibeconsole startup-stop` | Stop the service |
 | `vibeconsole startup-disable` | Disable and stop the service |
 | `vibeconsole daemon` | Headless program-following runtime used by the optional service; old flags are accepted and ignored |

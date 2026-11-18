@@ -523,6 +523,34 @@ impl Terminal {
         }
     }
 
+    /// v7.7 ticket 224: the run state `startup-status` shows: running, with the program and
+    /// what it waits for, or paused with why (the error, else the notice, else "no reason
+    /// recorded"; never guessed).
+    fn run_state(&self) -> String {
+        let program = format!(
+            "Program {} {}",
+            self.context + 1,
+            if self.context_verified {
+                "verified"
+            } else {
+                "unverified"
+            }
+        );
+        match self.run_label().strip_prefix("RUNNING") {
+            Some("") => format!("running ({program})"),
+            Some(more) => format!(
+                "running ({program}; {})",
+                more.trim().trim_matches(['(', ')'])
+            ),
+            None => {
+                let why = [&self.error, &self.notice]
+                    .into_iter()
+                    .find(|t| !t.is_empty())
+                    .map_or("no reason recorded", |t| t.as_str());
+                format!("paused: {why}")
+            }
+        }
+    }
     /// v7.7 ticket 203: a terminal run leaves its status changes in the journal, as the login
     /// service does: run state, program, notice and error, one line per change. Notices and
     /// errors name controls, actions and prompt files, never what was pasted or typed.
@@ -3214,6 +3242,8 @@ impl Terminal {
         let rescue = self.flow_pending && self.flow_resume && self.service();
         if rescue {
             self.flow_rescue = Some("Flow work cancelled".into());
+            // v7.7 ticket 224: said while it waits, not "Flow operation pending".
+            self.error = "Flow work cancelled; output resumes once it has stopped".into();
         } else if self.flow_pending {
             self.error = "Flow work cancelled; output remains paused. If Flow was already quit, reopen it manually after VibeConsole's keyboard is ready, test physical Shift, then Run.".into();
         }
@@ -9123,6 +9153,8 @@ fn quit_login(ui: &mut impl Ui, until_next_login: bool) -> Result<()> {
     ui.login(Login::SetRunOnQuit(start)).map(drop)
 }
 
+/// v7.7 ticket 224: the service's run state, in `status::state_dir()`, for `startup-status`.
+pub const RUN_STATE: &str = "run-state";
 /// v7.7 ticket 214: the note `doctor` reads from the service, in `status::state_dir()`.
 pub const FLOW_MARKER: &str = "flow-deaf";
 const FLOW_DEAF: &str = "Flow can't hear VibeConsole's keyboard";
@@ -12768,6 +12800,9 @@ pub fn daemon(path: &Path, current: Vec<Mapping>) -> Result<()> {
     }
     ui.at_menu = true;
     let mut previous = String::new();
+    // v7.7 ticket 224: the run state for `startup-status`, written on each change.
+    let state_file = crate::status::state_dir().map(|d| d.join(RUN_STATE));
+    let mut stated = String::new();
     while !ui.stop.load(Ordering::Relaxed) {
         if let Err(error) = ui.tick() {
             if ui.stop.load(Ordering::Relaxed) {
@@ -12798,7 +12833,22 @@ pub fn daemon(path: &Path, current: Vec<Mapping>) -> Result<()> {
             eprintln!("{status}");
             previous = status;
         }
+        let state = ui.run_state();
+        if state != stated {
+            if let Ok(file) = &state_file {
+                let written = std::fs::create_dir_all(file.parent().unwrap_or(file))
+                    .map_err(Into::into)
+                    .and_then(|()| crate::actions::write_atomic(file, &format!("{state}\n")));
+                if let Err(error) = written {
+                    eprintln!("run state not written for startup-status: {error}");
+                }
+            }
+            stated = state;
+        }
         std::thread::sleep(Duration::from_millis(20));
+    }
+    if let Ok(file) = &state_file {
+        let _ = std::fs::remove_file(file); // stopped: nothing to report
     }
     ui.pause()
 }
@@ -21651,6 +21701,34 @@ mod tests {
         );
         let note = std::fs::read_to_string(dir.join(FLOW_MARKER)).unwrap();
         assert!(note.starts_with("Flow can't hear VibeConsole's keyboard (the login service"));
+        drop(ui);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 224: the run state `startup-status` shows: running with its program, and
+    /// paused after a cancelled Flow repair under the service with why.
+    #[test]
+    fn run_state_says_running_or_paused_and_why() {
+        let (dir, mut ui, _ran, _) = configure_session("run-state");
+        assert_eq!(ui.run_state(), "running (Program 1 verified)");
+        ui.actions = slow_flow(Arc::new(AtomicBool::new(false)));
+        ui.at_menu = true;
+        ui.begin_flow(None).unwrap();
+        assert!(ui.run_state().starts_with("paused: Flow operation pending"));
+        ui.pause().unwrap();
+        assert_eq!(
+            ui.run_state(),
+            "paused: Flow work cancelled; output resumes once it has stopped"
+        );
+        ui.error.clear();
+        ui.notice.clear();
+        assert_eq!(ui.run_state(), "paused: no reason recorded");
+        ui.wanted_run = true;
+        ui.context_verified = false;
+        assert_eq!(
+            ui.run_state(),
+            "running (Program 1 unverified; detecting program; actions inactive)"
+        );
         drop(ui);
         std::fs::remove_dir_all(dir).unwrap();
     }
