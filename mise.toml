@@ -65,3 +65,12 @@ state="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/vibeconsole/run-state"
 if [ -f "$state" ]; then cat "$state"; else echo "no run state: the login service isn't running"; fi
 exit "$first"
 '''
+
+[tasks.all]
+description = "Every check before a version ends: check (cargo-gate, pty), config-isolation, idle; stops at the first failure"
+# mise ticket 08. Each step keeps its own isolation; this adds none.
+run = [
+  "mise run check",
+  "mise run config-isolation",
+  "mise run idle",
+]
