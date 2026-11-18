@@ -887,6 +887,53 @@ pub fn rgb_word(effect: Rgb) -> String {
         Rgb::Spectrum(t) => format!("spectrum{}", timing(Timing { form: None, ..t })),
     }
 }
+/// v7.7 ticket 210: a colour as shown: its name when its bytes equal a named colour, else
+/// `custom #rrggbb`.
+pub fn colour_name(c: Colour) -> String {
+    match COLOURS.iter().find(|n| rgb_bytes(n) == c) {
+        Some(n) => n[..1].to_uppercase() + &n[1..],
+        None => format!("custom {}", colour_word(c)),
+    }
+}
+/// v7.7 ticket 210: the effect as shown on screen: `Static · White`,
+/// `Breath · Blue · 5 s · sine · 25%`, `Spectrum · 1 s`. The config keeps `rgb_word`.
+pub fn rgb_name(effect: Rgb) -> String {
+    let timing = |t: Timing| {
+        let mut out = Vec::new();
+        if let Some(p) = t.period {
+            out.push(format!("{} s", f64::from(p) / 1000.0));
+        }
+        if let Some(f) = t.form {
+            out.push(FORMS[usize::from(f) % FORMS.len()].to_owned());
+        }
+        if let Some(i) = t.intensity {
+            out.push(format!("{i}%"));
+        }
+        out
+    };
+    let parts = match effect {
+        Rgb::Off => vec!["Off".into()],
+        Rgb::Static(c) => vec!["Static".into(), colour_name(c)],
+        Rgb::Breath(c, t) => [vec!["Breath".into(), colour_name(c)], timing(t)].concat(),
+        Rgb::BreathTwo(a, b) => vec![
+            "Breath".into(),
+            format!("{} and {}", colour_name(a), colour_name(b)),
+        ],
+        Rgb::BreathRandom => vec!["Breath".into(), "random colours".into()],
+        Rgb::Reactive(c, s) => [
+            vec!["Reactive".into(), colour_name(c)],
+            s.map(|s| format!("speed {s}")).into_iter().collect(),
+        ]
+        .concat(),
+        Rgb::Wave(d) => [
+            vec!["Wave".into()],
+            d.map(|d| format!("direction {d}")).into_iter().collect(),
+        ]
+        .concat(),
+        Rgb::Spectrum(t) => [vec!["Spectrum".into()], timing(Timing { form: None, ..t })].concat(),
+    };
+    parts.join(" · ")
+}
 /// v7.7 ticket 199: an effect word, checked in full; also the older `static-red` words
 /// (config v32–34), whose named colour becomes its RGB.
 pub fn parse_rgb(word: &str) -> Result<Rgb> {
@@ -1539,6 +1586,31 @@ fn hooks(events: &[(&str, Option<&str>, &str)]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// v7.7 ticket 210: effects show words; only a colour off the named list shows its code.
+    #[test]
+    fn effects_show_their_names() {
+        use super::*;
+        let name = |w: &str| rgb_name(parse_rgb(w).unwrap());
+        assert_eq!(name("static #ffffff"), "Static · White");
+        assert_eq!(name("static #12ab34"), "Static · custom #12ab34");
+        assert_eq!(
+            name("breath #0000ff period=5000 form=sine intensity=25"),
+            "Breath · Blue · 5 s · sine · 25%"
+        );
+        assert_eq!(name("spectrum period=1000"), "Spectrum · 1 s");
+        assert_eq!(name("breath #ff0000 #00ff00"), "Breath · Red and Green");
+        assert_eq!(name("breath random"), "Breath · random colours");
+        assert_eq!(
+            name("reactive #ff8000 speed=3"),
+            "Reactive · Orange · speed 3"
+        );
+        assert_eq!(name("wave direction=2"), "Wave · direction 2");
+        assert_eq!(name("off"), "Off");
+        assert_eq!(
+            name("breath #8000ff period=1500"),
+            "Breath · Purple · 1.5 s"
+        );
+    }
     /// v7.7 ticket 162: the status line JSON becomes the agent's context file; tokens are
     /// summed from the transcript and only new lines are read; installing wraps an existing
     /// `statusLine` command and keeps it, once.

@@ -873,7 +873,7 @@ impl RgbKeyboards {
         if !lacking.is_empty() {
             self.unavailable = Some(format!(
                 "{} unavailable on {}: it has no {} effect",
-                crate::status::rgb_word(effect),
+                crate::status::rgb_name(effect),
                 lacking.join(", "),
                 rgb_write(effect).0.trim_start_matches("matrix_effect_")
             ));
@@ -994,7 +994,7 @@ impl MouseLight {
             Rgb::BreathTwo(..) | Rgb::BreathRandom | Rgb::Wave(_) | Rgb::Reactive(..) => {
                 self.unavailable = Some(format!(
                     "{} unavailable on the G502 logo: it shows off, static, breath with one colour and spectrum only",
-                    crate::status::rgb_word(effect)
+                    crate::status::rgb_name(effect)
                 ));
                 return Ok(());
             }
@@ -2317,7 +2317,7 @@ mod tests {
         speakers.show(Rgb::Reactive([255, 0, 0], None), 90).unwrap();
         assert_eq!(
             speakers.unavailable.take().as_deref(),
-            Some("reactive #ff0000 unavailable on Razer Nommo Chroma: it has no reactive effect")
+            Some("Reactive · Red unavailable on Razer Nommo Chroma: it has no reactive effect")
         );
         assert!(
             !nommo.join("matrix_effect_reactive").exists(),
@@ -2379,7 +2379,7 @@ mod tests {
         assert_eq!(
             mouse.unavailable.take().as_deref(),
             Some(
-                "wave unavailable on the G502 logo: it shows off, static, breath with one colour and spectrum only"
+                "Wave unavailable on the G502 logo: it shows off, static, breath with one colour and spectrum only"
             )
         );
         drop(mouse);

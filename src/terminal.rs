@@ -8958,7 +8958,7 @@ enum RgbRow {
     OwnEffect(usize, Option<usize>),
 }
 fn rgb_rows(d: &crate::status::DevicePatterns, names: &[&str; 4]) -> Vec<(String, RgbRow)> {
-    use crate::status::{RGB_DEVICES, rgb_word};
+    use crate::status::{RGB_DEVICES, rgb_name};
     let short = |name: &str| name.split(" (").next().unwrap_or(name).to_owned();
     let on = |b: bool| if b { "On" } else { "Off" };
     let mut rows = Vec::new();
@@ -8967,15 +8967,15 @@ fn rgb_rows(d: &crate::status::DevicePatterns, names: &[&str; 4]) -> Vec<(String
             format!(
                 "RGB, all lights · {}: {}",
                 short(names[i]),
-                rgb_word(*effect)
+                rgb_name(*effect)
             ),
             RgbRow::Shared(Some(i)),
         ));
     }
     rows.push((
         format!(
-            "RGB, all lights · resting effect (idle, paused, after quit; the mouse rests on its own): {}",
-            rgb_word(d.rgb_shared.rest)
+            "RGB, all lights · resting effect: {} (idle, paused, after quit; the mouse rests on its own)",
+            rgb_name(d.rgb_shared.rest)
         ),
         RgbRow::Shared(None),
     ));
@@ -9004,13 +9004,13 @@ fn rgb_rows(d: &crate::status::DevicePatterns, names: &[&str; 4]) -> Vec<(String
         if let Some(own) = device.own {
             for (i, effect) in own.states.iter().enumerate() {
                 rows.push((
-                    format!("{name} own · {}: {}", short(names[i]), rgb_word(*effect)),
+                    format!("{name} own · {}: {}", short(names[i]), rgb_name(*effect)),
                     RgbRow::OwnEffect(j, Some(i)),
                 ));
             }
             if j != 3 {
                 rows.push((
-                    format!("{name} own · resting effect: {}", rgb_word(own.rest)),
+                    format!("{name} own · resting effect: {}", rgb_name(own.rest)),
                     RgbRow::OwnEffect(j, None),
                 ));
             }
@@ -21818,7 +21818,7 @@ mod tests {
         ui.show_rgb();
         assert!(
             ui.notice
-                .contains("reactive #ff0000 unavailable on Razer Nommo Chroma"),
+                .contains("Reactive · Red unavailable on Razer Nommo Chroma"),
             "{}",
             ui.notice
         );
@@ -21880,7 +21880,7 @@ mod tests {
         ui.agent_states[0].2 = "thinking";
         until(|| {
             ui.show_rgb();
-            ui.notice.contains("wave unavailable on the G502 logo")
+            ui.notice.contains("Wave unavailable on the G502 logo")
         });
         ui.agent_states[0].2 = "idle";
         ui.show_rgb();
@@ -22396,6 +22396,55 @@ mod tests {
             "started from the shared set"
         );
         assert!(lights.rgb_devices[1..].iter().all(|d| d.own.is_none()));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 210: the shared set's rows show effect and colour names, a typed colour
+    /// shows `custom #rrggbb`, and opening the screen leaves lights.json as it was.
+    #[test]
+    fn rgb_rows_show_effect_and_colour_names() {
+        use crate::status::Rgb;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-rgb-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let mut config = mappings::Config::default();
+        config.device_lights.rgb_shared.states[0] = Rgb::Static([255, 255, 255]);
+        config.device_lights.rgb_shared.rest = Rgb::Static([0x12, 0xab, 0x34]);
+        mappings::save_config(&path, &config).unwrap();
+        let lights = dir.join("lights.json");
+        let before = std::fs::read(&lights).unwrap();
+        let mut ui = Script {
+            keys: [Key::Escape].into(),
+            rows: Some(80),
+            ..Default::default()
+        };
+        light_patterns_menu(&mut ui, &path).unwrap();
+        let screen = ui
+            .screens
+            .iter()
+            .find(|s| s.contains("RGB, all lights"))
+            .expect("Status light patterns screen");
+        let shared = screen
+            .lines()
+            .filter(|l| l.contains("RGB, all lights"))
+            .collect::<Vec<_>>();
+        assert_eq!(shared.len(), 5, "{screen}");
+        assert!(shared[0].ends_with(": Static · White"), "{}", shared[0]);
+        assert!(
+            shared[4].contains("resting effect: Static · custom #12ab34"),
+            "{}",
+            shared[4]
+        );
+        for row in &shared[..4] {
+            assert!(!row.contains('#'), "a code on a named row: {row}");
+        }
+        assert_eq!(
+            std::fs::read(&lights).unwrap(),
+            before,
+            "lights.json untouched"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
