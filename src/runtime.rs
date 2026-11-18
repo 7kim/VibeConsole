@@ -623,6 +623,9 @@ pub enum Fix {
     Run { args: Vec<String>, ask: String },
     /// What to run yourself.
     Show(String),
+    /// v7.7 ticket 242: VibeConsole's own Start or repair Wispr Flow (a transition: held keys
+    /// released, output paused while it runs), after asking.
+    Flow,
 }
 /// What a missing prerequisite's Fedora package is called.
 const PACKAGES: [(&str, &str); 5] = [

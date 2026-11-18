@@ -1774,6 +1774,16 @@ impl Terminal {
                 }
             }
         }
+        // v7.7 ticket 242: the login service's note that Flow can't hear its keyboard, from
+        // the file doctor reads; no file, nothing listed.
+        let flow = (self.flow_marker.as_ref()).and_then(|m| std::fs::read_to_string(m).ok());
+        if let Some(note) = flow.map(|n| n.trim().to_owned()).filter(|n| !n.is_empty()) {
+            self.problems.push(crate::runtime::Problem {
+                stage: "Wispr Flow",
+                message: note,
+                fix: crate::runtime::Fix::Flow,
+            });
+        }
         self.problems_at = Some(Instant::now());
     }
     /// v7.7 ticket 157: Enter on a problem: a fixed command asks first and runs through the
@@ -1799,6 +1809,22 @@ impl Terminal {
                     &format!("{}\n\n{text}", problem.message),
                     &options(&["Back"]),
                 )?;
+            }
+            Fix::Flow => {
+                let text = format!(
+                    "{}\n\nStart or repair Wispr Flow: held keys are released and output pauses while it runs.",
+                    problem.message
+                );
+                if choose(
+                    self,
+                    &text,
+                    &options(&["Cancel", "Start or repair Wispr Flow"]),
+                )? == Some(1)
+                {
+                    self.start_flow()
+                        .map_err(|e| format!("{}: {e}", problem.stage))?;
+                    self.read_problems();
+                }
             }
         }
         Ok(())
@@ -2426,6 +2452,9 @@ impl Terminal {
                                 let fix = match problem.fix {
                                     crate::runtime::Fix::Run { .. } => "Enter: fix (asks first)",
                                     crate::runtime::Fix::Show(_) => "Enter: what to run",
+                                    crate::runtime::Fix::Flow => {
+                                        "Enter: start or repair Wispr Flow (asks first)"
+                                    }
                                 };
                                 let line = format!("! {} · {fix}", problem.message);
                                 (vec![line], Some(Open::Problem(index)))
@@ -17054,6 +17083,49 @@ mod tests {
             "the click opened /list"
         );
         assert_eq!(ui.tab, 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 242: the service's "Flow can't hear" note shows in System with its fix;
+    /// Enter asks, then starts the Flow repair through the (fake) action runner. Without
+    /// the note, nothing is listed.
+    #[test]
+    fn system_lists_the_flow_note_and_its_fix_starts_the_repair() {
+        use crate::runtime::Fix;
+        let (dir, mut ui, ran, _) = configure_session("flow-note");
+        ui.status_at = Instant::now() + Duration::from_secs(3600);
+        let marker = dir.join(FLOW_MARKER);
+        ui.flow_marker = Some(marker.clone());
+        ui.read_problems();
+        assert!(
+            !ui.problems.iter().any(|p| p.fix == Fix::Flow),
+            "no note, nothing"
+        );
+        std::fs::write(&marker, "Flow can't hear VibeConsole's keyboard (the login service, after: Flow repair failed); select Start or repair Wispr Flow\n").unwrap();
+        ui.read_problems();
+        let index = (ui.problems.iter())
+            .position(|p| p.fix == Fix::Flow)
+            .expect("the note is listed");
+        assert!(
+            ui.problems[index]
+                .message
+                .starts_with("Flow can't hear VibeConsole's keyboard")
+        );
+        ui.script = Some(Play {
+            steps: VecDeque::from([Step::Key(Key::Down), Step::Key(Key::Enter)]),
+            ..Play::default()
+        });
+        ui.fix_problem(index).unwrap();
+        let play = ui.script.take().unwrap();
+        assert!(
+            play.screens
+                .iter()
+                .any(|s| s.contains("held keys are released"))
+        );
+        assert!(ui.flow_pending, "the repair started");
+        let action = ran.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(action.flow(), "{action:?}");
+        drop(ui);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
