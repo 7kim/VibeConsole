@@ -396,8 +396,8 @@ struct Terminal {
     program_keys: crate::gamepad::ProgramKeys,
     last_xbox: bool,
     /// v7.8 ticket 19: the key VibeConsole sent for the last Xbox press, and when: that key
-    /// arriving back in the terminal keeps the Xbox hints.
-    xbox_sent: Option<(String, Instant)>,
+    /// arriving back in the terminal keeps the Xbox hints. Ticket 38: a combination too.
+    xbox_sent: Option<(Vec<String>, Instant)>,
     /// v7.8 ticket 19: the Xbox hint lines (tab menu, other screens), built with `hint_line`.
     xbox_hints: [String; 2],
     /// v7 ticket 113: the keyboard's lock-key LEDs, opened when first needed; a failure to
@@ -4730,19 +4730,21 @@ impl Terminal {
         self.xbox_hints = [true, false].map(|menu| self.xbox_hints_for(config, menu));
     }
     /// v7.8 ticket 19: an Xbox event: the hints follow the Xbox, and a press remembers the
-    /// key its mapping sends, which then arrives back in the terminal.
+    /// key (ticket 38: or combination) its mapping sends, which then arrives back in the
+    /// terminal.
     fn xbox_used(&mut self, event: &Event) {
         self.last_xbox = true;
         if let Event::Press(control) = event {
             if let Ok(Some(m)) = self.fired(*control) {
-                if let (crate::actions::Action::Shortcut, [key]) = (&m.action, m.keys.as_slice()) {
-                    self.xbox_sent = Some((key.clone(), Instant::now()));
+                if m.action == crate::actions::Action::Shortcut && !m.keys.is_empty() {
+                    self.xbox_sent = Some((m.keys, Instant::now()));
                 }
             }
         }
     }
     /// v7.8 ticket 19: a terminal key: the keyboard is the device used last, unless it is
-    /// the key VibeConsole sent for an Xbox press in the last 250 ms.
+    /// the key (ticket 38: or combination) VibeConsole sent for an Xbox press in the last
+    /// 250 ms.
     fn keyboard_used(&mut self, key: &Key) {
         let name = match key {
             Key::Enter => "Enter".to_owned(),
@@ -4757,9 +4759,27 @@ impl Terminal {
             Key::Character(c) => char::from(*c).to_string(),
             _ => String::new(),
         };
+        // Ticket 38: a combination (RT's Ctrl+Tab) arrives as its last key when the terminal
+        // drops the modifiers, or as the form its modifiers give it: a CSI `u`/`~` report
+        // (any modifier), Shift+Tab, Ctrl+letter's control byte, Alt's ESC prefix.
         let echo = (self.xbox_sent.as_ref()).is_some_and(|(sent, at)| {
+            let Some((last, modifiers)) = sent.split_last() else {
+                return false;
+            };
+            let has = |m: &str| modifiers.iter().any(|k| k.trim_start_matches("Right") == m);
+            let modified = match key {
+                Key::Other => !modifiers.is_empty(),
+                Key::BackTab => last == "Tab" && has("Shift"),
+                Key::InvalidInput => {
+                    has("Ctrl") && last.len() == 1 && last.as_bytes()[0].is_ascii_alphabetic()
+                }
+                Key::Escape => has("Alt"),
+                _ => false,
+            };
             at.elapsed() < Duration::from_millis(250)
-                && (sent.eq_ignore_ascii_case(&name) || (sent == "slash" && name == "/"))
+                && (last.eq_ignore_ascii_case(&name)
+                    || (last == "slash" && name == "/")
+                    || modified)
         });
         if echo {
             self.xbox_sent = None; // one echo per press
@@ -20778,6 +20798,44 @@ mod tests {
         assert!(remapped.contains("Ⓨ confirm"), "{remapped}");
         assert!(remapped.contains("Ⓐ select"), "{remapped}");
         assert!(!remapped.contains("Ⓐ confirm"), "{remapped}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.8 ticket 38: RT's built-in Ctrl+Tab arrives back as plain Tab (most terminals drop
+    /// the Ctrl) or as a key the terminal can't name (a CSI `9;5u`): either echo keeps the
+    /// Xbox hints, once; a second key, or one too late, brings the keyboard's back.
+    #[test]
+    fn xbox_hints_survive_a_combination_echo() {
+        let (dir, mut ui, _ran, _) = configure_session("xbox-combo-echo");
+        ui.refresh_hints(&mappings::load_config(&dir.join("mappings.tsv")).unwrap());
+        let keyboard = ui.screen("").hints;
+        let rt = crate::gamepad::default_layout()
+            .into_iter()
+            .find(|m| m.keys == ["Ctrl", "Tab"])
+            .expect("RT sends Ctrl+Tab")
+            .control;
+        for echo in [Key::Tab, Key::Other] {
+            ui.xbox_used(&Event::Press(rt));
+            let xbox = ui.screen("").hints;
+            assert_ne!(xbox, keyboard);
+            ui.keyboard_used(&echo);
+            assert_eq!(ui.screen("").hints, xbox, "{echo:?} is RT's echo");
+            ui.keyboard_used(&echo);
+            assert_eq!(ui.screen("").hints, keyboard, "only one echo per press");
+        }
+        // Another key is typed, not an echo: Ctrl+Tab never arrives as Esc or Shift+Tab.
+        for typed in [Key::Down, Key::Escape, Key::BackTab] {
+            ui.xbox_used(&Event::Press(rt));
+            ui.keyboard_used(&typed);
+            assert_eq!(ui.screen("").hints, keyboard, "{typed:?} was typed");
+        }
+        // The echo window is 250 ms.
+        ui.xbox_used(&Event::Press(rt));
+        if let Some((_, at)) = &mut ui.xbox_sent {
+            *at -= Duration::from_millis(300);
+        }
+        ui.keyboard_used(&Key::Tab);
+        assert_eq!(ui.screen("").hints, keyboard, "too late to be an echo");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
