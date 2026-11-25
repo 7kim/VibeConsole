@@ -1,6 +1,6 @@
 # Developer tests: Local Markdown (`docs/<version>/developer-tests/`)
 
-Checks only the user can perform (hardware, desktop effects, installs, logins, reboots, real Flow/agents) live in `docs/<version>/developer-tests/`, git-ignored. What the agent can check itself goes in `agent-tests/` instead (see `issue-tracker.md`). A build or simulated test never counts as a developer-test pass. V1–V6 tests are in `archive/tests/`.
+Checks only the user can perform (hardware, desktop effects, installs, logins, reboots, real Flow/agents) live in `docs/<version>/developer-tests/`, git-ignored. What the agent can check itself goes in `agent-tests/` instead (see `issue-tracker.md`). A build or simulated test never counts as a developer-test pass, with one exception: an emulator run (`scripts/emulate/`) that shows every one of a test's boxes may close it, its Result naming the run (the user's agreement, 25 Nov 2026, v7.8 ticket 64). A box it doesn't show (lights, rumble, sound heard, Bluetooth, keys reaching a real app) keeps the test open. V1–V6 tests are in `archive/tests/`.
 
 ## Conventions
 
