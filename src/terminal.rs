@@ -8432,7 +8432,8 @@ fn orca_place(
             && folder
                 .as_ref()
                 .and_then(Option::as_deref)
-                .is_none_or(|f| Path::new(f) == Path::new(&pane.workspace))
+                // v7.8 ticket 69: the folder or any folder inside it, by path component.
+                .is_none_or(|f| Path::new(&pane.workspace).starts_with(f))
     });
     let Some(pane) = panes.next() else {
         return OrcaPlace::NotRunning;
@@ -21588,6 +21589,53 @@ mod tests {
                 .0
                 .pane,
             "tab:omp"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.8 ticket 69: an Orca agent's folder includes the folders inside it, by path
+    /// component; more than one live pane under it stays unknown.
+    #[test]
+    fn orca_agent_folder_matches_workspaces_inside_it() {
+        use crate::status::orca_live_sessions;
+        let (dir, mut ui, _ran, _) = configure_session("orca-folder-match");
+        let mut config = mappings::Config::default();
+        let mut agent = mappings::Agent::new("orca-claude", "claude", "orca-claude").unwrap();
+        agent.host = mappings::Host::Orca;
+        agent.dir = Some("/x/Documents".into());
+        config.agents = vec![agent];
+        ui.agent_states = vec![("orca-claude".into(), "orca-claude".into(), "idle")];
+        ui.agent_places = vec![(mappings::Host::Orca, None)];
+        let reply = |paths: &[&str]| {
+            let worktrees = paths
+                .iter()
+                .enumerate()
+                .map(|(i, path)| {
+                    format!(
+                        r#"{{"hostId":"local","path":"{path}","repo":"r{i}","agents":[
+                        {{"agentType":"claude","paneKey":"tab{i}:claude","state":"working","hasLivePty":true}}]}}"#
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            orca_live_sessions(&format!(
+                r#"{{"result":{{"hostScope":{{"hostIds":["local"]}},"worktrees":[{worktrees}]}}}}"#
+            ))
+            .unwrap()
+        };
+        let word = |ui: &mut Terminal, paths: &[&str]| {
+            ui.orca_places = orca_places(&config, Some(&reply(paths)), &[]);
+            state_word(ui.agent_rows()[0].state)
+        };
+        assert_eq!(word(&mut ui, &["/x/Documents/VibeConsole"]), "WORKING");
+        assert_eq!(word(&mut ui, &["/x/Documents"]), "WORKING");
+        assert_eq!(word(&mut ui, &["/x/Documents-old"]), "NOT RUNNING");
+        assert_eq!(
+            word(
+                &mut ui,
+                &["/x/Documents/VibeConsole", "/x/Documents/Trading"]
+            ),
+            "STATUS UNKNOWN"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
