@@ -340,6 +340,10 @@ trait Transport {
     fn stored_program(&mut self, _slot: u8) -> Result<Payload> {
         Err("stored-program queries unavailable".into())
     }
+    /// v7.7 ticket 270: load stored program `slot` (1–8) into RAM, as /prog-select does.
+    fn select_stored(&mut self, _slot: u8) -> Result<()> {
+        Err("program selection unavailable".into())
+    }
     fn read(&mut self) -> Result<Payload>;
     fn write(&mut self, payload: &Payload) -> Result<()>;
 }
@@ -355,6 +359,9 @@ impl Hardware {
 impl Transport for Hardware {
     fn stored_program(&mut self, slot: u8) -> Result<Payload> {
         self.read_slot(slot)
+    }
+    fn select_stored(&mut self, slot: u8) -> Result<()> {
+        self.select_slot(slot)
     }
     fn read(&mut self) -> Result<Payload> {
         self.read_slot(0)
@@ -417,6 +424,15 @@ fn select_program(transport: &mut impl Programs, context: u8) -> Result<Payload>
         );
     }
     Ok(expected)
+}
+/// The RAM bytes VibeConsole writes for feedback: octave, arpeggiator, tempo (high, low).
+const OWN_FIELDS: [usize; 4] = [0x13, 0x14, 0x1B, 0x1C];
+/// v7.7 ticket 270: the one stored program RAM equals outside VibeConsole's own fields.
+fn own_fields_match(ram: &Payload, programs: &[Payload]) -> Option<u8> {
+    let same = |p: &Payload| (0..ram.len()).all(|i| OWN_FIELDS.contains(&i) || p[i] == ram[i]);
+    let mut matches = programs.iter().enumerate().filter(|(_, p)| same(p));
+    let (context, _) = matches.next()?;
+    matches.next().is_none().then_some(context as u8)
 }
 fn identify_program(ram: &Payload, programs: &[Payload]) -> Option<u8> {
     let mut matches = programs
@@ -741,7 +757,7 @@ impl Controller {
                     }
                 }
             }
-            let original = match transport.read() {
+            let mut original = match transport.read() {
                 Ok(payload) => payload,
                 Err(error) => {
                     let _ = sender.send(Notice::Failed(format!(
@@ -750,6 +766,19 @@ impl Controller {
                     return Ok("No owned hardware fields to restore".into());
                 }
             };
+            // v7.7 ticket 270 (a Safety Rules change the user agreed, 26 Nov 2026): RAM left
+            // with VibeConsole's own feedback (e.g. after a lost link) and otherwise equal to
+            // exactly one stored program: select that program, as /prog-select does, and read
+            // back; it is adopted below only if it now matches exactly.
+            if follow && expected.is_none() && identify_program(&original, &programs).is_none() {
+                if let Some(context) = own_fields_match(&original, &programs) {
+                    if transport.select_stored(context + 1).is_ok() {
+                        if let Ok(again) = transport.read() {
+                            original = again;
+                        }
+                    }
+                }
+            }
             if expected.is_some_and(|expected| expected != original) {
                 let _ = sender.send(Notice::Failed("RAM changed since verified selection; select /prog-select again; no update sent".into()));
                 return Ok("No owned hardware fields to restore".into());
@@ -1339,6 +1368,84 @@ mod tests {
             1,
             "no old-context restoration or queued write"
         );
+    }
+
+    /// v7.7 ticket 270: RAM that differs from exactly one stored program only in the fields
+    /// VibeConsole writes (octave, arpeggiator, tempo) gets that program selected once, read
+    /// back, and is adopted only on an exact match; any other difference, or two candidates,
+    /// writes nothing.
+    #[test]
+    fn follow_reloads_a_program_that_differs_only_in_its_own_fields() {
+        struct Device {
+            ram: Arc<Mutex<Payload>>,
+            slots: Vec<Payload>,
+            selects: Arc<Mutex<Vec<u8>>>,
+        }
+        impl Transport for Device {
+            fn stored_program(&mut self, slot: u8) -> Result<Payload> {
+                Ok(self.slots[slot as usize - 1])
+            }
+            fn select_stored(&mut self, slot: u8) -> Result<()> {
+                self.selects.lock().unwrap().push(slot);
+                *self.ram.lock().unwrap() = self.slots[slot as usize - 1];
+                Ok(())
+            }
+            fn read(&mut self) -> Result<Payload> {
+                Ok(*self.ram.lock().unwrap())
+            }
+            fn write(&mut self, payload: &Payload) -> Result<()> {
+                *self.ram.lock().unwrap() = *payload;
+                Ok(())
+            }
+        }
+        let slots = (0..8)
+            .map(|i| {
+                let mut p = payload();
+                p[80] = i;
+                p
+            })
+            .collect::<Vec<_>>();
+        let detect = |ram: Payload, slots: Vec<Payload>| {
+            let selects = Arc::new(Mutex::new(Vec::new()));
+            let mut controller = Controller::spawn_worker(
+                Device {
+                    ram: Arc::new(Mutex::new(ram)),
+                    slots,
+                    selects: selects.clone(),
+                },
+                None,
+                true,
+                None,
+            );
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let context = loop {
+                controller.poll().unwrap();
+                if let Some(ProgramObservation::Detected { context, .. }) =
+                    controller.program.take()
+                {
+                    break context;
+                }
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(1));
+            };
+            controller.finish().unwrap();
+            let selects = selects.lock().unwrap().clone();
+            (context, selects)
+        };
+        // Program 2 with the arpeggiator and octave VibeConsole left on: reloaded, adopted.
+        let mut lit = slots[1];
+        lit[0x14] = 1 - lit[0x14].min(1);
+        lit[0x13] = 7;
+        assert_eq!(detect(lit, slots.clone()), (Some(1), vec![2]));
+        // Another field differs too: nothing written, not detected.
+        let mut other = lit;
+        other[81] = 17;
+        assert_eq!(detect(other, slots.clone()), (None, vec![]));
+        // Two programs match outside those fields: nothing written.
+        let mut twins = slots.clone();
+        twins[3] = twins[1];
+        twins[3][0x1C] = 99;
+        assert_eq!(detect(lit, twins), (None, vec![]));
     }
 
     #[test]
