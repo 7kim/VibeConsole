@@ -183,6 +183,10 @@ trait Ui {
     fn xbox_program(&self) -> u8 {
         1
     }
+    /// v7.7 ticket 267: the Akai's program names as read from it (else "Program N").
+    fn program_names(&self) -> Vec<String> {
+        (1..=8).map(|n| format!("Program {n}")).collect()
+    }
     /// v7 ticket 129: the driver holding the Xbox controller now, and ALSA's card list.
     fn xbox_audio(&self) -> (Option<&'static str>, String) {
         (None, String::new())
@@ -6211,6 +6215,9 @@ impl Ui for Terminal {
     fn xbox_program(&self) -> u8 {
         self.xbox_program
     }
+    fn program_names(&self) -> Vec<String> {
+        self.program_names.clone()
+    }
     fn xbox_audio(&self) -> (Option<&'static str>, String) {
         let bound = crate::gamepad::bound_drivers();
         let cards = std::fs::read_to_string("/proc/asound/cards").unwrap_or_default();
@@ -7814,13 +7821,20 @@ fn ask_for(ui: &mut impl Ui, path: &Path, kind: AskKind) -> Result<()> {
 /// built into VibeConsole, so every agent gets the same context; Claude Code with the
 /// skills installed is also told to use it by name.
 fn ask(ui: &mut impl Ui, path: &Path, kind: AskKind, request: &str) -> Result<String> {
-    let look = mappings::load_config(path)?.look;
+    let config = mappings::load_config(path)?;
     let home = ui.lookup_env().1;
-    let named = look.default_agent == "Claude Code"
+    let named = config.look.default_agent == "Claude Code"
         && home.is_some_and(|h| crate::runtime::skills_installed(&h));
+    // v7.7 ticket 267: every ask knows the programs by the user's names.
+    let programs = mappings::programs_summary(
+        &config,
+        &ui.program_names(),
+        ui.context(),
+        ui.xbox_program(),
+    );
     ui.ask_agent(&mappings::one_shot(
-        &look,
-        &with_skill(kind, named, request),
+        &config.look,
+        &with_skill(kind, named, &format!("{programs}\n{request}")),
     )?)
 }
 /// v7.7 ticket 185: the AI tab's asks as AI settings names them, each with its kind.
@@ -12565,18 +12579,21 @@ fn lock_on(profile: Option<&str>) -> mappings::Lock {
 
 /// /configure's saved list: the open program's mappings and the Xbox ones (active beside
 /// every program).
-fn listed(mapping: &Mapping, context: u8) -> bool {
-    mapping.context == context || mappings::gamepad_context(mapping.context)
+/// v7.7 ticket 267: the Akai's program in use, and the Xbox program in use (both layers).
+fn listed(mapping: &Mapping, context: u8, xbox_program: u8) -> bool {
+    mapping.context == context
+        || mappings::xbox_program(mapping.context).is_some_and(|(p, _)| p == xbox_program)
 }
 /// The saved list with favourites first (v7 ticket 24), each flagged for its ★.
 fn saved_list<'a>(
     current: &'a [Mapping],
     context: u8,
+    xbox_program: u8,
     favourites: &[String],
 ) -> Vec<(&'a Mapping, bool)> {
     let mut list = current
         .iter()
-        .filter(|m| listed(m, context))
+        .filter(|m| listed(m, context, xbox_program))
         .map(|m| (m, favourites.contains(&mappings::favourite_key(m))))
         .collect::<Vec<_>>();
     list.sort_by_key(|(_, star)| !star);
@@ -12809,7 +12826,8 @@ fn configure_steps(
                 .unwrap_or_default();
             // v7 ticket 111: the built-in Xbox defaults not changed yet are listed too, marked
             // default (they apply to Default only, on layer 1).
-            let defaults = if profile.is_none() && ui.xbox_connected() {
+            // v7.7 ticket 267: they apply in Xbox Program 1 only.
+            let defaults = if profile.is_none() && ui.xbox_connected() && ui.xbox_program() == 1 {
                 crate::gamepad::default_layout()
                     .into_iter()
                     .filter(|d| {
@@ -12823,7 +12841,7 @@ fn configure_steps(
             };
             // v7 ticket 109: Xbox and MIDI assignments are listed apart; with both saved,
             // the device comes first.
-            let all = saved_list(current, ui.context(), &favourites)
+            let all = saved_list(current, ui.context(), ui.xbox_program(), &favourites)
                 .into_iter()
                 .map(|(m, star)| (m, star, false))
                 .chain(defaults.iter().map(|m| (m, false, true)))
@@ -12849,14 +12867,17 @@ fn configure_steps(
                 .into_iter()
                 .filter(|(m, _, _)| want_xbox.is_none_or(|x| xbox(m) == x))
                 .collect::<Vec<_>>();
+            let xbox_name = mappings::load_config(path)
+                .map(|c| mappings::xbox_program_name(&c, ui.xbox_program()))
+                .unwrap_or_else(|_| format!("Program {}", ui.xbox_program()));
             let title = match want_xbox {
-                Some(true) => "Saved assignments · Xbox controller",
-                Some(false) => "Saved assignments · MIDI keyboard",
-                None => "Saved assignments",
+                Some(true) => format!("Saved assignments · Xbox controller · {xbox_name}"),
+                Some(false) => "Saved assignments · MIDI keyboard".into(),
+                None => "Saved assignments".into(),
             };
             let Some(index) = choose(
                 ui,
-                title,
+                &title,
                 &list
                     .iter()
                     .map(|(m, star, default)| {
@@ -14409,6 +14430,8 @@ mod tests {
         program: Option<(u8, crate::feedback::Payload)>,
         /// An Xbox controller is connected (v7 ticket 111).
         xbox: bool,
+        /// v7.7 ticket 267: the Xbox program in use (0: Program 1).
+        xbox_program: u8,
         /// v7 ticket 129: the driver in use, the card list, every program run, and the
         /// error a run gives (when set).
         driver: Option<&'static str>,
@@ -14448,6 +14471,9 @@ mod tests {
         }
         fn xbox_connected(&self) -> bool {
             self.xbox
+        }
+        fn xbox_program(&self) -> u8 {
+            self.xbox_program.max(1)
         }
         fn midi_devices(&mut self) -> Result<Vec<String>> {
             Ok(self.midi_devices.clone())
@@ -15263,6 +15289,101 @@ mod tests {
                 .unwrap()
                 .keys,
             ["Enter"]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 267: like the Akai's, the Xbox list holds only the Xbox program in use
+    /// (both layers), titled with its name; another program's buttons stay out.
+    #[test]
+    fn xbox_assignments_are_listed_per_program() {
+        use Key::*;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-xbox-programs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let pad = Mapping::new(Control::from_note(10, 36).unwrap(), "F1", "hold").unwrap();
+        let in_context = |id: u8, keys: &str, context: u8| {
+            let mut m = Mapping::new(Control::button(id), keys, "hold").unwrap();
+            m.context = context;
+            m
+        };
+        let x = in_context(2, "F8", mappings::GAMEPAD_CONTEXT);
+        let b = in_context(1, "F9", mappings::xbox_context(2, false));
+        let y = in_context(3, "F10", mappings::xbox_context(2, true));
+        let mut config = mappings::Config::default();
+        config.mappings = vec![pad, x, b, y];
+        config.xbox_names[1] = "Browser".into();
+        mappings::save_config(&path, &config).unwrap();
+        let mut current = config.mappings.clone();
+        let mut ui = Script {
+            // Edit -> Xbox -> back; leave
+            keys: [Tab, Enter, Down, Enter, Escape, Escape, Escape].into(),
+            xbox_program: 2,
+            ..Default::default()
+        };
+        configure(&mut ui, &path, &mut current).unwrap();
+        let screens = ui.screens.join("\n----\n");
+        assert!(screens.contains("Xbox controller (2)"), "{screens}");
+        let xbox = ui
+            .screens
+            .iter()
+            .find(|s| s.starts_with("Saved assignments · Xbox controller · Browser"))
+            .unwrap_or_else(|| panic!("{screens}"));
+        assert!(
+            xbox.contains("Xbox B") && xbox.contains("Xbox Y") && !xbox.contains("Xbox X"),
+            "{xbox}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.7 ticket 267: every ask names the programs: the Akai's, and each Xbox program with
+    /// its context numbers and the user's name, and which one is in use.
+    #[test]
+    fn every_ask_names_the_programs_in_use() {
+        use Key::*;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-ask-programs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let mut config = mappings::Config::default();
+        config.xbox_names[4] = "Browser".into();
+        let mut b = Mapping::new(Control::button(1), "Ctrl+W", "hold").unwrap();
+        b.context = mappings::xbox_context(5, false);
+        config.mappings = vec![b];
+        mappings::save_config(&path, &config).unwrap();
+        let mut keys = typed("Which Xbox program is for browsing?");
+        keys.extend([Enter, Up, Enter]);
+        let mut ui = Script {
+            keys: keys.into(),
+            claude: "Program 5, Browser.".into(),
+            xbox_program: 5,
+            ..Default::default()
+        };
+        ask_for(&mut ui, &path, AskKind::About).unwrap();
+        let sent = &ui.asked[0];
+        assert!(
+            sent.contains("Xbox controller (in use: Program 5 · Browser)"),
+            "{sent}"
+        );
+        assert!(
+            sent.contains("- context 231: Program 5 · Browser (layer 2, LB held: 230)"),
+            "{sent}"
+        );
+        assert!(
+            sent.contains("- context 239: Program 1 (layer 2, LB held: 238)"),
+            "{sent}"
+        );
+        assert!(
+            sent.contains("Akai MPK mini 3 (in use: Program 1)"),
+            "{sent}"
+        );
+        assert!(sent.contains("- context 0: Program 1"), "{sent}");
+        assert!(
+            sent.contains("suggest another program by its name"),
+            "{sent}"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -16353,7 +16474,9 @@ mod tests {
                 !request.contains("Use the vibeconsole-ask-"),
                 "{name}: only Claude Code is told"
             );
-            assert!(request.ends_with("\n---\n\nTHE REQUEST"), "{name}");
+            // v7.7 ticket 267: the programs, then the request.
+            assert!(request.contains("\n---\n\nPrograms ("), "{name}");
+            assert!(request.ends_with("\nTHE REQUEST"), "{name}");
         }
         let _ = std::fs::remove_dir_all(home.join(".claude"));
         for (kind, argv) in sent("Claude Code", false) {
@@ -16367,7 +16490,10 @@ mod tests {
         for (kind, argv) in sent("Claude Code", true) {
             let name = skill_name(kind);
             assert_eq!(argv[..2], ["claude", "-p"]);
-            assert!(argv[2].ends_with(&format!("\n---\n\nUse the {name} skill.\n\nTHE REQUEST")));
+            assert!(
+                argv[2].contains(&format!("\n---\n\nUse the {name} skill.\n\nPrograms ("))
+                    && argv[2].ends_with("\nTHE REQUEST")
+            );
         }
         // The largest: the biggest skill with a mappings request for both devices.
         let config = mappings::Config::default();
@@ -20401,7 +20527,7 @@ mod tests {
         assert!(ui.keys.is_empty());
         let config = mappings::load_config(&path).unwrap();
         assert_eq!(config.favourites, [mappings::favourite_key(&b)]);
-        let list = saved_list(&config.mappings, 0, &config.favourites);
+        let list = saved_list(&config.mappings, 0, 1, &config.favourites);
         assert_eq!(list[0], (&b, true));
         assert_eq!(list[1], (&a, false));
         std::fs::remove_dir_all(dir).unwrap();

@@ -1501,9 +1501,57 @@ pub fn mappings_summary(config: &Config) -> String {
             } else {
                 m.label.clone()
             };
-            format!("- {} {name}: {what}\n", program_label(m.context))
+            // v7.7 ticket 267: an Xbox program with the user's name for it.
+            let program = match xbox_program(m.context) {
+                Some((p, _)) if xbox_program_name(config, p) != format!("Program {p}") => {
+                    format!(
+                        "{} · {}",
+                        program_label(m.context),
+                        xbox_program_name(config, p)
+                    )
+                }
+                _ => program_label(m.context),
+            };
+            format!("- {program} {name}: {what}\n")
         })
         .collect()
+}
+/// v7.7 ticket 267: the programs every ask is told about: the Akai's by the names read from
+/// it, each Xbox program by the user's name with its context numbers (layer 1, and layer 2
+/// with LB held), and which program of each is in use.
+pub fn programs_summary(
+    config: &Config,
+    akai_names: &[String],
+    akai_context: u8,
+    xbox_program: u8,
+) -> String {
+    let akai_name = |context: u8| {
+        akai_names
+            .get(usize::from(context))
+            .cloned()
+            .unwrap_or_else(|| format!("Program {}", context + 1))
+    };
+    let xbox_name = |program: u8| match xbox_program_name(config, program) {
+        name if name == format!("Program {program}") => name,
+        name => format!("Program {program} · {name}"),
+    };
+    let mut text = format!(
+        "Programs (a mapping line's first field is its context):\n{AKAI_NAME} (in use: {}):\n",
+        akai_name(akai_context)
+    );
+    for context in 0..akai_names.len().min(8) as u8 {
+        text += &format!("- context {context}: {}\n", akai_name(context));
+    }
+    text += &format!("{XBOX_NAME} (in use: {}):\n", xbox_name(xbox_program));
+    for program in 1..=XBOX_PROGRAMS {
+        text += &format!(
+            "- context {}: {} (layer 2, LB held: {})\n",
+            xbox_context(program, false),
+            xbox_name(program),
+            xbox_context(program, true)
+        );
+    }
+    text + "Put a change in the program whose name fits it; when the program in use has no free control, suggest another program by its name.\n"
 }
 /// v7.7 ticket 168: the agent CLIs Set up agents looks for on PATH (looked up, never run).
 pub const AGENT_CLIS: [&str; 10] = [
