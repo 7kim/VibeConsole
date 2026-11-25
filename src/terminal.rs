@@ -4834,7 +4834,7 @@ impl Terminal {
     /// (`/program-name (Xbox)`), so no device question.
     fn rename_program(&mut self) -> Result<()> {
         self.program_connection()?;
-        let names = crate::feedback::names(self.input.as_mut().ok_or("MIDI disconnected")?)?;
+        let names = crate::feedback::names(self.input.as_mut().ok_or("MIDI: disconnected")?)?;
         self.program_names = names.clone();
         // v7 ticket 144: the Xbox fires while the names are chosen; the write below runs
         // with output suspended.
@@ -4863,7 +4863,7 @@ impl Terminal {
         })?;
         if let Some((context, name)) = renamed {
             crate::feedback::rename(
-                self.input.as_mut().ok_or("MIDI disconnected")?,
+                self.input.as_mut().ok_or("MIDI: disconnected")?,
                 context as u8 + 1,
                 &name,
             )?;
@@ -5209,7 +5209,8 @@ impl Terminal {
                     }
                     if input.next()?.is_some() {
                         return Err(
-                            "Continuous MIDI during detection; stop controls and retry".into()
+                            "MIDI: continuous input during detection; stop controls and retry"
+                                .into(),
                         );
                     }
                 }
@@ -5936,7 +5937,7 @@ Changing musical settings while running is unsupported.",
         }
         self.program_connection()?;
         let next = crate::feedback::set_knob_mode(
-            self.input.as_mut().ok_or("MIDI disconnected")?,
+            self.input.as_mut().ok_or("MIDI: disconnected")?,
             context,
             knob,
             cc,
@@ -5952,7 +5953,7 @@ Changing musical settings while running is unsupported.",
         while self
             .input
             .as_ref()
-            .ok_or("MIDI disconnected")?
+            .ok_or("MIDI: disconnected")?
             .next()?
             .is_some()
         {}
@@ -6002,7 +6003,7 @@ Changing musical settings while running is unsupported.",
             let restored = (|| -> Result<_> {
                 self.program_connection()?;
                 crate::feedback::set_knob_mode(
-                    self.input.as_mut().ok_or("MIDI disconnected")?,
+                    self.input.as_mut().ok_or("MIDI: disconnected")?,
                     context,
                     knob,
                     cc,
@@ -6923,7 +6924,14 @@ fn history_menu(ui: &mut impl Ui, path: &Path) -> Result<Option<String>> {
     let mut newer = mappings::load_config(path)?;
     let mut rows = Vec::new();
     for (file, secs) in &entries {
-        let older = vibeconsole_core::config::before(file, &newer).unwrap_or_default();
+        // An unreadable entry ends the list: every older row would be compared against it.
+        let older = match vibeconsole_core::config::before(file, &newer) {
+            Ok(older) => older,
+            Err(e) => {
+                rows.push(format!("{} · (unreadable: {e})", clock(*secs)));
+                break;
+            }
+        };
         rows.push(format!(
             "{} · {}",
             clock(*secs),
@@ -7631,17 +7639,25 @@ fn presets_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 }
                 std::fs::create_dir_all(&dir)?;
                 let config = mappings::load_config(path)?;
-                if one {
-                    mappings::save_config(
-                        &dir.join(mappings::program_preset_file_name(name.trim())),
-                        &mappings::program_preset(&config, context),
+                let (file, preset) = if one {
+                    (
+                        mappings::program_preset_file_name(name.trim()),
+                        mappings::program_preset(&config, context),
                     )
                 } else {
-                    mappings::save_config(
-                        &dir.join(mappings::preset_file_name(name.trim())),
-                        &config,
-                    )
+                    (mappings::preset_file_name(name.trim()), config)
+                };
+                // Presets have no history: replacing one is asked first.
+                if dir.join(&file).exists()
+                    && question(
+                        ui,
+                        &format!("Replace preset {file}?"),
+                        &strings(&["Cancel", "Replace"]),
+                    )? != Some(1)
+                {
+                    return Ok(());
                 }
+                mappings::save_config(&dir.join(file), &preset)
             })()
         } else {
             let file = dir.join(&files[choice]);
@@ -7680,7 +7696,15 @@ fn presets_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                     )?;
                     Ok(())
                 })(),
-                Some(1) => std::fs::remove_file(&file).map_err(Into::into),
+                Some(1)
+                    if question(
+                        ui,
+                        &format!("Delete preset {}? Presets have no history.", files[choice]),
+                        &strings(&["Cancel", "Delete"]),
+                    )? == Some(1) =>
+                {
+                    std::fs::remove_file(&file).map_err(stage("file I/O"))
+                }
                 _ => Ok(()),
             }
         };
@@ -8268,7 +8292,7 @@ fn next_agent(ui: &mut impl Ui, path: &Path) -> Result<()> {
         let model = model.trim().to_owned();
         if !mappings::valid_model(&model) {
             return Err(
-                "an Ollama model is one word of letters, digits, . _ : / and -; nothing saved"
+                "validation: an Ollama model is one word of letters, digits, . _ : / and -; nothing saved"
                     .into(),
             );
         }
@@ -10685,8 +10709,7 @@ fn prompt_choice(ui: &mut impl Ui, path: &Path, index: usize) -> Result<()> {
             Some(name) => edit_prompt(ui, &dir, &name),
             None => Ok(()),
         }
-    } else {
-        let name = &files[index];
+    } else if let Some(name) = files.get(index) {
         match choose(
             ui,
             &format!("Prompt {name}"),
@@ -10727,6 +10750,9 @@ fn prompt_choice(ui: &mut impl Ui, path: &Path, index: usize) -> Result<()> {
             }
             _ => Ok(()),
         }
+    } else {
+        // The folder changed since the list was shown (an agent or editor removed a file).
+        Err("file I/O: that prompt is gone; reopen Prompts".into())
     };
     if let Err(error) = result {
         not_saved(ui, &error)?;
@@ -12070,9 +12096,11 @@ fn sequence_choice(ui: &mut impl Ui, path: &Path, index: usize) -> Result<()> {
                 return Ok(());
             };
             config.sequences.push((name, steps));
-            return mappings::save_config(path, &config).map_err(stage("file I/O"));
+            return mappings::save_config(path, &config);
         }
-        let name = config.sequences[index].0.clone();
+        let Some((name, _)) = config.sequences.get(index).cloned() else {
+            return Err("file I/O: that sequence is gone; reopen Saved prompt sequences".into());
+        };
         match choose(
             ui,
             &format!("Saved sequence {name}"),
@@ -12084,7 +12112,7 @@ fn sequence_choice(ui: &mut impl Ui, path: &Path, index: usize) -> Result<()> {
                     prompt_sequence_action(ui, path, Some(&steps))?
                 {
                     config.sequences[index].1 = steps;
-                    mappings::save_config(path, &config).map_err(stage("file I/O"))?;
+                    mappings::save_config(path, &config)?;
                 }
                 Ok(())
             }
@@ -12092,6 +12120,9 @@ fn sequence_choice(ui: &mut impl Ui, path: &Path, index: usize) -> Result<()> {
                 let Some(new) = text_entry(ui, "New name", &name)? else {
                     return Ok(());
                 };
+                if new == name {
+                    return Ok(()); // unchanged
+                }
                 if !mappings::simple_name(&new) || mappings::saved_sequence(&config, &new).is_some()
                 {
                     return Err(format!(
@@ -12111,7 +12142,7 @@ fn sequence_choice(ui: &mut impl Ui, path: &Path, index: usize) -> Result<()> {
                     .iter_mut()
                     .flat_map(|p| p.mappings.iter_mut())
                     .for_each(rename);
-                mappings::save_config(path, &config).map_err(stage("file I/O"))
+                mappings::save_config(path, &config)
             }
             Some(2) => {
                 let used = users(&config, &name);
@@ -12125,7 +12156,7 @@ fn sequence_choice(ui: &mut impl Ui, path: &Path, index: usize) -> Result<()> {
                 )? == Some(1)
                 {
                     config.sequences.remove(index);
-                    mappings::save_config(path, &config).map_err(stage("file I/O"))?;
+                    mappings::save_config(path, &config)?;
                 }
                 Ok(())
             }
@@ -12653,7 +12684,7 @@ fn rename_xbox_program(ui: &mut impl Ui, path: &Path) -> Result<()> {
         return Ok(());
     };
     config.xbox_names[at] = name.trim().to_owned();
-    mappings::save_config(path, &config).map_err(stage("validation"))?;
+    mappings::save_config(path, &config)?;
     Ok(())
 }
 /// One Learn page's observation (v7 ticket 45).
@@ -14120,7 +14151,7 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
                     let mut config = mappings::load_config(path)?;
                     if config.mappings != current {
                         return Err(
-                            "Mappings changed externally; reload before saving idle feedback"
+                            "file I/O: mappings changed externally; reload before saving idle feedback"
                                 .into(),
                         );
                     }
@@ -14139,7 +14170,7 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
             10 => (|| {
                 ui.program_connection()?;
                 let contexts =
-                    crate::feedback::names(ui.input.as_mut().ok_or("MIDI disconnected")?)?;
+                    crate::feedback::names(ui.input.as_mut().ok_or("MIDI: disconnected")?)?;
                 ui.program_names = contexts.clone();
                 let selected_program = usize::from(ui.context);
                 // v7 ticket 144: the Xbox fires while the program is chosen; the selection
@@ -14160,7 +14191,7 @@ Running/paused mode is retained; held keys and toggles start inactive.",
                     let input = ui
                         .input
                         .as_mut()
-                        .ok_or("MIDI disconnected during program selection")?;
+                        .ok_or("MIDI: disconnected during program selection")?;
                     let snapshot = crate::feedback::select(input, context as u8)?;
                     // Bound draining even if the controller generates continuous arpeggiator traffic.
                     for _ in 0..1024 {
@@ -14170,7 +14201,7 @@ Running/paused mode is retained; held keys and toggles start inactive.",
                     }
                     if input.next()?.is_some() {
                         return Err(
-                            "Continuous MIDI during selection; stop input and select again".into(),
+                            "MIDI: continuous input during selection; stop input and select again".into(),
                         );
                     }
                     ui.program_snapshot = Some(snapshot);
@@ -20719,6 +20750,31 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A prompt or sequence row from a list shown before its file went away says so
+    /// instead of crashing.
+    #[test]
+    fn a_row_gone_since_the_list_was_shown_is_refused() {
+        let dir = std::env::temp_dir().join(format!("vibeconsole-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut ui = Script {
+            keys: [Key::Enter, Key::Enter].into(),
+            ..Default::default()
+        };
+        prompt_choice(&mut ui, &path, 4).unwrap();
+        sequence_choice(&mut ui, &path, 4).unwrap();
+        assert!(ui.keys.is_empty());
+        assert!(ui.screens.iter().any(|s| s.contains("that prompt is gone")));
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains("that sequence is gone"))
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn presets_save_load_and_refuse_bad_files() {
         use Key::*;
@@ -20763,6 +20819,20 @@ mod tests {
                 .any(|s| s.contains("Bad.preset") && s.contains("nothing loaded"))
         );
         assert_eq!(config_bytes(&path), before);
+        // Presets have no history: replacing or deleting one asks first, Cancel first.
+        let work = dir.join("presets/Work.preset");
+        let kept = std::fs::read(&work).unwrap();
+        let c = Mapping::new(Control::from_note(10, 38).unwrap(), "F3", "hold").unwrap();
+        mappings::save(&path, &[c]).unwrap(); // a replace would now change Work.preset
+        let mut again = vec![Down, Down, Down, Enter]; // Save All Programs Preset
+        again.extend(b"Work".map(Character));
+        again.extend([Enter, Enter]); // Replace preset Work.preset? -> Cancel
+        presets(again);
+        assert_eq!(std::fs::read(&work).unwrap(), kept);
+        presets(vec![Down, Enter, Down, Enter, Enter]); // Work -> Delete it -> Cancel
+        assert!(work.exists());
+        presets(vec![Down, Enter, Down, Enter, Down, Enter]); // Work -> Delete it -> Delete
+        assert!(!work.exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

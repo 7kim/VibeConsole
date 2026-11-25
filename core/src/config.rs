@@ -159,7 +159,7 @@ fn move_from_tsv(dir: &Path, config: &Config) -> Result<()> {
 pub fn save(path: &Path, config: &Config) -> Result<()> {
     let dir = folder(path)?;
     // The whole config is checked with every rule before any file is written.
-    mappings::serialize_config(config)?;
+    mappings::serialize_config(config).map_err(|e| format!("validation: {e}"))?;
     let mut files = Vec::new();
     for file in FILES {
         files.push((dir.join(file), text(file, config)?));
@@ -195,7 +195,7 @@ fn write_all(files: &[(PathBuf, String)], history: Option<&Path>) -> Result<()> 
         if let Err(e) = write_new(&temporary, text.as_bytes()) {
             unstage(&staged);
             return Err(format!(
-                "cannot save {}: {e}; saved config unchanged",
+                "file I/O: cannot save {}: {e}; saved config unchanged",
                 path.display()
             )
             .into());
@@ -226,7 +226,7 @@ fn write_all(files: &[(PathBuf, String)], history: Option<&Path>) -> Result<()> 
                 true => "saved config unchanged".to_string(),
                 false => format!("could not put back {}", unrestored.join(", ")),
             };
-            return Err(format!("cannot save {}: {e}; {state}", path.display()).into());
+            return Err(format!("file I/O: cannot save {}: {e}; {state}", path.display()).into());
         }
         done.push((path, old));
     }
@@ -468,7 +468,7 @@ fn pairs(at: &Obj, key: &str) -> Result<Vec<(String, String)>> {
 /// v7.7 ticket 198: a preset file: every config file's JSON in one file. Presets hold the
 /// whole setup as before; loading one still merges only what `apply_preset` takes.
 pub fn preset_text(config: &Config) -> Result<String> {
-    mappings::serialize_config(config)?;
+    mappings::serialize_config(config).map_err(|e| format!("validation: {e}"))?;
     let mut files = Map::new();
     for file in FILES {
         files.insert(file.into(), serde_json::from_str(&text(file, config)?)?);
