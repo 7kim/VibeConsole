@@ -154,6 +154,13 @@ struct SpeedDevice {
     press: Option<(String, Option<f64>)>,
     /// The speed test's line while it runs and after.
     test: String,
+    /// The Akai link test's line. Other MIDI inputs have only a press test.
+    knob_test: Option<String>,
+}
+struct KnobTest {
+    started: Instant,
+    source: Option<(u8, u8)>,
+    stamps: Vec<u64>,
 }
 /// v7.8 ticket 26: Detect's link and speed test (only while Detect is open, never while Run
 /// sends keys).
@@ -163,11 +170,12 @@ struct Speed {
     akai: Option<SpeedDevice>,
     /// The Xbox test's start; the pad collects right-stick stamps until it ends.
     xbox_since: Option<Instant>,
+    akai_knob: Option<KnobTest>,
     /// The Akai test's press delays.
     akai_delays: Option<Vec<f64>>,
     kept: Vec<crate::speed::Kept>,
 }
-const XBOX_TEST: Duration = Duration::from_secs(3);
+const LINK_TEST: Duration = Duration::from_secs(3);
 const AKAI_PRESSES: usize = 10;
 
 trait Ui {
@@ -976,6 +984,15 @@ impl Terminal {
         self.note_flashes.clear();
         self.cc_values.clear();
         self.bend = None;
+        if let Some(speed) = &mut self.speed
+            && speed.akai_knob.take().is_some()
+            && let Some(row) = speed
+                .akai
+                .as_mut()
+                .and_then(|device| device.knob_test.as_mut())
+        {
+            *row = "knob, 3 s: not measured: MIDI input changed, press T to retry".into();
+        }
     }
 
     fn note_light(&self, control: Control, now: Instant) -> bool {
@@ -1043,13 +1060,26 @@ impl Terminal {
     /// Bank A | Bank B panes over piano, knobs and joystick; one Unidentified pane when the
     /// program is unverified (SPEC-UI story 4). `live` gates bulbs on an open MIDI input.
     fn detection_view(&self, (columns, rows): (usize, usize), live: bool) -> String {
-        use crate::screen::{bulb, fit, grid, group};
+        use crate::screen::{bulb, fit, grid, group, wrap};
         let now = Instant::now();
         let width = self.screen("").details_size(columns, rows).0;
         let lit = |control| fit(bulb(live && self.note_light(control, now)), 6);
         let raw = |c: Control| format!("{} Note ch{} #{}", lit(c), c.channel, c.id);
         let value = |v: Option<String>| v.unwrap_or_else(|| "–".into());
+        let mut measurements = self
+            .speed_rows()
+            .iter()
+            .flat_map(|row| wrap(row, width))
+            .collect::<Vec<_>>();
         let mut rows = Vec::new();
+        if self.speed.as_ref().is_some_and(|speed| {
+            [&speed.akai, &speed.xbox]
+                .into_iter()
+                .flatten()
+                .any(|device| !device.test.is_empty())
+        }) {
+            rows.append(&mut measurements);
+        }
         let Some((_, payload)) = self.program() else {
             let mut items = self
                 .note_flashes
@@ -1072,11 +1102,7 @@ impl Terminal {
                 width,
             ));
             rows.extend(self.xbox_rows(width, live));
-            rows.extend(
-                self.speed_rows()
-                    .iter()
-                    .map(|r| fit(r, width).trim_end().to_owned()),
-            );
+            rows.append(&mut measurements);
             rows.push(fit(&self.last_event, width).trim_end().into());
             return rows.join("\n");
         };
@@ -1178,11 +1204,7 @@ impl Terminal {
             width,
         ));
         rows.extend(self.xbox_rows(width, live));
-        rows.extend(
-            self.speed_rows()
-                .iter()
-                .map(|r| fit(r, width).trim_end().to_owned()),
-        );
+        rows.append(&mut measurements);
         rows.push(fit(&self.last_event, width).trim_end().into());
         rows.join("\n")
     }
@@ -1290,6 +1312,7 @@ impl Terminal {
                     || "MIDI · its link can't be read here".into(),
                     |usb| format!("{usb} · MIDI read as it arrives"),
                 ),
+                knob_test: input.akai.then(String::new),
                 ..SpeedDevice::default()
             }
         });
@@ -1303,19 +1326,55 @@ impl Terminal {
     fn speed_file(&self) -> PathBuf {
         self.path.with_file_name("speed-tests.tsv")
     }
-    /// T: a fresh test on every device: the Xbox's right stick for 3 s, the Akai's 10 presses.
+    /// T starts fresh link samples and the MIDI press test.
     fn speed_start(&mut self) {
         let Some(speed) = &mut self.speed else {
             return;
         };
+        let started = Instant::now();
         if let (Some(device), Some(pad)) = (&mut speed.xbox, &mut self.gamepad) {
             pad.reports = Some(Vec::new());
-            speed.xbox_since = Some(Instant::now());
+            speed.xbox_since = Some(started);
             device.test = "running: keep moving the right stick (3 s left)".into();
         }
         if let Some(device) = &mut speed.akai {
             speed.akai_delays = Some(Vec::new());
             device.test = format!("running: press pads (0 of {AKAI_PRESSES})");
+            if let Some(row) = &mut device.knob_test {
+                speed.akai_knob = Some(KnobTest {
+                    started,
+                    source: None,
+                    stamps: Vec::new(),
+                });
+                *row = "running: turn one knob (3 s left)".into();
+            }
+        }
+    }
+    fn speed_knob(&mut self, [status, cc, _]: [u8; 3], timing: midi::Timing) {
+        if status & 0xf0 != 0xb0 {
+            return;
+        }
+        let program = self.program();
+        let Some(test) = self
+            .speed
+            .as_mut()
+            .and_then(|speed| speed.akai_knob.as_mut())
+        else {
+            return;
+        };
+        let source = (status & 0xf, cc);
+        if timing.received < test.started || timing.received - test.started >= LINK_TEST {
+            return;
+        }
+        if test.source.is_none()
+            && program.is_some_and(|(_, payload)| (0..8).all(|k| payload[0x55 + 20 * k] != cc))
+        {
+            return;
+        }
+        // Use just one CC source. With no verified program, the first CC can be identified
+        // only by channel and number, so the test asks the user to turn one knob.
+        if *test.source.get_or_insert(source) == source {
+            test.stamps.push(timing.stamp_us);
         }
     }
     /// A press reached Detect: name it with its delay, and count it in the Akai's test.
@@ -1351,9 +1410,30 @@ impl Terminal {
         let Some(speed) = &mut self.speed else {
             return;
         };
-        let mut kept = Vec::new();
+        let mut save = |name: &str, connection: &str, row: &mut String, result| {
+            let result = crate::speed::Kept {
+                device: name.into(),
+                connection: connection.into(),
+                when: now,
+                result,
+            };
+            match crate::speed::keep(&path, result) {
+                Ok(all) => speed.kept = all,
+                Err(error) => row.push_str(&format!(" · not kept: {error}")),
+            }
+        };
+        let mut finish_link =
+            |name: &str, connection: &str, row: &mut String, control, stamps: &[u64]| {
+                match crate::speed::link(stamps) {
+                    Ok(link) => {
+                        *row = format!("{control}, 3 s: {}", link.text());
+                        save(name, connection, row, crate::speed::Kind::Link(link));
+                    }
+                    Err(error) => *row = format!("{control}, 3 s: not measured: {error}"),
+                }
+            };
         if let (Some(since), Some(device)) = (speed.xbox_since, &mut speed.xbox) {
-            let left = XBOX_TEST.saturating_sub(since.elapsed());
+            let left = LINK_TEST.saturating_sub(since.elapsed());
             if left.is_zero() {
                 speed.xbox_since = None;
                 let stamps = (self.gamepad.as_mut())
@@ -1363,25 +1443,13 @@ impl Terminal {
                     .filter_map(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_micros() as u64)
                     .collect::<Vec<_>>();
-                device.test = match crate::speed::link(&stamps) {
-                    Ok(link) => {
-                        kept.push((
-                            true,
-                            crate::speed::Kept {
-                                device: device.name.clone(),
-                                connection: device.connection.clone(),
-                                when: now,
-                                result: crate::speed::Kind::Link {
-                                    per_second: link.per_second,
-                                    gap_ms: link.gap_ms,
-                                    jitter_ms: link.jitter_ms,
-                                },
-                            },
-                        ));
-                        format!("right stick, 3 s: {}", link.text())
-                    }
-                    Err(error) => format!("right stick, 3 s: not measured: {error}"),
-                };
+                finish_link(
+                    &device.name,
+                    &device.connection,
+                    &mut device.test,
+                    "right stick",
+                    &stamps,
+                );
             } else {
                 device.test = format!(
                     "running: keep moving the right stick ({} s left)",
@@ -1389,42 +1457,34 @@ impl Terminal {
                 );
             }
         }
-        if let (Some(delays), Some(device)) = (&speed.akai_delays, &mut speed.akai) {
-            if delays.len() >= AKAI_PRESSES {
-                if let Some(d) = crate::speed::delays(delays) {
-                    device.test = d.text(delays.len());
-                    kept.push((
-                        false,
-                        crate::speed::Kept {
-                            device: device.name.clone(),
-                            connection: device.connection.clone(),
-                            when: now,
-                            result: crate::speed::Kind::Presses {
-                                low: d.low,
-                                high: d.high,
-                                average: d.average,
-                            },
-                        },
-                    ));
-                }
-                speed.akai_delays = None;
+        if let (Some(test), Some(device)) = (&speed.akai_knob, &mut speed.akai)
+            && let Some(row) = &mut device.knob_test
+        {
+            let left = LINK_TEST.saturating_sub(test.started.elapsed());
+            if left.is_zero() {
+                let test = speed.akai_knob.take().unwrap();
+                finish_link(&device.name, &device.connection, row, "knob", &test.stamps);
+            } else {
+                *row = format!("running: turn one knob ({} s left)", left.as_secs() + 1);
             }
         }
-        for (xbox, result) in kept {
-            match crate::speed::keep(&path, result) {
-                Ok(all) => speed.kept = all,
-                // Shown on its own row: the result stands, but it wasn't kept.
-                Err(error) => {
-                    let device = if xbox {
-                        &mut speed.xbox
-                    } else {
-                        &mut speed.akai
-                    };
-                    if let Some(device) = device {
-                        device.test.push_str(&format!(" · not kept: {error}"));
-                    }
-                }
+        if let (Some(delays), Some(device)) = (&speed.akai_delays, &mut speed.akai)
+            && delays.len() >= AKAI_PRESSES
+        {
+            if let Some(d) = crate::speed::delays(delays) {
+                device.test = d.text(delays.len());
+                save(
+                    &device.name,
+                    &device.connection,
+                    &mut device.test,
+                    crate::speed::Kind::Presses {
+                        low: d.low,
+                        high: d.high,
+                        average: d.average,
+                    },
+                );
             }
+            speed.akai_delays = None;
         }
     }
     /// Detect's rows for each device: header, link, last press, speed test, and the last
@@ -1456,6 +1516,14 @@ impl Terminal {
                     Some((name, None)) => format!("{name} · {}", crate::speed::CLOCK_CHANGED),
                 }
             ));
+            if let Some(knob) = &device.knob_test {
+                let line = if knob.is_empty() {
+                    "T: turn one knob for 3 s"
+                } else {
+                    knob
+                };
+                rows.push(format!("  Link test   {line}"));
+            }
             rows.push(format!(
                 "  Speed test  {}",
                 if device.test.is_empty() {
@@ -1464,10 +1532,21 @@ impl Terminal {
                     &device.test
                 }
             ));
-            let before = (speed.kept.iter())
-                .filter(|k| k.device == device.name)
-                .map(|k| k.text(now))
-                .collect::<Vec<_>>();
+            let mut before = Vec::new();
+            for kept in speed.kept.iter().filter(|k| k.device == device.name) {
+                if device.knob_test.is_some()
+                    && let crate::speed::Kind::Link(link) = &kept.result
+                {
+                    rows.push(format!(
+                        "  Kept link   {} ({}): {}",
+                        kept.connection,
+                        crate::speed::date(kept.when, now),
+                        link.text()
+                    ));
+                } else {
+                    before.push(kept.text(now));
+                }
+            }
             if !before.is_empty() {
                 rows.push(format!("  Kept        {}", before.join(" · ")));
             }
@@ -6282,14 +6361,18 @@ impl Terminal {
             );
             self.observe_light(None, Instant::now());
             let channel = (message[0] & 15) + 1;
-            // v7.8 ticket 26: on Detect, a note-on's delay from midir's callback to now.
-            if self.speed.is_some() && message[0] & 0xf0 == 0x90 && message[2] > 0 {
-                let delay = (self.input.as_ref())
-                    .and_then(|input| input.received())
-                    .and_then(|at| crate::speed::delay_ms(at.elapsed().as_micros() as u64, 0));
-                let name = Control::from_note(channel, message[1])
-                    .map_or_else(|| format!("Note #{}", message[1]), |c| self.name(c));
-                self.speed_press(false, name, delay);
+            if self.speed.is_some()
+                && let Some(timing) = self.input.as_ref().and_then(midi::Input::timing)
+            {
+                if message[0] & 0xf0 == 0x90 && message[2] > 0 {
+                    let delay =
+                        crate::speed::delay_ms(timing.received.elapsed().as_micros() as u64, 0);
+                    let name = Control::from_note(channel, message[1])
+                        .map_or_else(|| format!("Note #{}", message[1]), |c| self.name(c));
+                    self.speed_press(false, name, delay);
+                } else {
+                    self.speed_knob(message, timing);
+                }
             }
             match message[0] & 0xf0 {
                 0xb0 => {
@@ -29567,11 +29650,12 @@ mod tests {
                     device: "Xbox Wireless Controller".into(),
                     connection: connection.into(),
                     when: 1_763_000_000,
-                    result: Kind::Link {
+                    result: Kind::Link(crate::speed::Link {
                         per_second: 1000.0 / gap_ms,
                         gap_ms,
                         jitter_ms: 1.0,
-                    },
+                        dropped: None,
+                    }),
                 },
             )
             .unwrap();
@@ -29597,6 +29681,108 @@ mod tests {
                 entry.path()
             );
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn detect_measures_one_akai_knob_and_keeps_it_beside_press_delays() {
+        use crate::speed::{Kind, Link};
+        let (dir, mut ui, _ran, _) = configure_session("detect-akai-knob");
+        let (context, program) = recorded_program();
+        ui.context = context;
+        ui.program_snapshot = Some(program);
+        let device = || SpeedDevice {
+            name: "Akai MPK mini 3".into(),
+            header: "Akai MPK mini 3".into(),
+            connection: "USB".into(),
+            link: "USB 12 Mb/s".into(),
+            knob_test: Some(String::new()),
+            ..SpeedDevice::default()
+        };
+        ui.speed = Some(Speed {
+            akai: Some(device()),
+            ..Speed::default()
+        });
+        ui.speed_start();
+        assert!(
+            ui.speed_rows()
+                .join("\n")
+                .contains("turn one knob (3 s left)")
+        );
+
+        let started = Instant::now() - LINK_TEST;
+        ui.speed
+            .as_mut()
+            .unwrap()
+            .akai_knob
+            .as_mut()
+            .unwrap()
+            .started = started;
+        let cc = program[0x55];
+        let other = (0..=127)
+            .find(|cc| (0..8).all(|k| program[0x55 + 20 * k] != *cc))
+            .unwrap();
+        let mut report = |status, cc, received, stamp_us| {
+            ui.speed_knob([status, cc, 1], midi::Timing { received, stamp_us });
+        };
+        // A queued old report, an unrelated CC before movement, and a note are ignored.
+        report(0xb0, cc, started - Duration::from_millis(1), 0);
+        report(0xb0, other, started, 0);
+        report(0x90, cc, started, 0);
+        for i in 0..=10 {
+            let stamp_us = 12_000_000 + 4_000 * i + if i >= 5 { 44_000 } else { 0 };
+            // The callback instants have entirely different gaps from the MIDI timestamps.
+            let received = started + Duration::from_millis(i * 200);
+            report(0xb0, cc, received, stamp_us);
+            report(0xb1, cc, received, 0); // same CC on another channel, ignored
+        }
+        report(0xb0, cc, started + LINK_TEST, 0);
+        for _ in 0..AKAI_PRESSES {
+            ui.speed_press(false, "Pad 1".into(), Some(9.0));
+        }
+        ui.speed_tick();
+
+        let size = (80, 24);
+        let view = ui.detection_view(size, true);
+        let frame = ui.screen(&view).render(size.0, size.1, false);
+        for text in [
+            "119 reports/s",
+            "one every 8.4 ms",
+            "jitter ±13.2 ms",
+            "a 48 ms gap",
+            "🔴",
+            "average 9 ms 🟢",
+        ] {
+            assert!(frame.contains(text), "{text} missing:\n{frame}");
+        }
+        let kept = crate::speed::load(&ui.speed_file());
+        assert_eq!(kept.len(), 2);
+        assert!(kept.iter().any(|record| matches!(
+            record.result,
+            Kind::Link(Link {
+                dropped: Some(48.0),
+                ..
+            })
+        )));
+        assert!(
+            kept.iter()
+                .any(|record| matches!(record.result, Kind::Presses { average: 9.0, .. }))
+        );
+        ui.speed = Some(Speed {
+            akai: Some(device()),
+            kept: kept.clone(),
+            ..Speed::default()
+        });
+        let rows = ui.speed_rows().join("\n");
+        assert!(rows.contains("Kept link"));
+        assert!(rows.contains("a 48 ms gap (possible lost report or pause) 🔴"));
+        assert!(rows.contains("handled after 9 ms on average"));
+
+        ui.speed_start();
+        ui.reset_input_lights();
+        assert!(ui.speed_rows().join("\n").contains("MIDI input changed"));
+        ui.speed_tick();
+        assert_eq!(crate::speed::load(&ui.speed_file()), kept);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

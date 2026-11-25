@@ -39,7 +39,7 @@ impl Link {
     pub fn text(&self) -> String {
         let dropped = self
             .dropped
-            .map(|ms| format!(" · a {ms:.0} ms gap (a lost report, or the stick stood still)"))
+            .map(|ms| format!(" · a {ms:.0} ms gap (possible lost report or pause)"))
             .unwrap_or_default();
         format!(
             "{:.0} reports/s · one every {:.1} ms · jitter ±{:.1} ms{dropped} {}",
@@ -55,10 +55,13 @@ impl Link {
 /// gap when it is a dropout. Stamps going backwards are a clock change, never a result.
 pub fn link(stamps_us: &[u64]) -> Result<Link, String> {
     if stamps_us.len() < 3 {
-        return Err("too few reports: keep the stick moving for the whole test".into());
+        return Err("too few reports: keep the control moving for the whole test".into());
     }
     if stamps_us.windows(2).any(|w| w[1] < w[0]) {
         return Err(CLOCK_CHANGED.into());
+    }
+    if stamps_us.first() == stamps_us.last() {
+        return Err("the reports all have the same timestamp".into());
     }
     let gaps = stamps_us
         .windows(2)
@@ -72,7 +75,7 @@ pub fn link(stamps_us: &[u64]) -> Result<Link, String> {
     let median = sorted[sorted.len() / 2];
     let longest = sorted[sorted.len() - 1];
     Ok(Link {
-        per_second: if gap_ms > 0.0 { 1000.0 / gap_ms } else { 0.0 },
+        per_second: 1000.0 / gap_ms,
         gap_ms,
         jitter_ms,
         dropped: (longest > median * GAP_FACTOR && longest > RED_ABOVE_MS).then_some(longest),
@@ -185,50 +188,52 @@ pub struct Kept {
 }
 #[derive(Clone, Debug, PartialEq)]
 pub enum Kind {
-    Link {
-        per_second: f64,
-        gap_ms: f64,
-        jitter_ms: f64,
-    },
-    Presses {
-        low: f64,
-        high: f64,
-        average: f64,
-    },
+    Link(Link),
+    Presses { low: f64, high: f64, average: f64 },
 }
 impl Kept {
     fn line(&self) -> String {
-        let (word, [a, b, c]) = match self.result {
-            Kind::Link {
+        let (word, [a, b, c], dropped) = match self.result {
+            Kind::Link(Link {
                 per_second,
                 gap_ms,
                 jitter_ms,
-            } => ("link", [per_second, gap_ms, jitter_ms]),
-            Kind::Presses { low, high, average } => ("presses", [low, high, average]),
+                dropped,
+            }) => ("link", [per_second, gap_ms, jitter_ms], dropped),
+            Kind::Presses { low, high, average } => ("presses", [low, high, average], None),
         };
-        format!(
-            "{}\t{}\t{}\t{word}\t{a:.3}\t{b:.3}\t{c:.3}",
+        let mut line = format!(
+            "{}\t{}\t{}\t{word}\t{a}\t{b}\t{c}",
             self.device, self.connection, self.when
-        )
+        );
+        if let Some(ms) = dropped {
+            line.push_str(&format!("\t{ms}"));
+        }
+        line
     }
     fn parse(line: &str) -> Option<Self> {
         let f = line.split('\t').collect::<Vec<_>>();
-        let [device, connection, when, word, a, b, c] = f[..] else {
+        let &[device, connection, when, word, a, b, c, ref extra @ ..] = f.as_slice() else {
             return None;
         };
-        let [a, b, c] = [a, b, c].map(|v| v.parse::<f64>().ok().filter(|v| v.is_finite()));
+        let number = |v: &str| v.parse::<f64>().ok().filter(|v| v.is_finite());
+        let [a, b, c] = [a, b, c].map(number);
         let (a, b, c) = (a?, b?, c?);
         Some(Self {
             device: device.to_owned(),
             connection: connection.to_owned(),
             when: when.parse().ok()?,
-            result: match word {
-                "link" => Kind::Link {
+            result: match (word, extra) {
+                ("link", [] | [_]) => Kind::Link(Link {
                     per_second: a,
                     gap_ms: b,
                     jitter_ms: c,
-                },
-                "presses" => Kind::Presses {
+                    dropped: match extra.first() {
+                        Some(ms) => Some(number(ms)?),
+                        None => None,
+                    },
+                }),
+                ("presses", []) => Kind::Presses {
                     low: a,
                     high: b,
                     average: c,
@@ -240,7 +245,7 @@ impl Kept {
     /// `USB (12 Nov): one every 4.0 ms`, dated from `now` (both epoch seconds).
     pub fn text(&self, now: u64) -> String {
         let what = match self.result {
-            Kind::Link { gap_ms, .. } => format!("one every {gap_ms:.1} ms"),
+            Kind::Link(Link { gap_ms, .. }) => format!("one every {gap_ms:.1} ms"),
             Kind::Presses { average, .. } => format!("handled after {average:.0} ms on average"),
         };
         format!("{} ({}): {what}", self.connection, date(self.when, now))
@@ -375,6 +380,7 @@ mod tests {
         assert_eq!(delay_ms(3_000_000, 1_000), None, "over a second");
         assert_eq!(delay_ms(15_000, 3_000), Some(12.0));
         assert!(link(&[1, 2]).is_err(), "too few reports");
+        assert!(link(&[1, 1, 1]).is_err(), "no elapsed time");
     }
 
     #[test]
@@ -401,11 +407,12 @@ mod tests {
             device: "Xbox Wireless Controller".into(),
             connection: connection.into(),
             when,
-            result: Kind::Link {
+            result: Kind::Link(Link {
                 per_second: 1000.0 / gap_ms,
                 gap_ms,
                 jitter_ms: 1.0,
-            },
+                dropped: None,
+            }),
         };
         keep(&path, kept("USB", 100, 4.0)).unwrap();
         keep(&path, kept("Bluetooth", 200, 8.1)).unwrap();

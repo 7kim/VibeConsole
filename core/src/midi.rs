@@ -162,13 +162,15 @@ mod tests {
         let (frames, _frame_queue) = std::sync::mpsc::sync_channel(1);
         let mut senders: Senders = Some((notes, frames));
         for _ in 0..20 {
-            deliver(&mut senders, &[0xF0, 0x7E, 0x7F, 0x06, 0x02, 0xF7]);
+            deliver(&mut senders, 100, &[0xF0, 0x7E, 0x7F, 0x06, 0x02, 0xF7]);
         }
         assert!(senders.is_some());
-        deliver(&mut senders, &[0x99, 36, 100]);
-        assert_eq!(note_queue.try_recv().unwrap().unwrap().0, [0x99, 36, 100]);
-        deliver(&mut senders, &[0x99, 37, 100]);
-        deliver(&mut senders, &[0x99, 38, 100]);
+        deliver(&mut senders, 8_001, &[0x99, 36, 100]);
+        let (note, timing) = note_queue.try_recv().unwrap().unwrap();
+        assert_eq!(note, [0x99, 36, 100]);
+        assert_eq!(timing.stamp_us, 8_001);
+        deliver(&mut senders, 9_000, &[0x99, 37, 100]);
+        deliver(&mut senders, 10_000, &[0x99, 38, 100]);
         assert!(senders.is_none(), "a lost note ends the input");
     }
 
@@ -368,16 +370,18 @@ pub fn other_devices() -> crate::Result<Vec<String>> {
 /// One midir message into the queues. A full note queue ends the input (a lost release
 /// must never pass silently); a full or unread SysEx queue only drops that frame, since
 /// SysEx is never pad input (a chatty device or a session without feedback can't stop it).
-fn deliver(senders: &mut Senders, message: &[u8]) {
-    // v7.8 ticket 26: when the computer handed it over, for Detect's "handled after".
-    let received = std::time::Instant::now();
+fn deliver(senders: &mut Senders, stamp_us: u64, message: &[u8]) {
+    let timing = Timing {
+        received: std::time::Instant::now(),
+        stamp_us,
+    };
     let Some((notes, frames)) = senders else {
         return;
     };
     for packet in message_packets(message) {
         match packet {
             Packet::Channel(note) => {
-                if notes.try_send(Ok((note, received))).is_err() {
+                if notes.try_send(Ok((note, timing))).is_err() {
                     *senders = None;
                     return;
                 }
@@ -390,19 +394,27 @@ fn deliver(senders: &mut Senders, message: &[u8]) {
     crate::wake::wake(); // v7.7 ticket 225: the terminal handles it now, not in 50 ms
 }
 
+/// The callback instant measures handling delay. Only differences between midir stamps
+/// on the same connection measure report gaps.
+#[derive(Clone, Copy)]
+pub struct Timing {
+    pub received: std::time::Instant,
+    pub stamp_us: u64,
+}
+type TimedMessage = io::Result<([u8; 3], Timing)>;
+
 /// Bounded queues fed by the midir callback. A full queue drops both senders, so `next`
 /// reports the overflow instead of silently losing a release.
 type Senders = Option<(
-    std::sync::mpsc::SyncSender<io::Result<([u8; 3], std::time::Instant)>>,
+    std::sync::mpsc::SyncSender<TimedMessage>,
     std::sync::mpsc::SyncSender<std::result::Result<Vec<u8>, String>>,
 )>;
 
 pub struct Input {
     // Field order: the connection closes before the queues it feeds.
     _connection: midir::MidiInputConnection<Senders>,
-    receiver: std::sync::mpsc::Receiver<io::Result<([u8; 3], std::time::Instant)>>,
-    /// v7.8 ticket 26: when midir's callback got the message `next` returned last.
-    received: std::cell::Cell<Option<std::time::Instant>>,
+    receiver: std::sync::mpsc::Receiver<TimedMessage>,
+    timing: std::cell::Cell<Option<Timing>>,
     /// Lists ports for the disconnect check; never connected.
     probe: midir::MidiInput,
     /// The sequencer `client:port` id; a replugged device gets a new one.
@@ -458,7 +470,7 @@ impl Input {
             .connect(
                 &port,
                 "VibeConsole input",
-                |_, message, senders: &mut Senders| deliver(senders, message),
+                |stamp_us, message, senders: &mut Senders| deliver(senders, stamp_us, message),
                 Some((sender, sysex_sender)),
             )
             .map_err(|e| format!("cannot open MIDI input {name}: {e}"))?;
@@ -469,7 +481,7 @@ impl Input {
                 .map_err(|e| format!("MIDI input unavailable: {e}"))?,
             id,
             checked: std::cell::Cell::new(std::time::Instant::now()),
-            received: std::cell::Cell::new(None),
+            timing: std::cell::Cell::new(None),
             akai: device.is_none(),
             port: name,
             sysex: Some(sysex),
@@ -490,10 +502,9 @@ impl Input {
         )?))
     }
 
-    /// v7.8 ticket 26: when midir's callback got the message `next` returned last (the
-    /// computer's MIDI layer had it then; the session handles it now).
-    pub fn received(&self) -> Option<std::time::Instant> {
-        self.received.get()
+    /// Timing of the last message returned by `next`.
+    pub fn timing(&self) -> Option<Timing> {
+        self.timing.get()
     }
     pub fn next(&self) -> crate::Result<Option<[u8; 3]>> {
         // ponytail: re-enumerating ports every 250 ms; an ALSA announce subscription would
@@ -506,8 +517,8 @@ impl Input {
         }
         match self.receiver.try_recv() {
             Ok(message) => {
-                let (message, received) = message?;
-                self.received.set(Some(received));
+                let (message, timing) = message?;
+                self.timing.set(Some(timing));
                 Ok(Some(message))
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => Ok(None),
