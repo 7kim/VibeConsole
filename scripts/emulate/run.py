@@ -60,7 +60,7 @@ class Run:
         fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 110, 0, 0))
         self.child = subprocess.Popen([*sandbox, BINARY, "--emulated", directory, *command], stdin=self.slave,
                                       stdout=self.slave, stderr=self.slave,
-                                      env=without_bus(TERM="xterm-256color"))
+                                      env=without_bus(TERM="xterm-256color"), start_new_session=True)
         self.data = b""
         # Read the screen all the time: a full PTY blocks the app's next draw (and its loop).
         self._lock = threading.Lock()
@@ -81,12 +81,21 @@ class Run:
         return self
 
     def __exit__(self, *_):
-        self.child.send_signal(signal.SIGINT)
+        # v7.8 ticket 65: bwrap dies on SIGINT without passing it on, which left the app (an
+        # emulated detect) running. The run has its own process group (bwrap and the app, only
+        # what this Run started), so SIGINT goes to both: the app quits cleanly, releasing keys.
+        group = self.child.pid
         try:
-            self.child.wait(5)
-        except subprocess.TimeoutExpired:
-            self.child.kill()
-            raise
+            os.killpg(group, signal.SIGINT)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                self.child.poll()  # reap bwrap, or the group never empties
+                os.killpg(group, 0)
+                time.sleep(0.05)
+            os.killpg(group, signal.SIGKILL)
+            raise TimeoutError(f"the emulated run didn't quit within 5 s of SIGINT: {self.child.args}")
+        except ProcessLookupError:
+            pass  # the group is empty: everything it started has quit
         finally:
             os.close(self.slave)
             time.sleep(0.1)
