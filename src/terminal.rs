@@ -14082,14 +14082,20 @@ fn configure_steps(
                 .unwrap_or_default();
             // v7 ticket 111: the built-in Xbox defaults not changed yet are listed too, marked
             // default (they apply to Default only, on layer 1).
-            // v7.7 ticket 267: they apply in Xbox Program 1 only.
-            let defaults = if profile.is_none() && ui.xbox_connected() && ui.xbox_program() == 1 {
+            // v7.8 ticket 22: in the Xbox program in use: they apply in every program until a
+            // button is saved there (v7 ticket 115, `gamepad::layout_in`).
+            let defaults = if profile.is_none() && ui.xbox_connected() {
+                let context = mappings::xbox_context(ui.xbox_program(), false);
                 crate::gamepad::default_layout()
                     .into_iter()
                     .filter(|d| {
                         !current
                             .iter()
-                            .any(|m| m.context == d.context && m.control == d.control)
+                            .any(|m| m.context == context && m.control == d.control)
+                    })
+                    .map(|mut d| {
+                        d.context = context;
+                        d
                     })
                     .collect::<Vec<_>>()
             } else {
@@ -14140,7 +14146,11 @@ fn configure_steps(
                         format!(
                             "{}{}{}",
                             if *star { "★ " } else { "" },
-                            if *default { "(default) " } else { "" },
+                            match (default, builtin_default(profile, m.context, m.control)) {
+                                (true, _) => "(default) ",
+                                (false, Some(_)) => "(changed default) ", // v7.8 ticket 22
+                                (false, None) => "",
+                            },
                             mapping_label(m, ui.program().as_ref(), agents.as_deref())
                         )
                     })
@@ -14157,20 +14167,47 @@ fn configure_steps(
             .iter()
             .find(|m| m.context == pad_context && m.control == pad)
             .map(|m| mapping_label(m, ui.program().as_ref(), agents.as_deref()))
+            .or_else(|| {
+                // v7.8 ticket 22: an unchanged built-in default reads as what it does.
+                (chose_default.then(|| builtin_default(profile, pad_context, pad)))
+                    .flatten()
+                    .map(|mut d| {
+                        d.context = pad_context;
+                        mapping_label(&d, ui.program().as_ref(), agents.as_deref())
+                    })
+            })
             .unwrap_or_else(|| {
                 let name = mappings::control_name(pad, None, ui.context(), ui.program().as_ref());
                 format!("{name}: unassigned")
             });
         // v7.8 ticket 20: Edit asks what changes: the action (as before) or the control.
         if action == 5 {
-            match choose(
-                ui,
-                &format!("Edit {existing}"),
-                &strings(&["Change action", "Change mapped input"]),
-            )? {
+            // v7.8 ticket 22: a changed built-in default can go back to it from here too.
+            let changed_default = builtin_default(profile, pad_context, pad)
+                .filter(|_| !chose_default)
+                .map(|d| format!("Reset to default ({})", d.action_label()));
+            let mut rows = strings(&["Change action", "Change mapped input"]);
+            rows.extend(changed_default.clone());
+            match choose(ui, &format!("Edit {existing}"), &rows)? {
                 Some(0) => {}
-                Some(_) => {
+                Some(1) => {
                     change_input(ui, path, current, profile, pad, pad_context)?;
+                    continue;
+                }
+                Some(_) => {
+                    if question(
+                        ui,
+                        &format!(
+                            "{}? {existing} is replaced.",
+                            changed_default.unwrap_or_default()
+                        ),
+                        &strings(&["Cancel", "Reset"]),
+                    )? == Some(1)
+                    {
+                        commit(path, current, pad, pad_context, None, profile)
+                            .map_err(stage("file I/O"))?;
+                        ui.applied().map_err(stage("controller I/O"))?;
+                    }
                     continue;
                 }
                 None => continue,
@@ -14194,12 +14231,13 @@ fn configure_steps(
                     &strings(&["Cancel", "Silence it"]),
                 )? == Some(1)
                 {
-                    let silent = Mapping::new_action(
+                    let mut silent = Mapping::new_action(
                         pad,
                         mappings::Input::Pad,
                         crate::actions::Action::Nothing,
                     )
                     .map_err(stage("validation"))?;
+                    silent.context = pad_context; // v7.8 ticket 22: the program it was listed in
                     commit(path, current, pad, pad_context, Some(silent), profile)
                         .map_err(stage("file I/O"))?;
                     ui.applied().map_err(stage("controller I/O"))?;
@@ -16526,6 +16564,98 @@ mod tests {
                 .unwrap()
                 .keys,
             ["Enter"]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.8 ticket 22: the built-in defaults are listed in the Xbox program in use (they
+    /// apply in every program); one is changed and saved as that program's override, Edit
+    /// resets it, and a silenced one is saved in the same program.
+    #[test]
+    fn xbox_defaults_change_and_reset_in_the_program_in_use() {
+        use crate::actions::Action;
+        use Key::*;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-defaults-22-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut current = Vec::new();
+        let (a, b) = (Control::button(0), Control::button(1));
+        let program2 = mappings::xbox_context(2, false);
+        let does = |saved: &[Mapping], program, control| {
+            crate::gamepad::layout_in(saved, program)
+                .into_iter()
+                .find(|m| m.control == control)
+                .map(|m| (m.action, m.keys))
+        };
+        // Edit -> B (default) -> Change action -> Music & Sound -> Output mute; save, finish.
+        let mut ui = Script {
+            keys: [
+                vec![Tab, Enter, Down, Enter, Enter],
+                vec![Down, Down, Enter, Down, Down, Enter],
+                vec![Enter, Enter, Down, Enter, Escape],
+            ]
+            .concat()
+            .into(),
+            xbox: true,
+            xbox_program: 2,
+            ..Default::default()
+        };
+        configure(&mut ui, &path, &mut current).unwrap();
+        let screens = ui.screens.join("\n----\n");
+        let titles = (ui.screens.iter())
+            .map(|s| s.lines().next().unwrap_or(""))
+            .collect::<Vec<_>>();
+        assert!(ui.keys.is_empty(), "{titles:?}");
+        assert!(
+            screens.contains("(default) Xbox Program 2 | Xbox B | Xbox button | Escape"),
+            "listed in Program 2: {screens}"
+        );
+        assert!(
+            screens.contains("Edit Xbox Program 2 | Xbox B"),
+            "{screens}"
+        );
+        let saved = mappings::load(&path).unwrap();
+        assert_eq!(
+            saved.len(),
+            1,
+            "only the override is saved: {saved:?} {titles:?}"
+        );
+        assert_eq!(saved[0].context, program2);
+        assert_eq!(does(&saved, 2, b).unwrap().0, Action::OutputMute);
+        assert_eq!(
+            does(&saved, 1, b).unwrap().1,
+            ["Escape"],
+            "Program 1 keeps it"
+        );
+        // Edit -> B (changed default, listed first) -> Reset to default (Escape) -> Reset.
+        ui.screens.clear();
+        ui.keys = [Tab, Enter, Enter, Down, Down, Enter, Down, Enter, Escape].into();
+        configure(&mut ui, &path, &mut current).unwrap();
+        let screens = ui.screens.join("\n----\n");
+        assert!(ui.keys.is_empty(), "{screens}");
+        assert!(
+            screens.contains("(changed default) Xbox Program 2 | Xbox B"),
+            "{screens}"
+        );
+        assert!(screens.contains("Reset to default (Escape)"), "{screens}");
+        let saved = mappings::load(&path).unwrap();
+        assert!(saved.is_empty(), "the override is gone: {saved:?}");
+        assert_eq!(does(&saved, 2, b).unwrap().1, ["Escape"]);
+        // Remove -> A (default) -> Silence it: saved as nothing in Program 2 only.
+        ui.screens.clear();
+        ui.keys = [Tab, Down, Enter, Enter, Down, Enter, Escape].into();
+        configure(&mut ui, &path, &mut current).unwrap();
+        let saved = mappings::load(&path).unwrap();
+        assert_eq!(saved.len(), 1, "{saved:?}");
+        assert_eq!((saved[0].control, saved[0].context), (a, program2));
+        assert_eq!(does(&saved, 2, a).unwrap().0, Action::Nothing);
+        assert_eq!(
+            does(&saved, 1, a).unwrap().1,
+            ["Enter"],
+            "Program 1 keeps it"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
