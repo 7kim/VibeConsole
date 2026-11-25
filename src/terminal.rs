@@ -5516,6 +5516,96 @@ impl Terminal {
         self.reset_input_lights();
         Ok(())
     }
+    fn akai_program_names(&mut self) -> Result<Vec<String>> {
+        midi::akai_only(self.device.is_none())?;
+        if self.controller.is_some() {
+            // The watcher owns SysEx. Use its names while keeping its input and snapshot.
+            return Ok(self.program_names.clone());
+        }
+        let names = match &mut self.input {
+            Some(input) => crate::feedback::names(input)?,
+            None => crate::feedback::names(&mut self.open_input()?)?,
+        };
+        self.program_names.clone_from(&names);
+        Ok(names)
+    }
+
+    fn select_program(&mut self, xbox_connected: bool, current: &[Mapping]) -> Result<()> {
+        let was_running = self.wanted_run;
+        let xbox = if xbox_connected {
+            let config = mappings::load_config(&self.path)?;
+            (1..=mappings::XBOX_PROGRAMS)
+                .map(|p| mappings::xbox_program_name(&config, p))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let akai = match self.akai_program_names() {
+            Ok(names) => names,
+            Err(_) if !xbox.is_empty() => Vec::new(),
+            Err(error) => return Err(error),
+        };
+        let at = if self.last_xbox && !xbox.is_empty() {
+            Picked::Xbox(self.xbox_program)
+        } else {
+            Picked::Akai(self.context)
+        };
+        let picked = self.menu_fires(true, |ui| program_select(ui, &akai, &xbox, at))?;
+        let xbox_notice = match picked {
+            Some(Picked::Xbox(program)) => {
+                self.set_xbox_program(program)?;
+                Some(format!("Xbox · {}", xbox[usize::from(program - 1)]))
+            }
+            Some(Picked::Akai(context)) => {
+                self.program_connection()?;
+                self.context_verified = false;
+                self.feedback_allowed = false;
+                let input = self
+                    .input
+                    .as_mut()
+                    .ok_or("MIDI: disconnected during program selection")?;
+                let snapshot = crate::feedback::select(input, context)?;
+                // Bound draining even if the controller generates continuous arpeggiator traffic.
+                for _ in 0..1024 {
+                    if input.next()?.is_none() {
+                        break;
+                    }
+                }
+                if input.next()?.is_some() {
+                    return Err(
+                        "MIDI: continuous input during selection; stop input and select again"
+                            .into(),
+                    );
+                }
+                self.program_snapshot = Some(snapshot);
+                self.context = context;
+                self.context_verified = true;
+                self.notice.clear();
+                self.feedback_allowed = true;
+                self.idle = mappings::load_config(&self.path)?.idle_for(context);
+                self.run_mappings = self.context_mappings(current);
+                let all = self.with_gamepad(&self.run_mappings)?;
+                if let Some(output) = &mut self.output {
+                    output.keyboard.replace(&all)?;
+                }
+                self.reconnected = true;
+                None
+            }
+            None => None,
+        };
+        if self.context_verified {
+            if was_running {
+                self.run_mode(&self.context_mappings(current), false)?;
+            } else {
+                self.selected_idle()?;
+            }
+        }
+        if let Some(notice) = xbox_notice {
+            self.notice = notice;
+        }
+        Ok(())
+    }
+
     fn selected_idle(&mut self) -> Result<()> {
         if !self.feedback_enabled() {
             return Ok(());
@@ -7444,7 +7534,7 @@ fn choose(ui: &mut impl Ui, title: &str, options: &[String]) -> Result<Option<us
 }
 
 fn refresh_idle_after_menu(command: usize, was_running: bool, verified: bool) -> bool {
-    !was_running && verified && matches!(command, 9 | 10 | 14)
+    !was_running && verified && matches!(command, 9 | 14)
 }
 
 fn program_name_prompt(ui: &mut impl Ui, label: &str) -> Result<Option<String>> {
@@ -16214,75 +16304,7 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
                 }
                 Ok(())
             })(),
-            10 => (|| {
-                // v7.8 ticket 07: the connected devices' programs in one list: the Akai's
-                // (read from it) and the Xbox controller's (named in the config).
-                let xbox = if ui.xbox_connected() {
-                    let config = mappings::load_config(path)?;
-                    (1..=mappings::XBOX_PROGRAMS)
-                        .map(|p| mappings::xbox_program_name(&config, p))
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                let akai = (|| -> Result<Vec<String>> {
-                    ui.program_connection()?;
-                    crate::feedback::names(ui.input.as_mut().ok_or("MIDI: disconnected")?)
-                })();
-                let akai = match akai {
-                    Ok(names) => names,
-                    Err(_) if !xbox.is_empty() => Vec::new(), // the Xbox's alone
-                    Err(error) => return Err(error),
-                };
-                if !akai.is_empty() {
-                    ui.program_names = akai.clone();
-                }
-                let at = match ui.last_xbox && !xbox.is_empty() {
-                    true => Picked::Xbox(ui.xbox_program),
-                    false => Picked::Akai(ui.context),
-                };
-                // v7 ticket 144: the Xbox fires while the program is chosen; the selection
-                // below writes to the controller with output suspended.
-                let picked = ui.menu_fires(true, |ui| program_select(ui, &akai, &xbox, at))?;
-                let picked = match picked {
-                    Some(Picked::Xbox(program)) => return ui.set_xbox_program(program),
-                    Some(Picked::Akai(context)) => Some(usize::from(context)),
-                    None => None,
-                };
-                if let Some(context) = picked {
-                    ui.context_verified = false;
-                    ui.feedback_allowed = false;
-                    let input = ui
-                        .input
-                        .as_mut()
-                        .ok_or("MIDI: disconnected during program selection")?;
-                    let snapshot = crate::feedback::select(input, context as u8)?;
-                    // Bound draining even if the controller generates continuous arpeggiator traffic.
-                    for _ in 0..1024 {
-                        if input.next()?.is_none() {
-                            break;
-                        }
-                    }
-                    if input.next()?.is_some() {
-                        return Err(
-                            "MIDI: continuous input during selection; stop input and select again".into(),
-                        );
-                    }
-                    ui.program_snapshot = Some(snapshot);
-                    ui.context = context as u8;
-                    ui.context_verified = true;
-                    ui.notice.clear();
-                    ui.feedback_allowed = true;
-                    ui.idle = mappings::load_config(path)?.idle_for(ui.context);
-                    ui.run_mappings = ui.context_mappings(&current);
-                    let all = ui.with_gamepad(&ui.run_mappings)?;
-                    if let Some(output) = &mut ui.output {
-                        output.keyboard.replace(&all)?;
-                        }
-                    ui.reconnected = true;
-                }
-                Ok(())
-            })(),
+            10 => ui.select_program(ui.xbox_connected(), &current),
             12 => ui.start_flow(),
             14 => ui.rename_program(),
             // v7.7 ticket 152: Devices' Xbox rows. Picking a program is a transition (held
@@ -16345,7 +16367,7 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
                 && was_running
                 && matches!(
                     command,
-                    0 | 6 | 7 | 8 | 9 | 10 | 14 | 17 | 19 | 20 | 23 | 24 | SETTING..
+                    0 | 6 | 7 | 8 | 9 | 14 | 17 | 19 | 20 | 23 | 24 | SETTING..
                 )
             {
                 ui.run_mode(&ui.context_mappings(&current), false)?;
@@ -16792,11 +16814,11 @@ mod tests {
 
     #[test]
     fn paused_verified_program_menus_reapply_idle_without_resuming_keys() {
-        for command in [9, 10, 14] {
+        for command in [9, 14] {
             assert!(refresh_idle_after_menu(command, false, true));
         }
-        assert!(!refresh_idle_after_menu(10, true, true));
-        assert!(!refresh_idle_after_menu(10, false, false));
+        assert!(!refresh_idle_after_menu(9, true, true));
+        assert!(!refresh_idle_after_menu(14, false, false));
         assert!(!refresh_idle_after_menu(3, false, true));
     }
 
@@ -17556,6 +17578,52 @@ mod tests {
         let picked = program_select(&mut ui, &akai, &[], Picked::Akai(0)).unwrap();
         assert!(!ui.screens.last().unwrap().contains("Apps"));
         assert_eq!(picked, Some(Picked::Akai(1)));
+    }
+
+    #[test]
+    fn xbox_program_pick_keeps_its_notice_and_the_akai_connection() {
+        let (dir, mut ui, _ran, _) = configure_session("program-pick");
+        let path = dir.join("mappings.tsv");
+        let mut config = mappings::load_config(&path).unwrap();
+        config.mappings.clear();
+        config.xbox_names[1] = "Editor".into();
+        mappings::save_config(&path, &config).unwrap();
+        ui.run_mappings.clear();
+        ui.program_names[0] = "Program 1 — Pads".into();
+        let (_, snapshot) = recorded_program();
+        ui.program_snapshot = Some(snapshot);
+        ui.follow_programs = true;
+        ui.controller = Some(crate::feedback::Controller::fake_for_reset(
+            Default::default(),
+        ));
+        ui.script = Some(Play {
+            steps: [Key::Up, Key::Up, Key::Enter].map(Step::Key).into(),
+            ..Play::default()
+        });
+        ui.xbox_program = 4;
+        ui.last_xbox = true;
+        ui.select_program(true, &config.mappings).unwrap();
+        let screen = ui.screen("").render(120, 40, false);
+        assert!(screen.contains("Xbox · Editor"), "{screen}");
+        assert!(!screen.contains("MIDI reconnected"), "{screen}");
+        assert_eq!(ui.xbox_program, 2);
+        assert!(ui.controller.is_some());
+        assert_eq!(ui.program_snapshot, Some(snapshot));
+        assert!(ui.output.as_ref().unwrap().keyboard.running());
+
+        // The Akai branch still hands the port back from the watcher to program selection.
+        // The scripted build refuses the subsequent real MIDI open.
+        ui.script.as_mut().unwrap().steps = [Step::Key(Key::Enter)].into();
+        ui.last_xbox = false;
+        ui.rows_left.clear();
+        let error = ui.select_program(true, &config.mappings).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("real MIDI is not opened in tests")
+        );
+        assert!(ui.controller.is_none());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// v7.8 ticket 06: the header names the program (Program N only when unnamed), then the
