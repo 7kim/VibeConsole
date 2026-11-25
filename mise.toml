@@ -6,6 +6,8 @@
 min_version = { soft = "2026.8.10" }
 
 [tools]
+bun = "latest"
+npm = "latest"
 # mise installs Rust through rustup (~/.rustup, ~/.cargo) and pins this toolchain here.
 rust = { version = "1.98.1", components = "rustfmt,clippy" }
 # uv runs the Python checks; each script names its Python in a PEP 723 header.
@@ -41,6 +43,11 @@ run = [
   "cargo build --release --locked",
   "uv run scripts/check-idle.py",
 ]
+
+[tasks.appimage]
+description = "AppImage of the committed HEAD into target/appimage/, then an Arch container check (args: [label] [--no-arch])"
+# v7.8 tickets 61–62. `mise run appimage preview.2` names the build; publishing is separate.
+run = "scripts/appimage.sh"
 
 [tasks.config-isolation]
 description = "The test suite against a sentinel config: reports reads and any write (--each: each test alone)"

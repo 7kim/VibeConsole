@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=VibeConsole
+Comment=Controller shortcuts and coding-agent status
+Exec=vibeconsole
+Icon=vibeconsole
+Terminal=true
+Categories=Utility;
