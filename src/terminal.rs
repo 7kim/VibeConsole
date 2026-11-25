@@ -3834,6 +3834,12 @@ impl Terminal {
                                 })?;
                             crate::actions::Action::PromptSequence(steps.to_vec())
                         }
+                        // v7.8 ticket 17: one step per press, through the same positions.
+                        crate::actions::Action::PressSequence(steps) => {
+                            crate::actions::Action::PromptSequence(
+                                crate::actions::Action::per_press(&steps),
+                            )
+                        }
                         action => action,
                     };
                     let sequence = match &action {
@@ -3900,6 +3906,7 @@ impl Terminal {
                     action,
                     crate::actions::Action::PromptSequence(_)
                         | crate::actions::Action::SavedSequence(_)
+                        | crate::actions::Action::PressSequence(_)
                 ) {
                     self.holds.release(pad, Instant::now());
                 }
@@ -4611,6 +4618,7 @@ impl Terminal {
                         m.action,
                         crate::actions::Action::PromptSequence(_)
                             | crate::actions::Action::SavedSequence(_)
+                            | crate::actions::Action::PressSequence(_)
                     )
                 });
                 if sequence {
@@ -4752,7 +4760,8 @@ impl Terminal {
                 }
                 Some(
                     crate::actions::Action::PromptSequence(_)
-                    | crate::actions::Action::SavedSequence(_),
+                    | crate::actions::Action::SavedSequence(_)
+                    | crate::actions::Action::PressSequence(_),
                 ) => {
                     self.positions.restart(pad);
                     self.notice = format!("{}: sequence starts over at step 1", self.name(pad));
@@ -11997,7 +12006,7 @@ fn must_hold(action: &crate::actions::Action) -> bool {
     match action {
         Action::Command { line, .. } => UPDATES.iter().any(|(l, _)| l == line),
         // v7.8 ticket 16: a sequence holding a held step is held too.
-        Action::Sequence(steps) => steps
+        Action::Sequence(steps) | Action::PressSequence(steps) => steps
             .iter()
             .any(|step| matches!(step, Step::Do(action) if must_hold(action))),
         action => action.must_hold(),
@@ -12311,7 +12320,7 @@ fn action_family(mapping: &Mapping) -> usize {
         Action::Command { .. } if mapping.risky => 12,
         Action::Command { .. } => 4,
         Action::Prompt { .. } => 3,
-        Action::Sequence(_) => 5,
+        Action::Sequence(_) | Action::PressSequence(_) => 5,
         Action::Choice(_) => 6,
         Action::Value { .. } => 7,
         Action::OrcaJump { .. } => 8,
@@ -13657,15 +13666,34 @@ fn configure_steps(
             if !matches!(input, mappings::Input::Pad | mappings::Input::Piano) {
                 return Err("validation: sequences require a pad or piano press".into());
             }
-            let steps = match saved.as_ref().map(|m| &m.action) {
-                Some(crate::actions::Action::Sequence(steps)) => steps.clone(),
-                _ => Vec::new(),
+            use crate::actions::Action::{PressSequence, Sequence};
+            let (steps, per_press) = match saved.as_ref().map(|m| &m.action) {
+                Some(Sequence(steps)) => (steps.clone(), Some(0)),
+                Some(PressSequence(steps)) => (steps.clone(), Some(1)),
+                _ => (Vec::new(), None),
             };
             let Some(steps) = sequence_menu(ui, path, steps)? else {
                 continue;
             };
-            Mapping::new_action(pad, input, crate::actions::Action::Sequence(steps))
-                .map_err(stage("validation"))?
+            // v7.8 ticket 17: two modes, as prompt sequences have.
+            let Some(mode) = choose_saved(
+                ui,
+                "Sequence mode",
+                strings(&[
+                    "All at once (one press runs every step)",
+                    "One per press (press 1 runs step 1, press 2 step 2, …; hold 1 s at the end to start over)",
+                ]),
+                per_press,
+            )?
+            else {
+                continue;
+            };
+            let action = if mode == 1 {
+                PressSequence(steps)
+            } else {
+                Sequence(steps)
+            };
+            Mapping::new_action(pad, input, action).map_err(stage("validation"))?
         } else if family >= 6 {
             if !matches!(input, mappings::Input::Knob { .. }) {
                 return Err("validation: choice and value actions need an absolute knob".into());
@@ -13754,7 +13782,8 @@ fn configure_steps(
         let name = window_name(&mapping.name(ui.program().as_ref()));
         match &mut mapping.action {
             crate::actions::Action::Command { window, .. } => *window = name,
-            crate::actions::Action::Sequence(steps) => {
+            crate::actions::Action::Sequence(steps)
+            | crate::actions::Action::PressSequence(steps) => {
                 for step in steps {
                     if let crate::actions::Step::Do(crate::actions::Action::Command {
                         window,
@@ -19518,6 +19547,7 @@ mod tests {
                     family(5),
                     vec![
                         Enter, Down, Enter, Enter, Enter, Enter, Enter, Down, Down, Enter,
+                        Enter, // v7.8 ticket 17: all at once
                     ],
                 ]
                 .concat(),
@@ -19627,7 +19657,8 @@ mod tests {
                 3 => [prompt.clone(), vec![Enter, Enter]].concat(),
                 4 => [command("claude"), vec![Enter, Enter]].concat(),
                 5 => vec![
-                    Enter, Down, Enter, Enter, Enter, Enter, Enter, Down, Down, Enter, Enter, Enter,
+                    Enter, Down, Enter, Enter, Enter, Enter, Enter, Down, Down, Enter, Enter,
+                    Enter, Enter, // v7.8 ticket 17: the mode, all at once
                 ],
                 6 => [
                     vec![Enter],
@@ -22175,7 +22206,7 @@ mod tests {
         keys.extend([Enter, Down, Down, Down, Down, Down, Enter]); // learn B -> sequence
         keys.extend([Enter, Down, Enter]); // add step -> prompt
         keys.extend([Enter, Enter, Enter, Enter]); // review, use existing, claude, paste only
-        keys.extend([Down, Down, Enter]); // done
+        keys.extend([Down, Down, Enter, Enter]); // done, all at once (v7.8 ticket 17)
         keys.extend([Enter, Enter, Down, Enter]); // fire when pressed, status Off, save and finish
         let mut ui = Script {
             keys: keys.into(),
@@ -22941,6 +22972,94 @@ mod tests {
     /// v7 ticket 101: through the real event path (keyboard, then the session), a finished
     /// sequence sends nothing on any number of taps, even a second apart; a ½ s hold re-arms
     /// nothing; only a full one-second hold starts it over, and the next tap sends step 1.
+    #[test]
+    fn one_per_press_sequence_steps_once_per_press() {
+        use crate::actions::{Action, Media, Step, System};
+        let dir = std::env::temp_dir().join(format!("vibeconsole-perpress-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let steps = vec![
+            Step::Do(Action::Media(Media::PlayPause)),
+            Step::Keys(vec!["MouseLeft".into()]),
+            Step::Do(Action::System(System::DarkStyle(true))),
+        ];
+        let pad = Control::from_note(10, 42).unwrap();
+        let seq = Mapping::new_action(
+            pad,
+            mappings::Input::Pad,
+            Action::PressSequence(steps.clone()),
+        )
+        .unwrap();
+        mappings::save(&path, &[seq]).unwrap();
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        let (sent, ran) = std::sync::mpsc::channel();
+        ui.actions = crate::actions::Dispatcher::with(move |action, _, _| {
+            sent.send(action.clone()).unwrap();
+            Ok("done".into())
+        });
+        ui.run_mappings = ui.context_mappings(&mappings::load_config(&path).unwrap().mappings);
+        let mut output = crate::keyboard::Output::recording(&ui.run_mappings).unwrap();
+        output.keyboard.resume();
+        ui.output = Some(output);
+        ui.wanted_run = true;
+        ui.suspended = false;
+        let press = |ui: &mut Terminal| ui.handle_events(vec![Event::Press(pad)]).unwrap();
+        let release = |ui: &mut Terminal| {
+            ui.handle_events(vec![Event::Release(pad, crate::ReleaseType::NoteOff)])
+                .unwrap()
+        };
+        let next = |ran: &std::sync::mpsc::Receiver<Action>| {
+            ran.recv_timeout(Duration::from_secs(2)).unwrap()
+        };
+        let nothing = |ran: &std::sync::mpsc::Receiver<Action>| {
+            assert!(
+                ran.recv_timeout(Duration::from_millis(150)).is_err(),
+                "nothing sent"
+            );
+        };
+        press(&mut ui);
+        release(&mut ui);
+        assert_eq!(next(&ran), Action::Sequence(vec![steps[0].clone()]));
+        // A transition between presses neither advances nor replays: a release whose press
+        // wasn't seen sends nothing, and the next press runs step 2.
+        ui.release_all().unwrap();
+        ui.handle_events(vec![Event::UnmatchedRelease(pad)])
+            .unwrap();
+        nothing(&ran);
+        press(&mut ui);
+        release(&mut ui);
+        assert_eq!(next(&ran), Action::Sequence(vec![steps[1].clone()]));
+        press(&mut ui);
+        release(&mut ui);
+        assert_eq!(next(&ran), Action::Sequence(vec![steps[2].clone()]));
+        // Finished: a tap sends nothing; a full hold starts it over at step 1.
+        press(&mut ui);
+        release(&mut ui);
+        nothing(&ran);
+        assert!(
+            ui.notice.ends_with("hold 1 s to start over"),
+            "{}",
+            ui.notice
+        );
+        press(&mut ui);
+        std::thread::sleep(Duration::from_millis(1100));
+        ui.quit_holds();
+        release(&mut ui);
+        assert!(
+            ui.notice.ends_with("sequence starts over at step 1"),
+            "{}",
+            ui.notice
+        );
+        press(&mut ui);
+        release(&mut ui);
+        assert_eq!(next(&ran), Action::Sequence(vec![steps[0].clone()]));
+        // It saves and loads as one-per-press.
+        let saved = mappings::load(&path).unwrap();
+        assert_eq!(saved[0].action, Action::PressSequence(steps));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn a_finished_sequence_restarts_only_after_a_full_hold() {
         use crate::actions::{Action, Target};

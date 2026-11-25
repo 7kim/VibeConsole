@@ -96,6 +96,7 @@ impl Step {
             Self::Do(
                 Action::Shortcut
                 | Action::Sequence(_)
+                | Action::PressSequence(_)
                 | Action::PromptSequence(_)
                 | Action::SavedSequence(_)
                 | Action::Choice(_)
@@ -180,6 +181,9 @@ pub enum Action {
         browser: Browser,
         what: BrowserDo,
     },
+    /// v7.8 ticket 17: a step sequence run one step per press (press 1 runs step 1, …; once
+    /// finished, a one-second hold starts it over), like prompt sequences.
+    PressSequence(Vec<Step>),
     /// v7.8 ticket 15: Playwright codegen for a URL, or a saved script by name, in a visible
     /// terminal (a tmux window of `vibe`), from `~/.config/vibeconsole/playwright`.
     Playwright(Playwright),
@@ -763,12 +767,20 @@ pub fn on_path(program: &str) -> bool {
         })
 }
 impl Action {
+    /// v7.8 ticket 17: a one-per-press sequence as the prompt-sequence machinery runs it: each
+    /// step its own one-step sequence (so any step kind runs as it does at once).
+    pub fn per_press(steps: &[Step]) -> Vec<Action> {
+        steps
+            .iter()
+            .map(|step| Self::Sequence(vec![step.clone()]))
+            .collect()
+    }
     /// v7.8 tickets 12, 16: fires only after a one-second hold: suspend, turning the
     /// controller off, and a sequence holding one of them.
     pub fn must_hold(&self) -> bool {
         match self {
             Self::System(system) => system.risky(),
-            Self::Sequence(steps) => steps
+            Self::Sequence(steps) | Self::PressSequence(steps) => steps
                 .iter()
                 .any(|step| matches!(step, Step::Do(action) if action.must_hold())),
             _ => false,
@@ -788,7 +800,7 @@ impl Action {
                 target: Target::Agent(name),
                 ..
             } => vec![name],
-            Self::Sequence(steps) => steps
+            Self::Sequence(steps) | Self::PressSequence(steps) => steps
                 .iter()
                 .flat_map(|step| match step {
                     Step::Agent(name) => vec![name.as_str()],
@@ -825,7 +837,7 @@ impl Action {
             Self::Choice(choices) | Self::PromptSequence(choices) => {
                 choices.iter().flat_map(Self::prompt_files).collect()
             }
-            Self::Sequence(steps) => steps
+            Self::Sequence(steps) | Self::PressSequence(steps) => steps
                 .iter()
                 .flat_map(|step| match step {
                     Step::Do(action) => action.prompt_files(),
@@ -839,7 +851,7 @@ impl Action {
     pub fn commands(&self) -> Vec<(&str, &str)> {
         match self {
             Self::Command { line, dir, .. } => vec![(line, dir)],
-            Self::Sequence(steps) => steps
+            Self::Sequence(steps) | Self::PressSequence(steps) => steps
                 .iter()
                 .flat_map(|step| match step {
                     Step::Do(action) => action.commands(),
@@ -861,10 +873,14 @@ impl Action {
     }
     pub fn validate(&self) -> Result<()> {
         match self {
-            Self::Sequence(steps) if steps.is_empty() || steps.len() > 32 => {
+            Self::Sequence(steps) | Self::PressSequence(steps)
+                if steps.is_empty() || steps.len() > 32 =>
+            {
                 Err("a sequence needs 1–32 steps".into())
             }
-            Self::Sequence(steps) => steps.iter().try_for_each(Step::validate),
+            Self::Sequence(steps) | Self::PressSequence(steps) => {
+                steps.iter().try_for_each(Step::validate)
+            }
             Self::OrcaKeys(steps)
                 if steps.is_empty()
                     || steps.len() > 32
@@ -1003,8 +1019,12 @@ impl Action {
                     .collect::<Vec<_>>()
                     .join(&STEP_SEPARATOR.to_string())
             ),
-            Self::Sequence(steps) => format!(
-                "sequence:{}",
+            Self::Sequence(steps) | Self::PressSequence(steps) => format!(
+                "{}:{}",
+                match self {
+                    Self::PressSequence(_) => "sequence-per-press",
+                    _ => "sequence",
+                },
                 steps
                     .iter()
                     .map(Step::encode)
@@ -1134,6 +1154,12 @@ impl Action {
             }
             _ if value.starts_with("orca-keys:") => Self::OrcaKeys(
                 value["orca-keys:".len()..]
+                    .split(STEP_SEPARATOR)
+                    .map(Step::parse)
+                    .collect::<Result<_>>()?,
+            ),
+            _ if value.starts_with("sequence-per-press:") => Self::PressSequence(
+                value["sequence-per-press:".len()..]
                     .split(STEP_SEPARATOR)
                     .map(Step::parse)
                     .collect::<Result<_>>()?,
@@ -1310,6 +1336,14 @@ impl Action {
                 steps
                     .iter()
                     .filter(|s| !matches!(s, Step::Wait(_)))
+                    .map(Step::description)
+                    .collect::<Vec<_>>()
+                    .join(" → ")
+            ),
+            Self::PressSequence(steps) => format!(
+                "Sequence, one step per press: {}",
+                steps
+                    .iter()
                     .map(Step::description)
                     .collect::<Vec<_>>()
                     .join(" → ")
@@ -3559,6 +3593,7 @@ impl Action {
         match self {
             Self::Shortcut => "shortcut",
             Self::Sequence(_) => "sequence",
+            Self::PressSequence(_) => "sequence-per-press",
             Self::SavedSequence(_) => "saved-sequence",
             Self::Nothing => "nothing",
             Self::OrcaKeys(_) => "orca-keys",
