@@ -669,6 +669,7 @@ mod tests {
         // The skills (ten, and one per Ask since ticket 184), each a name, a "Use when" description, and links that resolve.
         let want = [
             "vibeconsole",
+            "vibeconsole-add-controller",
             "vibeconsole-agents",
             "vibeconsole-ask-about",
             "vibeconsole-ask-family",

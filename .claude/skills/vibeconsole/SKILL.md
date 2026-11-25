@@ -21,7 +21,7 @@ VibeConsole is a Rust terminal app that turns an Akai MPK mini 3 and Xbox contro
 | agent states and lights | `vibeconsole-agents`, `vibeconsole-lights` |
 | to change the code safely | `vibeconsole-safety-review`, `vibeconsole-hardware-test`, `vibeconsole-release` |
 | an answer to one of VibeConsole's 0 AI asks | its own `vibeconsole-ask-*` skill (one per Ask: profile, mappings, setup-agents, map-agents, prompt, sequence, preset, setup, family, about, improve, recommendations) |
-| to add a new kind of controller | `vibeconsole-add-controller` (reserved, not written yet) |
+| to add a new controller (MIDI device or gamepad) | `vibeconsole-add-controller` |
 
 ## Reference (shared by every skill)
 

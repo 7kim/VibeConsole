@@ -443,7 +443,12 @@ pub fn compare_text(rows: &[ModeRow]) -> String {
 }
 /// v7.7 ticket 158: the VibeConsole skills (ten, and since ticket 184 one per Ask), embedded at build time: (path under
 /// `~/.claude/skills`, text). A test keeps this list equal to the repo's `.claude/skills`.
-pub const SKILLS: [(&str, &str); 29] = [
+pub const SKILLS: [(&str, &str); 30] = [
+    // v7.8 ticket 31: adding a new MIDI device or gamepad.
+    (
+        "vibeconsole-add-controller/SKILL.md",
+        include_str!("../.claude/skills/vibeconsole-add-controller/SKILL.md"),
+    ),
     (
         "vibeconsole-agents/SKILL.md",
         include_str!("../.claude/skills/vibeconsole-agents/SKILL.md"),
@@ -1669,7 +1674,7 @@ mod tests {
         assert!(!skills_installed(&home));
         let note = install_skills(&home).unwrap();
         assert!(
-            note.contains("29 files written") && note.contains("backed up first"),
+            note.contains("30 files written") && note.contains("backed up first"),
             "{note}"
         );
         assert!(skills_installed(&home));
