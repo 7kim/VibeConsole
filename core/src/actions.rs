@@ -167,6 +167,8 @@ pub enum Action {
     /// v7.8 ticket 10: a media key, tapped through the virtual keyboard; the desktop hands it
     /// to whatever player is playing (nothing happens when none is).
     Media(Media),
+    /// v7.8 ticket 12: a Fedora System action: one fixed command (or the Print key).
+    System(System),
     /// Start Wispr Flow when it is not running; repair (quit and reopen) it once when it is.
     Flow,
     /// v7 ticket 15: bring Orca's tab for `agent` working in `folder` to the front. The
@@ -236,6 +238,192 @@ impl Media {
             Self::Stop => evdev::KeyCode::KEY_STOPCD,
         }
     }
+}
+/// v7.8 ticket 12: GNOME Settings panels `gnome-control-center <panel>` opens; the names its
+/// installed panels have on Fedora 44 (`/usr/share/applications/gnome-*-panel.desktop`).
+pub const SETTINGS_PANELS: [&str; 27] = [
+    "about",
+    "applications",
+    "background",
+    "bluetooth",
+    "color",
+    "datetime",
+    "display",
+    "keyboard",
+    "mouse",
+    "multitasking",
+    "network",
+    "notifications",
+    "online-accounts",
+    "power",
+    "printers",
+    "privacy",
+    "region",
+    "search",
+    "sharing",
+    "sound",
+    "system",
+    "universal-access",
+    "users",
+    "wacom",
+    "wellbeing",
+    "wifi",
+    "wwan",
+];
+/// v7.8 ticket 12: the Fedora System actions. Each runs one fixed program with fixed single
+/// arguments (the panel is one of `SETTINGS_PANELS`), never through a shell.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum System {
+    Lock,
+    Suspend,
+    Screenshot,
+    DoNotDisturb(bool),
+    NightLight(bool),
+    DarkStyle(bool),
+    WiFi(bool),
+    Bluetooth(bool),
+    EmptyTrash,
+    Settings(String),
+}
+impl System {
+    /// Every action but the panel (its rows follow these in Configure).
+    pub const FIXED: [System; 13] = [
+        Self::Lock,
+        Self::Suspend,
+        Self::Screenshot,
+        Self::DoNotDisturb(true),
+        Self::DoNotDisturb(false),
+        Self::NightLight(true),
+        Self::NightLight(false),
+        Self::DarkStyle(true),
+        Self::DarkStyle(false),
+        Self::WiFi(true),
+        Self::WiFi(false),
+        Self::Bluetooth(true),
+        Self::Bluetooth(false),
+    ];
+    fn on(on: bool) -> &'static str {
+        if on { "on" } else { "off" }
+    }
+    /// The config word after `system:`.
+    pub fn word(&self) -> String {
+        match self {
+            Self::Lock => "lock".into(),
+            Self::Suspend => "suspend".into(),
+            Self::Screenshot => "screenshot".into(),
+            Self::DoNotDisturb(on) => format!("do-not-disturb-{}", Self::on(*on)),
+            Self::NightLight(on) => format!("night-light-{}", Self::on(*on)),
+            Self::DarkStyle(on) => format!("dark-style-{}", Self::on(*on)),
+            Self::WiFi(on) => format!("wifi-{}", Self::on(*on)),
+            Self::Bluetooth(on) => format!("bluetooth-{}", Self::on(*on)),
+            Self::EmptyTrash => "empty-trash".into(),
+            Self::Settings(panel) => format!("settings-{panel}"),
+        }
+    }
+    pub fn parse(word: &str) -> Result<Self> {
+        if let Some(panel) = word.strip_prefix("settings-") {
+            return match SETTINGS_PANELS.contains(&panel) {
+                true => Ok(Self::Settings(panel.into())),
+                false => Err(format!("unknown GNOME Settings panel {panel:?}").into()),
+            };
+        }
+        Self::FIXED
+            .into_iter()
+            .chain([Self::EmptyTrash])
+            .find(|s| s.word() == word)
+            .ok_or_else(|| format!("unknown Fedora System action {word:?}").into())
+    }
+    pub fn label(&self) -> String {
+        let on = |on: bool| if on { "on" } else { "off" };
+        match self {
+            Self::Lock => "Lock screen".into(),
+            Self::Suspend => "Suspend (hold 1 second)".into(),
+            Self::Screenshot => "Screenshot (the Print key)".into(),
+            Self::DoNotDisturb(o) => format!("Do Not Disturb {}", on(*o)),
+            Self::NightLight(o) => format!("Night light {}", on(*o)),
+            Self::DarkStyle(o) => format!("Dark style {}", on(*o)),
+            Self::WiFi(o) => format!("Wi-Fi {}", on(*o)),
+            Self::Bluetooth(o) => format!("Bluetooth {}", on(*o)),
+            Self::EmptyTrash => "Empty trash".into(),
+            Self::Settings(panel) => format!("Open Settings: {panel}"),
+        }
+    }
+    /// Risky: fires only after a one-second hold (suspend).
+    pub fn risky(&self) -> bool {
+        *self == Self::Suspend
+    }
+    /// The program and its single arguments; None for the screenshot (a key, not a program).
+    pub fn command(&self) -> Option<(&'static str, Vec<String>)> {
+        let set = |schema: &str, key: &str, value: &str| {
+            ("gsettings", strings(&["set", schema, key, value]))
+        };
+        let tf = |b: bool| if b { "true" } else { "false" };
+        Some(match self {
+            // GNOME's own lock, on the session bus: it works from the login service too, which
+            // has no logind session for `loginctl lock-session` to lock.
+            Self::Lock => (
+                "gdbus",
+                strings(&[
+                    "call",
+                    "--session",
+                    "--dest",
+                    "org.gnome.ScreenSaver",
+                    "--object-path",
+                    "/org/gnome/ScreenSaver",
+                    "--method",
+                    "org.gnome.ScreenSaver.Lock",
+                ]),
+            ),
+            Self::Suspend => ("systemctl", strings(&["suspend"])),
+            Self::Screenshot => return None,
+            // Banners off is Do Not Disturb on.
+            Self::DoNotDisturb(on) => {
+                set("org.gnome.desktop.notifications", "show-banners", tf(!on))
+            }
+            Self::NightLight(on) => set(
+                "org.gnome.settings-daemon.plugins.color",
+                "night-light-enabled",
+                tf(*on),
+            ),
+            Self::DarkStyle(on) => set(
+                "org.gnome.desktop.interface",
+                "color-scheme",
+                if *on { "prefer-dark" } else { "default" },
+            ),
+            Self::WiFi(on) => ("nmcli", strings(&["radio", "wifi", Self::on(*on)])),
+            Self::Bluetooth(on) => ("bluetoothctl", strings(&["power", Self::on(*on)])),
+            Self::EmptyTrash => ("gio", strings(&["trash", "--empty"])),
+            Self::Settings(panel) => ("gnome-control-center", vec![panel.clone()]),
+        })
+    }
+}
+/// v7.8 ticket 12: a Fedora System action through `run` (program, arguments) or, for the
+/// screenshot, one tap of the Print key. A program not on PATH is unavailable, named.
+pub fn system(
+    action: &System,
+    installed: impl Fn(&str) -> bool,
+    mut run: impl FnMut(&str, &[String]) -> Result<String>,
+    tap: &dyn Fn(Vec<evdev::KeyCode>) -> Result<()>,
+) -> Result<String> {
+    let Some((program, args)) = action.command() else {
+        tap(vec![evdev::KeyCode::KEY_SYSRQ])?;
+        return Ok("Screenshot: Print key sent".into());
+    };
+    if !installed(program) {
+        return Err(format!("{}: unavailable: {program} isn't installed", action.label()).into());
+    }
+    run(program, &args).map_err(|e| format!("{}: {e}", action.label()))?;
+    Ok(format!("{}: done", action.label()))
+}
+/// A program found on PATH (an absolute PATH entry holding an executable file of that name).
+pub fn on_path(program: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .filter(|dir| dir.is_absolute())
+        .any(|dir| {
+            std::fs::metadata(dir.join(program))
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
 }
 impl Action {
     pub fn flow(&self) -> bool {
@@ -507,6 +695,7 @@ impl Action {
             }
             Self::OutputMute => "output-mute".into(),
             Self::Media(media) => format!("media:{}", media.word()),
+            Self::System(system) => format!("system:{}", system.word()),
             Self::Nothing => "nothing".into(),
             Self::SavedSequence(name) => format!("saved-sequence:{name}"),
             Self::MicrophoneMute => "microphone-mute".into(),
@@ -617,6 +806,9 @@ impl Action {
                 }
             }
             "output-mute" => Self::OutputMute,
+            _ if value.starts_with("system:") => {
+                Self::System(System::parse(&value["system:".len()..])?)
+            }
             _ if value.starts_with("media:") => Self::Media(
                 *Media::ALL
                     .iter()
@@ -772,6 +964,7 @@ impl Action {
             ),
             Self::OutputMute => "Toggle default output mute".into(),
             Self::Media(media) => format!("Media key: {}", media.label()),
+            Self::System(system) => system.label(),
             Self::Nothing => "No action (built-in default silenced)".into(),
             Self::SavedSequence(name) => format!("Saved prompt sequence {name} (one step per tap)"),
             Self::MicrophoneMute => "Toggle default microphone mute".into(),
@@ -2657,6 +2850,12 @@ fn perform(
             tap(vec![media.key()])?;
             Ok(format!("{} sent", media.label()))
         }
+        Action::System(action) => system(
+            action,
+            |p| crate::emulated().is_some() || on_path(p),
+            |program, args| command(program, args, &cancelled),
+            tap,
+        ),
         Action::Choice(_) | Action::Value { .. } => Err("knob actions run in the session".into()),
         _ => audio(action, |args| command("wpctl", args, &cancelled)),
     }
@@ -2974,6 +3173,7 @@ impl Action {
             Self::OutputMute => "output-mute",
             Self::MicrophoneMute => "microphone-mute",
             Self::Media(_) => "media",
+            Self::System(_) => "system",
             Self::Flow => "flow",
             Self::OrcaJump { .. } => "orca-jump",
             Self::AppToggleQuit(_) => "app-toggle-quit",
@@ -4031,6 +4231,115 @@ mod tests {
             assert_eq!(notice, format!("{} sent", media.label()));
         }
         assert!(Action::parse("media:louder").is_err());
+    }
+
+    /// v7.8 ticket 12: each Fedora System action runs its one fixed program with single
+    /// arguments through the injected runner (the screenshot taps Print); a program not
+    /// installed is unavailable and nothing runs; every word round-trips; panels are fixed.
+    #[test]
+    fn fedora_system_actions_run_their_fixed_commands() {
+        let all = System::FIXED
+            .into_iter()
+            .chain([System::EmptyTrash, System::Settings("wifi".into())]);
+        for action in all {
+            let ran = std::cell::RefCell::new(Vec::new());
+            let taps = std::cell::RefCell::new(Vec::new());
+            let notice = system(
+                &action,
+                |_| true,
+                |p, a| {
+                    ran.borrow_mut().push((p.to_owned(), a.to_vec()));
+                    Ok(String::new())
+                },
+                &|k| {
+                    taps.borrow_mut().push(k);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let encoded = Action::System(action.clone()).encode();
+            assert_eq!(
+                Action::parse(&encoded).unwrap(),
+                Action::System(action.clone())
+            );
+            let (ran, taps) = (ran.into_inner(), taps.into_inner());
+            match &action {
+                System::Screenshot => {
+                    assert!(ran.is_empty());
+                    assert_eq!(taps, [vec![evdev::KeyCode::KEY_SYSRQ]]);
+                }
+                _ => {
+                    assert_eq!(ran.len(), 1, "{action:?}");
+                    assert!(taps.is_empty());
+                    assert!(notice.ends_with("done"), "{notice}");
+                }
+            }
+            let expect = |p: &str, a: &[&str]| (p.to_owned(), strings(a));
+            let want = match &action {
+                System::Suspend => Some(expect("systemctl", &["suspend"])),
+                System::DoNotDisturb(true) => Some(expect(
+                    "gsettings",
+                    &[
+                        "set",
+                        "org.gnome.desktop.notifications",
+                        "show-banners",
+                        "false",
+                    ],
+                )),
+                System::NightLight(false) => Some(expect(
+                    "gsettings",
+                    &[
+                        "set",
+                        "org.gnome.settings-daemon.plugins.color",
+                        "night-light-enabled",
+                        "false",
+                    ],
+                )),
+                System::DarkStyle(true) => Some(expect(
+                    "gsettings",
+                    &[
+                        "set",
+                        "org.gnome.desktop.interface",
+                        "color-scheme",
+                        "prefer-dark",
+                    ],
+                )),
+                System::WiFi(false) => Some(expect("nmcli", &["radio", "wifi", "off"])),
+                System::Bluetooth(true) => Some(expect("bluetoothctl", &["power", "on"])),
+                System::EmptyTrash => Some(expect("gio", &["trash", "--empty"])),
+                System::Settings(_) => Some(expect("gnome-control-center", &["wifi"])),
+                System::Lock => Some(expect(
+                    "gdbus",
+                    &[
+                        "call",
+                        "--session",
+                        "--dest",
+                        "org.gnome.ScreenSaver",
+                        "--object-path",
+                        "/org/gnome/ScreenSaver",
+                        "--method",
+                        "org.gnome.ScreenSaver.Lock",
+                    ],
+                )),
+                _ => None,
+            };
+            if let Some(want) = want {
+                assert_eq!(ran[0], want, "{action:?}");
+            }
+        }
+        // Not installed: unavailable, by name, and nothing runs.
+        let error = system(
+            &System::WiFi(true),
+            |_| false,
+            |_, _| panic!("must not run"),
+            &|_| Ok(()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(error, "Wi-Fi on: unavailable: nmcli isn't installed");
+        assert!(Action::parse("system:settings-../../etc").is_err());
+        assert!(Action::parse("system:reboot").is_err());
+        assert!(System::Suspend.risky() && !System::Lock.risky());
     }
     #[test]
     fn repressing_a_running_sequence_is_ignored_and_taps_wait_for_the_session() {

@@ -11778,6 +11778,77 @@ Media keys go to the player that is playing; with none, nothing happens.",
     }
 }
 
+/// v7.8 ticket 12: the ready-made updates, as terminal commands (visible, hold 1 second).
+const UPDATES: [(&str, &str); 2] = [
+    (
+        "sudo dnf upgrade --refresh",
+        "System update: sudo dnf upgrade --refresh (visible terminal, hold 1 second)",
+    ),
+    (
+        "flatpak update",
+        "Flatpak update: flatpak update (visible terminal, hold 1 second)",
+    ),
+];
+/// v7.8 ticket 12: Fedora System actions that fire only after a one-second hold.
+fn must_hold(action: &crate::actions::Action) -> bool {
+    match action {
+        crate::actions::Action::System(system) => system.risky(),
+        crate::actions::Action::Command { line, .. } => UPDATES.iter().any(|(l, _)| l == line),
+        _ => false,
+    }
+}
+/// v7.8 ticket 12: the Fedora System family: the updates, then each fixed action, then a
+/// Settings panel.
+fn fedora_system(
+    ui: &mut impl Ui,
+    saved: Option<&crate::actions::Action>,
+) -> Result<Option<crate::actions::Action>> {
+    use crate::actions::{Action, SETTINGS_PANELS, System};
+    let fixed = System::FIXED
+        .into_iter()
+        .chain([System::EmptyTrash])
+        .collect::<Vec<_>>();
+    let mut rows = UPDATES
+        .iter()
+        .map(|(_, label)| label.to_string())
+        .collect::<Vec<_>>();
+    rows.extend(fixed.iter().map(System::label));
+    rows.push("Open a GNOME Settings panel…".into());
+    let at = match saved {
+        Some(Action::Command { line, .. }) => UPDATES.iter().position(|(l, _)| l == line),
+        Some(Action::System(System::Settings(_))) => Some(rows.len() - 1),
+        Some(Action::System(s)) => fixed.iter().position(|f| f == s).map(|i| i + UPDATES.len()),
+        _ => None,
+    };
+    let Some(row) = choose_saved(
+        ui,
+        "Fedora System. Each runs one fixed command; updates and suspend fire after a one-second hold.",
+        rows.clone(),
+        at,
+    )?
+    else {
+        return Ok(None);
+    };
+    if let Some((line, _)) = UPDATES.get(row) {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+        return Ok(Some(Action::Command {
+            window: "command".into(),
+            dir: home,
+            line: (*line).into(),
+        }));
+    }
+    if let Some(system) = fixed.get(row - UPDATES.len()) {
+        return Ok(Some(Action::System(system.clone())));
+    }
+    let panels = SETTINGS_PANELS.map(String::from).to_vec();
+    let at = match saved {
+        Some(Action::System(System::Settings(p))) => SETTINGS_PANELS.iter().position(|x| x == p),
+        _ => None,
+    };
+    Ok(choose_saved(ui, "GNOME Settings panel", panels, at)?
+        .map(|i| Action::System(System::Settings(SETTINGS_PANELS[i].into()))))
+}
+
 /// v7.7 ticket 243: `agents` are the saved agents the caller already has (None: unknown,
 /// so nothing is marked); a label never reads a file itself.
 fn mapping_label(
@@ -11980,6 +12051,7 @@ fn families(input: mappings::Input) -> Vec<usize> {
     if matches!(input, mappings::Input::Pad | mappings::Input::Piano) {
         offered.push(14);
         offered.push(15); // v7.7 ticket 182
+        offered.push(17); // v7.8 ticket 12
     }
     offered
 }
@@ -11993,6 +12065,8 @@ fn action_family(mapping: &Mapping) -> usize {
         Action::OrcaKeys(_) => 8,
         Action::Shortcut if mappings::mouse_action(&mapping.keys) => 16,
         Action::Shortcut => 0,
+        // v7.8 ticket 12: the ready-made updates edit in Fedora System.
+        Action::Command { .. } if mapping.risky && must_hold(&mapping.action) => 17,
         Action::Command { .. } if mapping.risky => 12,
         Action::Command { .. } => 4,
         Action::Prompt { .. } => 3,
@@ -12005,6 +12079,7 @@ fn action_family(mapping: &Mapping) -> usize {
         Action::TmuxJump(_) => 15,
         Action::PromptSequence(_) | Action::SavedSequence(_) => 11,
         Action::Media(_) => 2,
+        Action::System(_) => 17,
         action if action.audio() => 2,
         _ => 1, // launchers, hold to quit, Wispr Flow
     }
@@ -12064,7 +12139,7 @@ fn favourite_mapping(
     Ok(Some(copy))
 }
 
-const FAMILIES: [&str; 17] = [
+const FAMILIES: [&str; 18] = [
     "Keyboard shortcut",
     "Launch application",
     "Music & Sound", // v7.8 ticket 10: was "Fedora system action" (volume and mute only)
@@ -12082,6 +12157,7 @@ const FAMILIES: [&str; 17] = [
     "Your families (named groups made in 0 AI)",
     "tmux agent (go to its window)",
     "Mouse Actions (click, hold to drag, scroll)", // v7.8 ticket 11
+    "Fedora System (updates, lock, suspend, Wi-Fi, Bluetooth, …)", // v7.8 ticket 12
 ];
 
 fn configure(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) -> Result<()> {
@@ -13252,6 +13328,12 @@ fn configure_steps(
                 _ => "hold",
             };
             Mapping::new(pad, mappings::MOUSE_KEYS[row].0, behavior).map_err(stage("validation"))?
+        } else if family == 17 {
+            let saved_action = saved.as_ref().map(|m| &m.action);
+            let Some(action) = fedora_system(ui, saved_action)? else {
+                continue;
+            };
+            Mapping::new_action(pad, input, action).map_err(stage("validation"))?
         } else if family == 11 {
             if !matches!(input, mappings::Input::Pad | mappings::Input::Piano) {
                 return Err("validation: prompt sequences require a pad or piano press".into());
@@ -13439,7 +13521,7 @@ fn configure_steps(
         }
         // v7 ticket 23: a terminal command (sudo and the like) is a risky control: it fires
         // only after a one-second hold, in a visible terminal where sudo asks for the password.
-        if family == 12 {
+        if family == 12 || (family == 17 && must_hold(&mapping.action)) {
             mapping.risky = true;
         } else if copied {
             // A favourite keeps its "fire when", but only pads and keys can be held.
@@ -19316,6 +19398,9 @@ mod tests {
                 12 => [command("sudo dnf update"), vec![Enter]].concat(),
                 14 => vec![Enter, Enter], // v7.7 ticket 169: the family, its one action
                 15 => vec![Enter, Enter], // v7.7 ticket 182: the first tmux agent, fire when
+                // v7.8 ticket 12: the System update (a held terminal command: fire when isn't
+                // asked), then its status feedback.
+                17 => vec![Enter, Enter],
                 // v7.8 ticket 11: Left click, then what a shortcut asks after its behaviour.
                 16 => match kind {
                     "pad" => vec![Enter; 3],  // click, hardware feedback, fire when
@@ -19346,7 +19431,7 @@ mod tests {
             deadzone: 1024,
             hysteresis: 128,
         };
-        let pressed = vec![0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 16, 13, 14, 15];
+        let pressed = vec![0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 16, 13, 14, 15, 17];
         // (kind, learn page, control, motion, families offered)
         let kinds: Vec<(&str, usize, Control, Option<Input>, Vec<usize>)> = vec![
             (
@@ -20899,6 +20984,68 @@ mod tests {
         };
         assert!(!window.is_empty(), "the window is named after the pad");
         assert_eq!(line, "sudo dnf update");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.8 ticket 12: Fedora System's suspend is always held for one second (never asked),
+    /// and Lock is asked like any action (pressed by default).
+    #[test]
+    fn fedora_system_suspend_is_always_held() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-fedora-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let family = |row: usize| {
+            let mut keys = vec![Enter];
+            keys.extend(vec![Down; 15]); // Fedora System, the last family a pad offers
+            keys.push(Enter);
+            keys.extend(vec![Down; row]);
+            keys.push(Enter);
+            keys
+        };
+        let mut keys = family(3); // the two updates, Lock, Suspend
+        keys.extend([Down, Enter]); // save and finish
+        let mut ui = Script {
+            keys: keys.into(),
+            pads: [Control::from_note(10, 43).unwrap()].into(),
+            ..Default::default()
+        };
+        let mut current = Vec::new();
+        configure(&mut ui, &path, &mut current).unwrap();
+        assert!(ui.keys.is_empty(), "{}", ui.screens.join("\n---\n"));
+        assert!(!ui.screens.iter().any(|s| s.starts_with("Fire when")));
+        let saved = mappings::load(&path).unwrap();
+        use crate::actions::{Action, System};
+        assert_eq!(saved[0].action, Action::System(System::Suspend));
+        assert!(saved[0].risky, "fires only after a one-second hold");
+        // Lock: asked, and Pressed saves it unheld.
+        let mut keys = family(2);
+        keys.extend([Enter, Down, Enter]); // Fire when: Pressed; save and finish
+        let mut ui = Script {
+            keys: keys.into(),
+            pads: [Control::from_note(10, 44).unwrap()].into(),
+            ..Default::default()
+        };
+        let mut current = saved.clone();
+        configure(&mut ui, &path, &mut current).unwrap();
+        let saved = mappings::load(&path).unwrap();
+        let lock = saved
+            .iter()
+            .find(|m| m.action == Action::System(System::Lock))
+            .unwrap();
+        assert!(!lock.risky);
+        // A suspend the file says isn't held is refused, never run unheld.
+        let mut unheld = saved[0].clone();
+        unheld.risky = false;
+        assert!(
+            unheld
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("held for one second")
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

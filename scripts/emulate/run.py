@@ -18,9 +18,13 @@ ANSI = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()][A-Z0-9]"
 
 
 def hide(*nodes):
-    """bwrap: no input device but `nodes` (an emulator's own), and no journal."""
+    """bwrap: no input device but `nodes` (an emulator's own), no journal, and no system or
+    session bus: the emulated run records every program instead of running it, and should one
+    ever slip through (systemctl suspend, gsettings), it reaches nothing (v7.8 ticket 12)."""
     binds = [arg for node in nodes for arg in ("--dev-bind", str(node), str(node))]
-    return ["bwrap", "--dev-bind", "/", "/", "--tmpfs", "/dev/input", *binds, "--tmpfs", "/run/systemd/journal"]
+    bus = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}") + "/bus"
+    return ["bwrap", "--dev-bind", "/", "/", "--tmpfs", "/dev/input", *binds, "--tmpfs", "/run/systemd/journal",
+            "--tmpfs", "/run/dbus", "--ro-bind", "/dev/null", bus]
 
 
 def mapping(context, label, message, channel, id, keys, behavior="hold", action="shortcut"):
@@ -32,6 +36,11 @@ def mapping(context, label, message, channel, id, keys, behavior="hold", action=
 
 def screen(data):
     return ANSI.sub(b" ", data).decode(errors="replace")
+
+
+def without_bus(**extra):
+    env = {k: v for k, v in os.environ.items() if k != "DBUS_SESSION_BUS_ADDRESS"}
+    return env | extra
 
 
 class Run:
@@ -47,7 +56,7 @@ class Run:
         fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 110, 0, 0))
         self.child = subprocess.Popen([*sandbox, BINARY, "--emulated", directory, *command], stdin=self.slave,
                                       stdout=self.slave, stderr=self.slave,
-                                      env=dict(os.environ, TERM="xterm-256color"))
+                                      env=without_bus(TERM="xterm-256color"))
         self.data = b""
         # Read the screen all the time: a full PTY blocks the app's next draw (and its loop).
         self._lock = threading.Lock()
@@ -105,4 +114,4 @@ class Run:
 def describe(sandbox):
     """A normal (not emulated) run's view of the devices; read-only, opens nothing."""
     return subprocess.run([*sandbox, BINARY, "describe"], capture_output=True, text=True,
-                          env=dict(os.environ, NO_COLOR="1")).stdout
+                          env=without_bus(NO_COLOR="1")).stdout

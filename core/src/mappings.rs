@@ -319,6 +319,9 @@ impl Mapping {
     ) -> Result<Self> {
         let mut mapping = Self::new(control, "Shift", "hold")?;
         mapping.input = input;
+        // v7.8 ticket 12: an action that must be held (suspend) starts held; a file that says
+        // otherwise is refused when it's read (the parsers validate after reading `risky`).
+        mapping.risky = matches!(&action, crate::actions::Action::System(s) if s.risky());
         mapping.action = action;
         mapping.keys.clear();
         mapping.behavior = Behavior::Trigger;
@@ -348,6 +351,13 @@ impl Mapping {
             return Err(
                 "application/system actions require Trigger, empty keys, and no feedback".into(),
             );
+        }
+        // v7.8 ticket 12: suspend fires only after a one-second hold, whatever the file says.
+        if let crate::actions::Action::System(system) = &self.action
+            && system.risky()
+            && !self.risky
+        {
+            return Err(format!("{} must be held for one second (risky)", system.label()).into());
         }
         if (self.context > 16 && self.context < XBOX_LOWEST)
             || gamepad_context(self.context) != (self.control.message == crate::Message::Button)

@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from akai import Akai  # noqa: E402
@@ -42,7 +43,12 @@ def main():
         # v7.8 ticket 10: a Music & Sound media key.
         media = mapping(0, "Bank A Pad 2", "note", akai.ram[0x10] + 1, akai.ram[0x27], None, "trigger",
                         "media:next")
-        with Run(directory, [pad, media], hide()) as run:
+        # v7.8 ticket 12: Fedora System, recorded (never run) in the emulated run.
+        dark = mapping(0, "Bank A Pad 3", "note", akai.ram[0x10] + 1, akai.ram[0x2A], None, "trigger",
+                       "system:dark-style-on")
+        suspend = mapping(0, "Bank A Pad 4", "note", akai.ram[0x10] + 1, akai.ram[0x2D], None, "trigger",
+                          "system:suspend") | {"risky": True}
+        with Run(directory, [pad, media, dark, suspend], hide()) as run:
             # The run detects the program, then fires on the next press.
             run.read_until("Pads fire on their next press", 15)
             queries = [f for f in akai.received if f[4] == 0x66]
@@ -59,6 +65,21 @@ def main():
             run.wait_recorded("key KEY_NEXTSONG up")
             assert run.recorded()[2:4] == ["key KEY_NEXTSONG down", "key KEY_NEXTSONG up"], run.recorded()
             print("ok: a pad mapped to Next track taps KEY_NEXTSONG once")
+            tools = lambda: [t for t in run.recorded("tools.log") if "gsettings" in t or "systemctl" in t]
+            akai.pad(3)
+            deadline = time.monotonic() + 5
+            while not tools() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert tools() == ['["gsettings", "set", "org.gnome.desktop.interface", "color-scheme", "prefer-dark"]'], tools()
+            akai.pad(4, hold=0.3)  # let go early: nothing
+            time.sleep(1.5)
+            assert len(tools()) == 1, tools()
+            akai.pad(4, hold=1.4)  # held past one second: suspend (recorded, never run)
+            deadline = time.monotonic() + 5
+            while len(tools()) < 2 and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert tools()[1:] == ['["systemctl", "suspend"]'], tools()
+            print("ok: Dark style runs its gsettings; Suspend only after a one-second hold (recorded)")
             described = describe(hide()).lower()
             assert "emulator" not in described and "multiple" not in described, described
             print("ok: a normal run ignores the emulator's port")
