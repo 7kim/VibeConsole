@@ -865,11 +865,16 @@ pub fn next_default_agent(current: &str, installed: impl Fn(&str) -> bool) -> &'
 /// v7.7 ticket 168: an executable file named `name` in a `PATH` directory (looked up, never
 /// run).
 pub fn executable_on_path(path_var: &str, name: &str) -> bool {
+    executable_path(path_var, name).is_some()
+}
+
+pub fn executable_path(path_var: &str, name: &str) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
-    std::env::split_paths(path_var).any(|dir| {
-        fs::metadata(dir.join(name))
-            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-    })
+    std::env::split_paths(path_var)
+        .map(|dir| dir.join(name))
+        .find(|path| {
+            fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
 }
 /// A mapping's favourite key: its context and control, which stay the same when its
 /// action is edited.
@@ -1303,6 +1308,7 @@ pub fn map_agents_request(
             Host::Orca => crate::actions::Action::OrcaJump {
                 agent: agent.launch.clone(),
                 folder: config.agent_directory(agent)?.unwrap_or_else(|| "/".into()),
+                pane: None,
             },
             Host::Herdr => crate::actions::Action::HerdrFocus(agent.name.clone()),
             // v7.7 ticket 182
@@ -1362,11 +1368,13 @@ pub fn check_agent_mappings(
     for m in mappings {
         let known = match &m.action {
             crate::actions::Action::OrcaKeys(steps) => is_orca_needs_me(steps),
-            crate::actions::Action::OrcaJump { agent, folder } => config.agents.iter().any(|a| {
-                a.host == Host::Orca
-                    && &a.launch == agent
-                    && config.agent_directory(a).ok().flatten().as_ref() == Some(folder)
-            }),
+            crate::actions::Action::OrcaJump { agent, folder, .. } => {
+                config.agents.iter().any(|a| {
+                    a.host == Host::Orca
+                        && &a.launch == agent
+                        && config.agent_directory(a).ok().flatten().as_ref() == Some(folder)
+                })
+            }
             crate::actions::Action::HerdrFocus(name) => config
                 .agents
                 .iter()

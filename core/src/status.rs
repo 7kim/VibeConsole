@@ -103,11 +103,24 @@ fn session_hook(state: &str) -> Result<()> {
         &mut input,
     )?;
     let (pid, kind) = agent_process();
-    session_report(&state_dir()?, &input, state, pid, kind)
+    let pane = std::env::var("ORCA_AGENT_PANE").ok();
+    session_report_at(&state_dir()?, &input, state, pid, kind, pane.as_deref())
 }
 
 /// `kind` is the agent program (`claude`, `codex`) or "" when unknown (v7 ticket 59).
+#[cfg(test)]
 fn session_report(dir: &Path, input: &str, state: &str, pid: u32, kind: &str) -> Result<()> {
+    session_report_at(dir, input, state, pid, kind, None)
+}
+
+fn session_report_at(
+    dir: &Path,
+    input: &str,
+    state: &str,
+    pid: u32,
+    kind: &str,
+    pane: Option<&str>,
+) -> Result<()> {
     if !STATES.contains(&state) {
         return Err(format!("unknown agent state {state:?}; use {}", STATES.join(", ")).into());
     }
@@ -136,7 +149,8 @@ fn session_report(dir: &Path, input: &str, state: &str, pid: u32, kind: &str) ->
     }
     std::fs::create_dir_all(dir)?;
     let kind = if kind.is_empty() { "-" } else { kind };
-    crate::actions::write_atomic(&file, &format!("{state}\t{pid}\t{kind}\t{cwd}\n"))
+    let pane = pane.filter(|pane| valid_pane(pane)).unwrap_or_default();
+    crate::actions::write_atomic(&file, &format!("{state}\t{pid}\t{kind}\t{cwd}\t{pane}\n"))
 }
 
 /// The Claude Code or Codex process this hook runs under (it runs hooks through a shell) and
@@ -175,6 +189,88 @@ pub struct Session {
     pub cwd: String,
     /// The agent program that reported it (`claude`, `codex`); "" when not known (v7 ticket 59).
     pub kind: &'static str,
+    pub pane: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct OrcaSession {
+    pub kind: String,
+    pub workspace: String,
+    pub project: String,
+    pub pane: String,
+    pub state: &'static str,
+}
+
+pub(crate) fn valid_pane(pane: &str) -> bool {
+    pane.split_once(':').is_some_and(|(tab, leaf)| {
+        [tab, leaf].iter().all(|id| {
+            !id.is_empty()
+                && id.len() <= 128
+                && id
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+        })
+    })
+}
+
+/// Orca's local live panes. An incomplete reply cannot establish absence.
+pub fn orca_live_sessions(text: &str) -> Option<Vec<OrcaSession>> {
+    let reply = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    let result = &reply["result"];
+    let hosts = result["hostScope"]["hostIds"].as_array()?;
+    let worktrees = result["worktrees"].as_array()?;
+    if reply["ok"] == false
+        || !hosts.iter().any(|host| host == "local")
+        || result["truncated"].as_bool() == Some(true)
+    {
+        return None;
+    }
+    let mut sessions = Vec::new();
+    for worktree in worktrees.iter().filter(|w| w["hostId"] == "local") {
+        let workspace = worktree["path"].as_str()?;
+        let project = worktree["repo"].as_str()?;
+        let agents = worktree["agents"].as_array()?;
+        if !workspace.starts_with('/')
+            || workspace.chars().any(char::is_control)
+            || project.is_empty()
+            || project.chars().any(char::is_control)
+            || worktree["unverifiableTerminalCount"]
+                .as_u64()
+                .is_some_and(|n| n > 0)
+        {
+            return None;
+        }
+        for agent in agents {
+            if !agent["hasLivePty"].as_bool()? {
+                continue;
+            }
+            let kind = agent["agentType"].as_str()?;
+            let pane = agent["paneKey"].as_str()?;
+            if !crate::mappings::simple_name(kind) || !valid_pane(pane) {
+                return None;
+            }
+            sessions.push(OrcaSession {
+                kind: kind.into(),
+                workspace: workspace.into(),
+                project: project.into(),
+                pane: pane.into(),
+                state: orca_state(agent["state"].as_str().unwrap_or_default())
+                    .unwrap_or("status-unknown"),
+            });
+        }
+    }
+    Some(sessions)
+}
+
+fn orca_state(state: &str) -> Option<&'static str> {
+    Some(match state {
+        "working" | "thinking" | "running" => "thinking",
+        "waiting" | "blocked" | "needs-input" | "permission" => "needs-input",
+        "done" | "finished" | "completed" => "finished",
+        "idle" => "idle",
+        "needs-decision" => "needs-decision",
+        _ => return None,
+    })
 }
 
 /// Recorded sessions, dropping those whose agent process is gone, plus Orca's agents in
@@ -240,6 +336,7 @@ pub fn herdr_sessions(json: &str) -> Vec<Session> {
                 state,
                 cwd,
                 kind: "",
+                pane: None,
             })
         })
         .collect()
@@ -292,18 +389,13 @@ pub fn orca_sessions(text: &str) -> Vec<Session> {
     entries
         .values()
         .filter_map(|entry| {
-            let state = match entry["payload"]["state"].as_str()? {
-                "working" | "thinking" | "running" => "thinking",
-                "waiting" | "blocked" | "needs-input" | "permission" => "needs-input",
-                "done" | "finished" | "completed" => "finished",
-                "idle" => "idle",
-                _ => return None,
-            };
+            let state = orca_state(entry["payload"]["state"].as_str()?)?;
             let (_, folder) = entry["worktreeId"].as_str()?.split_once("::")?;
             (folder.starts_with('/') && !folder.contains(['\t', '\n'])).then(|| Session {
                 state,
                 cwd: folder.to_owned(),
                 kind: "",
+                pane: None,
             })
         })
         .collect()
@@ -328,8 +420,8 @@ fn sessions_in(dir: &Path, alive: impl Fn(u32) -> bool) -> Vec<Session> {
             continue;
         }
         let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
-        // `state pid kind cwd`; files from before v7 ticket 59 have no kind.
-        let mut fields = text.trim_end_matches('\n').splitn(4, '\t');
+        // `state pid kind cwd [pane]`; files from before v7 ticket 59 have no kind.
+        let mut fields = text.trim_end_matches('\n').splitn(5, '\t');
         let (Some(state), Some(pid), Some(third)) = (fields.next(), fields.next(), fields.next())
         else {
             let _ = std::fs::remove_file(entry.path());
@@ -348,6 +440,10 @@ fn sessions_in(dir: &Path, alive: impl Fn(u32) -> bool) -> Vec<Session> {
                 state,
                 cwd: cwd.to_owned(),
                 kind,
+                pane: fields
+                    .next()
+                    .filter(|pane| valid_pane(pane))
+                    .map(str::to_owned),
             }),
             _ => {
                 let _ = std::fs::remove_file(entry.path());
@@ -2130,11 +2226,13 @@ mod tests {
                     state: "thinking",
                     cwd: "/work/app".into(),
                     kind: "",
+                    pane: None,
                 },
                 Session {
                     state: "needs-input",
                     cwd: "/work/lib".into(),
                     kind: "",
+                    pane: None,
                 },
             ]
         );
@@ -2146,6 +2244,7 @@ mod tests {
             state: "finished",
             cwd: "/work/app".into(),
             kind: "",
+            pane: None,
         }];
         let all = with_fallback(hooks, orca);
         assert_eq!(all.len(), 2);
@@ -2172,16 +2271,19 @@ mod tests {
                     state: "thinking",
                     cwd: "/work/api".into(),
                     kind: "",
+                    pane: None,
                 },
                 Session {
                     state: "needs-input",
                     cwd: "/work/docs".into(),
                     kind: "",
+                    pane: None,
                 },
                 Session {
                     state: "finished",
                     cwd: "/work/old".into(),
                     kind: "",
+                    pane: None,
                 },
             ]
         );
@@ -2195,6 +2297,7 @@ mod tests {
             state: "idle",
             cwd: "/work/api".into(),
             kind: "",
+            pane: None,
         }];
         assert_eq!(with_fallback(hooks, found).len(), 3);
     }
@@ -2216,10 +2319,27 @@ mod tests {
         )
         .unwrap();
         session_report(&dir, &hook("b2", "/work/app"), "thinking", 0, "claude").unwrap();
-        session_report(&dir, &hook("c3", "/work/app"), "finished", 0, "codex").unwrap();
+        session_report_at(
+            &dir,
+            &hook("c3", "/work/app"),
+            "finished",
+            0,
+            "codex",
+            Some("tab:pane"),
+        )
+        .unwrap();
         session_report(&dir, &hook("d4", "/work/both"), "thinking", 0, "claude").unwrap();
         std::fs::write(dir.join("session-e5"), "thinking\t0\t/work/old\n").unwrap();
         let mut sessions = sessions_in(&dir, |_| true);
+        assert_eq!(
+            sessions
+                .iter()
+                .find(|s| s.kind == "codex")
+                .unwrap()
+                .pane
+                .as_deref(),
+            Some("tab:pane")
+        );
         sessions.sort_by(|a, b| (&a.cwd, a.kind).cmp(&(&b.cwd, b.kind)));
         let hosted = [
             (
@@ -2292,26 +2412,31 @@ mod tests {
                 state: "thinking",
                 cwd: "/work/app/src".into(),
                 kind: "",
+                pane: None,
             },
             Session {
                 state: "needs-input",
                 cwd: "/work/app".into(),
                 kind: "",
+                pane: None,
             },
             Session {
                 state: "finished",
                 cwd: "/work/apple".into(),
                 kind: "",
+                pane: None,
             },
             Session {
                 state: "thinking",
                 cwd: "/home/me".into(),
                 kind: "",
+                pane: None,
             },
             Session {
                 state: "idle",
                 cwd: "/work".into(),
                 kind: "",
+                pane: None,
             },
         ];
         // /work/app wins over /work; its two sessions combine to the most urgent.

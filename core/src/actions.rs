@@ -194,6 +194,8 @@ pub enum Action {
     OrcaJump {
         agent: String,
         folder: String,
+        /// Live resolves a specific pane. Saved mappings resolve by kind and workspace.
+        pane: Option<String>,
     },
     /// v7 ticket 21: a launcher pad whose tap minimizes/restores like `AppToggle`, and whose
     /// one-second hold quits the app (only when a window is open and not minimized).
@@ -969,11 +971,12 @@ impl Action {
             {
                 Err("T3 command must be a name like chat.new".into())
             }
-            Self::OrcaJump { agent, folder }
+            Self::OrcaJump { agent, folder, pane }
                 if !crate::mappings::simple_name(agent)
                     || !Path::new(folder).is_absolute()
                     || folder.len() > 4096
-                    || folder.chars().any(char::is_control) =>
+                    || folder.chars().any(char::is_control)
+                    || pane.as_deref().is_some_and(|p| !crate::status::valid_pane(p)) =>
             {
                 Err("Orca jump needs an agent name and an absolute folder".into())
             }
@@ -1071,7 +1074,7 @@ impl Action {
             Self::Nothing => "nothing".into(),
             Self::SavedSequence(name) => format!("saved-sequence:{name}"),
             Self::MicrophoneMute => "microphone-mute".into(),
-            Self::OrcaJump { agent, folder } => format!("orca-jump:{agent}:{folder}"),
+            Self::OrcaJump { agent, folder, .. } => format!("orca-jump:{agent}:{folder}"),
             Self::T3(command) => format!("t3:{command}"),
             Self::AppToggleQuit(path) => format!("app-toggle:minimize+hold-quit:{path}"),
             Self::AppQuit(path) => format!("app-quit:{path}"),
@@ -1269,6 +1272,7 @@ impl Action {
                 Self::OrcaJump {
                     agent: agent.into(),
                     folder: folder.into(),
+                    pane: None,
                 }
             }
             _ if value.starts_with("volume-up:") => Self::Volume {
@@ -1383,7 +1387,7 @@ impl Action {
             Self::Nothing => "No action (built-in default silenced)".into(),
             Self::SavedSequence(name) => format!("Saved prompt sequence {name} (one step per tap)"),
             Self::MicrophoneMute => "Toggle default microphone mute".into(),
-            Self::OrcaJump { agent, folder } => format!("Orca: jump to {agent} in {folder}"),
+            Self::OrcaJump { agent, folder, .. } => format!("Orca: jump to {agent} in {folder}"),
             Self::T3(command) => format!("T3 Code: {command}"),
             Self::AppToggleQuit(path) => format!(
                 "{}: tap minimizes/restores, hold 1 s quits",
@@ -2117,6 +2121,13 @@ fn is_orca_ide(path: &Path) -> bool {
 /// Orca's terminals as (agent, folder, handle), from `orca terminal list --json`. Only
 /// those three fields are read; previews and titles (which hold your text) are not.
 pub fn orca_terminals(json: &str) -> Result<Vec<(String, String, String)>> {
+    orca_terminals_for_pane(json, None)
+}
+
+fn orca_terminals_for_pane(
+    json: &str,
+    pane: Option<&str>,
+) -> Result<Vec<(String, String, String)>> {
     let value: serde_json::Value = serde_json::from_str(json)?;
     let list = value["result"]["terminals"]
         .as_array()
@@ -2124,6 +2135,12 @@ pub fn orca_terminals(json: &str) -> Result<Vec<(String, String, String)>> {
     Ok(list
         .iter()
         .filter_map(|t| {
+            if let Some(pane) = pane {
+                let (tab, leaf) = pane.split_once(':')?;
+                if t["executionHostId"] != "local" || t["tabId"] != tab || t["leafId"] != leaf {
+                    return None;
+                }
+            }
             Some((
                 t["agentIdentity"].as_str()?.to_owned(),
                 t["worktreePath"].as_str()?.to_owned(),
@@ -2137,14 +2154,21 @@ pub fn orca_terminals(json: &str) -> Result<Vec<(String, String, String)>> {
 fn orca_jump(
     agent: &str,
     folder: &str,
+    pane: Option<&str>,
     mut orca: impl FnMut(&[String]) -> Result<String>,
 ) -> Result<String> {
     let args = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
-    let terminals = orca_terminals(&orca(&args(&["terminal", "list", "--json"]))?)?;
-    let (_, _, handle) = terminals
+    let reply = orca_reply(orca(&args(&["terminal", "list", "--json"]))?)?;
+    let terminals = orca_terminals_for_pane(&reply, pane)?;
+    let mut matches = terminals
         .iter()
-        .find(|(a, f, _)| a == agent && f == folder)
+        .filter(|(a, f, _)| a == agent && f == folder);
+    let (_, _, handle) = matches
+        .next()
         .ok_or_else(|| format!("Orca: no {agent} terminal in {folder}"))?;
+    if matches.next().is_some() {
+        return Err(format!("Orca: more than one {agent} terminal in {folder}").into());
+    }
     orca(&args(&["terminal", "switch", "--terminal", handle]))?;
     Ok(format!("Orca: switched to {agent} in {folder}"))
 }
@@ -3253,7 +3277,11 @@ fn perform(
             )?;
             Ok(format!("herdr: focused {name}"))
         }
-        Action::OrcaJump { agent, folder } => orca_jump(agent, folder, |args| {
+        Action::OrcaJump {
+            agent,
+            folder,
+            pane,
+        } => orca_jump(agent, folder, pane.as_deref(), |args| {
             command(&orca_program()?, args, &cancelled)
         }),
         Action::TmuxJump(window) => tmux_jump(window, &mut tmux_status, &mut open_terminal),
@@ -4078,7 +4106,7 @@ mod tests {
             {"handle":"term_1","worktreePath":"/work/app","agentIdentity":"codex","preview":"secret"},
             {"handle":"term_2","worktreePath":"/work/app","agentIdentity":"claude","title":"x"}]}}"#;
         let mut calls = Vec::new();
-        let result = orca_jump("claude", "/work/app", |args| {
+        let result = orca_jump("claude", "/work/app", None, |args| {
             calls.push(args.to_vec());
             Ok(if args[1] == "list" {
                 list.into()
@@ -4089,15 +4117,37 @@ mod tests {
         .unwrap();
         assert_eq!(result, "Orca: switched to claude in /work/app");
         assert_eq!(calls[1], ["terminal", "switch", "--terminal", "term_2"]);
-        let missing = orca_jump("claude", "/other", |_| Ok(list.into())).unwrap_err();
+        let missing = orca_jump("claude", "/other", None, |_| Ok(list.into())).unwrap_err();
         assert_eq!(missing.to_string(), "Orca: no claude terminal in /other");
         let jump = Action::OrcaJump {
             agent: "claude".into(),
             folder: "/work/app".into(),
+            pane: None,
         };
         assert_eq!(Action::parse(&jump.encode()).unwrap(), jump);
         assert!(Action::parse("orca-jump:../x:/work").is_err());
         assert!(Action::parse("orca-jump:claude:relative").is_err());
+    }
+
+    #[test]
+    fn orca_live_jump_uses_the_selected_local_pane() {
+        let list = r#"{"result":{"terminals":[
+            {"handle":"remote","worktreePath":"/work/app","agentIdentity":"omp","tabId":"tab","leafId":"leaf","executionHostId":"remote"},
+            {"handle":"other","worktreePath":"/work/app","agentIdentity":"omp","tabId":"tab","leafId":"other","executionHostId":"local"},
+            {"handle":"selected","worktreePath":"/work/app","agentIdentity":"omp","tabId":"tab","leafId":"leaf","executionHostId":"local"}
+        ]}}"#;
+        let mut calls = Vec::new();
+        orca_jump("omp", "/work/app", Some("tab:leaf"), |args| {
+            calls.push(args.to_vec());
+            Ok(if args[1] == "list" {
+                list.into()
+            } else {
+                String::new()
+            })
+        })
+        .unwrap();
+        assert_eq!(calls[1], ["terminal", "switch", "--terminal", "selected"]);
+        assert!(orca_jump("omp", "/work/app", Some("tab:gone"), |_| Ok(list.into())).is_err());
     }
 
     /// v7 ticket 49: a prompt reaches an Orca-hosted agent through Orca's CLI, every value

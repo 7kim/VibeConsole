@@ -508,6 +508,7 @@ struct Terminal {
     terminal_run: bool,
     /// v7.7 ticket 151: each agent's host and folder, in `agent_states` order.
     agent_places: Vec<(mappings::Host, Option<String>)>,
+    orca_places: BTreeMap<String, OrcaPlace>,
     /// v7.7 ticket 151: folder → project (its git top-level folder's name), found in the
     /// status refresh, never while drawing.
     projects: BTreeMap<String, String>,
@@ -530,10 +531,11 @@ struct Terminal {
     problems_at: Option<Instant>,
     /// v7.7 ticket 158: every VibeConsole skill is in `~/.claude/skills` (read on 3 Agents).
     skills_installed: bool,
-    /// v7.7 ticket 176: which of `mappings::AGENT_TABLE`'s binaries are on PATH (read on
-    /// 3 Agents), and the PATH tests look in instead of the real one.
-    agents_found: Vec<bool>,
+    /// Install status of each agent on 3 Agents.
+    agents_found: Vec<Option<String>>,
     lookup_path: Option<String>,
+    #[cfg(test)]
+    lookup_home: Option<PathBuf>,
     /// v7.7 ticket 179: Start at login as the login service said when 8 System was drawn;
     /// None when it couldn't be read.
     login_on: Option<bool>,
@@ -1674,6 +1676,7 @@ impl Terminal {
             #[cfg(test)]
             terminal_run: false,
             agent_places: Vec::new(),
+            orca_places: BTreeMap::new(),
             projects: BTreeMap::new(),
             agent_cards: false,
             pressed: None,
@@ -1688,6 +1691,8 @@ impl Terminal {
             skills_installed: false,
             agents_found: Vec::new(),
             lookup_path: None,
+            #[cfg(test)]
+            lookup_home: None,
             login_on: None,
             map_bank_b: false,
             map_layer2: false,
@@ -1951,11 +1956,20 @@ impl Terminal {
                     .get(index)
                     .cloned()
                     .unwrap_or((mappings::Host::Tmux, None));
+                let place = self.orca_places.get(name);
+                let orca = place.and_then(OrcaPlace::live).map(|(session, _)| session);
+                let state = match place {
+                    Some(OrcaPlace::NotRunning) => "not-running",
+                    Some(OrcaPlace::Live(session, _)) => session.state,
+                    _ if host == mappings::Host::Orca => "status-unknown",
+                    _ => state,
+                };
                 AgentRow {
                     name: name.clone(),
-                    project: project(&folder),
+                    project: orca.map_or_else(|| project(&folder), |s| s.project.clone()),
                     window: window.clone(),
                     folder,
+                    workspace: orca.map(|s| s.workspace.clone()),
                     state,
                     host: Some(host),
                     wait: waiting(name, state),
@@ -1970,6 +1984,7 @@ impl Terminal {
                     project: project(&folder),
                     window: String::new(),
                     folder,
+                    workspace: None,
                     state,
                     host: None,
                     wait: waiting(&name, state),
@@ -2256,13 +2271,21 @@ impl Terminal {
     fn go_to_agent(&mut self, row: &AgentRow) -> Result<()> {
         use crate::actions::Action;
         match row.host {
-            Some(mappings::Host::Orca) => self.actions.submit(
-                Action::OrcaJump {
-                    agent: row.name.clone(),
-                    folder: row.folder.clone().ok_or("no folder to jump to")?,
-                },
-                None,
-            )?,
+            Some(mappings::Host::Orca) => {
+                let (session, _) = self
+                    .orca_places
+                    .get(&row.name)
+                    .and_then(OrcaPlace::live)
+                    .ok_or_else(|| format!("Orca: no unique live pane for {}", row.name))?;
+                self.actions.submit(
+                    Action::OrcaJump {
+                        agent: session.kind.clone(),
+                        folder: session.workspace.clone(),
+                        pane: Some(session.pane.clone()),
+                    },
+                    None,
+                )?;
+            }
             Some(mappings::Host::Herdr) => self
                 .actions
                 .submit(Action::HerdrFocus(row.name.clone()), None)?,
@@ -2697,10 +2720,10 @@ impl Terminal {
         if self.tab == 2 || self.tab == 9 {
             self.skills_installed =
                 home_dir().is_some_and(|h| crate::runtime::skills_installed(&h));
-            let path_var = self.lookup_env().0;
+            let (path_var, home, _) = self.lookup_env();
             self.agents_found = mappings::AGENT_TABLE
                 .iter()
-                .map(|(_, binary, _)| mappings::executable_on_path(&path_var, binary))
+                .map(|(_, binary, _)| agent_install_status(&path_var, home.as_deref(), binary))
                 .collect();
         }
         if self.tab == 7 {
@@ -2781,6 +2804,7 @@ impl Terminal {
                         name: String::new(),
                         project: String::new(),
                         folder: config.agent_directory(agent).ok().flatten(),
+                        workspace: None,
                         window: String::new(),
                         state,
                         host: None,
@@ -2861,12 +2885,9 @@ impl Terminal {
                     head("Install agents · found on PATH or not"),
                 ]);
                 // v7.7 ticket 176: each agent found on PATH, or its fixed install command.
-                for (i, (name, binary, _)) in mappings::AGENT_TABLE.iter().enumerate() {
-                    rows.push(if self.agents_found.get(i) == Some(&true) {
-                        (
-                            vec![format!("✓ {name} · installed ({binary} on PATH)")],
-                            None,
-                        )
+                for (i, (name, _, _)) in mappings::AGENT_TABLE.iter().enumerate() {
+                    rows.push(if let Some(Some(status)) = self.agents_found.get(i) {
+                        (vec![format!("✓ {name} · {status}")], None)
                     } else {
                         one(
                             format!("+ {name} · {}", mappings::AGENT_INSTALL[i]),
@@ -3351,24 +3372,25 @@ impl Terminal {
             for (number, row) in rows.iter().enumerate() {
                 let open = row.host.is_some().then_some(Open::Agent(number));
                 let chosen = buttons.len() + agents.len() == selected && open.is_some();
-                let lines = [
-                    format!(
-                        "● {}{}  {}",
-                        state_word(row.state),
-                        wait_text(row.wait, false),
-                        row.hour
+                let mut lines = vec![format!(
+                    "● {}{}  {}",
+                    state_word(row.state),
+                    wait_text(row.wait, false),
+                    row.hour
+                )];
+                lines.extend(crate::screen::wrap(
+                    &format!("{} · {}{}", row.project, row.place(), row.place_suffix()),
+                    width.saturating_sub(4),
+                ));
+                lines.push(match row.context {
+                    Some((used, size, tokens)) => format!(
+                        "Context {} of {} · {} tokens",
+                        used.map_or("—".into(), |u| format!("{u}%")),
+                        tokens_text(size),
+                        tokens_text(tokens)
                     ),
-                    format!("{} · {}", row.project, row.place()),
-                    match row.context {
-                        Some((used, size, tokens)) => format!(
-                            "Context {} of {} · {} tokens",
-                            used.map_or("—".into(), |u| format!("{u}%")),
-                            tokens_text(size),
-                            tokens_text(tokens)
-                        ),
-                        None => "Context — · tokens —".into(),
-                    },
-                ];
+                    None => "Context — · tokens —".into(),
+                });
                 let card = crate::screen::card(&row.name, &lines, width, chosen);
                 agents.push((card, open));
             }
@@ -3386,15 +3408,20 @@ impl Terminal {
                     // A folder keeps its end, the part that names it: `…/VibeConsole/docs`.
                     let place = row.place();
                     let count = place.chars().count();
-                    let place = if count < 28 {
+                    let suffix = row.place_suffix();
+                    let path_width = 27 - suffix.len();
+                    let place = if count <= path_width {
                         place
                     } else {
                         format!(
                             "…{}",
-                            place.chars().skip(count + 2 - 28).collect::<String>()
+                            place
+                                .chars()
+                                .skip(count + 1 - path_width)
+                                .collect::<String>()
                         )
                     };
-                    text += &fit(&place, 28);
+                    text += &fit(&format!("{place}{suffix}"), 28);
                 }
                 let status = format!("{}{}", state_word(row.state), wait_text(row.wait, true));
                 let (used, tokens) = row.context.map_or((None, None), |(u, _, t)| (u, t));
@@ -3598,6 +3625,26 @@ impl Terminal {
         self.light_patterns = config.light_patterns;
         // v7 ticket 59: an Orca-hosted agent's sessions light its own octave light; the
         // rest light by folder.
+        let has_orca = config.agents.iter().any(|a| a.host == mappings::Host::Orca);
+        let mut sessions = if config.status_lights || has_orca {
+            crate::status::sessions()
+        } else {
+            Vec::new()
+        };
+        #[cfg(not(test))]
+        let live = has_orca.then(orca_snapshot).flatten();
+        #[cfg(test)]
+        let live: Option<Vec<_>> = None;
+        self.orca_places = orca_places(&config, live.as_deref(), &sessions);
+        sessions.retain(|s| {
+            s.pane.as_ref().is_none_or(|pane| {
+                !self
+                    .orca_places
+                    .values()
+                    .filter_map(OrcaPlace::live)
+                    .any(|(live, _)| &live.pane == pane)
+            })
+        });
         let (hosted, sessions) = if config.status_lights {
             let orca = config
                 .agents
@@ -3608,7 +3655,7 @@ impl Terminal {
                     Some((a.name.clone(), a.launch.clone(), folder))
                 })
                 .collect::<Vec<_>>();
-            crate::status::hosted_states(crate::status::sessions(), &orca)
+            crate::status::hosted_states(sessions, &orca)
         } else {
             (Vec::new(), Vec::new())
         };
@@ -3637,7 +3684,17 @@ impl Terminal {
         self.agent_places = config
             .agents
             .iter()
-            .map(|a| (a.host, config.agent_directory(a).ok().flatten()))
+            .map(|a| {
+                let folder = if a.host == mappings::Host::Orca {
+                    self.orca_places
+                        .get(&a.name)
+                        .and_then(OrcaPlace::live)
+                        .and_then(|(_, cwd)| cwd.cloned())
+                } else {
+                    config.agent_directory(a).ok().flatten()
+                };
+                (a.host, folder)
+            })
             .collect();
         let folders = self.agent_places.iter().filter_map(|(_, f)| f.clone());
         let outside = self.light_sessions.iter().map(|(f, _, _)| f.clone());
@@ -3683,8 +3740,16 @@ impl Terminal {
         }
         // After the tmux checks: a hosted agent has no tmux window to clear it by.
         for (name, _, state) in &mut self.agent_states {
-            if let Some((_, hosted)) = hosted.iter().find(|(n, _)| n == name) {
-                *state = hosted;
+            match self.orca_places.get(name) {
+                Some(OrcaPlace::NotRunning) => *state = "idle",
+                Some(OrcaPlace::Live(live, _)) if live.state != "status-unknown" => {
+                    *state = live.state;
+                }
+                _ => {
+                    if let Some((_, hosted)) = hosted.iter().find(|(n, _)| n == name) {
+                        *state = hosted;
+                    }
+                }
             }
         }
         self.track_agents(Instant::now()); // v7.7 ticket 161
@@ -7214,11 +7279,15 @@ impl Ui for Terminal {
         self.usage_dir.clone()
     }
     fn lookup_env(&self) -> (String, Option<PathBuf>, Option<PathBuf>) {
+        #[cfg(test)]
+        let home = self.lookup_home.clone().or_else(home_dir);
+        #[cfg(not(test))]
+        let home = home_dir();
         (
             self.lookup_path
                 .clone()
                 .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default()),
-            home_dir(),
+            home,
             std::env::current_dir().ok(),
         )
     }
@@ -8166,6 +8235,7 @@ struct AgentRow {
     name: String,
     project: String,
     folder: Option<String>,
+    workspace: Option<String>,
     window: String,
     state: &'static str,
     host: Option<mappings::Host>,
@@ -8212,14 +8282,26 @@ fn wait_text(wait: Option<Duration>, short: bool) -> String {
 impl AgentRow {
     /// The folder with the home folder as `~`, or `—` (a herdr agent without one).
     fn place(&self) -> String {
-        let Some(folder) = &self.folder else {
+        let Some(folder) = self.folder.as_ref().or(self.workspace.as_ref()) else {
             return "—".into();
         };
         match std::env::var("HOME") {
-            Ok(home) if !home.is_empty() && folder.starts_with(&home) => {
+            Ok(home)
+                if !home.is_empty()
+                    && folder
+                        .strip_prefix(&home)
+                        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/')) =>
+            {
                 format!("~{}", &folder[home.len()..])
             }
             _ => folder.clone(),
+        }
+    }
+    fn place_suffix(&self) -> &'static str {
+        if self.folder.is_none() && self.workspace.is_some() {
+            " (workspace)"
+        } else {
+            ""
         }
     }
 }
@@ -8230,6 +8312,8 @@ fn state_word(state: &str) -> &'static str {
         "needs-decision" => "DECISION",
         "thinking" => "WORKING",
         "finished" => "FINISHED",
+        "not-running" => "NOT RUNNING",
+        "status-unknown" => "STATUS UNKNOWN",
         _ => "IDLE",
     }
 }
@@ -8247,6 +8331,107 @@ fn project_of(folder: &str) -> String {
             || folder_name(folder).into(),
             |n| n.to_string_lossy().into(),
         )
+}
+
+enum OrcaPlace {
+    Live(crate::status::OrcaSession, Option<String>),
+    NotRunning,
+    Unknown,
+}
+
+impl OrcaPlace {
+    fn live(&self) -> Option<(&crate::status::OrcaSession, Option<&String>)> {
+        match self {
+            Self::Live(session, cwd) => Some((session, cwd.as_ref())),
+            _ => None,
+        }
+    }
+}
+
+/// Resolve an Orca entry by agent kind and, if set explicitly, workspace.
+fn orca_places(
+    config: &mappings::Config,
+    live: Option<&[crate::status::OrcaSession]>,
+    hooks: &[crate::status::Session],
+) -> BTreeMap<String, OrcaPlace> {
+    config
+        .agents
+        .iter()
+        .filter(|a| a.host == mappings::Host::Orca)
+        .map(|agent| (agent.name.clone(), orca_place(config, agent, live, hooks)))
+        .collect()
+}
+
+fn orca_place(
+    config: &mappings::Config,
+    agent: &mappings::Agent,
+    live: Option<&[crate::status::OrcaSession]>,
+    hooks: &[crate::status::Session],
+) -> OrcaPlace {
+    let folder = agent
+        .dir
+        .as_ref()
+        .map(|_| config.agent_directory(agent))
+        .transpose();
+    let (Some(live), Ok(folder)) = (live, folder) else {
+        return OrcaPlace::Unknown;
+    };
+    let mut panes = live.iter().filter(|pane| {
+        pane.kind == agent.launch
+            && folder
+                .as_ref()
+                .and_then(Option::as_deref)
+                .is_none_or(|f| Path::new(f) == Path::new(&pane.workspace))
+    });
+    let Some(pane) = panes.next() else {
+        return OrcaPlace::NotRunning;
+    };
+    if panes.next().is_some() {
+        return OrcaPlace::Unknown;
+    }
+    let mut folders = hooks.iter().filter_map(|hook| {
+        (hook.pane.as_deref() == Some(&pane.pane)
+            && hook.kind == pane.kind
+            && Path::new(&hook.cwd).is_absolute()
+            && !hook.cwd.chars().any(char::is_control))
+        .then_some(&hook.cwd)
+    });
+    let cwd = folders
+        .next()
+        .filter(|first| folders.all(|f| f == *first))
+        .cloned();
+    OrcaPlace::Live(pane.clone(), cwd)
+}
+
+/// The controller loop uses the latest result while Orca runs off-thread.
+#[cfg(not(test))]
+fn orca_snapshot() -> Option<Vec<crate::status::OrcaSession>> {
+    use std::sync::Mutex;
+    static CACHE: Mutex<(Option<Instant>, Option<Vec<crate::status::OrcaSession>>)> =
+        Mutex::new((None, None));
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if cache
+        .0
+        .is_none_or(|last| last.elapsed() >= Duration::from_secs(4))
+    {
+        cache.0 = Some(Instant::now());
+        std::thread::spawn(|| {
+            let sessions = crate::actions::orca_program()
+                .ok()
+                .and_then(|program| {
+                    vibeconsole_core::program("timeout")
+                        .args(["--kill-after=1", "2", &program, "worktree", "ps", "--json"])
+                        .output()
+                        .ok()
+                })
+                .filter(|output| output.status.success())
+                .and_then(|output| {
+                    crate::status::orca_live_sessions(&String::from_utf8_lossy(&output.stdout))
+                });
+            CACHE.lock().unwrap_or_else(|e| e.into_inner()).1 = sessions;
+        });
+    }
+    cache.1.clone()
 }
 
 /// A failed press stays failed until the next press; otherwise the derived state wins, so a
@@ -9286,19 +9471,32 @@ fn review_recommendation(
     mappings::save_config(path, &config)?;
     Ok(true)
 }
-/// v7.7 ticket 176: install a missing agent: asks first, showing the fixed command, then runs
-/// it in a visible terminal (the user sees every line and answers any password prompt).
-/// PATH is looked at again the next time 3 Agents is drawn.
+fn agent_install_status(path: &str, home: Option<&Path>, binary: &str) -> Option<String> {
+    let on_path = mappings::executable_path(path, binary);
+    if binary == "omp"
+        && let Some(bin) = home.map(|home| home.join(".bun/bin"))
+        && let Some(launcher) = mappings::executable_path(bin.to_str()?, binary)
+    {
+        let uses_bun = on_path.as_ref().is_some_and(|found| {
+            std::fs::canonicalize(found)
+                .ok()
+                .zip(std::fs::canonicalize(launcher).ok())
+                .is_some_and(|(found, launcher)| found == launcher)
+        });
+        if on_path.is_none() || (uses_bun && !mappings::executable_on_path(path, "bun")) {
+            return Some("installed · unavailable on this PATH".into());
+        }
+    }
+    on_path.map(|_| format!("installed ({binary} on PATH)"))
+}
+
+/// v7.7 ticket 176: install a missing agent in a visible terminal after confirmation.
 fn install_agent(ui: &mut impl Ui, index: usize) -> Result<()> {
     let (name, binary, _) = *mappings::AGENT_TABLE.get(index).ok_or("no such agent")?;
     let install = mappings::AGENT_INSTALL[index];
     let (path_var, home, _) = ui.lookup_env();
-    if mappings::executable_on_path(&path_var, binary) {
-        choose(
-            ui,
-            &format!("{name} is installed ({binary} on PATH)."),
-            &strings(&["Back"]),
-        )?;
+    if let Some(status) = agent_install_status(&path_var, home.as_deref(), binary) {
+        choose(ui, &format!("{name} is {status}."), &strings(&["Back"]))?;
         return Ok(());
     }
     if question(
@@ -14457,7 +14655,11 @@ fn orca_mapping(
                 return Ok(None);
             };
             let (agent, folder) = agents[index].clone();
-            crate::actions::Action::OrcaJump { agent, folder }
+            crate::actions::Action::OrcaJump {
+                agent,
+                folder,
+                pane: None,
+            }
         }
         // v7 ticket 98: Orca's shortcuts are Orca keys too, sent only while Orca is focused.
         n => crate::actions::Action::OrcaKeys(vec![crate::actions::Step::Keys(
@@ -18427,7 +18629,7 @@ mod tests {
             ])
             .chain(
                 (0..mappings::AGENT_TABLE.len())
-                    .filter(|i| ui.agents_found.get(*i) != Some(&true))
+                    .filter(|i| ui.agents_found.get(*i).is_none_or(Option::is_none))
                     .map(|i| INSTALL_AGENT + i),
             )
             .chain((0..3).map(|n| PROFILE + n))
@@ -19180,6 +19382,7 @@ mod tests {
                 .unwrap();
         }
         ui.lookup_path = Some(bin.display().to_string());
+        ui.lookup_home = Some(dir.clone());
         ui.tab = 2;
         ui.read_view(None);
         let rows = ui
@@ -19234,6 +19437,37 @@ mod tests {
         );
         let (shown, screens) = install(vec![Enter], 0); // installed already
         assert!(shown.is_empty() && screens[0].contains("Claude Code is installed"));
+        let bun_bin = dir.join(".bun/bin");
+        std::fs::create_dir_all(&bun_bin).unwrap();
+        let launcher = bun_bin.join("omp");
+        std::fs::write(&launcher, "#!/usr/bin/env bun\n").unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ui.read_view(None);
+        let omp = ui
+            .tab_panes(2, 120, usize::MAX)
+            .into_iter()
+            .flat_map(|(_, entries)| entries)
+            .find(|(lines, _)| lines[0].contains("Oh My Pi"))
+            .unwrap();
+        assert!(omp.0[0].contains("installed · unavailable on this PATH"));
+        assert_eq!(omp.1, None);
+        let (shown, screens) = install(vec![Enter], 3);
+        assert!(shown.is_empty() && screens[0].contains("Oh My Pi is installed"));
+
+        ui.lookup_path = Some(bun_bin.display().to_string());
+        ui.read_view(None);
+        assert_eq!(
+            ui.agents_found[3].as_deref(),
+            Some("installed · unavailable on this PATH")
+        );
+        let bun = bun_bin.join("bun");
+        std::fs::write(&bun, "").unwrap();
+        std::fs::set_permissions(&bun, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ui.read_view(None);
+        assert_eq!(
+            ui.agents_found[3].as_deref(),
+            Some("installed (omp on PATH)")
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
     /// v7.7 ticket 168: Ask for mappings fills empty controls, asks before each replacement,
@@ -19441,6 +19675,7 @@ mod tests {
                 crate::actions::Action::OrcaJump {
                     agent: "claude".into(),
                     folder: folder.into(),
+                    pane: None,
                 },
             )
             .unwrap();
@@ -20775,6 +21010,107 @@ mod tests {
     /// submits its jump; an outside session opens nothing; the Table | Gallery switch
     /// draws cards and is saved as `agents-view`.
     #[test]
+    fn live_orca_uses_hook_folder_and_labels_workspace_fallback() {
+        use crate::status::{Session, orca_live_sessions};
+        let (dir, mut ui, _ran, _) = configure_session("live-orca-folders");
+        let mut config = mappings::Config::default();
+        config.agent_dir = Some("/home/developer/Documents".into());
+        config.agents = ["codex", "omp"]
+            .map(|kind| {
+                let name = format!("orca-{kind}");
+                let mut agent = mappings::Agent::new(&name, kind, &name).unwrap();
+                agent.host = mappings::Host::Orca;
+                agent
+            })
+            .to_vec();
+        let reply = r#"{"result":{"hostScope":{"hostIds":["local"]},"worktrees":[
+            {"hostId":"local","path":"/work/VibeConsole","repo":"VibeConsole","agents":[
+                {"agentType":"codex","paneKey":"tab:codex","state":"working","hasLivePty":true},
+                {"agentType":"omp","paneKey":"tab:omp","state":"done","hasLivePty":true},
+                {"agentType":"omp","paneKey":"old:omp","state":"done","hasLivePty":false}
+            ]},
+            {"hostId":"remote","path":"/work/remote","repo":"remote","agents":[
+                {"agentType":"omp","paneKey":"remote:omp","state":"working","hasLivePty":true}
+            ]}
+        ]}}"#;
+        let mut live = orca_live_sessions(reply).unwrap();
+        assert_eq!(live.len(), 2);
+        let hooks = [
+            Session {
+                state: "thinking",
+                cwd: "/work/VibeConsole/core".into(),
+                kind: "codex",
+                pane: Some("tab:codex".into()),
+            },
+            Session {
+                state: "thinking",
+                cwd: "/another/project".into(),
+                kind: "codex",
+                pane: Some("tab:unrelated".into()),
+            },
+        ];
+        ui.orca_places = orca_places(&config, Some(&live), &hooks);
+        for agent in &config.agents {
+            let (orca, cwd) = ui.orca_places[&agent.name].live().unwrap();
+            ui.agent_states
+                .push((agent.name.clone(), agent.window.clone(), orca.state));
+            ui.agent_places.push((agent.host, cwd.cloned()));
+        }
+        let rows = ui.agent_rows();
+        assert_eq!(rows[0].project, "VibeConsole");
+        assert_eq!(rows[0].place(), "/work/VibeConsole/core");
+        assert_eq!(rows[0].place_suffix(), "");
+        assert_eq!(rows[1].place(), "/work/VibeConsole");
+        assert_eq!(rows[1].place_suffix(), " (workspace)");
+        assert_eq!(rows[1].state, "finished");
+        let panes = ui.live_panes(140, usize::MAX);
+        assert!(
+            panes[1]
+                .1
+                .iter()
+                .any(|(lines, _)| lines[0].contains(" (workspace)"))
+        );
+
+        let omp_status = |ui: &Terminal| {
+            state_word(
+                ui.agent_rows()
+                    .into_iter()
+                    .find(|r| r.name == "orca-omp")
+                    .unwrap()
+                    .state,
+            )
+        };
+        ui.agent_states[1].2 = "idle";
+        ui.orca_places = orca_places(&config, Some(&live[..1]), &hooks);
+        assert_eq!(omp_status(&ui), "NOT RUNNING");
+        assert!(
+            orca_live_sessions(
+                r#"{"result":{"hostScope":{"hostIds":["local"]},"truncated":true,"worktrees":[]}}"#
+            )
+            .is_none()
+        );
+        ui.orca_places = orca_places(&config, orca_live_sessions("invalid").as_deref(), &hooks);
+        assert_eq!(omp_status(&ui), "STATUS UNKNOWN");
+
+        let mut other = live[1].clone();
+        other.workspace = "/work/Other".into();
+        other.pane = "another:omp".into();
+        live.push(other);
+        ui.orca_places = orca_places(&config, Some(&live), &hooks);
+        assert_eq!(omp_status(&ui), "STATUS UNKNOWN");
+        config.agents[1].dir = Some("/work/VibeConsole".into());
+        assert_eq!(
+            orca_places(&config, Some(&live), &hooks)["orca-omp"]
+                .live()
+                .unwrap()
+                .0
+                .pane,
+            "tab:omp"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn live_agents_sort_go_to_the_agent_and_switch_to_cards() {
         use crate::actions::Action;
         let (dir, mut ui, ran, _) = configure_session("live-agents");
@@ -20801,6 +21137,19 @@ mod tests {
             tmux,
             (mappings::Host::Herdr, None),
         ];
+        ui.orca_places.insert(
+            "orca-claude".into(),
+            OrcaPlace::Live(
+                crate::status::OrcaSession {
+                    kind: "claude".into(),
+                    workspace: repo.display().to_string(),
+                    project: "VibeConsole".into(),
+                    pane: "tab:leaf".into(),
+                    state: "needs-decision",
+                },
+                Some(docs.clone()),
+            ),
+        );
         ui.light_sessions = vec![("/srv/outside".into(), "thinking", 0)];
         ui.projects.insert(docs.clone(), project_of(&docs));
         ui.projects
@@ -20888,8 +21237,9 @@ mod tests {
             got,
             [
                 Action::OrcaJump {
-                    agent: "orca-claude".into(),
-                    folder: docs.clone()
+                    agent: "claude".into(),
+                    folder: repo.display().to_string(),
+                    pane: Some("tab:leaf".into()),
                 },
                 Action::HerdrFocus("herdr-one".into())
             ]
@@ -22674,7 +23024,8 @@ mod tests {
             saved[1].action,
             crate::actions::Action::OrcaJump {
                 agent: "codex".into(),
-                folder: "/work/b".into()
+                folder: "/work/b".into(),
+                pane: None,
             }
         );
         assert_eq!(
