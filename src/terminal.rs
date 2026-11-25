@@ -11974,6 +11974,7 @@ fn families(input: mappings::Input) -> Vec<usize> {
         mappings::Input::RelativeKnob { .. } => vec![0, 2],
         mappings::Input::Joystick { .. } => vec![0],
     };
+    offered.push(16); // v7.8 ticket 11: Mouse Actions, wherever a shortcut can go
     offered.push(13); // v7 ticket 46: Favourites, for every control
     // v7.7 ticket 169: the families made in 0 AI hold press actions.
     if matches!(input, mappings::Input::Pad | mappings::Input::Piano) {
@@ -11990,6 +11991,7 @@ fn action_family(mapping: &Mapping) -> usize {
     use crate::actions::Action;
     match &mapping.action {
         Action::OrcaKeys(_) => 8,
+        Action::Shortcut if mappings::mouse_action(&mapping.keys) => 16,
         Action::Shortcut => 0,
         Action::Command { .. } if mapping.risky => 12,
         Action::Command { .. } => 4,
@@ -12062,7 +12064,7 @@ fn favourite_mapping(
     Ok(Some(copy))
 }
 
-const FAMILIES: [&str; 16] = [
+const FAMILIES: [&str; 17] = [
     "Keyboard shortcut",
     "Launch application",
     "Music & Sound", // v7.8 ticket 10: was "Fedora system action" (volume and mute only)
@@ -12079,6 +12081,7 @@ const FAMILIES: [&str; 16] = [
     "Favourites (the same action as a starred assignment)",
     "Your families (named groups made in 0 AI)",
     "tmux agent (go to its window)",
+    "Mouse Actions (click, hold to drag, scroll)", // v7.8 ticket 11
 ];
 
 fn configure(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) -> Result<()> {
@@ -13226,6 +13229,29 @@ fn configure_steps(
                 }
             };
             Mapping::new(pad, &keys.join("+"), behavior).map_err(stage("validation"))?
+        } else if family == 16 {
+            // v7.8 ticket 11: a click follows the control (held: the button stays down, so it
+            // drags); a scroll is one wheel step per press, or per knob step.
+            let rows = mappings::MOUSE_KEYS
+                .map(|(_, label)| label.to_string())
+                .to_vec();
+            let saved_row = saved
+                .as_ref()
+                .and_then(|m| (mappings::MOUSE_KEYS.iter()).position(|(key, _)| m.keys == [*key]));
+            let Some(row) = choose_saved(
+                ui,
+                "Mouse Actions\nA click follows the control: hold it to hold the button (drag). Scroll: one step per press.",
+                rows,
+                saved_row,
+            )?
+            else {
+                continue;
+            };
+            let behavior = match input {
+                mappings::Input::Knob { .. } | mappings::Input::RelativeKnob { .. } => "pulse",
+                _ => "hold",
+            };
+            Mapping::new(pad, mappings::MOUSE_KEYS[row].0, behavior).map_err(stage("validation"))?
         } else if family == 11 {
             if !matches!(input, mappings::Input::Pad | mappings::Input::Piano) {
                 return Err("validation: prompt sequences require a pad or piano press".into());
@@ -15058,7 +15084,7 @@ mod tests {
         };
         // An Akai pad: Favourites -> Output mute -> Review -> save.
         let b = Control::from_note(10, 38).unwrap();
-        let mut keys = favourites(11);
+        let mut keys = favourites(12);
         keys.extend([Enter, Enter, Tab, Tab, Enter]); // the favourite, save, finish
         let (saved, screens) = run(&[&mute, &prompt], keys, vec![b], VecDeque::new());
         assert!(screens.contains("★"), "{screens}");
@@ -15069,14 +15095,14 @@ mod tests {
             "the favourite itself stays"
         );
         // A prompt copies its status feedback too.
-        let mut keys = favourites(11);
+        let mut keys = favourites(12);
         keys.extend([Down, Enter, Enter, Tab, Tab, Enter]);
         let (saved, _) = run(&[&mute, &prompt], keys, vec![b], VecDeque::new());
         let copy = saved.iter().find(|m| m.control == b).unwrap();
         assert!(matches!(copy.action, Action::Prompt { .. }) && copy.status);
         // An Xbox button: its layer is asked first (v7 ticket 97), then Review.
         let mut keys = vec![Enter, Enter]; // learn, layer 1
-        keys.extend(vec![Down; 11]);
+        keys.extend(vec![Down; 12]); // past Mouse Actions (v7.8 ticket 11)
         keys.push(Enter); // Favourites
         keys.extend([Enter, Enter, Tab, Tab, Enter]); // favourite, save, finish
         let (saved, _) = run(&[&mute], keys, vec![Control::button(3)], VecDeque::new());
@@ -15096,7 +15122,7 @@ mod tests {
             direction: 1,
         };
         let mut keys = vec![Down, Down, Enter]; // Learn a knob
-        keys.extend(vec![Down; 4]);
+        keys.extend(vec![Down; 5]); // past Mouse Actions (v7.8 ticket 11)
         keys.extend([Enter, Enter, Enter, Tab, Tab, Enter]); // Favourites, the prompt, Back
         let turned = (
             knob,
@@ -15110,7 +15136,7 @@ mod tests {
             "{screens}"
         );
         // Nothing starred: it says where to star one.
-        let mut keys = favourites(11);
+        let mut keys = favourites(12);
         keys.extend([Enter, Tab, Tab, Enter]); // Back, finish
         let (_, screens) = run(&[], keys, vec![b], VecDeque::new());
         assert!(screens.contains("Settings → Favourites"), "{screens}");
@@ -19290,8 +19316,15 @@ mod tests {
                 12 => [command("sudo dnf update"), vec![Enter]].concat(),
                 14 => vec![Enter, Enter], // v7.7 ticket 169: the family, its one action
                 15 => vec![Enter, Enter], // v7.7 ticket 182: the first tmux agent, fire when
+                // v7.8 ticket 11: Left click, then what a shortcut asks after its behaviour.
+                16 => match kind {
+                    "pad" => vec![Enter; 3],  // click, hardware feedback, fire when
+                    "knob" => vec![Enter; 2], // click, knob step
+                    "joystick" => vec![Enter],
+                    _ => vec![Enter; 2], // click, fire when
+                },
                 _ if kind == "knob" => vec![Enter, Enter], // 13: the favourite, knob step
-                _ => vec![Enter],         // 13: the starred favourite
+                _ => vec![Enter],                          // 13: the starred favourite
             }
         };
         let knob = Control {
@@ -19313,7 +19346,7 @@ mod tests {
             deadzone: 1024,
             hysteresis: 128,
         };
-        let pressed = vec![0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15];
+        let pressed = vec![0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 16, 13, 14, 15];
         // (kind, learn page, control, motion, families offered)
         let kinds: Vec<(&str, usize, Control, Option<Input>, Vec<usize>)> = vec![
             (
@@ -19335,9 +19368,9 @@ mod tests {
                 2,
                 knob,
                 Some(Input::Knob { step: 4 }),
-                vec![0, 2, 6, 7, 13],
+                vec![0, 2, 6, 7, 16, 13],
             ),
-            ("joystick", 3, joystick, Some(stick), vec![0, 13]),
+            ("joystick", 3, joystick, Some(stick), vec![0, 16, 13]),
             ("Xbox button", 4, Control::button(0), None, pressed),
         ];
         // The favourite: Output mute on another pad.

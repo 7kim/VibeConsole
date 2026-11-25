@@ -481,6 +481,7 @@ pub fn parse_shortcut(shortcut: &str) -> Result<Vec<String>> {
         };
         let key = if let Some(key) = NAMED_KEYS
             .iter()
+            .chain(MOUSE_KEYS.iter().map(|(key, _)| key))
             .find(|key| key.eq_ignore_ascii_case(alias))
         {
             (*key).to_owned()
@@ -514,6 +515,21 @@ pub fn parse_shortcut(shortcut: &str) -> Result<Vec<String>> {
         )
     });
     Ok(keys)
+}
+
+/// v7.8 ticket 11: Mouse Actions, as keys the keyboard state machine holds and releases like
+/// any other (so a held click drags, and every transition lets go); the output sends them to
+/// the pointer. Not offered in the shortcut picker.
+pub const MOUSE_KEYS: [(&str, &str); 5] = [
+    ("MouseLeft", "Left click"),
+    ("MouseRight", "Right click"),
+    ("MouseMiddle", "Middle click"),
+    ("ScrollUp", "Scroll up"),
+    ("ScrollDown", "Scroll down"),
+];
+/// An assignment made in Mouse Actions: its keys are all mouse keys.
+pub fn mouse_action(keys: &[String]) -> bool {
+    !keys.is_empty() && keys.iter().all(|k| MOUSE_KEYS.iter().any(|(m, _)| m == k))
 }
 
 pub fn key_groups() -> Vec<(&'static str, Vec<String>)> {

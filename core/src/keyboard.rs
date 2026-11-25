@@ -20,6 +20,12 @@ pub fn key_code(name: &str) -> Result<KeyCode> {
         "LeftBracket" => "LEFTBRACE",
         "RightBracket" => "RIGHTBRACE",
         "Apostrophe" => "APOSTROPHE",
+        // v7.8 ticket 11: Mouse Actions; the scroll keys are only ever sent to the pointer.
+        "MouseLeft" => return Ok(KeyCode::BTN_LEFT),
+        "MouseRight" => return Ok(KeyCode::BTN_RIGHT),
+        "MouseMiddle" => return Ok(KeyCode::BTN_MIDDLE),
+        "ScrollUp" => return Ok(KeyCode::KEY_SCROLLUP),
+        "ScrollDown" => return Ok(KeyCode::KEY_SCROLLDOWN),
         other => &other.to_ascii_uppercase(),
     };
     format!("KEY_{linux_name}")
@@ -452,18 +458,77 @@ pub struct Output {
     pub keyboard: Keyboard,
     /// None: a recording output (v7 ticket 51), for session tests; nothing reaches the desktop.
     device: Option<VirtualDevice>,
+    /// v7.8 ticket 11: the mouse buttons and wheel, created at the first mouse key (never for
+    /// a recording output, which records them with the keys).
+    pointer: Option<VirtualDevice>,
     pub node: std::path::PathBuf,
     /// Keys a recording output was asked to press (true) and release (false), in order.
     pub recorded: Vec<(KeyCode, bool)>,
 }
 
+/// v7.8 ticket 11: a key the pointer sends (mouse buttons, and the wheel's scroll keys).
+fn pointer_key(key: KeyCode) -> bool {
+    matches!(
+        key,
+        KeyCode::BTN_LEFT
+            | KeyCode::BTN_RIGHT
+            | KeyCode::BTN_MIDDLE
+            | KeyCode::KEY_SCROLLUP
+            | KeyCode::KEY_SCROLLDOWN
+    )
+}
+/// The pointer's events for a mouse key: a button follows the key; a scroll key's press is one
+/// wheel step (in hi-res units too), its release nothing.
+fn pointer_events(key: KeyCode, down: bool) -> Vec<InputEvent> {
+    use evdev::RelativeAxisCode as Rel;
+    let step = match key {
+        KeyCode::KEY_SCROLLUP => 1,
+        KeyCode::KEY_SCROLLDOWN => -1,
+        _ => return vec![InputEvent::new(EventType::KEY.0, key.0, i32::from(down))],
+    };
+    match down {
+        true => vec![
+            InputEvent::new(EventType::RELATIVE.0, Rel::REL_WHEEL.0, step),
+            InputEvent::new(EventType::RELATIVE.0, Rel::REL_WHEEL_HI_RES.0, 120 * step),
+        ],
+        false => Vec::new(),
+    }
+}
+fn create_pointer() -> io::Result<VirtualDevice> {
+    use evdev::RelativeAxisCode as Rel;
+    let buttons =
+        AttributeSet::from_iter([KeyCode::BTN_LEFT, KeyCode::BTN_RIGHT, KeyCode::BTN_MIDDLE]);
+    let axes = AttributeSet::from_iter([
+        Rel::REL_X,
+        Rel::REL_Y,
+        Rel::REL_WHEEL,
+        Rel::REL_WHEEL_HI_RES,
+    ]);
+    VirtualDevice::builder()?
+        .name("VibeConsole mouse buttons")
+        .with_keys(&buttons)?
+        .with_relative_axes(&axes)?
+        .build()
+}
+
 fn send(
     device: &mut Option<VirtualDevice>,
+    pointer: &mut Option<VirtualDevice>,
     recorded: &mut Vec<(KeyCode, bool)>,
     key: KeyCode,
     down: bool,
 ) -> io::Result<()> {
     match device {
+        Some(_) if pointer_key(key) => {
+            if pointer.is_none() {
+                *pointer = Some(create_pointer()?);
+            }
+            let events = pointer_events(key, down);
+            match (events.is_empty(), pointer) {
+                (false, Some(pointer)) => pointer.emit(&events),
+                _ => Ok(()),
+            }
+        }
         Some(device) => device.emit(&[InputEvent::new(EventType::KEY.0, key.0, i32::from(down))]),
         None => {
             recorded.push((key, down));
@@ -1238,6 +1303,7 @@ impl Output {
         Ok(Self {
             keyboard,
             device: Some(device),
+            pointer: None,
             node,
             recorded: Vec::new(),
         })
@@ -1250,6 +1316,7 @@ impl Output {
         Ok(Self {
             keyboard,
             device: None,
+            pointer: None,
             node: std::path::PathBuf::new(),
             recorded: Vec::new(),
         })
@@ -1259,33 +1326,33 @@ impl Output {
         self.keyboard.take_early()
     }
     pub fn fire_due(&mut self) -> Result<Vec<(Control, bool)>> {
-        let (device, recorded) = (&mut self.device, &mut self.recorded);
+        let (device, pointer, recorded) = (&mut self.device, &mut self.pointer, &mut self.recorded);
         Ok(self.keyboard.fire_due(Instant::now(), &mut |key, down| {
-            send(device, recorded, key, down)
+            send(device, pointer, recorded, key, down)
         })?)
     }
     pub fn observe(&mut self, event: Event) -> Result<Option<(Control, bool)>> {
-        let (device, recorded) = (&mut self.device, &mut self.recorded);
-        Ok(self
-            .keyboard
-            .observe(event, &mut |key, down| send(device, recorded, key, down))?)
+        let (device, pointer, recorded) = (&mut self.device, &mut self.pointer, &mut self.recorded);
+        Ok(self.keyboard.observe(event, &mut |key, down| {
+            send(device, pointer, recorded, key, down)
+        })?)
     }
     pub fn tap(&mut self, keys: &[KeyCode]) -> Result<()> {
-        let (device, recorded) = (&mut self.device, &mut self.recorded);
-        Ok(self
-            .keyboard
-            .tap(keys, &mut |key, down| send(device, recorded, key, down))?)
+        let (device, pointer, recorded) = (&mut self.device, &mut self.pointer, &mut self.recorded);
+        Ok(self.keyboard.tap(keys, &mut |key, down| {
+            send(device, pointer, recorded, key, down)
+        })?)
     }
     pub fn pause(&mut self) -> Result<()> {
-        let (device, recorded) = (&mut self.device, &mut self.recorded);
+        let (device, pointer, recorded) = (&mut self.device, &mut self.pointer, &mut self.recorded);
         self.keyboard
-            .pause(&mut |key, down| send(device, recorded, key, down))?;
+            .pause(&mut |key, down| send(device, pointer, recorded, key, down))?;
         Ok(())
     }
     pub fn clear(&mut self) -> Result<()> {
-        let (device, recorded) = (&mut self.device, &mut self.recorded);
+        let (device, pointer, recorded) = (&mut self.device, &mut self.pointer, &mut self.recorded);
         self.keyboard
-            .clear(&mut |key, down| send(device, recorded, key, down))?;
+            .clear(&mut |key, down| send(device, pointer, recorded, key, down))?;
         Ok(())
     }
 }
@@ -1302,6 +1369,56 @@ mod tests {
     use super::*;
     use crate::{Detector, ReleaseType};
     use std::sync::mpsc;
+
+    /// v7.8 ticket 11: a held click holds the button until the control lets go; a pause lets
+    /// go of a held one; a scroll is one wheel step per press, nothing on release.
+    #[test]
+    fn mouse_clicks_hold_and_scroll_steps_once() {
+        let click = Control::from_note(10, 36).unwrap();
+        let scroll = Control::from_note(10, 37).unwrap();
+        let mappings = [
+            Mapping::new(click, "MouseLeft", "hold").unwrap(),
+            Mapping::new(scroll, "ScrollDown", "hold").unwrap(),
+        ];
+        let mut output = Output::recording(&mappings).unwrap();
+        output.keyboard.resume();
+        output.observe(Event::Press(click)).unwrap();
+        assert_eq!(
+            output.recorded,
+            [(KeyCode::BTN_LEFT, true)],
+            "held: no release yet"
+        );
+        output
+            .observe(Event::Release(click, ReleaseType::NoteOff))
+            .unwrap();
+        assert_eq!(output.recorded[1], (KeyCode::BTN_LEFT, false));
+        output.observe(Event::Press(click)).unwrap();
+        output.pause().unwrap();
+        assert_eq!(
+            output.recorded[2..],
+            [(KeyCode::BTN_LEFT, true), (KeyCode::BTN_LEFT, false)]
+        );
+        // The scroll key's press is one wheel step down; its release sends nothing.
+        use evdev::RelativeAxisCode as Rel;
+        let wheel = |key, down| {
+            pointer_events(key, down)
+                .iter()
+                .map(|e| (e.code(), e.value()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            wheel(KeyCode::KEY_SCROLLDOWN, true),
+            [(Rel::REL_WHEEL.0, -1), (Rel::REL_WHEEL_HI_RES.0, -120)]
+        );
+        assert_eq!(wheel(KeyCode::KEY_SCROLLUP, true)[0], (Rel::REL_WHEEL.0, 1));
+        assert!(wheel(KeyCode::KEY_SCROLLDOWN, false).is_empty());
+        assert_eq!(wheel(KeyCode::BTN_RIGHT, true), [(KeyCode::BTN_RIGHT.0, 1)]);
+        assert!(crate::mappings::mouse_action(&["ScrollDown".into()]));
+        assert!(!crate::mappings::mouse_action(&[
+            "Ctrl".into(),
+            "MouseLeft".into()
+        ]));
+    }
 
     /// v7.8 ticket 10: a media key taps through the keyboard like any key: down, then up,
     /// once, and nothing stays held.
