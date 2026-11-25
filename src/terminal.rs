@@ -2322,10 +2322,6 @@ impl Terminal {
                     one("/configure".into(), Some(0)),
                     one("/list".into(), Some(2)),
                     head("Keep"),
-                    one(
-                        format!("Favourites ({})", config.favourites.len()),
-                        Some(SETTING + 10),
-                    ),
                     one("Presets".into(), Some(SETTING + 11)),
                     head("History · your last 10 saves"),
                     one(format!("Undo last change · {}", self.undo_row), Some(23)),
@@ -6927,17 +6923,17 @@ fn sequence_menu(
                     }
                     1 => prompt_action(ui, path, None)?.map(Step::Do),
                     2 => command_action(ui, None)?.map(Step::Do),
-                    3 => action_menu(ui, 1, mappings::Input::Pad, None, false)?.map(Step::Do),
+                    3 => action_menu(ui, 1, mappings::Input::Pad, None, false, None)?.map(Step::Do),
                     4 => shortcut(ui, &[])?.map(Step::Keys),
                     5 => number(ui, "Wait (milliseconds)", 1000, 100, 60000)?
                         .map(|ms| Step::Wait(ms as u16)),
-                    6 => action_menu(ui, 2, mappings::Input::Pad, None, false)?.map(Step::Do),
+                    6 => action_menu(ui, 2, mappings::Input::Pad, None, false, None)?.map(Step::Do),
                     7 => {
                         let rows = mappings::MOUSE_KEYS.map(|(_, l)| l.to_string());
                         choose(ui, "Mouse action (one click or one scroll step)", &rows)?
                             .map(|i| Step::Keys(vec![mappings::MOUSE_KEYS[i].0.into()]))
                     }
-                    8 => fedora_system(ui, None)?.map(Step::Do),
+                    8 => fedora_system(ui, None, None)?.map(Step::Do),
                     9 => browser_action(ui, path, None)?.map(Step::Do),
                     10 => {
                         let any = Control::from_note(vibeconsole_core::PAD_CHANNEL, 36)
@@ -7645,7 +7641,6 @@ fn setting(ui: &mut impl Ui, path: &Path, choice: usize) -> Result<()> {
         7 => midi_device_menu(ui, path),
         8 => tuning_menu(ui, path),
         9 => profiles_menu(ui, path),
-        10 => favourites_menu(ui, path),
         _ => presets_menu(ui, path),
     };
     if let Err(error) = result {
@@ -7681,10 +7676,24 @@ fn profiles_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
             beside(path, "profiles").display()
         ));
         items.push("Ask Claude for a profile…".into());
-        let Some(choice) = choose(
+        // v7.8 ticket 18: F stars a profile (it lists first); the other rows can't be starred.
+        let rows = items
+            .into_iter()
+            .enumerate()
+            .map(|(i, label)| {
+                let key = config
+                    .profiles
+                    .get(i)
+                    .map_or_else(String::new, |p| mappings::profile_favourite_key(&p.name));
+                (label, key)
+            })
+            .collect::<Vec<_>>();
+        let Some(choice) = choose_starred(
             ui,
+            path,
             "App profiles: apps without a profile use Default",
-            &items,
+            &rows,
+            None,
         )?
         else {
             return Ok(());
@@ -7845,58 +7854,6 @@ fn presets_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
 }
 
 /// Settings -> Favourites (v7 ticket 24): Enter marks or unmarks one; saved at once.
-fn favourites_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
-    let mut cursor = 0;
-    loop {
-        let mut config = mappings::load_config(path)?;
-        let agents = config.agents.clone();
-        let mut keys = config
-            .mappings
-            .iter()
-            .map(|m| {
-                (
-                    mappings::favourite_key(m),
-                    mapping_label(m, None, Some(&agents)),
-                )
-            })
-            .collect::<Vec<_>>();
-        keys.extend(config.profiles.iter().map(|p| {
-            (
-                mappings::profile_favourite_key(&p.name),
-                format!("Profile {}", p.name),
-            )
-        }));
-        if keys.is_empty() {
-            return Err("nothing saved yet to mark".into());
-        }
-        let items = keys
-            .iter()
-            .map(|(key, label)| {
-                format!(
-                    "{} {label}",
-                    if config.favourites.contains(key) {
-                        "★"
-                    } else {
-                        "☆"
-                    }
-                )
-            })
-            .collect::<Vec<_>>();
-        let Some(choice) = choose_at(ui, "Favourites: Enter marks or unmarks", &items, cursor)?
-        else {
-            return Ok(());
-        };
-        cursor = choice;
-        let key = &keys[choice].0;
-        match config.favourites.iter().position(|k| k == key) {
-            Some(at) => {
-                config.favourites.remove(at);
-            }
-            None => config.favourites.push(key.clone()),
-        }
-        mappings::save_config(path, &config)?;
-    }
-}
 
 /// Profile files are shared through one folder beside the config (v7 ticket 14); names
 /// come from its listing, never typed paths.
@@ -11102,6 +11059,17 @@ fn pick(
     initial: usize,
     remembers: bool,
 ) -> Result<Option<usize>> {
+    Ok(pick_inner(ui, title, options, initial, remembers, false)?.map(|(row, _)| row))
+}
+/// [`pick`]; with `star`, F (or f) answers (row, true): star or unstar it (v7.8 ticket 18).
+fn pick_inner(
+    ui: &mut impl Ui,
+    title: &str,
+    options: &[String],
+    initial: usize,
+    remembers: bool,
+    star: bool,
+) -> Result<Option<(usize, bool)>> {
     if options.is_empty() {
         return Ok(None);
     }
@@ -11169,11 +11137,195 @@ fn pick(
                 if let Some(rows) = ui.rows_left().filter(|_| remembers) {
                     rows.insert(name, (cursor, options[cursor].clone()));
                 }
-                return Ok(Some(cursor));
+                return Ok(Some((cursor, false)));
             }
+            Some(Key::Character(b'f' | b'F')) if star => return Ok(Some((cursor, true))),
             Some(Key::Escape) => return Ok(None),
             _ => {}
         }
+    }
+}
+
+thread_local! {
+    /// v7.8 ticket 18: the row a ★ Favourites pick opens: the next starred list holding a row
+    /// with this label picks it at once, so the action's own setup follows.
+    static JUMP: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+/// v7.8 ticket 18: star or unstar `key` in the config (saved atomically).
+fn toggle_star(path: &Path, key: &str) -> Result<()> {
+    let mut config = mappings::load_config(path).map_err(stage("file I/O"))?;
+    match config.favourites.iter().position(|k| k == key) {
+        Some(at) => {
+            config.favourites.remove(at);
+        }
+        None => config.favourites.push(key.to_owned()),
+    }
+    mappings::save_config(path, &config).map_err(stage("file I/O"))
+}
+/// v7.8 ticket 18: a list whose rows can be starred with F: (label, star key; "" can't be
+/// starred). Starred rows come first with ★; the answer is the row's own index.
+fn choose_starred(
+    ui: &mut impl Ui,
+    path: &Path,
+    title: &str,
+    rows: &[(String, String)],
+    mut at: Option<usize>,
+) -> Result<Option<usize>> {
+    if let Some(row) = JUMP.with(|j| {
+        let want = j.borrow().clone()?;
+        let row = rows.iter().position(|(label, _)| *label == want)?;
+        j.borrow_mut().take();
+        Some(row)
+    }) {
+        return Ok(Some(row));
+    }
+    let saved = at; // the saved choice keeps its "(saved)" mark (v7 ticket 55)
+    loop {
+        let stars = mappings::load_config(path)
+            .map(|c| c.favourites)
+            .unwrap_or_default();
+        let starred = |key: &String| !key.is_empty() && stars.contains(key);
+        let mut order = (0..rows.len()).collect::<Vec<_>>();
+        // A row that is itself a list of stars ("★ Favourites") stays on top.
+        order.sort_by_key(|&i| (!rows[i].0.starts_with('★'), !starred(&rows[i].1)));
+        let labels = order
+            .iter()
+            .map(|&i| match starred(&rows[i].1) {
+                true => format!("★ {}", rows[i].0),
+                false => rows[i].0.clone(),
+            })
+            .collect::<Vec<_>>();
+        let initial = at
+            .and_then(|a| order.iter().position(|&i| i == a))
+            .unwrap_or(0);
+        let saved_row = saved.and_then(|a| order.iter().position(|&i| i == a));
+        let labels = mark_saved(labels, saved_row);
+        let title = format!("{title}\nF: star or unstar a row; starred rows come first");
+        match pick_inner(ui, &title, &labels, initial, false, true)? {
+            None => return Ok(None),
+            Some((row, false)) => return Ok(Some(order[row])),
+            Some((row, true)) => {
+                let key = &rows[order[row]].1;
+                if !key.is_empty() {
+                    toggle_star(path, key)?;
+                }
+                at = Some(order[row]);
+            }
+        }
+    }
+}
+/// v7.8 ticket 18: a family's action list: starrable (F) when the config is known (Configure),
+/// else a plain list (sequence steps).
+fn family_list(
+    ui: &mut impl Ui,
+    stars: Option<&Path>,
+    family: usize,
+    title: &str,
+    rows: Vec<String>,
+    at: Option<usize>,
+) -> Result<Option<usize>> {
+    match stars {
+        Some(path) => {
+            let rows = rows
+                .into_iter()
+                .map(|label| {
+                    let key = action_star(family, &label);
+                    (label, key)
+                })
+                .collect::<Vec<_>>();
+            choose_starred(ui, path, title, &rows, at)
+        }
+        None => choose_saved(ui, title, rows, at),
+    }
+}
+/// v7.8 ticket 18: the word a family's star is saved under (`family:<word>`).
+const FAMILY_WORDS: [&str; 19] = [
+    "shortcut",
+    "app",
+    "music",
+    "prompt",
+    "command",
+    "sequence",
+    "choice",
+    "value",
+    "orca",
+    "t3",
+    "herdr",
+    "prompt-sequence",
+    "terminal",
+    "favourites",
+    "your-families",
+    "tmux",
+    "mouse",
+    "fedora",
+    "browser",
+];
+fn family_star(family: usize) -> String {
+    format!("family:{}", FAMILY_WORDS[family])
+}
+fn action_star(family: usize, label: &str) -> String {
+    format!("action:{}:{label}", FAMILY_WORDS[family])
+}
+/// v7.8 ticket 18: what a starred action names: (family, row label).
+fn starred_action(key: &str) -> Option<(usize, &str)> {
+    let (word, label) = key.strip_prefix("action:")?.split_once(':')?;
+    Some((FAMILY_WORDS.iter().position(|w| *w == word)?, label))
+}
+/// v7.8 ticket 18: v7's stars were on control slots; each one on an assignment becomes a star
+/// on its family (and, for Music & Sound, Mouse Actions and Fedora System, on its action);
+/// a slot with no assignment is dropped; profile stars stay. Saved once, atomically.
+fn migrate_stars(path: &Path) -> Result<()> {
+    let mut config = mappings::load_config(path).map_err(stage("file I/O"))?;
+    let old = |k: &String| {
+        !["family:", "action:", "profile:"]
+            .iter()
+            .any(|p| k.starts_with(p))
+    };
+    if !config.favourites.iter().any(old) {
+        return Ok(());
+    }
+    let mut stars = Vec::new();
+    for key in &config.favourites {
+        let new = match old(key) {
+            false => vec![key.clone()],
+            true => config
+                .mappings
+                .iter()
+                .find(|m| mappings::favourite_key(m) == *key)
+                .map(|m| {
+                    let family = action_family(m);
+                    let row = action_row_label(m);
+                    std::iter::once(family_star(family))
+                        .chain(row.map(|label| action_star(family, &label)))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        for star in new {
+            if !stars.contains(&star) {
+                stars.push(star);
+            }
+        }
+    }
+    config.favourites = stars;
+    mappings::save_config(path, &config).map_err(stage("file I/O"))
+}
+/// The row an assignment's action has in its family's list, where that list can be starred.
+fn action_row_label(mapping: &Mapping) -> Option<String> {
+    use crate::actions::Action;
+    match &mapping.action {
+        Action::Volume { up: true, .. } => Some("Output volume up".into()),
+        Action::Volume { up: false, .. } => Some("Output volume down".into()),
+        Action::OutputMute => Some("Output mute".into()),
+        Action::MicrophoneMute => Some("Microphone mute".into()),
+        Action::Media(m) => Some(m.label().into()),
+        Action::System(s) if crate::actions::System::FIXED.contains(s) => Some(s.label()),
+        Action::System(crate::actions::System::EmptyTrash) => Some("Empty trash".into()),
+        Action::Shortcut if mappings::mouse_action(&mapping.keys) => mappings::MOUSE_KEYS
+            .iter()
+            .find(|(k, _)| mapping.keys == [*k])
+            .map(|(_, l)| l.to_string()),
+        _ => None,
     }
 }
 /// v7.7 ticket 206: a list's name for [`Ui::rows_left`]: its title's first line up to the
@@ -11688,6 +11840,7 @@ fn action_menu(
     input: mappings::Input,
     saved: Option<&crate::actions::Action>,
     second_press: bool,
+    stars: Option<&Path>,
 ) -> Result<Option<crate::actions::Action>> {
     use crate::actions::Action;
     if matches!(input, mappings::Input::Joystick { .. })
@@ -11802,8 +11955,10 @@ fn action_menu(
         "Microphone mute",
     ]);
     rows.extend(Media::ALL.iter().map(|m| m.label().to_string()));
-    let Some(i) = choose_saved(
+    let Some(i) = family_list(
         ui,
+        stars,
+        2,
         "Music & Sound. Volume and mute act on the default device (wpctl, in your desktop session).
 Media keys go to the player that is playing; with none, nothing happens.",
         rows,
@@ -11857,7 +12012,7 @@ fn browser_action(
         Some(Action::Playwright(_)) => Some(Browser::ALL.len()),
         _ => saved_browser.and_then(|b| Browser::ALL.iter().position(|x| *x == b)),
     };
-    let Some(b) = choose_saved(ui, "Which browser?", names, at)? else {
+    let Some(b) = family_list(ui, Some(path), 18, "Which browser?", names, at)? else {
         return Ok(None);
     };
     let Some(&browser) = Browser::ALL.get(b) else {
@@ -12017,6 +12172,7 @@ fn must_hold(action: &crate::actions::Action) -> bool {
 fn fedora_system(
     ui: &mut impl Ui,
     saved: Option<&crate::actions::Action>,
+    stars: Option<&Path>,
 ) -> Result<Option<crate::actions::Action>> {
     use crate::actions::{Action, SETTINGS_PANELS, System};
     let fixed = System::FIXED
@@ -12046,8 +12202,10 @@ fn fedora_system(
         Some(Action::System(s)) => fixed.iter().position(|f| f == s).map(|i| i + UPDATES.len()),
         _ => None,
     };
-    let Some(row) = choose_saved(
+    let Some(row) = family_list(
         ui,
+        stars,
+        17,
         "Fedora System. Each runs one fixed command; updates and suspend fire after a one-second hold.",
         rows.clone(),
         at,
@@ -12295,7 +12453,6 @@ fn families(input: mappings::Input) -> Vec<usize> {
         mappings::Input::Joystick { .. } => vec![0],
     };
     offered.push(16); // v7.8 ticket 11: Mouse Actions, wherever a shortcut can go
-    offered.push(13); // v7 ticket 46: Favourites, for every control
     // v7.7 ticket 169: the families made in 0 AI hold press actions.
     if matches!(input, mappings::Input::Pad | mappings::Input::Piano) {
         offered.push(14);
@@ -12334,60 +12491,6 @@ fn action_family(mapping: &Mapping) -> usize {
         action if action.audio() => 2,
         _ => 1, // launchers, hold to quit, Wispr Flow
     }
-}
-
-/// Configure's Favourites family (v7 ticket 46): a starred assignment's action, keys,
-/// behaviour, feedback, hold and status, copied onto the learned control. The favourite
-/// itself stays; the copy is independent. A family the control can't take is refused.
-fn favourite_mapping(
-    ui: &mut impl Ui,
-    path: &Path,
-    pad: Control,
-    input: mappings::Input,
-) -> Result<Option<Mapping>> {
-    let config = mappings::load_config(path).map_err(stage("file I/O"))?;
-    let starred = config
-        .mappings
-        .iter()
-        .filter(|m| config.favourites.contains(&mappings::favourite_key(m)))
-        .collect::<Vec<_>>();
-    if starred.is_empty() {
-        return Err(
-            "validation: no favourites yet; star an assignment in Settings → Favourites".into(),
-        );
-    }
-    let program = ui.program();
-    let Some(index) = choose(
-        ui,
-        "Favourites: give this control the same action",
-        &starred
-            .iter()
-            .map(|m| {
-                format!(
-                    "★ {}",
-                    mapping_label(m, program.as_ref(), Some(&config.agents))
-                )
-            })
-            .collect::<Vec<_>>(),
-    )?
-    else {
-        return Ok(None);
-    };
-    let favourite = starred[index];
-    let family = action_family(favourite);
-    if !families(input).contains(&family) {
-        let name = mappings::control_name(pad, Some(input), ui.context(), program.as_ref());
-        return Err(format!(
-            "validation: {} is a \"{}\" action, which {name} can't take",
-            mapping_label(favourite, program.as_ref(), Some(&config.agents)),
-            FAMILIES[family]
-        )
-        .into());
-    }
-    let mut copy = favourite.clone();
-    copy.control = pad;
-    copy.input = input;
-    Ok(Some(copy))
 }
 
 const FAMILIES: [&str; 19] = [
@@ -13031,6 +13134,7 @@ fn configure_for(
             stage("validation")(error)
         }
     };
+    migrate_stars(path).map_err(&staged)?; // v7.8 ticket 18
     loop {
         let Err(error) = configure_steps(ui, path, current, profile) else {
             return Ok(());
@@ -13506,25 +13610,52 @@ fn configure_steps(
         {
             continue;
         }
+        JUMP.with(|j| j.borrow_mut().take()); // a jump never outlives its choice
         let saved_family = saved.as_ref().map(action_family);
+        // v7.8 ticket 18: families star with F (★ first); "★ Favourites" lists every starred
+        // action this control can take, and opens its family on that row.
         let offered = families(input);
-        let Some(family) = choose_saved(
-            ui,
-            "Action family",
-            offered.iter().map(|f| FAMILIES[*f].to_string()).collect(),
-            saved_family.and_then(|f| offered.iter().position(|o| *o == f)),
-        )?
-        .map(|i| offered[i]) else {
+        let stars = mappings::load_config(path)
+            .map(|c| c.favourites)
+            .unwrap_or_default();
+        let starred_actions = stars
+            .iter()
+            .filter_map(|k| starred_action(k))
+            .filter(|(f, _)| offered.contains(f))
+            .map(|(f, l)| (f, l.to_owned()))
+            .collect::<Vec<_>>();
+        let top = usize::from(!starred_actions.is_empty());
+        let mut rows = offered
+            .iter()
+            .map(|f| (FAMILIES[*f].to_string(), family_star(*f)))
+            .collect::<Vec<_>>();
+        if top == 1 {
+            let label = format!("★ Favourites ({} starred actions)", starred_actions.len());
+            rows.insert(0, (label, String::new()));
+        }
+        let at = saved_family
+            .and_then(|f| offered.iter().position(|o| *o == f))
+            .map(|i| i + top);
+        let Some(row) = choose_starred(ui, path, "Action family", &rows, at)? else {
             continue;
         };
-        let copied = family == 13 || family == 14;
-        let mut mapping = if copied {
-            let copy = if family == 13 {
-                favourite_mapping(ui, path, pad, input)?
-            } else {
-                family_mapping(ui, path, pad, input)?
+        let family = if top == 1 && row == 0 {
+            let labels = starred_actions
+                .iter()
+                .map(|(f, l)| format!("{l} · {}", FAMILY_WORDS[*f]))
+                .collect::<Vec<_>>();
+            let Some(i) = choose(ui, "★ Favourites: opens the action's own setup", &labels)?
+            else {
+                continue;
             };
-            let Some(copy) = copy else {
+            JUMP.with(|j| *j.borrow_mut() = Some(starred_actions[i].1.clone()));
+            starred_actions[i].0
+        } else {
+            offered[row - top]
+        };
+        let copied = family == 14;
+        let mut mapping = if copied {
+            let Some(copy) = family_mapping(ui, path, pad, input)? else {
                 continue;
             };
             copy
@@ -13566,8 +13697,10 @@ fn configure_steps(
             let saved_row = saved
                 .as_ref()
                 .and_then(|m| (mappings::MOUSE_KEYS.iter()).position(|(key, _)| m.keys == [*key]));
-            let Some(row) = choose_saved(
+            let Some(row) = family_list(
                 ui,
+                Some(path),
+                16,
                 "Mouse Actions\nA click follows the control: hold it to hold the button (drag). Scroll: one step per press.",
                 rows,
                 saved_row,
@@ -13587,7 +13720,7 @@ fn configure_steps(
             Mapping::new_action(pad, input, action).map_err(stage("validation"))?
         } else if family == 17 {
             let saved_action = saved.as_ref().map(|m| &m.action);
-            let Some(action) = fedora_system(ui, saved_action)? else {
+            let Some(action) = fedora_system(ui, saved_action, Some(path))? else {
                 continue;
             };
             Mapping::new_action(pad, input, action).map_err(stage("validation"))?
@@ -13708,8 +13841,14 @@ fn configure_steps(
             };
             Mapping::new_action(pad, input, action).map_err(stage("validation"))?
         } else {
-            let Some(action) =
-                action_menu(ui, family, input, saved.as_ref().map(|m| &m.action), true)?
+            let Some(action) = action_menu(
+                ui,
+                family,
+                input,
+                saved.as_ref().map(|m| &m.action),
+                true,
+                Some(path),
+            )?
             else {
                 continue;
             };
@@ -14241,7 +14380,6 @@ const MOVED: &[(&str, usize, Option<usize>)] = &[
     ("/release-all", 0, Some(5)),
     ("/quit", 0, Some(11)),
     ("Status <pad>: <state> lines", 0, None),
-    ("Settings › Favourites", 1, Some(SETTING + 10)),
     ("Settings › Presets", 1, Some(SETTING + 11)),
     ("Agents (the list)", 2, None),
     ("Settings › Default agent directory", 2, Some(SETTING)),
@@ -15397,116 +15535,6 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// v7 ticket 46: Configure's Favourites family copies a starred assignment onto the
-    /// learned control (Akai pad or Xbox button) and goes to Review; an action the control
-    /// can't take is refused by name; with nothing starred it says where to star one.
-    #[test]
-    fn favourites_family_copies_a_starred_assignment() {
-        use crate::actions::Action;
-        use Key::*;
-        let dir =
-            std::env::temp_dir().join(format!("vibeconsole-fav-family-{}", std::process::id()));
-        let a = Control::from_note(10, 36).unwrap();
-        let mute = Mapping::new_action(a, mappings::Input::Pad, Action::OutputMute).unwrap();
-        let mut prompt = Mapping::new_action(
-            Control::from_note(10, 37).unwrap(),
-            mappings::Input::Pad,
-            Action::Prompt {
-                file: "review".into(),
-                target: crate::actions::Target::Agent("claude".into()),
-                enter: false,
-            },
-        )
-        .unwrap();
-        prompt.status = true;
-        let run = |starred: &[&Mapping], keys: Vec<Key>, pads: Vec<Control>, motions| {
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            let path = dir.join("mappings.tsv");
-            let mut config = mappings::Config::default();
-            config.mappings = vec![mute.clone(), prompt.clone()];
-            config.favourites = starred.iter().map(|m| mappings::favourite_key(m)).collect();
-            mappings::save_config(&path, &config).unwrap();
-            let mut ui = Script {
-                keys: keys.into(),
-                pads: pads.into(),
-                motions,
-                ..Default::default()
-            };
-            let mut current = config.mappings.clone();
-            let result = configure(&mut ui, &path, &mut current);
-            let screens = ui.screens.join("\n----\n");
-            assert!(result.is_ok(), "{result:?}\n{screens}");
-            assert!(ui.keys.is_empty(), "keys left\n{screens}");
-            (mappings::load_config(&path).unwrap().mappings, screens)
-        };
-        let favourites = |n: usize| {
-            let mut keys = vec![Enter];
-            keys.extend(vec![Down; n]); // Favourites is the last family offered
-            keys.push(Enter);
-            keys
-        };
-        // An Akai pad: Favourites -> Output mute -> Review -> save.
-        let b = Control::from_note(10, 38).unwrap();
-        let mut keys = favourites(12);
-        keys.extend([Enter, Enter, Tab, Tab, Enter]); // the favourite, save, finish
-        let (saved, screens) = run(&[&mute, &prompt], keys, vec![b], VecDeque::new());
-        assert!(screens.contains("★"), "{screens}");
-        let copy = saved.iter().find(|m| m.control == b).unwrap();
-        assert_eq!(copy.action, Action::OutputMute);
-        assert!(
-            saved.iter().any(|m| m.control == a),
-            "the favourite itself stays"
-        );
-        // A prompt copies its status feedback too.
-        let mut keys = favourites(12);
-        keys.extend([Down, Enter, Enter, Tab, Tab, Enter]);
-        let (saved, _) = run(&[&mute, &prompt], keys, vec![b], VecDeque::new());
-        let copy = saved.iter().find(|m| m.control == b).unwrap();
-        assert!(matches!(copy.action, Action::Prompt { .. }) && copy.status);
-        // An Xbox button: its layer is asked first (v7 ticket 97), then Review.
-        let mut keys = vec![Enter, Enter]; // learn, layer 1
-        keys.extend(vec![Down; 12]); // past Mouse Actions (v7.8 ticket 11)
-        keys.push(Enter); // Favourites
-        keys.extend([Enter, Enter, Tab, Tab, Enter]); // favourite, save, finish
-        let (saved, _) = run(&[&mute], keys, vec![Control::button(3)], VecDeque::new());
-        let copy = saved
-            .iter()
-            .find(|m| m.control == Control::button(3))
-            .unwrap();
-        assert_eq!(
-            (copy.action.clone(), copy.context),
-            (Action::OutputMute, mappings::GAMEPAD_CONTEXT)
-        );
-        // A knob can't take a prompt: refused by name, nothing saved.
-        let knob = Control {
-            channel: 1,
-            id: 70,
-            message: crate::Message::Cc,
-            direction: 1,
-        };
-        let mut keys = vec![Down, Down, Enter]; // Learn a knob
-        keys.extend(vec![Down; 5]); // past Mouse Actions (v7.8 ticket 11)
-        keys.extend([Enter, Enter, Enter, Tab, Tab, Enter]); // Favourites, the prompt, Back
-        let turned = (
-            knob,
-            mappings::Input::Knob { step: 4 },
-            "Knob 2 increase".to_string(),
-        );
-        let (saved, screens) = run(&[&prompt], keys, vec![], [turned].into());
-        assert!(!saved.iter().any(|m| m.control == knob));
-        assert!(
-            screens.contains("Not saved: validation:") && screens.contains("can't take"),
-            "{screens}"
-        );
-        // Nothing starred: it says where to star one.
-        let mut keys = favourites(12);
-        keys.extend([Enter, Tab, Tab, Enter]); // Back, finish
-        let (_, screens) = run(&[], keys, vec![b], VecDeque::new());
-        assert!(screens.contains("Settings → Favourites"), "{screens}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// Stored Program 2 of the recorded MPK Mini MK3 (testdata), as a verified program.
     fn recorded_program() -> (u8, crate::feedback::Payload) {
         let capture = include_str!(concat!(
@@ -16520,7 +16548,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            action_menu(&mut step, 1, mappings::Input::Pad, None, false).unwrap(),
+            action_menu(&mut step, 1, mappings::Input::Pad, None, false, None).unwrap(),
             Some(Action::Application("/nonexistent/recorded.desktop".into()))
         );
         assert!(current[1].keys.is_empty());
@@ -16545,7 +16573,8 @@ mod tests {
                 1,
                 mappings::Input::Knob { step: 4 },
                 None,
-                true
+                true,
+                None
             )
             .is_err()
         );
@@ -16595,7 +16624,7 @@ mod tests {
         let commands = [
             0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 19, 20, 21, 23, 24,
         ];
-        let settings = [0, 2, 3, 4, 5, 6, 7, 10, 11].map(|row| SETTING + row);
+        let settings = [0, 2, 3, 4, 5, 6, 7, 11].map(|row| SETTING + row); // v7.8 18: no 10
         // Each agent, then Add agent, the two hooks rows and Status lights; no prompts,
         // sequences or profiles, so each of those lists is its "New …" row.
         let agents = mappings::load_config(&dir.join("mappings.tsv"))
@@ -19716,7 +19745,7 @@ mod tests {
             deadzone: 1024,
             hysteresis: 128,
         };
-        let pressed = vec![0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 16, 13, 14, 15, 17, 18];
+        let pressed = vec![0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 16, 14, 15, 17, 18];
         // (kind, learn page, control, motion, families offered)
         let kinds: Vec<(&str, usize, Control, Option<Input>, Vec<usize>)> = vec![
             (
@@ -19738,9 +19767,9 @@ mod tests {
                 2,
                 knob,
                 Some(Input::Knob { step: 4 }),
-                vec![0, 2, 6, 7, 16, 13],
+                vec![0, 2, 6, 7, 16],
             ),
-            ("joystick", 3, joystick, Some(stick), vec![0, 16, 13]),
+            ("joystick", 3, joystick, Some(stick), vec![0, 16]),
             ("Xbox button", 4, Control::button(0), None, pressed),
         ];
         // The favourite: Output mute on another pad.
@@ -19772,8 +19801,7 @@ mod tests {
                 .unwrap();
                 let path = dir.join("mappings.tsv");
                 let mut config = mappings::Config::default();
-                config.mappings = vec![starred.clone()];
-                config.favourites = vec![mappings::favourite_key(&starred)];
+                config.mappings = vec![starred.clone()]; // an existing assignment, unstarred
                 mappings::save_config(&path, &config).unwrap();
                 let mut keys = vec![Down; page];
                 keys.push(Enter);
@@ -19828,7 +19856,7 @@ mod tests {
                     let pick = if kind == "Xbox button" {
                         vec![Enter, Down, Enter, Enter]
                     } else {
-                        vec![Enter, Down, Enter]
+                        vec![Enter, Enter] // v7.8 ticket 18: nothing starred, the copy is first
                     };
                     let mut edit = Script {
                         keys: [vec![Down; 5], pick, vec![Escape, Escape]].concat().into(),
@@ -19843,7 +19871,7 @@ mod tests {
                         .is_some_and(|m| m.lines().any(|l| l.starts_with(&cursor)))
                 };
                 // A joystick can't take the starred Output mute: refused by name, nothing saved.
-                let refused = kind == "joystick" && family == 13;
+                let refused = false; // v7.8 ticket 18: the Favourites family is gone
                 let ok = matches!(result, Ok(Ok(())))
                     && ui.keys.is_empty()
                     && listed == offered
@@ -21284,7 +21312,7 @@ mod tests {
         mappings::save(&path, &[]).unwrap();
         let family = |row: usize| {
             let mut keys = vec![Enter];
-            keys.extend(vec![Down; 15]); // Fedora System, the last family a pad offers
+            keys.extend(vec![Down; 14]); // Fedora System
             keys.push(Enter);
             keys.extend(vec![Down; row]);
             keys.push(Enter);
@@ -21334,6 +21362,127 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7.8 ticket 18: F stars a family and an action inside it (★ first); "★ Favourites"
+    /// opens a starred action's own setup; F again unstars; removing an assignment leaves
+    /// the stars alone.
+    #[test]
+    fn stars_on_families_and_actions() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-stars-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let f = Character(b'f');
+        let stars = || mappings::load_config(&path).unwrap().favourites;
+        // Learn a pad → Down to Music & Sound, F → (now first, ★) Enter → Down 5 to Next
+        // track, F → back out.
+        let mut ui = Script {
+            keys: [
+                Enter, Down, Down, f, Enter, Down, Down, Down, Down, Down, f, Escape, Escape, Tab,
+                Tab, Enter,
+            ]
+            .into(),
+            pads: [Control::from_note(10, 40).unwrap()].into(),
+            ..Default::default()
+        };
+        let mut current = Vec::new();
+        configure(&mut ui, &path, &mut current).unwrap();
+        assert_eq!(stars(), ["family:music", "action:music:Next track"]);
+        let screens = ui.screens.join("\n---\n");
+        assert!(screens.contains("> ★ Music & Sound"), "{screens}");
+        assert!(screens.contains("★ Next track"), "{screens}");
+        // ★ Favourites → Next track → its setup (fire when: Pressed) → save and finish.
+        let mut ui = Script {
+            keys: [Enter, Enter, Enter, Enter, Down, Enter].into(),
+            pads: [Control::from_note(10, 41).unwrap()].into(),
+            ..Default::default()
+        };
+        configure(&mut ui, &path, &mut current).unwrap();
+        let screens = ui.screens.join("\n---\n");
+        assert!(
+            screens.contains("> ★ Favourites (1 starred actions)"),
+            "{screens}"
+        );
+        use crate::actions::{Action, Media};
+        assert_eq!(
+            mappings::load(&path).unwrap()[0].action,
+            Action::Media(Media::Next)
+        );
+        // Removing the assignment leaves the stars alone.
+        let mut ui = Script {
+            keys: [Tab, Down, Enter, Enter, Down, Enter, Tab, Tab, Enter].into(),
+            ..Default::default()
+        };
+        configure(&mut ui, &path, &mut current).unwrap();
+        assert!(
+            mappings::load(&path).unwrap().is_empty(),
+            "{}",
+            ui.screens.join("\n---\n")
+        );
+        assert_eq!(stars(), ["family:music", "action:music:Next track"]);
+        // F on the starred family again unstars it.
+        let mut ui = Script {
+            keys: [Enter, Down, f, Escape, Tab, Tab, Enter].into(),
+            pads: [Control::from_note(10, 42).unwrap()].into(),
+            ..Default::default()
+        };
+        configure(&mut ui, &path, &mut current).unwrap();
+        assert_eq!(
+            stars(),
+            ["action:music:Next track"],
+            "{}",
+            ui.screens.join("\n---\n")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.8 ticket 18: v7's slot stars move once: each on an assignment becomes its family's
+    /// star (and its action's, where the action's list can be starred); a slot without an
+    /// assignment is dropped; profile stars stay.
+    #[test]
+    fn slot_stars_migrate_to_families_and_actions() {
+        let dir = std::env::temp_dir().join(format!("vibeconsole-starmig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let mute = Mapping::new_action(
+            Control::from_note(10, 36).unwrap(),
+            mappings::Input::Pad,
+            crate::actions::Action::OutputMute,
+        )
+        .unwrap();
+        let keys = Mapping::new(Control::from_note(10, 37).unwrap(), "Ctrl+T", "hold").unwrap();
+        let gone = Mapping::new(Control::from_note(10, 38).unwrap(), "F9", "hold").unwrap();
+        let mut config = mappings::Config::default();
+        config.mappings = vec![mute.clone(), keys.clone()];
+        config.favourites = vec![
+            mappings::favourite_key(&mute),
+            mappings::favourite_key(&gone),
+            mappings::profile_favourite_key("Orca"),
+            mappings::favourite_key(&keys),
+        ];
+        mappings::save_config(&path, &config).unwrap();
+        migrate_stars(&path).unwrap();
+        let after = mappings::load_config(&path).unwrap();
+        assert_eq!(
+            after.favourites,
+            [
+                "family:music",
+                "action:music:Output mute",
+                "profile:Orca",
+                "family:shortcut"
+            ]
+        );
+        assert_eq!(after.mappings, config.mappings, "assignments untouched");
+        migrate_stars(&path).unwrap(); // once: nothing left to move
+        assert_eq!(
+            mappings::load_config(&path).unwrap().favourites,
+            after.favourites
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// v7.8 ticket 15: Browser → Playwright lists the saved scripts beside the config and saves
     /// the one picked; with none saved it says where they go.
     #[test]
@@ -21346,7 +21495,7 @@ mod tests {
         mappings::save(&path, &[]).unwrap();
         let keys = |after: &[Key]| {
             let mut keys = vec![Enter];
-            keys.extend(vec![Down; 16]); // Browser
+            keys.extend(vec![Down; 15]); // Browser
             keys.extend([Enter, Down, Down, Enter, Down, Enter]); // Playwright, a saved script
             keys.extend(after);
             keys
@@ -21397,7 +21546,7 @@ mod tests {
         let rows = 2 + 14 + 1; // updates, fixed actions, Settings panel
         let pick = |row: usize, after: &[Key]| {
             let mut keys = vec![Enter];
-            keys.extend(vec![Down; 15]); // Fedora System
+            keys.extend(vec![Down; 14]); // Fedora System
             keys.push(Enter);
             keys.extend(vec![Down; row]);
             keys.push(Enter);
@@ -21440,33 +21589,6 @@ mod tests {
             .iter()
             .find(|m| m.action == Action::System(System::ControllerOff));
         assert!(off.is_some_and(|m| m.risky));
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// v7 ticket 24: Settings -> Favourites marks a mapping; /configure lists it first.
-    #[test]
-    fn favourites_are_marked_and_listed_first() {
-        use Key::*;
-        let dir = std::env::temp_dir().join(format!("vibeconsole-favs-ui-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("mappings.tsv");
-        let a = Mapping::new(Control::from_note(10, 36).unwrap(), "F1", "hold").unwrap();
-        let b = Mapping::new(Control::from_note(10, 37).unwrap(), "F2", "hold").unwrap();
-        mappings::save(&path, &[a.clone(), b.clone()]).unwrap();
-        let mut keys = vec![Down; 10];
-        keys.extend([Enter, Down, Enter, Escape, Escape]); // mark Pad 2
-        let mut ui = Script {
-            keys: keys.into(),
-            ..Default::default()
-        };
-        settings_menu(&mut ui, &path).unwrap();
-        assert!(ui.keys.is_empty());
-        let config = mappings::load_config(&path).unwrap();
-        assert_eq!(config.favourites, [mappings::favourite_key(&b)]);
-        let list = saved_list(&config.mappings, 0, 1, &config.favourites);
-        assert_eq!(list[0], (&b, true));
-        assert_eq!(list[1], (&a, false));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -22033,7 +22155,7 @@ mod tests {
         let menus = ui
             .screens
             .iter()
-            .filter(|s| s.starts_with("Action family\n\n> Keyboard shortcut"))
+            .filter(|s| s.starts_with("Action family\n") && s.contains("> Keyboard shortcut"))
             .collect::<Vec<_>>();
         assert_eq!(menus.len(), 3);
         assert!(!menus[0].contains("Launch") && !menus[0].contains("Prompt")); // joystick
