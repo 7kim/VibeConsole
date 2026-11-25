@@ -20,10 +20,12 @@ pub const LIGHTS_VERSION: u64 = 5;
 /// v7.8: mappings.json's own version: 2 holds v7.8's new action words (ticket 10: `media:…`);
 /// a version 1 file loads as it is (it has none of them). An older VibeConsole refuses a
 /// version 2 file by its version, not by an unknown word.
-pub const MAPPINGS_VERSION: u64 = 2;
+/// v3 adds a trigger's optional hard-press mapping.
+pub const MAPPINGS_VERSION: u64 = 3;
 /// devices.json: v2 (v7.8 ticket 23) adds the tuning's `layer_button`; v1 loads with LB.
 /// v3 (v7.8 ticket 24) adds `rumble_strength` and `rumble_ms`; older ones load medium, 300 ms.
-pub const DEVICES_VERSION: u64 = 3;
+/// v4 adds the hard point. Older files keep their fire point and get a compatible default.
+pub const DEVICES_VERSION: u64 = 4;
 /// The files, in the order they are applied: each one's references (variables, MIDI
 /// devices, idle settings) are in place before it is checked.
 pub const FILES: [&str; 5] = [
@@ -606,6 +608,7 @@ fn devices(config: &Config) -> Value {
         "tuning": {
             "dead_zone": t.dead_zone,
             "trigger": t.trigger,
+            "hard_point": t.hard_point,
             "mouse_speed": t.mouse_speed,
             "rumble": t.rumble,
             "mouse": t.mouse.text(),
@@ -670,6 +673,7 @@ fn apply_devices(at: &Obj, config: &mut Config) -> Result<()> {
     t.only(&[
         "dead_zone",
         "trigger",
+        "hard_point",
         "mouse_speed",
         "rumble",
         "mouse",
@@ -690,9 +694,18 @@ fn apply_devices(at: &Obj, config: &mut Config) -> Result<()> {
     if sticks.len() != 2 {
         return Err(t.err("sticks", "must be two strings, left then right"));
     }
+    let trigger = t.int("trigger")?;
+    let hard_point = if at.int::<u64>("version")? < 4 {
+        mappings::Tuning::default_hard_point(trigger)
+    } else if t.get("hard_point")?.is_null() {
+        None
+    } else {
+        Some(t.int("hard_point")?)
+    };
     let tuning = mappings::Tuning {
         dead_zone: t.int("dead_zone")?,
-        trigger: t.int("trigger")?,
+        trigger,
+        hard_point,
         mouse_speed: t.int("mouse_speed")?,
         rumble: t.bool("rumble")?,
         mouse: t.pick("mouse", &MOUSE)?,
@@ -770,14 +783,16 @@ fn mapping_json(mapping: &mappings::Mapping) -> Result<Value> {
     Ok(out.into())
 }
 /// A mapping object read back through the TSV record's own parser, so every rule stays.
-fn mapping(at: &Obj, midi_devices: &[String]) -> Result<mappings::Mapping> {
-    at.only(
-        &COLUMNS
-            .iter()
-            .filter(|c| **c != "device")
-            .copied()
-            .collect::<Vec<_>>(),
-    )?;
+fn mapping(at: &Obj, midi_devices: &[String], allow_hard: bool) -> Result<mappings::Mapping> {
+    let mut keys = COLUMNS
+        .iter()
+        .copied()
+        .filter(|c| *c != "device")
+        .collect::<Vec<_>>();
+    if allow_hard {
+        keys.push("hard");
+    }
+    at.only(&keys)?;
     let context: u8 = at.int("context")?;
     let mut fields = Vec::new();
     for column in COLUMNS {
@@ -805,7 +820,35 @@ fn mapping(at: &Obj, midi_devices: &[String]) -> Result<mappings::Mapping> {
 }
 
 fn mappings_json(config: &Config) -> Result<Value> {
-    let list = |m: &[mappings::Mapping]| m.iter().map(mapping_json).collect::<Result<Vec<_>>>();
+    let list = |mappings: &[mappings::Mapping]| -> Result<Vec<Value>> {
+        let mut rows = Vec::new();
+        for m in mappings {
+            let other = |direction| {
+                mappings.iter().find(|n| {
+                    n.context == m.context
+                        && n.control
+                            == crate::Control {
+                                direction,
+                                ..m.control
+                            }
+                })
+            };
+            if crate::gamepad::is_hard_trigger(m.control) {
+                if other(0).is_none() {
+                    rows.push(json!({"hard": mapping_json(m)?}));
+                }
+                continue;
+            }
+            let mut row = mapping_json(m)?;
+            if crate::gamepad::trigger_side(m.control).is_some()
+                && let Some(hard) = other(1)
+            {
+                row["hard"] = mapping_json(hard)?;
+            }
+            rows.push(row);
+        }
+        Ok(rows)
+    };
     let profiles = config
         .profiles
         .iter()
@@ -845,11 +888,40 @@ fn apply_mappings(at: &Obj, config: &mut Config) -> Result<()> {
     ])?;
     let vars = pairs(at, "vars")?;
     at.check("vars", mappings::validate_variables(&vars, "user"))?;
+    let allow_hard = at.int::<u64>("version")? >= 3;
     let read = |at: &Obj, key: &str| -> Result<Vec<mappings::Mapping>> {
-        at.objects(key)?
-            .iter()
-            .map(|m| mapping(m, &config.midi_devices))
-            .collect()
+        let mut list = Vec::new();
+        for row in at.objects(key)? {
+            let mut soft = None;
+            if !allow_hard || row.map.len() != 1 || !row.map.contains_key("hard") {
+                let m = mapping(&row, &config.midi_devices, allow_hard)?;
+                if crate::gamepad::is_hard_trigger(m.control) {
+                    return Err(row.err("direction", "hard presses belong in the hard field"));
+                }
+                soft = Some((m.context, m.control));
+                list.push(m);
+            }
+            if allow_hard && row.map.contains_key("hard") {
+                let hard = mapping(&row.obj("hard")?, &config.midi_devices, false)?;
+                if !crate::gamepad::is_hard_trigger(hard.control)
+                    || soft.is_some_and(|(context, control)| {
+                        context != hard.context
+                            || control
+                                != crate::Control {
+                                    direction: 0,
+                                    ..hard.control
+                                }
+                    })
+                {
+                    return Err(row.err(
+                        "hard",
+                        "needs a hard press on the same Xbox trigger and layer",
+                    ));
+                }
+                list.push(hard);
+            }
+        }
+        Ok(list)
     };
     let mut list = read(at, "mappings")?;
     list.sort_by_key(|m| (m.context, m.control));
@@ -1396,8 +1468,8 @@ mod tests {
         config.tuning.rumble_ms = 1200;
         mappings::save_config(&path, &config).unwrap();
         let text = fs::read_to_string(dir.join("devices.json")).unwrap();
-        let saved: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(saved["version"], 3);
+        let mut saved: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(saved["version"], DEVICES_VERSION);
         assert_eq!(saved["tuning"]["rumble_strength"], "strong");
         assert_eq!(saved["tuning"]["rumble_ms"], 1200);
         assert_eq!(mappings::load_config(&path).unwrap().tuning, config.tuning);
@@ -1405,12 +1477,12 @@ mod tests {
         long.tuning.rumble_ms = 5000;
         assert!(mappings::save_config(&path, &long).is_err());
         assert_eq!(fs::read_to_string(dir.join("devices.json")).unwrap(), text);
-        let v2 = text.replace("\"version\": 3", "\"version\": 2").replace(
-            ",\n    \"rumble_strength\": \"strong\",\n    \"rumble_ms\": 1200",
-            "",
-        );
-        assert!(!v2.contains("rumble_ms"), "{v2}");
-        fs::write(dir.join("devices.json"), v2).unwrap();
+        saved["version"] = json!(2);
+        let tuning = saved["tuning"].as_object_mut().unwrap();
+        for key in ["rumble_strength", "rumble_ms", "hard_point"] {
+            tuning.remove(key);
+        }
+        fs::write(dir.join("devices.json"), saved.to_string()).unwrap();
         let older = mappings::load_config(&path).unwrap().tuning;
         assert_eq!(
             (older.rumble_strength, older.rumble_ms),
@@ -1897,7 +1969,7 @@ mod tests {
     /// v7.8 ticket 10: mappings.json version 1 (before v7.8's words) loads as it is, a media
     /// action saves as version 2 and loads back, and a version from a newer VibeConsole is
     /// refused by its version.
-    fn mappings_json_version_2_holds_media_and_loads_version_1() {
+    fn mappings_json_holds_media_and_loads_version_1() {
         let dir = folder("media");
         let path = dir.join("mappings.tsv");
         let mut config = Config::default();
@@ -1910,8 +1982,8 @@ mod tests {
         config.mappings = vec![volume.clone()];
         mappings::save_config(&path, &config).unwrap();
         let saved = fs::read_to_string(dir.join("mappings.json")).unwrap();
-        assert!(saved.contains("\"version\": 2"), "{saved}");
-        let old = saved.replace("\"version\": 2", "\"version\": 1");
+        assert!(saved.contains("\"version\": 3"), "{saved}");
+        let old = saved.replace("\"version\": 3", "\"version\": 1");
         fs::write(dir.join("mappings.json"), &old).unwrap();
         assert_eq!(
             mappings::load_config(&path).unwrap().mappings,
@@ -1924,10 +1996,82 @@ mod tests {
         let saved = fs::read_to_string(dir.join("mappings.json")).unwrap();
         assert!(saved.contains("\"media:next\""), "{saved}");
         assert_eq!(mappings::load_config(&path).unwrap().mappings, [media]);
-        let newer = saved.replace("\"version\": 2", "\"version\": 3");
+        let newer = saved.replace("\"version\": 3", "\"version\": 4");
         fs::write(dir.join("mappings.json"), newer).unwrap();
         let error = mappings::load_config(&path).unwrap_err().to_string();
         assert!(error.contains("newer VibeConsole"), "{error}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn dual_trigger_mappings_round_trip_and_are_checked() {
+        use crate::Control;
+        use mappings::{GAMEPAD_LAYER_2, Mapping, Profile};
+        let dir = folder("dual-trigger-mappings");
+        let path = dir.join("mappings.tsv");
+        let rt = Control::button(7);
+        let soft = Mapping::new(rt, "A", "hold").unwrap();
+        let hard = Mapping::new(Control { direction: 1, ..rt }, "B", "tap").unwrap();
+        let mut layer2 = hard.clone();
+        layer2.context = GAMEPAD_LAYER_2;
+        let profile = Profile {
+            name: "Browser".into(),
+            apps: vec![],
+            mappings: vec![hard.clone()],
+        };
+        let mut config = Config::default();
+        config.mappings = vec![layer2, soft, hard.clone()];
+        config.profiles = vec![profile.clone()];
+        config.tuning.hard_point = Some(95);
+        mappings::save_config(&path, &config).unwrap();
+        assert_eq!(mappings::load_config(&path).unwrap(), config);
+        let text = fs::read_to_string(dir.join("mappings.json")).unwrap();
+        let json: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(json["mappings"][0]["hard"]["context"], GAMEPAD_LAYER_2);
+        assert_eq!(json["mappings"][1]["keys"], "A");
+        assert_eq!(json["mappings"][1]["hard"]["keys"], "B");
+        let exported = mappings::export_profile(&profile).unwrap();
+        assert_eq!(
+            mappings::import_profile(&exported, &Config::default()).unwrap(),
+            profile
+        );
+
+        config.tuning.hard_point = Some(config.tuning.trigger);
+        assert!(mappings::save_config(&path, &config).is_err());
+        assert_eq!(fs::read_to_string(dir.join("mappings.json")).unwrap(), text);
+        assert_eq!(
+            mappings::load_config(&path).unwrap().tuning.hard_point,
+            Some(95)
+        );
+        let mut damaged = json;
+        damaged["mappings"][1]["hard"]["id"] = json!(6);
+        fs::write(dir.join("mappings.json"), damaged.to_string()).unwrap();
+        let error = mappings::load_config(&path).unwrap_err().to_string();
+        assert!(error.contains("same Xbox trigger and layer"), "{error}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_devices_keep_their_trigger_fire_point() {
+        let dir = folder("legacy-trigger-point");
+        let path = dir.join("mappings.tsv");
+        let mut legacy = devices(&Config::default());
+        legacy["version"] = json!(3);
+        legacy["tuning"]
+            .as_object_mut()
+            .unwrap()
+            .remove("hard_point");
+        for (fire, hard) in [(30, Some(90)), (95, Some(96)), (100, None)] {
+            legacy["tuning"]["trigger"] = json!(fire);
+            fs::write(dir.join("devices.json"), legacy.to_string()).unwrap();
+            let config = mappings::load_config(&path).unwrap();
+            assert_eq!(
+                (config.tuning.trigger, config.tuning.hard_point),
+                (fire, hard)
+            );
+            mappings::save_config(&path, &config).unwrap();
+            assert_eq!(mappings::load_config(&path).unwrap().tuning, config.tuning);
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 

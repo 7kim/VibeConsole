@@ -132,7 +132,7 @@ impl Control {
                 Message::Note => self.direction != 0,
                 Message::Button => {
                     self.channel != 1
-                        || self.direction != 0
+                        || !(self.direction == 0 || gamepad::is_hard_trigger(self))
                         || usize::from(self.id) >= gamepad::CONTROLS
                 }
                 Message::Cc => ![-1, 1].contains(&self.direction),
@@ -145,7 +145,12 @@ impl Control {
     }
     pub fn label(self) -> String {
         if self.message == Message::Button {
-            return format!("Xbox {}", gamepad::button_name(self.id));
+            let press = if gamepad::is_hard_trigger(self) {
+                " hard press"
+            } else {
+                ""
+            };
+            return format!("Xbox {}{press}", gamepad::button_name(self.id));
         }
         if self.message != Message::Note {
             return format!(

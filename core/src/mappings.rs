@@ -1005,10 +1005,20 @@ pub(crate) fn validate_profiles(profiles: &[Profile]) -> Result<()> {
 }
 /// A profile file (v7 ticket 14): this header, the profile line, then its overrides.
 pub const PROFILE_HEADER: &str = "vibeconsole-profile-v1";
+const HARD_PROFILE_HEADER: &str = "vibeconsole-profile-v2";
 pub fn export_profile(profile: &Profile) -> Result<String> {
     validate_profiles(std::slice::from_ref(profile))?;
+    let header = if profile
+        .mappings
+        .iter()
+        .any(|m| crate::gamepad::is_hard_trigger(m.control))
+    {
+        HARD_PROFILE_HEADER
+    } else {
+        PROFILE_HEADER
+    };
     let mut text = format!(
-        "{PROFILE_HEADER}\nprofile\t{}\t{}\t{}\n",
+        "{header}\nprofile\t{}\t{}\t{}\n",
         profile.name,
         if profile.apps.is_empty() {
             "-".to_owned()
@@ -1026,9 +1036,11 @@ pub fn export_profile(profile: &Profile) -> Result<String> {
 /// its devices, and conflicts with existing profiles) before anything can be saved.
 pub fn import_profile(text: &str, config: &Config) -> Result<Profile> {
     let mut lines = text.lines();
-    if lines.next() != Some(PROFILE_HEADER) {
-        return Err("not a VibeConsole profile file".into());
-    }
+    let hard = match lines.next() {
+        Some(PROFILE_HEADER) => false,
+        Some(HARD_PROFILE_HEADER) => true,
+        _ => return Err("not a VibeConsole profile file".into()),
+    };
     let line = lines.next().ok_or("missing profile line")?;
     let ["profile", name, apps, count] = line.split('\t').collect::<Vec<_>>()[..] else {
         return Err("invalid profile line".into());
@@ -1050,12 +1062,12 @@ pub fn import_profile(text: &str, config: &Config) -> Result<Profile> {
         let line = lines
             .next()
             .ok_or("fewer overrides than the profile line says")?;
-        profile.mappings.push(
-            // v7.7 ticket 266: read as this build writes them (Xbox programs 2–8, newer
-            // actions); every line is still checked in full.
-            parse_mapping_line(line, CONFIG_VERSION, &config.midi_devices)
-                .map_err(|e| format!("override {}: {e}", n + 1))?,
-        );
+        let mapping = parse_mapping_line(line, CONFIG_VERSION, &config.midi_devices)
+            .map_err(|e| format!("override {}: {e}", n + 1))?;
+        if !hard && crate::gamepad::is_hard_trigger(mapping.control) {
+            return Err(format!("override {}: a hard trigger needs a v2 profile", n + 1).into());
+        }
+        profile.mappings.push(mapping);
     }
     if lines.next().is_some() {
         return Err("more lines than the profile line says".into());
@@ -1073,7 +1085,9 @@ pub fn import_profile(text: &str, config: &Config) -> Result<Profile> {
 /// `import_profile`, so nothing unchecked is ever saved.
 pub fn profile_text_from_reply(reply: &str) -> Option<String> {
     let lines = reply.lines().collect::<Vec<_>>();
-    let start = lines.iter().position(|l| l.trim() == PROFILE_HEADER)?;
+    let start = lines
+        .iter()
+        .position(|l| matches!(l.trim(), PROFILE_HEADER | HARD_PROFILE_HEADER))?;
     let mut text = String::new();
     for line in &lines[start..] {
         if line.trim_start().starts_with("```") {
@@ -1953,6 +1967,8 @@ pub fn overlay(all: &[Mapping], profile: Option<&Profile>, context: u8) -> Vec<M
 pub struct Tuning {
     pub dead_zone: u8,
     pub trigger: u8,
+    /// None preserves a legacy fire point of 100%, which leaves no room for a hard point.
+    pub hard_point: Option<u8>,
     pub mouse_speed: u8,
     pub rumble: bool,
     /// v7 ticket 22: the stick that moves the pointer, if any.
@@ -2110,6 +2126,10 @@ impl Default for Tuning {
     }
 }
 impl Tuning {
+    pub fn default_hard_point(fire: u8) -> Option<u8> {
+        (fire < 100).then(|| 90.max(fire + 1))
+    }
+
     pub fn validate(self) -> Result<Self> {
         if !RUMBLE_MS.contains(&self.rumble_ms) {
             return Err(format!(
@@ -2155,6 +2175,15 @@ impl Tuning {
         if !(1..=100).contains(&self.trigger) {
             return Err("tuning: trigger fire point must be 1–100%".into());
         }
+        match self.hard_point {
+            Some(hard) if (50..=100).contains(&hard) && hard > self.trigger => {}
+            None if self.trigger == 100 => {}
+            _ => {
+                return Err(
+                    "tuning: hard point must be 50–100% and above the trigger fire point".into(),
+                );
+            }
+        }
         if !(1..=50).contains(&self.mouse_speed) {
             return Err("tuning: mouse speed must be 1–50".into());
         }
@@ -2187,6 +2216,7 @@ impl Config {
                 rumble_ms: 300,
                 dead_zone: 0,
                 trigger: 0,
+                hard_point: Some(90),
                 mouse_speed: 0,
                 rumble: false,
                 mouse: MouseStick::Off,
@@ -3287,12 +3317,14 @@ pub(crate) fn parse_config(contents: &str) -> Result<Config> {
         else {
             return Err("expected tuning dead-zone/trigger/mouse-speed/rumble/mouse fields".into());
         };
+        let trigger = trigger.parse()?;
         Tuning {
             layer: crate::gamepad::LAYER_DEFAULT,    // devices.json v2 only
             rumble_strength: RumbleStrength::Medium, // devices.json v3 only
             rumble_ms: 300,
             dead_zone: dead_zone.parse()?,
-            trigger: trigger.parse()?,
+            trigger,
+            hard_point: Tuning::default_hard_point(trigger),
             mouse_speed: speed.parse()?,
             rumble: match rumble {
                 "on" => true,
@@ -3659,7 +3691,10 @@ fn layer_button_free(config: &Config) -> Result<()> {
                 .iter()
                 .flat_map(|p| p.mappings.iter().map(move |m| (m, Some(&p.name)))),
         )
-        .filter(|(m, _)| gamepad_context(m.context) && m.control == layer)
+        .filter(|(m, _)| {
+            gamepad_context(m.context)
+                && crate::gamepad::is_layer_key(m.control, config.tuning.layer)
+        })
         .map(|(m, profile)| match profile {
             Some(name) => format!("{} (profile {name})", program_label(m.context)),
             None => program_label(m.context),
@@ -3731,6 +3766,15 @@ const CONFIG_VERSION: u32 = 34;
 pub fn serialize_config(config: &Config) -> Result<String> {
     config.idle.validate()?;
     layer_button_free(config)?;
+    if config.tuning.hard_point.is_none()
+        && config
+            .mappings
+            .iter()
+            .chain(config.profiles.iter().flat_map(|p| &p.mappings))
+            .any(|m| crate::gamepad::is_hard_trigger(m.control))
+    {
+        return Err("tuning: lower the trigger fire point before assigning a hard press".into());
+    }
     validate_agents(&config.agents)?;
     validate_variables(&config.env, "startup")?;
     validate_variables(&config.vars, "user")?;
@@ -4552,6 +4596,7 @@ mod tests {
                 rumble_ms: 300,
                 dead_zone: 15,
                 trigger: 30,
+                hard_point: Some(90),
                 mouse_speed: 10,
                 rumble: false,
                 mouse: MouseStick::Off,
@@ -4576,6 +4621,7 @@ mod tests {
             rumble_ms: 300,
             dead_zone: 20,
             trigger: 60,
+            hard_point: Some(90),
             mouse_speed: 25,
             rumble: true,
             mouse: MouseStick::Off,

@@ -121,6 +121,9 @@ enum Learned {
 /// v7.8 ticket 19: an Xbox control's name in the hints: Ⓐ Ⓑ Ⓧ Ⓨ, LB, RB, LT, RT, View,
 /// Menu, D-pad (any direction), LS and RS; others (stick directions) by their label.
 fn xbox_hint_name(control: Control) -> String {
+    if crate::gamepad::is_hard_trigger(control) {
+        return format!("{} hard press", crate::gamepad::button_name(control.id));
+    }
     let name = (control.message == crate::Message::Button)
         .then(|| crate::gamepad::BUTTONS.get(usize::from(control.id)))
         .flatten()
@@ -1768,10 +1771,11 @@ impl Terminal {
             .filter(|m| m.status)
     }
     fn refresh_xbox_status(&mut self) {
-        self.xbox_status = self
-            .xbox_layout()
-            .map(|layout| layout.into_iter().filter(|m| m.status).collect())
-            .unwrap_or_default();
+        let layout = self.xbox_layout().unwrap_or_default();
+        if let Some(pad) = &mut self.gamepad {
+            pad.set_hard_triggers(&layout);
+        }
+        self.xbox_status = layout.into_iter().filter(|m| m.status).collect();
     }
     /// v7.7 ticket 151: `<control> · <what it does> · <state>` per status pad, in plain
     /// words; the one pressed in the last second starts `◆ ` and ends `← pressed`.
@@ -3472,16 +3476,21 @@ impl Terminal {
         // v7.8 ticket 23: so is a new layer 2 button (layer 1 again, held keys released).
         let layer =
             (self.gamepad.as_ref()).is_some_and(|pad| pad.tuning.layer != config.tuning.layer);
+        let trigger_points = self.gamepad.as_ref().is_some_and(|pad| {
+            pad.tuning.trigger != config.tuning.trigger
+                || pad.tuning.hard_point != config.tuning.hard_point
+        });
         let modes = (self.gamepad.as_mut()).is_some_and(|pad| {
             pad.set_gestures(&config.mappings); // v7 ticket 76
             pad.set_tuning(config.tuning.clone())
         });
-        if modes || layer {
+        if modes || layer || trigger_points {
             let notice = match layer {
                 true => format!(
                     "Layer 2 button is now {}: held keys released",
                     layer_label(config.tuning.layer)
                 ),
+                false if trigger_points => "Trigger tuning changed: held keys released".into(),
                 false => "Stick mode changed: held keys released".into(),
             };
             if let Err(error) = self.gamepad_transition(notice) {
@@ -3944,6 +3953,7 @@ impl Terminal {
         self.holds.clear();
         if let Some(pad) = &mut self.gamepad {
             pad.stop_rumble();
+            pad.cancel_trigger_pulls();
         }
         self.motion = crate::motion::Motion::default();
         // Every step runs even after one fails, so owned feedback is always restored; the
@@ -4080,6 +4090,9 @@ impl Terminal {
         }
         self.holds.clear();
         self.guide.cancel();
+        if let Some(pad) = &mut self.gamepad {
+            pad.cancel_trigger_pulls();
+        }
         self.motion = crate::motion::Motion::new(&self.run_mappings)?;
         if let Some(output) = &mut self.output {
             output.clear()?;
@@ -4626,6 +4639,9 @@ impl Terminal {
     /// keys are released, held pads and buttons wait for a fresh press.
     fn reload_keyboard(&mut self) -> Result<()> {
         self.refresh_xbox_status();
+        if let Some(pad) = &mut self.gamepad {
+            pad.cancel_trigger_pulls();
+        }
         let all = self.with_gamepad(&self.run_mappings)?;
         // Unverified, `all` holds the Xbox layout only (ticket 40), so it may run.
         let resume = self.wanted_run && !self.suspended;
@@ -4746,6 +4762,7 @@ impl Terminal {
                 if let Ok(config) = mappings::load_config(&self.path) {
                     pad.tuning = config.tuning.clone();
                     pad.set_gestures(&config.mappings);
+                    pad.set_hard_triggers(&self.xbox_layout_in(&config));
                 }
                 if let Some(name) = pad.connected().first() {
                     self.notice = format!("Xbox controller ready: {name}");
@@ -5021,6 +5038,10 @@ impl Terminal {
         match &mut self.output {
             Some(output) => output.keyboard.replace(&layout)?,
             None => self.output = Some(crate::keyboard::Output::new(&layout)?),
+        }
+        if let Some(pad) = &mut self.gamepad {
+            pad.set_hard_triggers(&layout);
+            pad.cancel_trigger_pulls();
         }
         if let Some(output) = &mut self.output {
             output.keyboard.resume();
@@ -6051,12 +6072,11 @@ impl Terminal {
             self.handle_events(events)?;
         }
         // Xbox controllers (v7 ticket 07): buttons take the same path as MIDI events.
-        let changes = self
+        while let Some(change) = self
             .gamepad
             .as_mut()
-            .map(crate::gamepad::Pad::poll)
-            .unwrap_or_default();
-        for change in changes {
+            .and_then(|pad| pad.poll(self.program_keys.held()))
+        {
             // v7.8 ticket 26: on Detect, a button's delay from the kernel's stamp to now (both
             // the realtime clock; a jump shows as not measured).
             if let (Some(_), crate::gamepad::Change::Event(Event::Press(control))) =
@@ -6073,11 +6093,18 @@ impl Terminal {
                     self.speed_press(true, control.label(), delay);
                 }
             }
-            if let crate::gamepad::Change::Event(event) = &change {
+            if let crate::gamepad::Change::Event(event)
+            | crate::gamepad::Change::TriggerAction(event) = &change
+            {
                 self.xbox_used(event);
                 // v7 ticket 115: View/Menu held + LB/LT/RB/RT picks an Xbox program; a tap of
                 // View or Menu alone fires its own mapping on release.
-                match self.program_keys.event(event) {
+                let program = if matches!(change, crate::gamepad::Change::Event(_)) {
+                    self.program_keys.event(event)
+                } else {
+                    crate::gamepad::ProgramStep::Pass
+                };
+                match program {
                     crate::gamepad::ProgramStep::Pass => {}
                     crate::gamepad::ProgramStep::Swallow => continue,
                     crate::gamepad::ProgramStep::Select(program) => {
@@ -6122,7 +6149,10 @@ impl Terminal {
                     .gamepad
                     .as_ref()
                     .is_some_and(|p| p.is_layer_key(control)) => {}
-                crate::gamepad::Change::Event(event) => self.handle_events(vec![event])?,
+                crate::gamepad::Change::Event(event)
+                | crate::gamepad::Change::TriggerAction(event) => {
+                    self.handle_events(vec![event])?
+                }
                 crate::gamepad::Change::Connected(name) => {
                     self.xbox_link = (self.gamepad.as_ref())
                         .map_or_else(String::new, |p| link_text(&p.details()));
@@ -6303,6 +6333,11 @@ Changing musical settings while running is unsupported.",
             || config.idle_for(self.context) != self.idle
         {
             return Err("saved configuration changed/invalid; paused until reloaded".into());
+        }
+        let xbox = self.xbox_layout_in(&config);
+        if let Some(pad) = &mut self.gamepad {
+            pad.set_hard_triggers(&xbox);
+            pad.cancel_trigger_pulls();
         }
         let feedback = self.feedback_enabled();
         if feedback {
@@ -6625,11 +6660,19 @@ Changing musical settings while running is unsupported.",
                 }
             }
             if let Some(control) = learned {
+                let physical = if crate::gamepad::is_hard_trigger(control) {
+                    Control {
+                        direction: 0,
+                        ..control
+                    }
+                } else {
+                    control
+                };
                 let held = self.detector.down.contains(&control)
                     || self
                         .gamepad
                         .as_ref()
-                        .is_some_and(|pad| pad.down.contains(&control));
+                        .is_some_and(|pad| pad.down.contains(&physical));
                 if !held {
                     self.detecting = false; // v7 ticket 112: detection is over; a menu again
                     if choose(
@@ -7139,8 +7182,17 @@ fn xbox_group(
         })
         .collect::<Vec<_>>();
     let trigger = |v: f32| (v.clamp(0.0, 1.0) * 100.0).round() as u8;
-    items.push(format!("LT {}%", trigger(analog.lt)));
-    items.push(format!("RT {}%", trigger(analog.rt)));
+    for ((name, value), peak) in [("LT", analog.lt), ("RT", analog.rt)]
+        .into_iter()
+        .zip(analog.trigger_peak)
+    {
+        let (value, peak) = (trigger(value), trigger(peak));
+        items.push(if peak > value {
+            format!("{name} {value}% · peak {peak}%")
+        } else {
+            format!("{name} {value}%")
+        });
+    }
     for (name, (x, y)) in [("Left", analog.left), ("Right", analog.right)] {
         items.push(format!("{name} stick x {x:+.2} y {y:+.2}"));
     }
@@ -10067,6 +10119,13 @@ fn tuning_items(ui: &impl Ui, tuning: &mappings::Tuning) -> Vec<String> {
             u32::from(tuning.rumble_ms) * 3
         ),
         "Test rumble (one rumble with these settings)".into(),
+        format!(
+            "Hard point: {}",
+            tuning.hard_point.map_or_else(
+                || "unavailable at a 100% fire point".into(),
+                |value| format!("{value}%")
+            )
+        ),
     ]
 }
 
@@ -10106,6 +10165,10 @@ fn tuning_choice(ui: &mut impl Ui, path: &Path, choice: usize) -> Result<()> {
                 return Ok(());
             };
             config.tuning.trigger = u8::try_from(value)?;
+            if tuning.hard_point.is_none() {
+                config.tuning.hard_point =
+                    mappings::Tuning::default_hard_point(config.tuning.trigger);
+            }
         }
         Some(2) => config.tuning.rumble = !tuning.rumble,
         // v7 ticket 108: applied by the running session within a status refresh.
@@ -10172,6 +10235,19 @@ fn tuning_choice(ui: &mut impl Ui, path: &Path, choice: usize) -> Result<()> {
             let said = ui.test_rumble(&tuning).map_err(stage("controller I/O"))?;
             choose(ui, &said, &strings(&["Back"]))?;
             return Ok(());
+        }
+        Some(16) => {
+            let Some(value) = number(
+                ui,
+                "Hard point in percent of travel (50–100, above the trigger fire point)",
+                i32::from(tuning.hard_point.unwrap_or(100)),
+                50,
+                100,
+            )?
+            else {
+                return Ok(());
+            };
+            config.tuning.hard_point = Some(u8::try_from(value)?);
         }
         Some(3) => {
             let Some(stick) = choose(
@@ -13958,13 +14034,16 @@ fn learn_target(
     let Some((page, learned)) = settle(ui, page, learned)? else {
         return Ok(None);
     };
-    let (control, motion) = match learned {
+    let (mut control, motion) = match learned {
         Learned::Press(control) => match range_or_gesture(ui, control)? {
             Some(control) => (control, None),
             None => return Ok(None),
         },
         Learned::Motion(control, input, label) => (control, Some((control, input, label))),
     };
+    if crate::gamepad::trigger_side(control).is_some() {
+        control.direction = 0;
+    }
     let context = if control.message == crate::Message::Button {
         let now = |context| {
             current
@@ -14000,6 +14079,25 @@ fn learn_target(
     } else {
         ui.context()
     };
+    if crate::gamepad::trigger_side(control).is_some() {
+        let hard = Control {
+            direction: 1,
+            ..control
+        };
+        let rows = [(control, "Normal / soft press"), (hard, "Hard press")].map(|(c, name)| {
+            let action = current
+                .iter()
+                .find(|m| m.context == context && m.control == c)
+                .map_or_else(|| "unassigned".into(), Mapping::action_label);
+            format!("{name}: {action}")
+        });
+        let Some(pull) = choose(ui, &format!("{}: which pull?", control.label()), &rows)? else {
+            return Ok(None);
+        };
+        if pull == 1 {
+            control = hard;
+        }
+    }
     Ok(Some(Target {
         page,
         control,
@@ -20500,9 +20598,10 @@ mod tests {
     #[test]
     fn xbox_button_saves_a_system_action_on_its_layer() {
         use Key::*;
-        for (layer, context) in [
-            (Enter, mappings::GAMEPAD_CONTEXT),
-            (Down, mappings::GAMEPAD_LAYER_2),
+        for (layer, context, control, hard) in [
+            (Enter, mappings::GAMEPAD_CONTEXT, Control::button(0), false),
+            (Down, mappings::GAMEPAD_LAYER_2, Control::button(0), false),
+            (Down, mappings::GAMEPAD_LAYER_2, Control::button(7), true),
         ] {
             let dir = std::env::temp_dir()
                 .join(format!("vibeconsole-xbox-family-{}", std::process::id()));
@@ -20510,18 +20609,20 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             let path = dir.join("mappings.tsv");
             mappings::save(&path, &[]).unwrap();
-            let a = Control::button(0);
             let mut keys = vec![Enter]; // learn a pad
             keys.push(layer); // its layer comes first (v7 ticket 97)
             if layer == Down {
                 keys.push(Enter);
+            }
+            if hard {
+                keys.extend([Down, Enter]); // hard press on RT
             }
             keys.extend([Down, Down, Enter]); // Music & Sound
             keys.extend([Down, Down, Enter]); // Output mute
             keys.extend([Enter, Enter, Tab, Tab, Enter]); // fire when, save, finish
             let mut ui = Script {
                 keys: keys.into(),
-                pads: [a].into(),
+                pads: [control].into(),
                 context: 2,
                 ..Default::default()
             };
@@ -20534,7 +20635,13 @@ mod tests {
             );
             let saved = mappings::load_config(&path).unwrap().mappings;
             assert_eq!(saved.len(), 1, "{}", ui.screens.join("\n----\n"));
-            assert_eq!(saved[0].control, a);
+            assert_eq!(
+                saved[0].control,
+                Control {
+                    direction: i8::from(hard),
+                    ..control
+                }
+            );
             assert_eq!(saved[0].context, context);
             assert_eq!(saved[0].action, crate::actions::Action::OutputMute);
             std::fs::remove_dir_all(dir).unwrap();
@@ -21188,7 +21295,10 @@ mod tests {
                         .any(|d| d.control == *c)
             })
             .unwrap();
-        ui.keys = [Tab, Enter, Enter, Down, Enter, Enter, Down, Enter, Escape].into();
+        ui.keys = [
+            Tab, Enter, Enter, Down, Enter, Enter, Enter, Down, Enter, Escape,
+        ]
+        .into();
         ui.pads = [free].into();
         configure(&mut ui, &path, &mut current).unwrap();
         let saved = mappings::load(&path).unwrap();

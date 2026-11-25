@@ -112,6 +112,13 @@ pub fn control(button: gilrs::Button) -> Option<Control> {
     let id = BUTTONS.iter().position(|(b, _)| *b == button)?;
     Some(Control::button(u8::try_from(id).ok()?))
 }
+pub fn trigger_side(control: Control) -> Option<usize> {
+    (control.message == crate::Message::Button && matches!(control.id, 6 | 7))
+        .then(|| usize::from(control.id - 6))
+}
+pub fn is_hard_trigger(control: Control) -> bool {
+    control.direction == 1 && trigger_side(control).is_some()
+}
 pub fn button_name(id: u8) -> String {
     if let Some((side, gesture)) = Gesture::of(id) {
         let side = if side == 0 { "Left" } else { "Right" };
@@ -198,7 +205,7 @@ pub const LAYER_DEFAULT: u8 = 4;
 /// The layer key (v7 ticket 09; v7.8 ticket 23: `layer`, Xbox tuning's [`BUTTONS`] index):
 /// held, every other button uses layer 2.
 pub fn is_layer_key(control: Control, layer: u8) -> bool {
-    control == Control::button(layer)
+    control.message == crate::Message::Button && control.id == layer
 }
 /// The Xbox button (v7 ticket 13): held with the D-pad it cycles profiles; held alone
 /// for a second it toggles the lock. Reserved like LB.
@@ -329,6 +336,10 @@ pub enum ProgramStep {
     Tap(Control),
 }
 impl ProgramKeys {
+    pub fn held(&self) -> bool {
+        self.held.is_some()
+    }
+
     pub fn event(&mut self, event: &Event) -> ProgramStep {
         let view = control(gilrs::Button::Select);
         let menu = control(gilrs::Button::Start);
@@ -389,8 +400,99 @@ pub fn keep_held_analog(down: &mut HashSet<Control>) {
 #[derive(Debug, PartialEq)]
 pub enum Change {
     Event(Event),
+    /// A decided dual pull goes to its mapping; program combos use the physical press.
+    TriggerAction(Event),
     Connected(String),
     Disconnected(String),
+}
+
+const SOFT_DELAY: std::time::Duration = std::time::Duration::from_millis(120);
+
+#[derive(Default)]
+enum TriggerPull {
+    #[default]
+    Idle,
+    Normal,
+    Pending {
+        deadline: std::time::Instant,
+        value: f32,
+        hard_point: f32,
+    },
+    Decided(Control),
+}
+
+impl TriggerPull {
+    fn decide(&mut self, control: Control) -> Vec<Change> {
+        *self = Self::Decided(control);
+        vec![Change::TriggerAction(Event::Press(control))]
+    }
+
+    fn start(
+        &mut self,
+        control: Control,
+        value: f32,
+        now: std::time::Instant,
+        hard_point: Option<u8>,
+    ) -> Vec<Change> {
+        let Some(hard_point) = hard_point else {
+            *self = Self::Normal;
+            return vec![Change::Event(Event::Press(control))];
+        };
+        let hard_point = f32::from(hard_point);
+        *self = Self::Pending {
+            deadline: now + SOFT_DELAY,
+            value,
+            hard_point,
+        };
+        self.update(control, value, now)
+    }
+
+    fn update(&mut self, control: Control, next: f32, now: std::time::Instant) -> Vec<Change> {
+        let Self::Pending {
+            deadline,
+            value,
+            hard_point,
+        } = self
+        else {
+            return Vec::new();
+        };
+        // ButtonChanged reports can fluctuate by a small amount while a trigger is held.
+        if now >= *deadline || next + 0.01 < *value {
+            return self.decide(control);
+        }
+        if next * 100.0 >= *hard_point {
+            return self.decide(Control {
+                direction: 1,
+                ..control
+            });
+        }
+        *value = value.max(next);
+        Vec::new()
+    }
+
+    fn tick(&mut self, control: Control, now: std::time::Instant) -> Vec<Change> {
+        match self {
+            Self::Pending { deadline, .. } if now >= *deadline => self.decide(control),
+            _ => Vec::new(),
+        }
+    }
+
+    fn release(&mut self, control: Control) -> Vec<Change> {
+        let up = |c| Event::Release(c, ReleaseType::ButtonUp);
+        match std::mem::take(self) {
+            Self::Idle => Vec::new(),
+            Self::Normal => vec![Change::Event(up(control))],
+            Self::Pending { .. } => vec![
+                Change::TriggerAction(Event::Press(control)),
+                Change::TriggerAction(up(control)),
+            ],
+            Self::Decided(chosen) => vec![Change::TriggerAction(up(chosen))],
+        }
+    }
+
+    fn cancel(&mut self) {
+        *self = Self::Idle;
+    }
 }
 /// gilrs events reduced to what VibeConsole uses.
 #[derive(Clone, Copy, Debug)]
@@ -433,6 +535,8 @@ pub fn change(down: &mut HashSet<Control>, kind: Kind, name: &str) -> Option<Cha
 pub struct Analog {
     pub lt: f32,
     pub rt: f32,
+    /// Peak travel of each pull, retained after release for Detect.
+    pub trigger_peak: [f32; 2],
     pub left: (f32, f32),
     pub right: (f32, f32),
     /// v7 ticket 75: after a stick's mode changes it fires nothing until it's let go.
@@ -486,6 +590,10 @@ pub fn analog(
             } else {
                 percent >= fire
             };
+            if on {
+                let peak = &mut analog.trigger_peak[trigger_side(control).expect("known trigger")];
+                *peak = if held { peak.max(value) } else { value };
+            }
             set(down, control, on, &mut changes);
         }
         Motion::Axis(axis, value) => {
@@ -1464,6 +1572,10 @@ pub struct Pad {
     pub down: HashSet<Control>,
     pub analog: Analog,
     pub tuning: crate::mappings::Tuning,
+    hard_triggers: [bool; 2],
+    pulls: [TriggerPull; 2],
+    trigger_transition: std::time::SystemTime,
+    pending: std::vec::IntoIter<Change>,
     /// v7 ticket 76: stick gestures, timed from `clock`.
     gestures: Gestures,
     clock: std::time::Instant,
@@ -1489,6 +1601,10 @@ impl Pad {
             down: HashSet::new(),
             analog: Analog::default(),
             tuning: crate::mappings::Tuning::default(),
+            hard_triggers: [false; 2],
+            pulls: Default::default(),
+            trigger_transition: std::time::SystemTime::now(),
+            pending: Vec::new().into_iter(),
             gestures: Gestures::default(),
             clock: std::time::Instant::now(),
             pressed_at: std::collections::HashMap::new(),
@@ -1502,6 +1618,18 @@ impl Pad {
     /// The gestures the saved mappings use (v7 ticket 76).
     pub fn set_gestures(&mut self, mappings: &[Mapping]) {
         self.gestures.set(mappings, &mut self.analog);
+    }
+    pub fn set_hard_triggers(&mut self, mappings: &[Mapping]) {
+        self.hard_triggers = [6, 7].map(|id| {
+            mappings
+                .iter()
+                .any(|m| m.control.id == id && is_hard_trigger(m.control))
+        });
+    }
+    pub fn cancel_trigger_pulls(&mut self) {
+        self.trigger_transition = std::time::SystemTime::now();
+        self.pulls.iter_mut().for_each(TriggerPull::cancel);
+        self.pending = Vec::new().into_iter();
     }
     /// gilrs's `next_event` with its default filters (dpad axes to buttons, jitter, dead
     /// zone) and state update, as gilrs does them; while a speed test runs, each right-stick
@@ -1535,10 +1663,20 @@ impl Pad {
             return Some(event);
         }
     }
-    pub fn poll(&mut self) -> Vec<Change> {
+    /// An event at a time so a program or layer change takes effect before the next pull.
+    pub fn poll(&mut self, selecting_program: bool) -> Option<Change> {
+        self.pending.next().or_else(|| {
+            self.pending = self.poll_changes(selecting_program).into_iter();
+            self.pending.next()
+        })
+    }
+
+    fn poll_changes(&mut self, selecting_program: bool) -> Vec<Change> {
         let mut changes = Vec::new();
         let triggers = [gilrs::Button::LeftTrigger2, gilrs::Button::RightTrigger2];
-        while let Some(event) = self.next_event() {
+        while changes.is_empty()
+            && let Some(event) = self.next_event()
+        {
             // v7.8 ticket 01: an emulated run reads only emulators; others never read them.
             // Ticket 02: the kernel's name (`os_name`); `name` is the SDL mapping's when the ids
             // match a known controller, as the emulator's do.
@@ -1553,12 +1691,36 @@ impl Pad {
                 _ => None,
             };
             if let Some(motion) = motion {
-                changes.extend(analog(
-                    &mut self.down,
-                    &mut self.analog,
-                    motion,
-                    &self.tuning,
-                ));
+                let physical = analog(&mut self.down, &mut self.analog, motion, &self.tuning);
+                if let Motion::Trigger(button, value) = motion {
+                    let control = control(button).expect("known trigger");
+                    let side = trigger_side(control).expect("known trigger");
+                    if self.is_layer_key(control) {
+                        changes.extend(physical);
+                    } else if event.time > self.trigger_transition {
+                        // Use report time so a full pull buffered in one poll keeps its timing.
+                        let received = std::time::Instant::now();
+                        let age = std::time::SystemTime::now()
+                            .duration_since(event.time)
+                            .unwrap_or_default();
+                        let now = received - age.min(self.clock.elapsed());
+                        let hard = self.hard_triggers[side] && !selecting_program;
+                        let pull = &mut self.pulls[side];
+                        changes.extend(match physical.first() {
+                            Some(Change::Event(Event::Press(_))) => pull.start(
+                                control,
+                                value,
+                                now,
+                                self.tuning.hard_point.filter(|_| hard),
+                            ),
+                            Some(Change::Event(Event::Release(..))) => pull.release(control),
+                            _ => pull.update(control, value, now),
+                        });
+                    }
+                    // Older reports still update travel and the release latch above.
+                    continue;
+                }
+                changes.extend(physical);
                 let side = match motion {
                     Motion::Axis(gilrs::Axis::LeftStickX | gilrs::Axis::LeftStickY, _) => 0,
                     Motion::Axis(gilrs::Axis::RightStickX | gilrs::Axis::RightStickY, _) => 1,
@@ -1599,14 +1761,26 @@ impl Pad {
             let name = self.gilrs.gamepad(event.id).name().to_owned();
             let before = changes.len();
             changes.extend(change(&mut self.down, kind, &name));
+            if matches!(kind, Kind::Disconnected) {
+                self.analog.lt = 0.0;
+                self.analog.rt = 0.0;
+                self.analog.trigger_peak = [0.0; 2];
+                self.cancel_trigger_pulls();
+            }
             for made in &changes[before..] {
                 if let Change::Event(Event::Press(control)) = made {
                     self.pressed_at.insert(*control, event.time);
                 }
             }
         }
-        let now = self.clock.elapsed().as_millis() as u64;
-        changes.extend(self.gestures.tick(&self.tuning, &mut self.down, now));
+        if changes.is_empty() {
+            let now = std::time::Instant::now();
+            for (side, pull) in self.pulls.iter_mut().enumerate() {
+                changes.extend(pull.tick(Control::button(6 + side as u8), now));
+            }
+            let ms = self.clock.elapsed().as_millis() as u64;
+            changes.extend(self.gestures.tick(&self.tuning, &mut self.down, ms));
+        }
         changes
     }
     /// New settings; true when a stick's mode changed ([`retune`]): the caller then runs a
@@ -1619,7 +1793,23 @@ impl Pad {
     /// A transition: queued events are dropped and held buttons forgotten, so the next
     /// fresh press fires and nothing replays.
     pub fn drain(&mut self) {
-        while self.next_event().is_some() {}
+        self.cancel_trigger_pulls();
+        while let Some(event) = self.next_event() {
+            if let gilrs::EventType::ButtonChanged(
+                button @ (gilrs::Button::LeftTrigger2 | gilrs::Button::RightTrigger2),
+                value,
+                _,
+            ) = event.event
+                && crate::ours(self.gilrs.gamepad(event.id).os_name())
+            {
+                analog(
+                    &mut self.down,
+                    &mut self.analog,
+                    Motion::Trigger(button, value),
+                    &self.tuning,
+                );
+            }
+        }
         self.pressed_at.clear();
         keep_held_analog(&mut self.down);
         self.gestures.cancel();
@@ -2086,6 +2276,86 @@ mod tests {
         assert_eq!(*sent.borrow(), [(KeyCode::KEY_ENTER, true)]);
     }
 
+    #[test]
+    fn dual_trigger_decides_once_and_cancels_pending_pulls() {
+        let rt = Control::button(7);
+        let hard = Control { direction: 1, ..rt };
+        let start = std::time::Instant::now();
+        let at = |ms| start + std::time::Duration::from_millis(ms);
+        let press = |c| Change::TriggerAction(Event::Press(c));
+        let release = |c| Change::TriggerAction(Event::Release(c, ReleaseType::ButtonUp));
+        let mut pull = TriggerPull::default();
+        assert!(pull.start(rt, 0.5, at(0), Some(90)).is_empty());
+        assert_eq!(pull.update(rt, 0.95, at(50)), [press(hard)]);
+        assert!(pull.update(rt, 0.7, at(80)).is_empty());
+        assert_eq!(pull.release(rt), [release(hard)]);
+
+        assert!(pull.start(rt, 0.5, at(100), Some(90)).is_empty());
+        assert!(pull.tick(rt, at(219)).is_empty());
+        assert_eq!(pull.tick(rt, at(220)), [press(rt)]);
+        assert!(pull.update(rt, 1.0, at(240)).is_empty());
+        assert_eq!(pull.release(rt), [release(rt)]);
+
+        assert!(pull.start(rt, 0.5, at(250), Some(90)).is_empty());
+        assert_eq!(pull.update(rt, 0.4, at(260)), [press(rt)]);
+        assert_eq!(pull.release(rt), [release(rt)]);
+        assert!(pull.start(rt, 0.5, at(270), Some(90)).is_empty());
+        assert_eq!(pull.release(rt), [press(rt), release(rt)]);
+
+        assert!(pull.start(rt, 0.5, at(280), Some(90)).is_empty());
+        pull.cancel();
+        assert!(pull.tick(rt, at(400)).is_empty());
+        assert!(pull.update(rt, 1.0, at(401)).is_empty());
+        assert!(pull.release(rt).is_empty());
+        assert_eq!(pull.start(rt, 1.0, at(410), Some(90)), [press(hard)]);
+        assert_eq!(pull.release(rt), [release(hard)]);
+
+        assert_eq!(
+            pull.start(rt, 0.5, at(420), None),
+            [Change::Event(Event::Press(rt))]
+        );
+        assert_eq!(
+            pull.release(rt),
+            [Change::Event(Event::Release(rt, ReleaseType::ButtonUp))]
+        );
+    }
+
+    #[test]
+    fn dual_trigger_holds_only_the_chosen_key_and_transition_releases_it() {
+        use crate::keyboard::Keyboard;
+        use evdev::KeyCode;
+        let rt = Control::button(7);
+        let hard = Control { direction: 1, ..rt };
+        let mut keyboard = Keyboard::new(&[
+            Mapping::new(rt, "A", "hold").unwrap(),
+            Mapping::new(hard, "B", "hold").unwrap(),
+        ])
+        .unwrap();
+        let mut sent = Vec::new();
+        let mut emit = |key, on| {
+            sent.push((key, on));
+            Ok(())
+        };
+        let now = std::time::Instant::now();
+        let mut pull = TriggerPull::default();
+        assert!(pull.start(rt, 0.4, now, Some(90)).is_empty());
+        let mut send = |keyboard: &mut Keyboard, changes| {
+            for change in changes {
+                let Change::TriggerAction(event) = change else {
+                    panic!("expected a decided pull")
+                };
+                keyboard.observe_at(event, now, &mut emit).unwrap();
+            }
+        };
+        send(&mut keyboard, pull.update(rt, 1.0, now));
+        assert!(keyboard.active(hard));
+        assert!(!keyboard.active(rt));
+        keyboard.clear(&mut emit).unwrap();
+        pull.cancel();
+        assert!(pull.release(rt).is_empty());
+        assert_eq!(sent, [(KeyCode::KEY_B, true), (KeyCode::KEY_B, false)]);
+    }
+
     /// v7 ticket 08: a trigger fires once at the tuned fire point and re-arms only after it
     /// eases off; a stick ignores drift inside the dead zone and reports its direction.
     #[test]
@@ -2539,7 +2809,7 @@ mod tests {
                 Ok(())
             };
             match change(down, kind, pad) {
-                Some(Change::Event(event)) => {
+                Some(Change::Event(event) | Change::TriggerAction(event)) => {
                     keyboard.observe(event, &mut emit).unwrap();
                 }
                 // The session's transition (gamepad_transition): every held key released.
