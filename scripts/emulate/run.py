@@ -93,6 +93,7 @@ class Run:
                 os.killpg(group, 0)
                 time.sleep(0.05)
             os.killpg(group, signal.SIGKILL)
+            self.child.wait()  # reap bwrap: no zombie left behind
             raise TimeoutError(f"the emulated run didn't quit within 5 s of SIGINT: {self.child.args}")
         except ProcessLookupError:
             pass  # the group is empty: everything it started has quit
