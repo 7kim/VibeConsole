@@ -1966,6 +1966,7 @@ impl Terminal {
                 let orca = place.and_then(OrcaPlace::live).map(|(session, _)| session);
                 let state = match place {
                     Some(OrcaPlace::NotRunning) => "not-running",
+                    Some(OrcaPlace::OtherFolder(_)) => "other-folder",
                     Some(OrcaPlace::Live(session, _)) => session.state,
                     _ if host == mappings::Host::Orca => "status-unknown",
                     _ => state,
@@ -3754,9 +3755,19 @@ impl Terminal {
             self.clear_finished(&attended);
         }
         // After the tmux checks: a hosted agent has no tmux window to clear it by.
+        self.apply_orca_places(&hosted);
+        self.track_agents(Instant::now()); // v7.7 ticket 161
+        if self.usage_at.elapsed() >= Duration::from_secs(30) {
+            self.flush_usage(); // v7.7 ticket 164
+        }
+        self.read_contexts();
+        self.rumble_since(&before);
+    }
+    /// Orca agents take their light state from their place, else from the hooks.
+    fn apply_orca_places(&mut self, hosted: &[(String, &'static str)]) {
         for (name, _, state) in &mut self.agent_states {
             match self.orca_places.get(name) {
-                Some(OrcaPlace::NotRunning) => *state = "idle",
+                Some(OrcaPlace::NotRunning | OrcaPlace::OtherFolder(_)) => *state = "idle",
                 Some(OrcaPlace::Live(live, _)) if live.state != "status-unknown" => {
                     *state = live.state;
                 }
@@ -3767,12 +3778,6 @@ impl Terminal {
                 }
             }
         }
-        self.track_agents(Instant::now()); // v7.7 ticket 161
-        if self.usage_at.elapsed() >= Duration::from_secs(30) {
-            self.flush_usage(); // v7.7 ticket 164
-        }
-        self.read_contexts();
-        self.rumble_since(&before);
     }
     /// v7 tickets 11 and 86: rumble as a source newly enters a state whose Xbox pattern
     /// rumbles, under the Status lights and Xbox switches.
@@ -8364,6 +8369,7 @@ fn state_word(state: &str) -> &'static str {
         "thinking" => "WORKING",
         "finished" => "FINISHED",
         "not-running" => "NOT RUNNING",
+        "other-folder" => "OTHER FOLDER",
         "status-unknown" => "STATUS UNKNOWN",
         _ => "IDLE",
     }
@@ -8387,6 +8393,8 @@ fn project_of(folder: &str) -> String {
 enum OrcaPlace {
     Live(crate::status::OrcaSession, Option<String>),
     NotRunning,
+    /// v7.8 ticket 70: live panes of its kind, all outside its folder (their workspaces).
+    OtherFolder(Vec<String>),
     Unknown,
 }
 
@@ -8436,7 +8444,17 @@ fn orca_place(
                 .is_none_or(|f| Path::new(&pane.workspace).starts_with(f))
     });
     let Some(pane) = panes.next() else {
-        return OrcaPlace::NotRunning;
+        // No folder matches every pane, so this is non-empty only for an agent with a folder.
+        let elsewhere = live
+            .iter()
+            .filter(|pane| pane.kind == agent.launch)
+            .map(|pane| pane.workspace.clone())
+            .collect::<Vec<_>>();
+        return if elsewhere.is_empty() {
+            OrcaPlace::NotRunning
+        } else {
+            OrcaPlace::OtherFolder(elsewhere)
+        };
     };
     if panes.next().is_some() {
         return OrcaPlace::Unknown;
@@ -21594,7 +21612,8 @@ mod tests {
     }
 
     /// v7.8 ticket 69: an Orca agent's folder includes the folders inside it, by path
-    /// component; more than one live pane under it stays unknown.
+    /// component; more than one live pane under it stays unknown. Ticket 70: live only
+    /// outside its folder reads OTHER FOLDER, with an idle light.
     #[test]
     fn orca_agent_folder_matches_workspaces_inside_it() {
         use crate::status::orca_live_sessions;
@@ -21629,7 +21648,12 @@ mod tests {
         };
         assert_eq!(word(&mut ui, &["/x/Documents/VibeConsole"]), "WORKING");
         assert_eq!(word(&mut ui, &["/x/Documents"]), "WORKING");
-        assert_eq!(word(&mut ui, &["/x/Documents-old"]), "NOT RUNNING");
+        // v7.8 ticket 70: live, but only outside the folder.
+        assert_eq!(word(&mut ui, &["/x/Documents-old"]), "OTHER FOLDER");
+        ui.agent_states[0].2 = "thinking";
+        ui.apply_orca_places(&[]);
+        assert_eq!(ui.agent_states[0].2, "idle", "its light is idle");
+        assert_eq!(word(&mut ui, &[]), "NOT RUNNING");
         assert_eq!(
             word(
                 &mut ui,
