@@ -1,0 +1,79 @@
+# /// script
+# requires-python = ">=3.12"
+# dependencies = []
+# ///
+"""v7.8 ticket 02: the real binary, run with --emulated, against the emulated Xbox controller.
+Run after cargo build --locked: uv run scripts/emulate/check-xbox.py
+
+Checks: A (built-in default Enter) records Enter in output.log; RT mapped to F2 and pulled past
+its fire point fires once, however far it goes, and lets go on release; a normal run beside the
+emulator never lists it. The run sees only the emulator's own event node (bwrap hides the rest).
+The emulator refuses to start while a VibeConsole older than ticket 01 runs (see xbox.py).
+"""
+from pathlib import Path
+import shutil
+import sys
+import tempfile
+import time
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from run import Run, describe, hide, mapping  # noqa: E402
+from xbox import Xbox  # noqa: E402
+
+if not shutil.which("bwrap"):
+    raise SystemExit("bwrap not found: install it (sudo dnf install bubblewrap); nothing was run.")
+GAMEPAD, RT = 239, 7  # mappings::GAMEPAD_CONTEXT, gamepad::BUTTONS' RT
+
+
+def main():
+    with tempfile.TemporaryDirectory() as directory, Xbox() as xbox:
+        sandbox = hide(xbox.node)
+        with Run(directory, [mapping(GAMEPAD, "Xbox RT", "button", 1, RT, "F2")], sandbox) as run:
+            run.read_until("Xbox controller connected", 15)
+            xbox.tap("A")
+            run.wait_recorded("key KEY_ENTER up")
+            assert run.recorded()[:2] == ["key KEY_ENTER down", "key KEY_ENTER up"], run.recorded()
+            print("ok: xbox.tap('A') records Enter in output.log")
+            for pull in (0.1, 0.5, 0.8, 1.0, 0.6):
+                xbox.trigger("RT", pull)
+                time.sleep(0.1)
+            assert run.recorded().count("key KEY_F2 down") == 1, run.recorded()
+            assert "key KEY_F2 up" not in run.recorded(), run.recorded()
+            xbox.trigger("RT", 0.0)
+            run.wait_recorded("key KEY_F2 up")
+            assert run.recorded().count("key KEY_F2 down") == 1, run.recorded()
+            print("ok: RT pulled past its fire point fires once and lets go on release")
+            # The built-in defaults name each button's key (gamepad::default_layout).
+            for button, key in [("B", "ESC"), ("X", "BACKSPACE"), ("Y", "TAB")]:
+                xbox.tap(button)
+                run.wait_recorded(f"key KEY_{key} up")
+            for direction in ("up", "down", "left", "right"):
+                xbox.dpad(direction)
+                time.sleep(0.05)
+                xbox.dpad(None)
+                run.wait_recorded(f"key KEY_{direction.upper()} up")
+            print("ok: B, X, Y and the D-pad fire their built-in keys")
+            assert "emulator" not in describe(sandbox).lower()
+            print("ok: a normal run beside the emulator ignores it")
+    # Detect shows the analog controls and the Xbox button as VibeConsole reads them.
+    with tempfile.TemporaryDirectory() as directory, Xbox() as xbox:
+        with Run(directory, [], hide(xbox.node), ["detect"]) as detect:
+            detect.read_until("Microsoft Xbox One", 15)  # gilrs names the emulator by its ids
+            time.sleep(0.5)
+            for act, token in [(lambda: xbox.trigger("LT", 0.5), "LT 50%"),
+                               # Through 50%: gilrs 0.11 drops a first pull that lands on
+                               # exactly 1.0 in one report (its pressed state starts at 1.0).
+                               (lambda: (xbox.trigger("RT", 0.5), time.sleep(0.1), xbox.trigger("RT", 1.0)),
+                                "RT 100%"),
+                               (lambda: xbox.stick("left", 1.0, 0.0), "Left stick x +1.00 y +0.00"),
+                               (lambda: xbox.stick("left", 0.0, 1.0), "Left stick x +0.00 y +1.00"),
+                               (lambda: xbox.stick("right", -1.0, 0.0), "Right stick x -1.00"),
+                               (lambda: xbox.press("Xbox"), "💡 ON Xbox")]:
+                mark = detect.mark()
+                act()
+                detect.read_until(token, 5, since=mark)
+            print("ok: Detect reads LT, RT, both sticks (up is up) and the Xbox button")
+
+
+if __name__ == "__main__":
+    main()

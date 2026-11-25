@@ -23,6 +23,7 @@ run = [
   "uv run scripts/check-terminal.py",
   "uv run scripts/check-installation.py",
   "uv run scripts/emulate/check-akai.py",
+  "uv run scripts/emulate/check-xbox.py",
 ]
 
 [tasks.check]
