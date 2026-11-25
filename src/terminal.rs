@@ -8925,7 +8925,7 @@ fn sound_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 Some(picked)
             }
         };
-        let mut pick_device = |ui: &mut _, sink: bool| -> Result<Option<sound::Named>> {
+        let pick_device = |ui: &mut _, sink: bool| -> Result<Option<sound::Named>> {
             let nodes = now
                 .nodes
                 .iter()
