@@ -175,6 +175,9 @@ pub enum Action {
         browser: Browser,
         what: BrowserDo,
     },
+    /// v7.8 ticket 15: Playwright codegen for a URL, or a saved script by name, in a visible
+    /// terminal (a tmux window of `vibe`), from `~/.config/vibeconsole/playwright`.
+    Playwright(Playwright),
     /// Start Wispr Flow when it is not running; repair (quit and reopen) it once when it is.
     Flow,
     /// v7 ticket 15: bring Orca's tab for `agent` working in `folder` to the front. The
@@ -333,6 +336,107 @@ impl BrowserDo {
         }
     }
 }
+/// v7.8 ticket 15: what a Playwright action runs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Playwright {
+    Codegen(String),
+    /// A script `<name>.spec.ts` in the Playwright folder.
+    Script(String),
+}
+impl Playwright {
+    pub fn word(&self) -> String {
+        match self {
+            Self::Codegen(url) => format!("codegen:{url}"),
+            Self::Script(name) => format!("script:{name}"),
+        }
+    }
+    pub fn parse(word: &str) -> Result<Self> {
+        if let Some(url) = word.strip_prefix("codegen:") {
+            return match web_url(url) {
+                true => Ok(Self::Codegen(url.into())),
+                false => Err("a Playwright URL must be http(s), one line".into()),
+            };
+        }
+        match word.strip_prefix("script:") {
+            Some(name) if crate::mappings::simple_name(name) => Ok(Self::Script(name.into())),
+            Some(name) => {
+                Err(format!("Playwright script name {name:?}: letters, digits, - and _").into())
+            }
+            None => Err("unknown Playwright action".into()),
+        }
+    }
+    pub fn label(&self) -> String {
+        match self {
+            Self::Codegen(url) => format!("Playwright codegen for {url}"),
+            Self::Script(name) => format!("Playwright script {name}"),
+        }
+    }
+    /// The argv run in the Playwright folder (each one argument).
+    pub fn argv(&self) -> Vec<String> {
+        match self {
+            Self::Codegen(url) => strings(&["npx", "playwright", "codegen", url]),
+            Self::Script(name) => {
+                strings(&["npx", "playwright", "test", &format!("{name}.spec.ts")])
+            }
+        }
+    }
+}
+/// v7.8 ticket 15: Playwright's folder: `<config folder>/playwright`.
+pub fn playwright_dir() -> Result<PathBuf> {
+    Ok(prompts_dir()?
+        .parent()
+        .ok_or("configuration directory missing")?
+        .join("playwright"))
+}
+/// v7.8 ticket 15: the saved scripts' names in `folder` (`<name>.spec.ts`), sorted.
+pub fn playwright_scripts(folder: &Path) -> Vec<String> {
+    let mut names = std::fs::read_dir(folder)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            e.file_name()
+                .to_str()?
+                .strip_suffix(".spec.ts")
+                .map(str::to_owned)
+        })
+        .filter(|n| crate::mappings::simple_name(n))
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+/// v7.8 ticket 15: run `action` in `folder` through `show` (window, folder, argv). It needs
+/// npx and Playwright installed in the folder (so npx never fetches it); a script must exist.
+pub fn playwright(
+    action: &Playwright,
+    folder: &Path,
+    installed: impl Fn(&str) -> bool,
+    show: impl FnOnce(&str, &str, &[&str]) -> Result<String>,
+) -> Result<String> {
+    if !installed("npx") || !folder.join("node_modules/.bin/playwright").is_file() {
+        return Err(format!(
+            "{}: unavailable: install Playwright (npm init playwright) in {}",
+            action.label(),
+            folder.display()
+        )
+        .into());
+    }
+    if let Playwright::Script(name) = action {
+        if !folder.join(format!("{name}.spec.ts")).is_file() {
+            return Err(format!(
+                "{}: no {name}.spec.ts in {}",
+                action.label(),
+                folder.display()
+            )
+            .into());
+        }
+    }
+    let argv = action.argv();
+    let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
+    show("playwright", &folder.to_string_lossy(), &argv)?;
+    Ok(format!("{}: started in the vibe terminal", action.label()))
+}
+
 /// v7.8 ticket 14: an http(s) URL on one line, at most 2048 characters.
 pub fn web_url(url: &str) -> bool {
     let rest = url
@@ -927,6 +1031,7 @@ impl Action {
             Self::Browser { browser, what } => {
                 format!("browser:{}:{}", browser.word(), what.word())
             }
+            Self::Playwright(action) => format!("playwright:{}", action.word()),
             Self::Nothing => "nothing".into(),
             Self::SavedSequence(name) => format!("saved-sequence:{name}"),
             Self::MicrophoneMute => "microphone-mute".into(),
@@ -1037,6 +1142,9 @@ impl Action {
                 }
             }
             "output-mute" => Self::OutputMute,
+            _ if value.starts_with("playwright:") => {
+                Self::Playwright(Playwright::parse(&value["playwright:".len()..])?)
+            }
             _ if value.starts_with("browser:") => {
                 let rest = &value["browser:".len()..];
                 let (browser, what) = rest.split_once(':').ok_or("invalid browser action")?;
@@ -1221,6 +1329,7 @@ impl Action {
             Self::Media(media) => format!("Media key: {}", media.label()),
             Self::System(system) => system.label(),
             Self::Browser { browser, what } => format!("{}: {}", browser.name(), what.label()),
+            Self::Playwright(action) => action.label(),
             Self::Nothing => "No action (built-in default silenced)".into(),
             Self::SavedSequence(name) => format!("Saved prompt sequence {name} (one step per tap)"),
             Self::MicrophoneMute => "Toggle default microphone mute".into(),
@@ -3118,6 +3227,12 @@ fn perform(
             }
             _ => browser_keys(*browser, what, focused_app(gdbus_output), tap),
         },
+        Action::Playwright(action) => playwright(
+            action,
+            &playwright_dir()?,
+            |p| crate::emulated().is_some() || on_path(p),
+            |window, dir, argv| show_program(window, dir, argv),
+        ),
         Action::System(action) => system(
             action,
             |p| crate::emulated().is_some() || on_path(p),
@@ -3443,6 +3558,7 @@ impl Action {
             Self::Media(_) => "media",
             Self::System(_) => "system",
             Self::Browser { .. } => "browser",
+            Self::Playwright(_) => "playwright",
             Self::Flow => "flow",
             Self::OrcaJump { .. } => "orca-jump",
             Self::AppToggleQuit(_) => "app-toggle-quit",
@@ -4682,6 +4798,87 @@ mod tests {
             Some(("flatpak", strings(&["run", "com.google.Chrome"])))
         );
         assert_eq!(Browser::Chrome.launcher(&only(&[])), None);
+    }
+
+    /// v7.8 ticket 15: codegen and a saved script run in the Playwright folder with the URL
+    /// and the file as single arguments; without npx or the folder's Playwright it's
+    /// unavailable and nothing runs; a missing script or a name leaving the folder is refused.
+    #[test]
+    fn playwright_runs_codegen_and_scripts_as_single_arguments() {
+        let folder = std::env::temp_dir().join(format!("vibeconsole-pw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        let shown = std::cell::RefCell::new(Vec::new());
+        let run = |action: &Playwright, npx: bool| {
+            playwright(
+                action,
+                &folder,
+                |p| npx && p == "npx",
+                |window, dir, argv: &[&str]| {
+                    shown
+                        .borrow_mut()
+                        .push((window.to_owned(), dir.to_owned(), strings(argv)));
+                    Ok(String::new())
+                },
+            )
+        };
+        let codegen = Playwright::Codegen("https://example.com/a b?c=d".into());
+        let error = run(&codegen, true).unwrap_err().to_string();
+        assert!(
+            error.contains("unavailable: install Playwright (npm init playwright)"),
+            "{error}"
+        );
+        std::fs::create_dir_all(folder.join("node_modules/.bin")).unwrap();
+        std::fs::write(folder.join("node_modules/.bin/playwright"), "").unwrap();
+        assert!(
+            run(&codegen, false)
+                .unwrap_err()
+                .to_string()
+                .contains("unavailable")
+        );
+        assert!(shown.borrow().is_empty(), "nothing ran");
+        run(&codegen, true).unwrap();
+        let script = Playwright::Script("login-flow".into());
+        assert!(
+            run(&script, true)
+                .unwrap_err()
+                .to_string()
+                .contains("no login-flow.spec.ts")
+        );
+        std::fs::write(folder.join("login-flow.spec.ts"), "").unwrap();
+        run(&script, true).unwrap();
+        let dir = folder.to_string_lossy().into_owned();
+        assert_eq!(
+            shown.into_inner(),
+            [
+                (
+                    "playwright".into(),
+                    dir.clone(),
+                    strings(&[
+                        "npx",
+                        "playwright",
+                        "codegen",
+                        "https://example.com/a b?c=d"
+                    ])
+                ),
+                (
+                    "playwright".into(),
+                    dir,
+                    strings(&["npx", "playwright", "test", "login-flow.spec.ts"])
+                ),
+            ]
+        );
+        assert_eq!(playwright_scripts(&folder), ["login-flow"]);
+        for bad in ["../x", "a/b", ".hidden", ""] {
+            assert!(
+                Action::parse(&format!("playwright:script:{bad}")).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(Action::parse("playwright:codegen:file:///etc").is_err());
+        let ok = Action::parse("playwright:script:login-flow").unwrap();
+        assert_eq!(Action::parse(&ok.encode()).unwrap(), ok);
+        std::fs::remove_dir_all(folder).unwrap();
     }
 
     /// v7.8 ticket 13: a paired device connects and disconnects with its address as one

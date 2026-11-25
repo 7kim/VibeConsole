@@ -11798,6 +11798,7 @@ Media keys go to the player that is playing; with none, nothing happens.",
 /// that browser is focused), or a URL to open in it.
 fn browser_action(
     ui: &mut impl Ui,
+    path: &Path,
     saved: Option<&crate::actions::Action>,
 ) -> Result<Option<crate::actions::Action>> {
     use crate::actions::{Action, Browser, BrowserDo};
@@ -11805,12 +11806,18 @@ fn browser_action(
         Some(Action::Browser { browser, what }) => (Some(*browser), Some(what.clone())),
         _ => (None, None),
     };
-    let names = Browser::ALL.map(|b| b.name().to_string()).to_vec();
-    let at = saved_browser.and_then(|b| Browser::ALL.iter().position(|x| *x == b));
+    let mut names = Browser::ALL.map(|b| b.name().to_string()).to_vec();
+    names.push("Playwright (codegen for a URL, saved scripts)".into()); // v7.8 ticket 15
+    let at = match saved {
+        Some(Action::Playwright(_)) => Some(Browser::ALL.len()),
+        _ => saved_browser.and_then(|b| Browser::ALL.iter().position(|x| *x == b)),
+    };
     let Some(b) = choose_saved(ui, "Which browser?", names, at)? else {
         return Ok(None);
     };
-    let browser = Browser::ALL[b];
+    let Some(&browser) = Browser::ALL.get(b) else {
+        return playwright_action(ui, path, saved);
+    };
     let mut whats = vec![
         BrowserDo::NewTab,
         BrowserDo::ReopenTab,
@@ -11854,6 +11861,73 @@ fn browser_action(
         browser,
         what: BrowserDo::OpenUrl(url.trim().into()),
     }))
+}
+
+/// v7.8 ticket 15: Playwright codegen for a URL, or one of the saved scripts in the
+/// Playwright folder beside the config (`<name>.spec.ts`).
+fn playwright_action(
+    ui: &mut impl Ui,
+    path: &Path,
+    saved: Option<&crate::actions::Action>,
+) -> Result<Option<crate::actions::Action>> {
+    use crate::actions::{Action, Playwright};
+    let saved = match saved {
+        Some(Action::Playwright(p)) => Some(p.clone()),
+        _ => None,
+    };
+    let rows = strings(&[
+        "Codegen: record a new script for a URL…",
+        "Run a saved script…",
+    ]);
+    let at = saved
+        .as_ref()
+        .map(|p| usize::from(matches!(p, Playwright::Script(_))));
+    let Some(row) = choose_saved(
+        ui,
+        "Playwright (runs in the visible vibe terminal)",
+        rows,
+        at,
+    )?
+    else {
+        return Ok(None);
+    };
+    if row == 0 {
+        let old = match &saved {
+            Some(Playwright::Codegen(url)) => url.clone(),
+            _ => "https://".into(),
+        };
+        let Some(url) = text_entry(ui, "URL to record (http or https)", &old)? else {
+            return Ok(None);
+        };
+        if !crate::actions::web_url(url.trim()) {
+            return Err(
+                "validation: a URL must start with http:// or https:// and be one line".into(),
+            );
+        }
+        return Ok(Some(Action::Playwright(Playwright::Codegen(
+            url.trim().into(),
+        ))));
+    }
+    let folder = crate::actions::prompts_dir_for(path)?
+        .parent()
+        .ok_or("file I/O: configuration directory missing")?
+        .join("playwright");
+    let names = crate::actions::playwright_scripts(&folder);
+    if names.is_empty() {
+        return Err(format!(
+            "validation: no saved Playwright scripts in {} (each is <name>.spec.ts)",
+            folder.display()
+        )
+        .into());
+    }
+    let at = match &saved {
+        Some(Playwright::Script(n)) => names.iter().position(|x| x == n),
+        _ => None,
+    };
+    Ok(
+        choose_saved(ui, "Run which saved script?", names.clone(), at)?
+            .map(|i| Action::Playwright(Playwright::Script(names[i].clone()))),
+    )
 }
 
 /// v7.8 ticket 12: the ready-made updates, as terminal commands (visible, hold 1 second).
@@ -12207,7 +12281,7 @@ fn action_family(mapping: &Mapping) -> usize {
         Action::PromptSequence(_) | Action::SavedSequence(_) => 11,
         Action::Media(_) => 2,
         Action::System(_) => 17,
-        Action::Browser { .. } => 18,
+        Action::Browser { .. } | Action::Playwright(_) => 18,
         action if action.audio() => 2,
         _ => 1, // launchers, hold to quit, Wispr Flow
     }
@@ -13458,7 +13532,7 @@ fn configure_steps(
             };
             Mapping::new(pad, mappings::MOUSE_KEYS[row].0, behavior).map_err(stage("validation"))?
         } else if family == 18 {
-            let Some(action) = browser_action(ui, saved.as_ref().map(|m| &m.action))? else {
+            let Some(action) = browser_action(ui, path, saved.as_ref().map(|m| &m.action))? else {
                 continue;
             };
             Mapping::new_action(pad, input, action).map_err(stage("validation"))?
@@ -21185,6 +21259,50 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("held for one second")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.8 ticket 15: Browser → Playwright lists the saved scripts beside the config and saves
+    /// the one picked; with none saved it says where they go.
+    #[test]
+    fn playwright_scripts_are_picked_from_the_folder_beside_the_config() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-pwui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("playwright")).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let keys = |after: &[Key]| {
+            let mut keys = vec![Enter];
+            keys.extend(vec![Down; 16]); // Browser
+            keys.extend([Enter, Down, Down, Enter, Down, Enter]); // Playwright, a saved script
+            keys.extend(after);
+            keys
+        };
+        let mut ui = Script {
+            keys: keys(&[Enter, Tab, Tab, Enter]).into(), // "Not saved" → Back, finish
+            pads: [Control::from_note(10, 40).unwrap()].into(),
+            ..Default::default()
+        };
+        let mut current = Vec::new();
+        configure(&mut ui, &path, &mut current).unwrap();
+        let screens = ui.screens.join("\n");
+        assert!(
+            screens.contains("no saved Playwright scripts in"),
+            "{screens}"
+        );
+        std::fs::write(dir.join("playwright/checkout.spec.ts"), "").unwrap();
+        let mut ui = Script {
+            keys: keys(&[Enter, Enter, Down, Enter]).into(), // the script, Pressed, save
+            pads: [Control::from_note(10, 40).unwrap()].into(),
+            ..Default::default()
+        };
+        configure(&mut ui, &path, &mut current).unwrap();
+        use crate::actions::{Action, Playwright};
+        assert_eq!(
+            mappings::load(&path).unwrap()[0].action,
+            Action::Playwright(Playwright::Script("checkout".into()))
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
