@@ -9,13 +9,8 @@ cd "$(dirname "$0")/.."
 unit=vibeconsole.service
 active() { systemctl --user is-active --quiet "$unit"; }
 
-# `vibeconsole --version` names the spec version, last ticket and commit of this build, from
-# the newest commit whose subject starts with "v<version> <ticket>", e.g. "v7 128".
-# mise ticket 11: also "mise 10" and the like: a subject starting with a version folder name
-# (docs/<version>/tickets, git-ignored, so a clone without docs/ matches only v<number>).
-versions=$(for d in docs/*/tickets; do [ -d "$d" ] && basename "$(dirname "$d")"; done | grep -vx skipped | sed 's/[.]/[.]/g' | paste -sd'|')
-names="v[0-9.]+${versions:+|$versions}"
-ticket=$(git log -1 --format=%s -E --grep="^($names) [0-9]" | sed -E "s/^(($names) [0-9, ]*[0-9]).*/\\1/")
+# `vibeconsole --version` names the spec version, last ticket and commit of this build.
+ticket=$(git log --format=%s | scripts/build-ticket.sh)
 commit=$(git rev-parse --short HEAD)$(git diff --quiet HEAD -- src core Cargo.toml Cargo.lock || echo "+changes")
 export VIBECONSOLE_BUILD="${ticket:-no ticket}, commit $commit"
 cargo build --release --locked

@@ -779,9 +779,21 @@ pub fn light_check(
         Ok(text) => (line(&text), None),
         Err(text) => (
             line(&text),
-            (on == Some(true)).then(|| light_problem(label, text)),
+            // v7.8 ticket 63: the probe's text starts with the label the stage already names.
+            (on == Some(true)).then(|| {
+                let rest = text.strip_prefix(label).and_then(|t| t.strip_prefix(": "));
+                light_problem(label, rest.map_or(text.clone(), str::to_owned))
+            }),
         ),
     }
+}
+/// v7.8 ticket 63: the Xbox button light's probe; with no Xbox controller connected there is
+/// no light to report (an error controller list still probes, so a light problem shows).
+pub fn xbox_light_found(connected: bool, leds: &Path) -> std::result::Result<String, String> {
+    if !connected {
+        return Ok("Xbox button light: no Xbox controller connected".into());
+    }
+    crate::gamepad::ButtonLight::open(leds).map(|light| light.describe())
 }
 /// v7.7 ticket 192: a light switched on in Status light patterns that isn't available.
 pub fn light_problem(label: &'static str, message: String) -> Problem {
@@ -1306,10 +1318,10 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
             }
             // v7.7 ticket 192: each light's probe, then its switch in Status light patterns.
             let mut found: Vec<std::result::Result<String, String>> = Vec::new();
-            found.push(
-                crate::gamepad::ButtonLight::open(Path::new(crate::gamepad::LEDS))
-                    .map(|light| light.describe()),
-            );
+            found.push(xbox_light_found(
+                !matches!(controllers.as_deref(), Ok([])),
+                Path::new(crate::gamepad::LEDS),
+            ));
             // v7 ticket 113: the keyboard's lock-key LED (opened only, nothing sent) and RGB.
             found.push(match crate::keyboard::LockLights::open() {
                 Ok(lights) => Ok(format!(
@@ -1860,6 +1872,37 @@ mod tests {
         let (line, problem) = light_check("RGB keyboard", None, Err("RGB keyboard: x".into()));
         assert!(line.ends_with("switch unknown: the config didn't load") && problem.is_none());
         fs::remove_dir_all(dir).unwrap();
+    }
+    /// v7.8 ticket 63: with no Xbox controller connected the light isn't a problem; with one
+    /// on xpad (no xone light folder), the Problem line names the light once.
+    #[test]
+    fn doctor_reports_the_xbox_light_only_with_a_controller_and_names_it_once() {
+        let leds =
+            std::env::temp_dir().join(format!("vibeconsole-doctor-leds-{}", std::process::id()));
+        fs::create_dir_all(&leds).unwrap();
+        let (line, problem) = light_check(
+            "Xbox button light",
+            Some(true),
+            xbox_light_found(false, &leds),
+        );
+        assert_eq!(
+            line,
+            "Xbox button light: no Xbox controller connected · on in Status light patterns"
+        );
+        assert!(problem.is_none(), "{problem:?}");
+        let (_, problem) = light_check(
+            "Xbox button light",
+            Some(true),
+            xbox_light_found(true, &leds),
+        );
+        let problem = problem.expect("a connected controller with no light is a problem");
+        let shown = format!("Problem · {}: {}", problem.stage, problem.message);
+        assert_eq!(shown.matches("Xbox button light").count(), 1, "{shown}");
+        assert!(
+            shown.starts_with("Problem · Xbox button light: unavailable: no xone"),
+            "{shown}"
+        );
+        fs::remove_dir_all(leds).unwrap();
     }
     /// v7.7 ticket 224: startup-status shows the run state the service wrote, and says why
     /// when it can't be read; it only reads.

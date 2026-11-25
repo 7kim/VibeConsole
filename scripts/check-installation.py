@@ -28,6 +28,17 @@ if os.environ.get("VIBECONSOLE_CHECK_IN_BWRAP") != "1":
                          "VIBECONSOLE_PTY_NO_BWRAP=1 on a machine with no input devices).")
 
 binary = Path(__file__).resolve().parents[1] / "target/debug/vibeconsole"
+
+# v7.8 ticket 63: install.sh's ticket lookup reads every subject style the repo uses.
+lookup = Path(__file__).resolve().parent / "build-ticket.sh"
+for subjects, ticket in [
+    ("emulate: a fix\nv7.8 ticket 38: x\nv7.7 271 y\n", "v7.8 ticket 38"),
+    ("v7.8 tickets 61, 62: x\nv7.8 ticket 38: y\n", "v7.8 tickets 61, 62"),
+    ("v7 128 x\n", "v7 128"),
+    ("no ticket here\n", ""),
+] + ([("mise 10: x\nv7 1 y\n", "mise 10")] if (lookup.parents[1] / "docs/mise/tickets").is_dir() else []):
+    found = subprocess.run([lookup], input=subjects, capture_output=True, text=True, check=True).stdout
+    assert found.strip() == ticket, (subjects, found)
 with tempfile.TemporaryDirectory(prefix="vibeconsole-install-") as directory:
     root = Path(directory)
     fake = root / "tools"
