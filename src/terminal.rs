@@ -449,6 +449,7 @@ struct Terminal {
     motion: crate::motion::Motion,
     capture: Option<Vec<[u8; 3]>>,
     output: Option<crate::keyboard::Output>,
+    control_socket: Option<crate::control_socket::Server>,
     actions: crate::actions::Dispatcher,
     flow_pending: bool,
     /// Status-feedback pads: what the last press did, and the derived running state.
@@ -1559,6 +1560,7 @@ impl Terminal {
             motion: crate::motion::Motion::default(),
             capture: None,
             output: None,
+            control_socket: None,
             actions: crate::actions::Dispatcher::new(),
             flow_pending: false,
             flow_resume: false,
@@ -1695,6 +1697,11 @@ impl Terminal {
                 Arc::clone(&terminal.stopped_by),
                 signal as usize,
             )?);
+        }
+        #[cfg(not(test))]
+        match crate::status::state_dir().and_then(|dir| crate::control_socket::Server::bind(&dir)) {
+            Ok(socket) => terminal.control_socket = Some(socket),
+            Err(error) => eprintln!("control socket unavailable: {error}"),
         }
         let Some(original) = original else {
             return Ok(terminal);
@@ -3931,6 +3938,7 @@ impl Terminal {
     }
     fn suspend(&mut self) -> Result<()> {
         self.suspended = true;
+        self.refuse_control_socket("session paused");
         // v7.7 ticket 211: a transition ends Test the lights; the lights rest below.
         if self.light_test.take().is_some() {
             self.light_test_stopped = true;
@@ -4082,6 +4090,7 @@ impl Terminal {
     }
 
     fn release_all(&mut self) -> Result<()> {
+        self.refuse_control_socket("session is transitioning");
         // v7.7 ticket 214: running Flow work isn't cancelled by a release (letting go of LB
         // after its 1 s hold changed the layer and cancelled the repair it had started);
         // pause and Esc still cancel it. Output is paused meanwhile, so nothing else is queued.
@@ -4215,7 +4224,16 @@ impl Terminal {
     }
     fn transition(&mut self, pad: Control, active: bool) -> Result<()> {
         let fired = self.fired(pad)?;
-        if let Some(action) = fired.as_ref().map(|m| m.action.clone()) {
+        self.transition_mapping(pad, active, fired.as_ref())
+    }
+
+    fn transition_mapping(
+        &mut self,
+        pad: Control,
+        active: bool,
+        fired: Option<&Mapping>,
+    ) -> Result<()> {
+        if let Some(action) = fired.map(|m| m.action.clone()) {
             if action != crate::actions::Action::Shortcut {
                 if active {
                     let agents = action
@@ -4224,7 +4242,7 @@ impl Terminal {
                         .map(str::to_owned)
                         .collect::<Vec<_>>();
                     self.clear_finished(&agents);
-                    let status = fired.as_ref().is_some_and(|m| m.status);
+                    let status = fired.is_some_and(|m| m.status);
                     // v7 ticket 20: a prompt sequence sends its current step, and moves on
                     // only once that step was sent. Ticket 88: once finished, a tap sends
                     // nothing, and a one-second hold starts it over.
@@ -4278,7 +4296,7 @@ impl Terminal {
                     if let (Some(steps), Ok(_)) = (sequence, &submitted) {
                         self.positions.sent(pad, &steps);
                     }
-                    let knob = fired.as_ref().is_some_and(|m| {
+                    let knob = fired.is_some_and(|m| {
                         matches!(
                             m.input,
                             mappings::Input::Knob { .. } | mappings::Input::RelativeKnob { .. }
@@ -4638,6 +4656,7 @@ impl Terminal {
     /// The keyboard takes a new mapping set (layer or profile change): a transition. Held
     /// keys are released, held pads and buttons wait for a fresh press.
     fn reload_keyboard(&mut self) -> Result<()> {
+        self.refuse_control_socket("session is transitioning");
         self.refresh_xbox_status();
         if let Some(pad) = &mut self.gamepad {
             pad.cancel_trigger_pulls();
@@ -5034,6 +5053,7 @@ impl Terminal {
         {
             return Ok(());
         }
+        self.refuse_control_socket("session is not running");
         let layout = self.xbox_layout()?;
         match &mut self.output {
             Some(output) => output.keyboard.replace(&layout)?,
@@ -5072,6 +5092,164 @@ impl Terminal {
             pad.drain();
         }
         self.notice = notice;
+        Ok(())
+    }
+
+    fn refuse_control_socket(&mut self, reason: &'static str) {
+        if let Some(server) = &mut self.control_socket {
+            server.refuse(reason);
+        }
+    }
+
+    fn control_unavailable(&self) -> Option<&'static str> {
+        if self.stop.load(Ordering::Relaxed) {
+            Some("session is stopping")
+        } else if self.suspended
+            || self.detecting
+            || (!self.wanted_run && !self.pause_cause.is_empty())
+        {
+            Some("session paused")
+        } else if !(self.wanted_run && self.output.as_ref().is_some_and(|o| o.keyboard.running())) {
+            Some("session is not running")
+        } else {
+            None
+        }
+    }
+
+    fn poll_control_socket(&mut self) {
+        let Some(mut server) = self.control_socket.take() else {
+            return;
+        };
+        if let Some(reason) = self.control_unavailable() {
+            server.refuse(reason);
+        } else {
+            server.poll(|line, dir| self.control_request(line, dir));
+            if let Some(reason) = self.control_unavailable() {
+                server.refuse(reason);
+            }
+        }
+        self.control_socket = Some(server);
+    }
+
+    fn control_request(&mut self, line: &str, dir: &Path) -> Result<String> {
+        if let Some(reason) = self.control_unavailable() {
+            return Err(reason.into());
+        }
+        if line.chars().any(char::is_control) {
+            return Err("request contains control characters".into());
+        }
+        if line == "state" {
+            let midi = if self.context_verified {
+                mappings::program_label(self.context)
+            } else {
+                "unverified".into()
+            };
+            return Ok(format!(
+                "ok running | MIDI {midi} | Xbox Program {} layer {}",
+                self.xbox_program,
+                if self.layer2 { 2 } else { 1 }
+            ));
+        }
+        if let Some(args) = line.strip_prefix("agent ") {
+            let mut args = args.split_ascii_whitespace();
+            let (Some(name), Some(state), None) = (args.next(), args.next(), args.next()) else {
+                return Err("usage: agent <name> <state>".into());
+            };
+            let config = mappings::read_config(&self.path)?;
+            crate::status::named_agent(&config.agents, name)?;
+            crate::status::write_in(dir, name, state).map_err(|e| format!("agent state: {e}"))?;
+        } else if let Some(name) = line.strip_prefix("press ") {
+            self.press_from_socket(name)?;
+        } else {
+            return Err("expected state, agent <name> <state>, or press <control name>".into());
+        }
+        Ok("ok".into())
+    }
+
+    fn press_from_socket(&mut self, name: &str) -> Result<()> {
+        use crate::actions::Action;
+        let config = mappings::read_config(&self.path)?;
+        let mut mapping = if let Some(name) = name.strip_prefix("xbox:") {
+            self.xbox_layout_in(&config).into_iter().find(|m| {
+                m.control
+                    .label()
+                    .strip_prefix("Xbox ")
+                    .is_some_and(|label| label.eq_ignore_ascii_case(name))
+            })
+        } else if let Some(slot) = name.strip_prefix("pad:") {
+            let slot = slot
+                .parse::<usize>()
+                .ok()
+                .filter(|n| (1..=16).contains(n))
+                .ok_or("pad name must be pad:1 through pad:16")?;
+            let (_, program) = self
+                .program()
+                .filter(|_| !self.akai_owned)
+                .ok_or("no verified Akai program is active")?;
+            let control = mappings::pad_controls(&program)[slot - 1];
+            self.run_mappings
+                .iter()
+                .find(|m| Some(m.control) == control && m.input == mappings::Input::Pad)
+                .cloned()
+        } else {
+            return Err("unknown control name: use xbox:<name> or pad:<1–16>".into());
+        }
+        .ok_or("no active assignment for that control")?;
+
+        // Use the checked action for the whole tap, including saved sequences that can be edited.
+        if let Action::SavedSequence(name) = &mapping.action {
+            let steps =
+                mappings::saved_sequence(&config, name).ok_or("saved sequence is unavailable")?;
+            mapping.action = Action::PromptSequence(steps.to_vec());
+        }
+        if mapping.risky || socket_risky(&mapping.action) {
+            return Err("risky assignment requires physical input".into());
+        }
+        if mapping.action == Action::Nothing {
+            return Err("control has no action assigned".into());
+        }
+        let control = mapping.control;
+        let physical = Control {
+            direction: 0,
+            ..control
+        };
+        if self.detector.down.contains(&control)
+            || self
+                .gamepad
+                .as_ref()
+                .is_some_and(|p| p.down.contains(&physical))
+        {
+            return Err("control is already physically held".into());
+        }
+        self.output
+            .as_ref()
+            .ok_or("keyboard is unavailable")?
+            .keyboard
+            .can_tap_control(&mapping)?;
+        self.count_press(control, Some(&mapping));
+        self.pressed = Some((control, Instant::now()));
+        let result = (|| -> Result<()> {
+            for event in [
+                Event::Press(control),
+                Event::Release(control, crate::ReleaseType::ButtonUp),
+            ] {
+                let output = self.output.as_mut().ok_or("keyboard is unavailable")?;
+                if let Some((_, active)) = output
+                    .observe(event)
+                    .map_err(|e| format!("keyboard output: {e}"))?
+                {
+                    self.transition_mapping(control, active, Some(&mapping))
+                        .map_err(|e| format!("action: {e}"))?;
+                }
+            }
+            self.holds.release(control, Instant::now());
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.pause("control socket action failed")?;
+            self.error = format!("control socket: {error}");
+            return Err(error);
+        }
         Ok(())
     }
     /// Pad, key and button events into the keyboard and actions (MIDI and Xbox alike).
@@ -6237,6 +6415,7 @@ impl Terminal {
                 self.error = format!("Connection remains paused: {error}");
             }
         }
+        self.poll_control_socket();
         Ok(())
     }
 
@@ -6307,6 +6486,7 @@ Changing musical settings while running is unsupported.",
             }
         }
         self.run_mappings = mappings.to_vec();
+        self.refuse_control_socket("session paused");
         self.wanted_run = true;
         self.suspended = false;
         let all = self.with_gamepad(mappings)?;
@@ -6328,6 +6508,7 @@ Changing musical settings while running is unsupported.",
     }
 
     fn prepare_connection(&mut self) -> Result<()> {
+        self.refuse_control_socket("session is transitioning");
         let config = mappings::load_config(&self.path)?;
         if self.context_mappings(&config.mappings) != self.run_mappings
             || config.idle_for(self.context) != self.idle
@@ -6770,8 +6951,27 @@ Changing musical settings while running is unsupported.",
     }
 }
 
+fn socket_risky(action: &crate::actions::Action) -> bool {
+    use crate::actions::{Action, Step, System};
+    match action {
+        Action::Command { .. }
+        | Action::Playwright(_)
+        | Action::AppQuit(_)
+        | Action::AppToggleQuit(_)
+        | Action::AppToggle { close: true, .. }
+        | Action::SavedSequence(_) => true,
+        Action::System(system) => system.risky() || *system == System::EmptyTrash,
+        Action::Sequence(steps) | Action::PressSequence(steps) | Action::OrcaKeys(steps) => steps
+            .iter()
+            .any(|step| matches!(step, Step::Do(action) if socket_risky(action))),
+        Action::PromptSequence(steps) | Action::Choice(steps) => steps.iter().any(socket_risky),
+        _ => false,
+    }
+}
+
 impl Drop for Terminal {
     fn drop(&mut self) {
+        self.control_socket = None;
         self.flush_usage(); // v7.7 ticket 164: the last counts
         if self.drawn {
             self.journal("Terminal run | quit");
@@ -28435,6 +28635,148 @@ mod tests {
             .iter()
             .filter(|(key, down)| *key == evdev::KeyCode::KEY_LEFTSHIFT && *down)
             .count()
+    }
+
+    #[test]
+    fn control_socket_handles_requests_without_real_desktop_output() {
+        use crate::actions::{Action, Step};
+        use std::io::{Read, Write};
+        use std::os::unix::{
+            fs::{DirBuilderExt, PermissionsExt},
+            net::{UnixListener, UnixStream},
+        };
+        let (dir, mut ui, ran, pads) = configure_session("control-socket");
+        let runtime = dir.join("run");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&runtime)
+            .unwrap();
+        let socket_dir = runtime.join("vibeconsole");
+        std::fs::create_dir(&socket_dir).unwrap();
+        let path = socket_dir.join("control.sock");
+        drop(UnixListener::bind(&path).unwrap()); // a pathname left after a crashed session
+        ui.control_socket = Some(crate::control_socket::Server::bind(&socket_dir).unwrap());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        ui.xbox_program = 2;
+        ui.layer2 = true;
+        let context = mappings::xbox_context(2, true);
+        let mut a = Mapping::new(Control::button(0), "F6", "hold").unwrap();
+        a.context = context;
+        let mut b = Mapping::new(Control::button(1), "F7", "hold").unwrap();
+        b.context = context;
+        b.risky = true;
+        let mut nested = Mapping::new_action(
+            Control::button(2),
+            mappings::Input::Pad,
+            Action::Sequence(vec![Step::Do(Action::Command {
+                window: "test".into(),
+                dir: "/tmp".into(),
+                line: "true".into(),
+            })]),
+        )
+        .unwrap();
+        nested.context = context;
+        let mut payload = [0; 245];
+        payload[0x10] = pads[0].channel - 1;
+        payload[0x24] = pads[0].id;
+        ui.program_snapshot = Some(payload);
+        let mut config = mappings::load_config(&ui.path).unwrap();
+        config.agents = vec![mappings::Agent::new("worker", "worker", "worker").unwrap()];
+        config
+            .mappings
+            .extend([a.clone(), b.clone(), nested.clone()]);
+        mappings::save_config(&ui.path, &config).unwrap();
+        let mut active = ui.run_mappings.clone();
+        active.extend([a, b, nested]);
+        let mut output = crate::keyboard::Output::recording(&active).unwrap();
+        output.keyboard.resume();
+        ui.output = Some(output);
+
+        let send = |request: &str| {
+            let mut client = UnixStream::connect(&path).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            client.write_all(request.as_bytes()).unwrap();
+            client
+        };
+        let read = |mut client: UnixStream| {
+            let mut reply = String::new();
+            client.read_to_string(&mut reply).unwrap();
+            assert_eq!(reply.lines().count(), 1, "{reply:?}");
+            reply
+        };
+        let request = |ui: &mut Terminal, line| {
+            let client = send(line);
+            ui.poll_control_socket();
+            read(client)
+        };
+        assert_eq!(
+            request(&mut ui, "state\n"),
+            "ok running | MIDI Program 1 | Xbox Program 2 layer 2\n"
+        );
+        assert_eq!(request(&mut ui, "agent worker thinking\n"), "ok\n");
+        assert_eq!(
+            std::fs::read_to_string(socket_dir.join("agent-worker")).unwrap(),
+            "thinking\n"
+        );
+        assert!(request(&mut ui, "agent ../worker thinking\n").contains("unknown agent"));
+        assert!(request(&mut ui, "press xbox:B\n").contains("risky"));
+        assert!(request(&mut ui, "press xbox:X\n").contains("risky"));
+        let mut split = send("press xbox:");
+        ui.poll_control_socket();
+        split.write_all(b"A\n").unwrap();
+        ui.poll_control_socket();
+        assert_eq!(read(split), "ok\n");
+        assert_eq!(request(&mut ui, "press pad:1\n"), "ok\n");
+        assert_eq!(
+            ran.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Action::OutputMute
+        );
+        let control = Control::button(0);
+        ui.handle_events(vec![Event::Press(control)]).unwrap();
+        assert!(request(&mut ui, "press xbox:A\n").contains("already held"));
+        ui.handle_events(vec![Event::Release(control, crate::ReleaseType::ButtonUp)])
+            .unwrap();
+        assert!(request(&mut ui, "state\npress xbox:A\n").contains("one request"));
+        let held = send("press xbox:");
+        ui.poll_control_socket();
+        let queued = send("press xbox:A\n");
+        ui.pause("socket test").unwrap();
+        assert!(read(held).contains("paused"));
+        assert!(read(queued).contains("paused"));
+        assert!(request(&mut ui, "press xbox:A\n").contains("paused"));
+        resume(&mut ui);
+        ui.poll_control_socket();
+        assert_eq!(
+            ui.output.as_ref().unwrap().recorded,
+            [
+                (evdev::KeyCode::KEY_F6, true),
+                (evdev::KeyCode::KEY_F6, false),
+                (evdev::KeyCode::KEY_F6, true),
+                (evdev::KeyCode::KEY_F6, false)
+            ]
+        );
+        assert!(ran.try_recv().is_err());
+        drop(ui.control_socket.take());
+        ui.control_socket = Some(crate::control_socket::Server::bind(&socket_dir).unwrap());
+        let clients = (0..11).map(|_| send("state\n")).collect::<Vec<_>>();
+        ui.poll_control_socket();
+        let replies = clients.into_iter().map(read).collect::<Vec<_>>();
+        assert_eq!(
+            replies
+                .iter()
+                .filter(|reply| reply.starts_with("ok "))
+                .count(),
+            10
+        );
+        assert!(replies.last().unwrap().contains("rate limit"));
+        drop(ui);
+        assert!(!path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// v7 ticket 112: in `/configure`'s menus a mapped pad fires, and pads mapped to Down and

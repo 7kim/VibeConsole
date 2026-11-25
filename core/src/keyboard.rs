@@ -361,6 +361,29 @@ impl Keyboard {
             .any(|assignment| assignment.control == control && assignment.active)
     }
 
+    pub fn running(&self) -> bool {
+        self.running
+    }
+
+    /// A synthetic tap must leave an in-progress physical press alone.
+    pub fn can_tap_control(&self, mapping: &Mapping) -> Result<()> {
+        let control = mapping.control;
+        if self.down.contains(&control) || self.blocked.contains(&control) {
+            return Err("control is already held or awaiting release".into());
+        }
+        let keys = mapping
+            .keys
+            .iter()
+            .map(|key| key_code(key))
+            .collect::<Result<Vec<_>>>()?;
+        if !self.assignments.iter().any(|a| {
+            a.control == control && a.keys == keys && a.behavior == mapping.behavior && !a.risky
+        }) {
+            return Err("assignment is not active in the keyboard".into());
+        }
+        Ok(())
+    }
+
     pub fn status(&self, name: impl Fn(Control) -> String) -> String {
         let active = self
             .assignments

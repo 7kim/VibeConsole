@@ -21,12 +21,24 @@ pub fn state_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(runtime).join("vibeconsole"))
 }
 
-fn write_in(dir: &Path, agent: &str, state: &str) -> Result<()> {
+/// Write a validated state for a caller that already checked the configured agent.
+pub fn write_in(dir: &Path, agent: &str, state: &str) -> Result<()> {
+    let state = if state == "ended" { "idle" } else { state };
     if !crate::mappings::simple_name(agent) || !STATES.contains(&state) {
         return Err(format!("unknown agent state {state:?}; use {}", STATES.join(", ")).into());
     }
     std::fs::create_dir_all(dir)?;
     crate::actions::write_atomic(&dir.join(format!("agent-{agent}")), &format!("{state}\n"))
+}
+
+pub fn named_agent<'a>(
+    agents: &'a [crate::mappings::Agent],
+    name: &str,
+) -> Result<&'a crate::mappings::Agent> {
+    agents
+        .iter()
+        .find(|a| a.name == name)
+        .ok_or_else(|| format!("unknown agent {name:?}").into())
 }
 
 /// Missing or unreadable files read as idle.
@@ -67,18 +79,11 @@ pub fn command(args: &[String]) -> Result<()> {
     };
     // v7.7 ticket 197: a hook reads only; the session moves an old mappings.tsv.
     let config = crate::mappings::read_config(&crate::mappings::config_path()?)?;
-    let Some(window) = config
-        .agents
-        .iter()
-        .find(|a| a.name == agent)
-        .map(|a| a.window.clone())
-    else {
-        return Err(format!("unknown agent {agent:?}").into());
-    };
+    let window = &named_agent(&config.agents, &agent)?.window;
     // A process that outlives its window keeps the variable: e.g. Codex's shared app-server
     // daemon, started from the agent's window and then used by other Codex clients. Only a
     // live pane in the agent's own `vibe` window may report.
-    if hook && !own_window(pane_window().as_deref(), &window) {
+    if hook && !own_window(pane_window().as_deref(), window) {
         return session_hook(state);
     }
     write(&agent, state)

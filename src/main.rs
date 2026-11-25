@@ -1,3 +1,4 @@
+mod control_socket;
 mod runtime;
 mod terminal;
 use mappings::{config_path, load};

@@ -393,6 +393,16 @@ cargo build --locked
 
 Ensure `~/.local/bin` is on PATH. Rebuilding alone does not update the installed executable. Installation does not enable/start login startup. One runtime owns MIDI, keyboard output, and editing. If the login service owns them, `vibeconsole` pauses the service for the session and starts it again when you quit; any other second session is refused. `list`, `doctor`, `agent-status` and the `startup-*` commands never stop the service. Keep ordinary editing in the same foreground session to preserve keyboard continuity.
 
+### Local control socket
+
+The terminal session and login service expose `$XDG_RUNTIME_DIR/vibeconsole/control.sock` with mode `0600`. Send one UTF-8 line per connection and read one reply. The socket accepts up to ten requests per second across clients. Requests while paused or transitioning get an `error` reply and expire with the connection.
+
+- `state` returns `ok running` with the active MIDI and Xbox programs and Xbox layer.
+- `agent <name> <state>` updates a configured agent using the same states as `vibeconsole agent-status`.
+- `press xbox:A` taps the active assignment for Xbox A. Use names from Detect, such as `xbox:D-pad up`, or `pad:1` through `pad:16` for Bank A then Bank B of the verified Akai program. Risky assignments and controls that are already held are refused.
+
+`agent` and `press` return `ok` when accepted. A refusal starts with `error` and gives the reason.
+
 ### Optional login service
 
 The service follows the controller's verified program, applies saved feedback only after verification, and uses the saved Flow startup setting. Unmatched programs stay inactive; piano mappings require interactive confirmation and remain inactive in the service. Re-run `startup-enable` to replace an older managed unit that passed flags.
