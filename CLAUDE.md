@@ -36,7 +36,9 @@ Rules:
 
 ## Start here
 
-- Before implementation, debugging or changing scope, read from the working version's spec its **Safety Rules** and the sections the task touches (`tickets show NN --spec`, or `tickets spec <heading>`), then the ticket being worked on and its blockers. Don't read the other tickets: `tickets next`, `agent`, `blocked` and `triage` list them. `tickets use <version>` sets the working version; [docs/README.md](docs/README.md) lists the versions.
+- Before implementing, debugging, or changing scope on a ticket, run `tickets begin NN` and read its output.
+- For work without a ticket, use `tickets spec <heading>` to read the working version's **Safety Rules** and the sections the task touches.
+- Don't read the other tickets. Use `tickets next`, `agent`, `blocked` and `triage` to inspect the queue. Set the working version with `tickets use <version>`. [docs/README.md](docs/README.md) lists the versions.
 - Each spec restates the Project rules it relies on, under **Safety Rules** (`/to-spec` does it). A spec may change a rule only with the user's agreement, and says so.
 - Recorded hardware limitations are under "Known limitations" in [docs/README.md](docs/README.md). Don't reopen them unless a ticket asks.
 - V1–V6 tickets and tests are in `archive/tickets/` and `archive/tests/`. Read them for history; don't add to them.
@@ -80,9 +82,7 @@ Specs, tickets and tests are markdown under `docs/<version>/` (git-ignored: the 
 
 ### Closing a ticket (before the next ticket and before committing)
 
-1. Run `cargo-gate` (`cargo fmt --check`, `check --locked`, `test --locked`; one line on pass); report failures or missing prerequisites.
-2. `tickets close NN --status resolved|ready-for-human --tick <boxes built and checked> --comment "<what was built, the commit, what's left open>"`: it ticks the boxes, sets the status, signs `### Builder · <date> <time>`, closes the agent test and adds the developer test to the run order. Leave a box unticked only when I must check it, and say so. Change a status only with evidence.
-3. Re-read the file to confirm, then commit the code with the ticket number in the message. If the ticket changed `~/.local/share/claude-scripts`, commit and push that repo too, with the same ticket number.
+Before starting the next ticket, follow the closing steps printed by `tickets begin NN`. Use `tickets close` for the status, acceptance checks, and Builder sign-off.
 
 At a version's end, `tickets check` prints nothing (no implemented ticket still says `ready-for-agent`, no box ticked only in your head).
 
