@@ -1449,11 +1449,22 @@ pub struct Pad {
     /// v7 ticket 76: stick gestures, timed from `clock`.
     gestures: Gestures,
     clock: std::time::Instant,
+    /// v7.8 ticket 26: the kernel's stamp on each button's last press `poll` turned into a
+    /// press (one per button, so it stays small; Detect takes them).
+    pub pressed_at: std::collections::HashMap<Control, std::time::SystemTime>,
+    /// v7.8 ticket 26: while Detect's speed test runs (Some), each right-stick report's stamp,
+    /// read before gilrs's filters drop small moves.
+    pub reports: Option<Vec<std::time::SystemTime>>,
 }
 impl Pad {
     pub fn open() -> crate::Result<Self> {
-        let gilrs =
-            gilrs::Gilrs::new().map_err(|e| format!("Xbox controllers unavailable: {e}"))?;
+        // v7.8 ticket 26: gilrs's default filters and state update run in `next_event`, so
+        // Detect's speed test can count the raw reports first.
+        let gilrs = gilrs::GilrsBuilder::new()
+            .with_default_filters(false)
+            .set_update_state(false)
+            .build()
+            .map_err(|e| format!("Xbox controllers unavailable: {e}"))?;
         Ok(Self {
             gilrs,
             effect: None,
@@ -1462,16 +1473,50 @@ impl Pad {
             tuning: crate::mappings::Tuning::default(),
             gestures: Gestures::default(),
             clock: std::time::Instant::now(),
+            pressed_at: std::collections::HashMap::new(),
+            reports: None,
         })
     }
     /// The gestures the saved mappings use (v7 ticket 76).
     pub fn set_gestures(&mut self, mappings: &[Mapping]) {
         self.gestures.set(mappings, &mut self.analog);
     }
+    /// gilrs's `next_event` with its default filters (dpad axes to buttons, jitter, dead
+    /// zone) and state update, as gilrs does them; while a speed test runs, each right-stick
+    /// report's stamp is kept first (X and Y of one report share a stamp: kept once).
+    fn next_event(&mut self) -> Option<gilrs::Event> {
+        use gilrs::ev::filter::{Filter, Jitter, axis_dpad_to_button, deadzone};
+        loop {
+            let raw = self.gilrs.next_event()?;
+            if let (
+                Some(reports),
+                gilrs::EventType::AxisChanged(
+                    gilrs::Axis::RightStickX | gilrs::Axis::RightStickY,
+                    ..,
+                ),
+            ) = (&mut self.reports, raw.event)
+            {
+                if crate::ours(self.gilrs.gamepad(raw.id).os_name())
+                    && reports.last() != Some(&raw.time)
+                {
+                    reports.push(raw.time);
+                }
+            }
+            let event = Some(raw)
+                .filter_ev(&axis_dpad_to_button, &mut self.gilrs)
+                .filter_ev(&Jitter::new(), &mut self.gilrs)
+                .filter_ev(&deadzone, &mut self.gilrs)?;
+            if event.is_dropped() {
+                continue;
+            }
+            self.gilrs.update(&event);
+            return Some(event);
+        }
+    }
     pub fn poll(&mut self) -> Vec<Change> {
         let mut changes = Vec::new();
         let triggers = [gilrs::Button::LeftTrigger2, gilrs::Button::RightTrigger2];
-        while let Some(event) = self.gilrs.next_event() {
+        while let Some(event) = self.next_event() {
             // v7.8 ticket 01: an emulated run reads only emulators; others never read them.
             // Ticket 02: the kernel's name (`os_name`); `name` is the SDL mapping's when the ids
             // match a known controller, as the emulator's do.
@@ -1530,7 +1575,13 @@ impl Pad {
                 _ => continue,
             };
             let name = self.gilrs.gamepad(event.id).name().to_owned();
+            let before = changes.len();
             changes.extend(change(&mut self.down, kind, &name));
+            for made in &changes[before..] {
+                if let Change::Event(Event::Press(control)) = made {
+                    self.pressed_at.insert(*control, event.time);
+                }
+            }
         }
         let now = self.clock.elapsed().as_millis() as u64;
         changes.extend(self.gestures.tick(&self.tuning, &mut self.down, now));
@@ -1546,7 +1597,8 @@ impl Pad {
     /// A transition: queued events are dropped and held buttons forgotten, so the next
     /// fresh press fires and nothing replays.
     pub fn drain(&mut self) {
-        while self.gilrs.next_event().is_some() {}
+        while self.next_event().is_some() {}
+        self.pressed_at.clear();
         keep_held_analog(&mut self.down);
         self.gestures.cancel();
     }
@@ -1603,6 +1655,18 @@ impl Pad {
             .filter(|(_, pad)| crate::ours(pad.os_name()))
             .map(|(_, pad)| pad.name().to_owned())
             .collect()
+    }
+    /// v7.8 ticket 26: the first controller's USB vendor and product ids, as sysfs writes
+    /// them (lowercase hex), when the driver reports them.
+    pub fn usb_ids(&self) -> Option<(String, String)> {
+        let (_, pad) = self
+            .gilrs
+            .gamepads()
+            .find(|(_, pad)| crate::ours(pad.os_name()))?;
+        Some((
+            format!("{:04x}", pad.vendor_id()?),
+            format!("{:04x}", pad.product_id()?),
+        ))
     }
     /// v7.8 tickets 06, 09: the first controller's connection, driver, battery and profile.
     pub fn details(&self) -> Vec<String> {

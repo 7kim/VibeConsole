@@ -118,6 +118,35 @@ enum Learned {
     Motion(Control, mappings::Input, String),
 }
 
+/// v7.8 ticket 26: one device on Detect's speed rows.
+#[derive(Default)]
+struct SpeedDevice {
+    /// Its name (kept results are filed under it) and its header line (name and details).
+    name: String,
+    header: String,
+    connection: String,
+    link: String,
+    /// The last press: its name and how long after the computer got it VibeConsole handled
+    /// it (None: a clock changed in between).
+    press: Option<(String, Option<f64>)>,
+    /// The speed test's line while it runs and after.
+    test: String,
+}
+/// v7.8 ticket 26: Detect's link and speed test (only while Detect is open, never while Run
+/// sends keys).
+#[derive(Default)]
+struct Speed {
+    xbox: Option<SpeedDevice>,
+    akai: Option<SpeedDevice>,
+    /// The Xbox test's start; the pad collects right-stick stamps until it ends.
+    xbox_since: Option<Instant>,
+    /// The Akai test's press delays.
+    akai_delays: Option<Vec<f64>>,
+    kept: Vec<crate::speed::Kept>,
+}
+const XBOX_TEST: Duration = Duration::from_secs(3);
+const AKAI_PRESSES: usize = 10;
+
 trait Ui {
     fn draw(&mut self, text: &str) -> Result<()>;
     fn key(&mut self) -> Result<Option<Key>>;
@@ -377,6 +406,8 @@ struct Terminal {
     /// The stop line is written once.
     stop_journaled: bool,
     input: Option<midi::Input>,
+    /// v7.8 ticket 26: Detect's link and speed test; Some only while Detect is open.
+    speed: Option<Speed>,
     detector: Detector,
     motion: crate::motion::Motion,
     capture: Option<Vec<[u8; 3]>>,
@@ -997,6 +1028,11 @@ impl Terminal {
                 width,
             ));
             rows.extend(self.xbox_rows(width, live));
+            rows.extend(
+                self.speed_rows()
+                    .iter()
+                    .map(|r| fit(r, width).trim_end().to_owned()),
+            );
             rows.push(fit(&self.last_event, width).trim_end().into());
             return rows.join("\n");
         };
@@ -1098,6 +1134,11 @@ impl Terminal {
             width,
         ));
         rows.extend(self.xbox_rows(width, live));
+        rows.extend(
+            self.speed_rows()
+                .iter()
+                .map(|r| fit(r, width).trim_end().to_owned()),
+        );
         rows.push(fit(&self.last_event, width).trim_end().into());
         rows.join("\n")
     }
@@ -1126,18 +1167,271 @@ impl Terminal {
                 Err(error) => return Err(error),
             }
         }
+        // v7.8 ticket 26: the speed rows live only on this page; leaving (or an error) ends
+        // any test, so nothing is measured while Run sends keys.
+        self.speed = Some(self.speed_devices());
+        if let Some(pad) = &mut self.gamepad {
+            pad.pressed_at.clear();
+        }
+        let result = self.detect_loop();
+        self.speed = None;
+        if let Some(pad) = &mut self.gamepad {
+            pad.reports = None;
+        }
+        result
+    }
+    fn detect_loop(&mut self) -> Result<()> {
         loop {
             self.tick()?;
+            self.speed_tick();
             let live = self.input.is_some() || self.gamepad.is_some();
             let view = self.detection_view(self.size(), live);
             self.draw(&view)?;
             if self.input.is_none() && self.gamepad.is_none() {
                 return Err(self.error.clone().into());
             }
-            if let Some(Key::Enter | Key::Escape) = self.key()? {
-                return Ok(());
+            match self.key()? {
+                Some(Key::Enter | Key::Escape) => return Ok(()),
+                // Only the keyboard's T: controller buttons are what Detect is showing.
+                Some(Key::Character(b't' | b'T')) => self.speed_start(),
+                _ => {}
             }
         }
+    }
+
+    /// v7.8 ticket 26: the devices Detect measures: how each is connected (read-only), and
+    /// the results kept for it.
+    fn speed_devices(&self) -> Speed {
+        let sys = Path::new("/sys");
+        let emulated = vibeconsole_core::emulated().is_some();
+        let xbox = self.gamepad.as_ref().and_then(|pad| {
+            let name = pad.connected().into_iter().next()?;
+            let details = pad.details();
+            let connection = details
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "unknown link".into());
+            let measured = "its report timing can't be read, so it's measured below";
+            let link = if emulated {
+                "an emulator: no link to read".into()
+            } else if connection == "Bluetooth" {
+                format!("Bluetooth · {measured}")
+            } else {
+                pad.usb_ids()
+                    .and_then(|(vendor, product)| crate::speed::usb_link(sys, &vendor, &product))
+                    .unwrap_or_else(|| format!("{connection} · {measured}"))
+            };
+            Some(SpeedDevice {
+                header: format!("{name}{}", link_text(&details)),
+                name,
+                connection,
+                link,
+                ..SpeedDevice::default()
+            })
+        });
+        let akai = self.input.as_ref().map(|input| {
+            let name = if input.akai {
+                "Akai MPK mini 3".to_owned()
+            } else {
+                midi::device_name(&input.port)
+            };
+            let usb = (input.akai && !emulated)
+                .then(|| crate::speed::usb_link(sys, "09e8", "1049"))
+                .flatten();
+            SpeedDevice {
+                header: name.clone(),
+                name,
+                connection: if usb.is_some() { "USB" } else { "MIDI" }.into(),
+                link: usb.map_or_else(
+                    || "MIDI · its link can't be read here".into(),
+                    |usb| format!("{usb} · MIDI read as it arrives"),
+                ),
+                ..SpeedDevice::default()
+            }
+        });
+        Speed {
+            xbox,
+            akai,
+            kept: crate::speed::load(&self.speed_file()),
+            ..Speed::default()
+        }
+    }
+    fn speed_file(&self) -> PathBuf {
+        self.path.with_file_name("speed-tests.tsv")
+    }
+    /// T: a fresh test on every device: the Xbox's right stick for 3 s, the Akai's 10 presses.
+    fn speed_start(&mut self) {
+        let Some(speed) = &mut self.speed else {
+            return;
+        };
+        if let (Some(device), Some(pad)) = (&mut speed.xbox, &mut self.gamepad) {
+            pad.reports = Some(Vec::new());
+            speed.xbox_since = Some(Instant::now());
+            device.test = "running: keep moving the right stick (3 s left)".into();
+        }
+        if let Some(device) = &mut speed.akai {
+            speed.akai_delays = Some(Vec::new());
+            device.test = format!("running: press pads (0 of {AKAI_PRESSES})");
+        }
+    }
+    /// A press reached Detect: name it with its delay, and count it in the Akai's test.
+    fn speed_press(&mut self, xbox: bool, name: String, delay: Option<f64>) {
+        let Some(speed) = &mut self.speed else {
+            return;
+        };
+        let device = if xbox {
+            &mut speed.xbox
+        } else {
+            &mut speed.akai
+        };
+        if let Some(device) = device {
+            device.press = Some((name, delay));
+        }
+        if let (false, Some(delays), Some(ms), Some(device)) =
+            (xbox, &mut speed.akai_delays, delay, &mut speed.akai)
+        {
+            if delays.len() >= AKAI_PRESSES {
+                return; // the test ends at the next tick; presses after the 10th don't count
+            }
+            delays.push(ms);
+            device.test = format!("running: press pads ({} of {AKAI_PRESSES})", delays.len());
+        }
+    }
+    /// Ends a test whose time or presses are up, and keeps its result (atomically; a failed
+    /// save is shown on the device's row and keeps the old file).
+    fn speed_tick(&mut self) {
+        let path = self.speed_file();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let Some(speed) = &mut self.speed else {
+            return;
+        };
+        let mut kept = Vec::new();
+        if let (Some(since), Some(device)) = (speed.xbox_since, &mut speed.xbox) {
+            let left = XBOX_TEST.saturating_sub(since.elapsed());
+            if left.is_zero() {
+                speed.xbox_since = None;
+                let stamps = (self.gamepad.as_mut())
+                    .and_then(|pad| pad.reports.take())
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_micros() as u64)
+                    .collect::<Vec<_>>();
+                device.test = match crate::speed::link(&stamps) {
+                    Ok(link) => {
+                        kept.push((
+                            true,
+                            crate::speed::Kept {
+                                device: device.name.clone(),
+                                connection: device.connection.clone(),
+                                when: now,
+                                result: crate::speed::Kind::Link {
+                                    per_second: link.per_second,
+                                    gap_ms: link.gap_ms,
+                                    jitter_ms: link.jitter_ms,
+                                },
+                            },
+                        ));
+                        format!("right stick, 3 s: {}", link.text())
+                    }
+                    Err(error) => format!("right stick, 3 s: not measured: {error}"),
+                };
+            } else {
+                device.test = format!(
+                    "running: keep moving the right stick ({} s left)",
+                    left.as_secs() + 1
+                );
+            }
+        }
+        if let (Some(delays), Some(device)) = (&speed.akai_delays, &mut speed.akai) {
+            if delays.len() >= AKAI_PRESSES {
+                if let Some(d) = crate::speed::delays(delays) {
+                    device.test = d.text(delays.len());
+                    kept.push((
+                        false,
+                        crate::speed::Kept {
+                            device: device.name.clone(),
+                            connection: device.connection.clone(),
+                            when: now,
+                            result: crate::speed::Kind::Presses {
+                                low: d.low,
+                                high: d.high,
+                                average: d.average,
+                            },
+                        },
+                    ));
+                }
+                speed.akai_delays = None;
+            }
+        }
+        for (xbox, result) in kept {
+            match crate::speed::keep(&path, result) {
+                Ok(all) => speed.kept = all,
+                // Shown on its own row: the result stands, but it wasn't kept.
+                Err(error) => {
+                    let device = if xbox {
+                        &mut speed.xbox
+                    } else {
+                        &mut speed.akai
+                    };
+                    if let Some(device) = device {
+                        device.test.push_str(&format!(" · not kept: {error}"));
+                    }
+                }
+            }
+        }
+    }
+    /// Detect's rows for each device: header, link, last press, speed test, and the last
+    /// result kept for each of its connections, side by side.
+    fn speed_rows(&self) -> Vec<String> {
+        let Some(speed) = &self.speed else {
+            return Vec::new();
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let mut rows = Vec::new();
+        for (device, start) in [
+            (&speed.xbox, "T: move the right stick for 3 s"),
+            (&speed.akai, "T: then press 10 pads"),
+        ] {
+            let Some(device) = device else {
+                continue;
+            };
+            rows.push(device.header.clone());
+            rows.push(format!("  Link        {}", device.link));
+            rows.push(format!(
+                "  Last press  {}",
+                match &device.press {
+                    None => "–".to_owned(),
+                    Some((name, Some(ms))) => {
+                        format!("{name} · handled {ms:.0} ms after the computer got it")
+                    }
+                    Some((name, None)) => format!("{name} · {}", crate::speed::CLOCK_CHANGED),
+                }
+            ));
+            rows.push(format!(
+                "  Speed test  {}",
+                if device.test.is_empty() {
+                    start
+                } else {
+                    &device.test
+                }
+            ));
+            let before = (speed.kept.iter())
+                .filter(|k| k.device == device.name)
+                .map(|k| k.text(now))
+                .collect::<Vec<_>>();
+            if !before.is_empty() {
+                rows.push(format!("  Kept        {}", before.join(" · ")));
+            }
+        }
+        if !rows.is_empty() {
+            rows.push("Measured inside this computer. The time inside the device and over the air can't be measured without extra hardware.".into());
+        }
+        rows
     }
 
     fn size(&self) -> (usize, usize) {
@@ -1215,6 +1509,7 @@ impl Terminal {
             stop_journaled: false,
             signals: Vec::new(),
             input: None,
+            speed: None,
             detector: Detector::default(),
             motion: crate::motion::Motion::default(),
             capture: None,
@@ -5512,6 +5807,15 @@ impl Terminal {
             );
             self.observe_light(None, Instant::now());
             let channel = (message[0] & 15) + 1;
+            // v7.8 ticket 26: on Detect, a note-on's delay from midir's callback to now.
+            if self.speed.is_some() && message[0] & 0xf0 == 0x90 && message[2] > 0 {
+                let delay = (self.input.as_ref())
+                    .and_then(|input| input.received())
+                    .and_then(|at| crate::speed::delay_ms(at.elapsed().as_micros() as u64, 0));
+                let name = Control::from_note(channel, message[1])
+                    .map_or_else(|| format!("Note #{}", message[1]), |c| self.name(c));
+                self.speed_press(false, name, delay);
+            }
             match message[0] & 0xf0 {
                 0xb0 => {
                     self.cc_values.insert((channel, message[1]), message[2]);
@@ -5567,6 +5871,22 @@ impl Terminal {
             .map(crate::gamepad::Pad::poll)
             .unwrap_or_default();
         for change in changes {
+            // v7.8 ticket 26: on Detect, a button's delay from the kernel's stamp to now (both
+            // the realtime clock; a jump shows as not measured).
+            if let (Some(_), crate::gamepad::Change::Event(Event::Press(control))) =
+                (&self.speed, &change)
+            {
+                if let Some(stamp) =
+                    (self.gamepad.as_mut()).and_then(|p| p.pressed_at.remove(control))
+                {
+                    let us = |t: std::time::SystemTime| {
+                        t.duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_micros() as u64)
+                    };
+                    let delay = crate::speed::delay_ms(us(std::time::SystemTime::now()), us(stamp));
+                    self.speed_press(true, control.label(), delay);
+                }
+            }
             if let crate::gamepad::Change::Event(event) = &change {
                 self.last_xbox = true;
                 // v7 ticket 115: View/Menu held + LB/LT/RB/RT picks an Xbox program; a tap of
@@ -27461,6 +27781,118 @@ mod tests {
             Action::OutputMute,
             "the first press on the new pad fires"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.8 ticket 26: Detect's speed rows with stand-in timings: each device's link and last
+    /// press, a 10-press Akai test that ends in its band and is kept, and the kept results
+    /// shown side by side after a reload. Outside Detect nothing is measured.
+    #[test]
+    fn detect_shows_link_last_press_speed_test_and_kept_results() {
+        use crate::speed::{Kept, Kind};
+        let (dir, mut ui, _ran, _) = configure_session("detect-speed");
+        ui.speed_press(false, "Pad 1".into(), Some(9.0));
+        assert!(
+            ui.speed.is_none() && ui.speed_rows().is_empty(),
+            "nothing outside Detect"
+        );
+        let device = |name: &str, connection: &str, link: &str| SpeedDevice {
+            name: name.into(),
+            header: format!("{name} · {connection}"),
+            connection: connection.into(),
+            link: link.into(),
+            ..SpeedDevice::default()
+        };
+        ui.speed = Some(Speed {
+            xbox: Some(device(
+                "Xbox Wireless Controller",
+                "Bluetooth",
+                "Bluetooth · its report timing can't be read, so it's measured below",
+            )),
+            akai: Some(device(
+                "Akai MPK mini 3",
+                "USB",
+                "USB 12 Mb/s · polled every 1ms",
+            )),
+            ..Speed::default()
+        });
+        ui.speed_press(true, "A".into(), Some(12.0));
+        ui.speed_press(false, "Pad 1".into(), None);
+        let screen = ui.detection_view((120, 40), true);
+        for line in [
+            "Xbox Wireless Controller · Bluetooth",
+            "  Link        Bluetooth · its report timing can't be read, so it's measured below",
+            "  Last press  A · handled 12 ms after the computer got it",
+            "  Speed test  T: move the right stick for 3 s",
+            "  Link        USB 12 Mb/s · polled every 1ms",
+            "  Last press  Pad 1 · clock changed, not measured",
+            "Measured inside this computer.",
+        ] {
+            assert!(screen.contains(line), "{line:?} missing:\n{screen}");
+        }
+        // T: the Akai counts 10 presses (no controller here, so no stick test), then ends
+        // in its band and is kept.
+        ui.speed_start();
+        for ms in [2.0, 31.0, 9.0, 14.0, 14.0, 14.0, 14.0, 14.0, 14.0, 14.0] {
+            ui.speed_tick();
+            ui.speed_press(false, "Pad 1".into(), Some(ms));
+        }
+        assert!(
+            ui.speed_rows()
+                .iter()
+                .any(|r| r.contains("running: press pads (10 of 10)"))
+        );
+        ui.speed_tick();
+        let rows = ui.speed_rows().join("\n");
+        assert!(
+            rows.contains("  Speed test  10 presses: handled after 2–31 ms, average 14 ms 🟡"),
+            "{rows}"
+        );
+        ui.speed_press(false, "Pad 1".into(), Some(90.0)); // after the test: not counted
+        ui.speed_tick();
+        assert!(
+            ui.speed_rows().join("\n").contains("average 14 ms 🟡"),
+            "the test ended at 10 presses"
+        );
+        // Two Xbox connections kept earlier; reopening Detect reads them back.
+        let file = ui.speed_file();
+        for (connection, gap_ms) in [("USB", 4.0), ("Bluetooth", 8.1)] {
+            crate::speed::keep(
+                &file,
+                Kept {
+                    device: "Xbox Wireless Controller".into(),
+                    connection: connection.into(),
+                    when: 1_763_000_000,
+                    result: Kind::Link {
+                        per_second: 1000.0 / gap_ms,
+                        gap_ms,
+                        jitter_ms: 1.0,
+                    },
+                },
+            )
+            .unwrap();
+        }
+        ui.speed.as_mut().unwrap().kept = crate::speed::load(&file);
+        let rows = ui.speed_rows().join("\n");
+        let date = crate::speed::date(1_763_000_000, 1_900_000_000);
+        assert!(
+            rows.contains(&format!(
+                "  Kept        USB ({date}): one every 4.0 ms · Bluetooth ({date}): one every 8.1 ms"
+            )),
+            "{rows}"
+        );
+        assert!(
+            rows.contains("USB (today "),
+            "the Akai's own result, kept now: {rows}"
+        );
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            assert!(
+                entry.path() == file || !text.contains("presses"),
+                "kept results are their own file, not the config: {:?}",
+                entry.path()
+            );
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 
