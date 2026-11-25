@@ -1352,7 +1352,9 @@ impl Pad {
         let triggers = [gilrs::Button::LeftTrigger2, gilrs::Button::RightTrigger2];
         while let Some(event) = self.gilrs.next_event() {
             // v7.8 ticket 01: an emulated run reads only emulators; others never read them.
-            if !crate::ours(self.gilrs.gamepad(event.id).name()) {
+            // Ticket 02: the kernel's name (`os_name`); `name` is the SDL mapping's when the ids
+            // match a known controller, as the emulator's do.
+            if !crate::ours(self.gilrs.gamepad(event.id).os_name()) {
                 continue;
             }
             let motion = match event.event {
@@ -1444,7 +1446,7 @@ impl Pad {
         let ids = self
             .gilrs
             .gamepads()
-            .filter(|(_, pad)| pad.is_ff_supported() && crate::ours(pad.name()))
+            .filter(|(_, pad)| pad.is_ff_supported() && crate::ours(pad.os_name()))
             .map(|(id, _)| id)
             .collect::<Vec<_>>();
         if ids.is_empty() {
@@ -1477,7 +1479,7 @@ impl Pad {
     pub fn connected(&self) -> Vec<String> {
         self.gilrs
             .gamepads()
-            .filter(|(_, pad)| crate::ours(pad.name()))
+            .filter(|(_, pad)| crate::ours(pad.os_name()))
             .map(|(_, pad)| pad.name().to_owned())
             .collect()
     }
@@ -1485,7 +1487,7 @@ impl Pad {
     pub fn connections(&self) -> Vec<String> {
         self.gilrs
             .gamepads()
-            .filter(|(_, pad)| crate::ours(pad.name()))
+            .filter(|(_, pad)| crate::ours(pad.os_name()))
             .map(|(_, pad)| format!("{} ({})", pad.name(), connection(pad.uuid())))
             .collect()
     }
