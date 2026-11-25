@@ -75,7 +75,9 @@ def refuse_unless_safe():
         if exe.endswith(" (deleted)"):
             refuse(f"VibeConsole pid {pid} runs a replaced binary ({exe})")
         version = subprocess.run([exe, "--version"], capture_output=True, text=True).stdout
-        commit = version.rpartition("commit ")[2].strip(" )\n")
+        # A build from a tree with edits reads "commit abc1234+changes": its base commit is what
+        # git can check (the edits are the user's own, outside the filter's file).
+        commit = version.rpartition("commit ")[2].strip(" )\n").partition("+")[0]
         built = commit and subprocess.run(
             ["git", "-C", str(REPO), "merge-base", "--is-ancestor", SKIPS_EMULATORS, commit],
             capture_output=True).returncode == 0
