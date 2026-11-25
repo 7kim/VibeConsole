@@ -73,6 +73,36 @@ def main():
                 act()
                 detect.read_until(token, 5, since=mark)
             print("ok: Detect reads LT, RT, both sticks (up is up) and the Xbox button")
+    bluetooth()
+
+
+def bluetooth():
+    """v7.8 ticket 04: the same controller over Bluetooth under xpadneo (its ids pick SDL's
+    "Xbox One Elite 2" line in gilrs): Detect reads LT, RT and the right stick, and a mapping
+    on RT fires."""
+    with tempfile.TemporaryDirectory() as directory, Xbox("bluetooth") as xbox:
+        with Run(directory, [], hide(xbox.node), ["detect"]) as detect:
+            detect.read_until("Xbox One Elite 2", 15)
+            time.sleep(0.5)
+            for act, token in [(lambda: xbox.trigger("LT", 0.5), "LT 50%"),
+                               (lambda: (xbox.trigger("RT", 0.5), time.sleep(0.1), xbox.trigger("RT", 1.0)),
+                                "RT 100%"),
+                               (lambda: xbox.stick("right", -1.0, 0.0), "Right stick x -1.00"),
+                               (lambda: xbox.stick("right", 0.0, 1.0), "Right stick x +0.00 y +1.00")]:
+                mark = detect.mark()
+                act()
+                detect.read_until(token, 5, since=mark)
+    print("ok: over Bluetooth (xpadneo's ids) Detect reads LT, RT and the right stick")
+    with tempfile.TemporaryDirectory() as directory, Xbox("bluetooth") as xbox:
+        with Run(directory, [mapping(GAMEPAD, "Xbox RT", "button", 1, RT, "F2")], hide(xbox.node)) as run:
+            run.read_until("Xbox controller connected", 15)
+            for pull in (0.1, 0.5, 0.8, 1.0, 0.6):
+                xbox.trigger("RT", pull)
+                time.sleep(0.1)
+            xbox.trigger("RT", 0.0)
+            run.wait_recorded("key KEY_F2 up")
+            assert run.recorded().count("key KEY_F2 down") == 1, run.recorded()
+    print("ok: over Bluetooth a mapping on RT fires once and lets go on release")
 
 
 if __name__ == "__main__":

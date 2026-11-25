@@ -12,7 +12,10 @@ A uinput device named `VibeConsole emulator · Xbox Controller` with the codes, 
 ids of the user's controller under xone, as /proc/bus/input/devices and EVIOCGABS read it
 (25 Nov 2026): bus 0x06, 045e:0b12; BTN_A/B/X/Y, TL/TR, SELECT/START/MODE, THUMBL/R, KEY_RECORD
 (Share); sticks ABS_X/Y/RX/RY -32768..32767 (fuzz 16, flat 128), triggers ABS_Z/RZ 0..1023,
-D-pad ABS_HAT0X/Y -1..1. It has no force feedback (a device that offers it must answer every
+D-pad ABS_HAT0X/Y -1..1. `Xbox("bluetooth")` is the same controller over Bluetooth under
+xpadneo 0.10.2 (v7.8 ticket 04), as its source and the kernel log read it: bus 0x05, 045e:028e
+version 0x1130 (xpadneo's ids, so gilrs picks SDL's "Xbox One Elite 2" line), no Share key,
+sticks fuzz 32 flat 3072, triggers fuzz 4, and ABS_PROFILE 0..3. It has no force feedback (a device that offers it must answer every
 rumble upload), so rumble is never tested here.
 
 Every program on the desktop sees a uinput device. A VibeConsole built before commit 7d505be
@@ -29,6 +32,8 @@ import time
 
 NAME = "VibeConsole emulator · Xbox Controller"
 BUS, VENDOR, PRODUCT, VERSION = 0x06, 0x045E, 0x0B12, 0x0509
+BLUETOOTH = (0x05, 0x045E, 0x028E, 0x1130)  # xpadneo's ids (v7.8 ticket 04)
+ABS_PROFILE = 0x21
 EV_SYN, EV_KEY, EV_ABS = 0, 1, 3
 BUTTONS = {
     "A": 0x130, "B": 0x131, "X": 0x133, "Y": 0x134, "LB": 0x136, "RB": 0x137,
@@ -79,22 +84,30 @@ def refuse_unless_safe():
 
 
 class Xbox:
-    def __init__(self):
+    def __init__(self, link="usb"):
+        """`link`: "usb" (xone, the default) or "bluetooth" (xpadneo)."""
+        bluetooth = link == "bluetooth"
         refuse_unless_safe()
         self.fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
         try:
             for ev in (EV_KEY, EV_ABS):
                 fcntl.ioctl(self.fd, UI_SET_EVBIT, ev)
-            for code in BUTTONS.values():
-                fcntl.ioctl(self.fd, UI_SET_KEYBIT, code)
-            ranges = {code: (-32768, 32767, 16, 128) for code in (ABS_X, ABS_Y, ABS_RX, ABS_RY)}
-            ranges |= {ABS_Z: (0, 1023, 0, 0), ABS_RZ: (0, 1023, 0, 0)}
+            for button, code in BUTTONS.items():
+                if not (bluetooth and button == "Share"):  # xpadneo clears BTN_SHARE
+                    fcntl.ioctl(self.fd, UI_SET_KEYBIT, code)
+            stick = (-32768, 32767, 32, 3072) if bluetooth else (-32768, 32767, 16, 128)
+            trigger = (0, 1023, 4, 0) if bluetooth else (0, 1023, 0, 0)
+            ranges = {code: stick for code in (ABS_X, ABS_Y, ABS_RX, ABS_RY)}
+            ranges |= {ABS_Z: trigger, ABS_RZ: trigger}
             ranges |= {ABS_HAT0X: (-1, 1, 0, 0), ABS_HAT0Y: (-1, 1, 0, 0)}
+            if bluetooth:
+                ranges[ABS_PROFILE] = (0, 3, 0, 0)
             for code, (low, high, fuzz, flat) in ranges.items():
                 fcntl.ioctl(self.fd, UI_SET_ABSBIT, code)
                 fcntl.ioctl(self.fd, UI_ABS_SETUP, struct.pack("HH6i", code, 0, 0, low, high, fuzz, flat, 0))
             name = NAME.encode()
-            fcntl.ioctl(self.fd, UI_DEV_SETUP, struct.pack("4H80sI", BUS, VENDOR, PRODUCT, VERSION, name, 0))
+            ids = BLUETOOTH if bluetooth else (BUS, VENDOR, PRODUCT, VERSION)
+            fcntl.ioctl(self.fd, UI_DEV_SETUP, struct.pack("4H80sI", *ids, name, 0))
             fcntl.ioctl(self.fd, UI_DEV_CREATE)
         except BaseException:
             os.close(self.fd)
