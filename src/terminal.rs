@@ -4490,9 +4490,20 @@ impl Terminal {
             output.keyboard.resume();
         }
         self.suspended = false;
-        self.notice =
-            "No verified MIDI program: the Xbox controller runs on its own; pads wait for their program."
-                .into();
+        // v7.7 ticket 265: keep why the pads wait (e.g. ticket 253's recovery hint), once.
+        const ALONE: &str = "No verified MIDI program: the Xbox controller runs on its own; pads wait for their program.";
+        let why = self
+            .notice
+            .split(ALONE)
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        self.notice = if why.is_empty() {
+            ALONE.into()
+        } else {
+            format!("{why} {ALONE}")
+        };
         Ok(())
     }
     /// Plugging or unplugging a controller is a transition: held keys are released, queued
@@ -8111,8 +8122,9 @@ fn apply_all_recommendations(
     if question(
         ui,
         &format!(
-            "Apply all {} recommendations?\n\n{}{left}",
+            "Apply all {} recommendation{}?\n\n{}{left}",
             applied.len(),
+            if applied.len() == 1 { "" } else { "s" },
             changes.join("\n")
         ),
         &options(&["Cancel", "Save all"]),
@@ -22380,6 +22392,30 @@ mod tests {
         assert!(
             !recorded.contains(&(KeyCode::KEY_F1, true)),
             "the unverified pad typed: {recorded:?}"
+        );
+        // v7.7 ticket 265: the reason the pads wait (ticket 253's recovery hint) stays on
+        // screen and in the run state, once, however often the Xbox-only path re-arms.
+        ui.suspend().unwrap();
+        ui.notice = "Current RAM matches no single stored program, so output stays inactive. To fix it: select Program 1 on the Akai (Prog Select), or unplug and replug it.".into();
+        ui.gamepad_only(true).unwrap();
+        ui.suspend().unwrap();
+        ui.gamepad_only(true).unwrap();
+        assert!(!ui.suspended);
+        assert_eq!(
+            ui.notice
+                .matches("Current RAM matches no single stored program")
+                .count(),
+            1,
+            "{}",
+            ui.notice
+        );
+        assert_eq!(
+            ui.notice
+                .matches("the Xbox controller runs on its own")
+                .count(),
+            1,
+            "{}",
+            ui.notice
         );
         // The program is verified: a transition first (observe_program suspends).
         ui.suspend().unwrap();
