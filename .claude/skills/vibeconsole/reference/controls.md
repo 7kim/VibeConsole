@@ -39,5 +39,13 @@ Generated from the code (`UPDATE_SKILLS=1 cargo test vibeconsole_skills`). Profi
 - Xbox D-pad down
 - Xbox D-pad left
 - Xbox D-pad right
+- Xbox Left stick up
+- Xbox Left stick down
+- Xbox Left stick left
+- Xbox Left stick right
+- Xbox Right stick up
+- Xbox Right stick down
+- Xbox Right stick left
+- Xbox Right stick right
 
 

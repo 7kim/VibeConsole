@@ -7990,10 +7990,10 @@ fn ask_recommendations(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 .join("\n")
         };
         ui.draw(&format!(
-            "AI Recommendations · Enter: review and save · Space: not now · R: refresh · Esc: back\n{rows}\n\nWritten by {agent} from your usage counts (Insights) and mappings. {}",
+            "AI Recommendations · Enter: review and save · A: apply all · Space: not now · R: refresh · Esc: back\n{rows}\n\nWritten by {agent} from your usage counts (Insights) and mappings. {}",
             sent_skill(AskKind::Recommendations)
         ))?;
-        let hide = |what: &str| -> Result<()> {
+        let hide = |whats: &[String]| -> Result<()> {
             let mut kept = hidden_text
                 .lines()
                 .filter(|l| {
@@ -8002,18 +8002,27 @@ fn ask_recommendations(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 })
                 .map(|l| format!("{l}\n"))
                 .collect::<String>();
-            kept += &format!("{today}\t{what}\n");
+            for what in whats {
+                kept += &format!("{today}\t{what}\n");
+            }
             std::fs::create_dir_all(&state)?;
             crate::actions::write_atomic(&hidden_file, &kept)
         };
         match ui.key()? {
             Some(Key::Up) => cursor = cursor.saturating_sub(1),
             Some(Key::Down) if cursor + 1 < shown.len() => cursor += 1,
-            Some(Key::Space) if !shown.is_empty() => hide(&shown[cursor].what)?,
+            Some(Key::Space) if !shown.is_empty() => hide(&[shown[cursor].what.clone()])?,
             Some(Key::Enter) if !shown.is_empty() => {
                 match review_recommendation(ui, path, &shown[cursor]) {
-                    Ok(true) => hide(&shown[cursor].what)?,
+                    Ok(true) => hide(&[shown[cursor].what.clone()])?,
                     Ok(false) => {}
+                    Err(error) => not_saved(ui, &error)?,
+                }
+            }
+            // v7.7 ticket 266: every recommendation in one review and one save.
+            Some(Key::Character(b'a' | b'A')) if !shown.is_empty() => {
+                match apply_all_recommendations(ui, path, &shown) {
+                    Ok(applied) => hide(&applied)?,
                     Err(error) => not_saved(ui, &error)?,
                 }
             }
@@ -8022,6 +8031,83 @@ fn ask_recommendations(ui: &mut impl Ui, path: &Path) -> Result<()> {
             _ => {}
         }
     }
+}
+/// v7.7 ticket 266: one recommendation's change put into `config`, checked like any AI
+/// reply (an app profile, or Default mappings whose replacements are asked), in words.
+/// Nothing is saved here.
+fn stage_recommendation(
+    ui: &mut impl Ui,
+    config: &mut mappings::Config,
+    recommendation: &mappings::Recommendation,
+    devices: &[mappings::ProfileDevice],
+) -> Result<Vec<String>> {
+    let profile = recommendation.text.lines().nth(1).unwrap_or_default();
+    if profile.split('\t').nth(2) != Some("-") {
+        let text = mappings::profile_text_from_reply(&recommendation.text)
+            .ok_or("the reply has no profile in VibeConsole's format")?;
+        let mut profile = mappings::import_profile(&text, config)?;
+        mappings::check_profile_controls(&mut profile, devices)?;
+        mappings::refuse_risky(&profile.mappings)?;
+        let words = vec![mappings::profile_in_words(&profile)];
+        config.profiles.push(profile);
+        return Ok(words);
+    }
+    let new = mappings::mappings_from_reply(&recommendation.text, config, devices)?;
+    merge_default(ui, config, new, true)
+}
+/// v7.7 ticket 266: A on AI Recommendations: every change staged in turn (a refused one is
+/// left out with its reason), shown in one review, saved in one atomic save on Save all.
+/// Returns what was applied.
+fn apply_all_recommendations(
+    ui: &mut impl Ui,
+    path: &Path,
+    shown: &[mappings::Recommendation],
+) -> Result<Vec<String>> {
+    let mut config = mappings::load_config(path)?;
+    let devices = mappings::profile_devices(&config, ui.context(), ui.program().as_ref());
+    let (mut applied, mut changes, mut left) = (Vec::new(), Vec::new(), Vec::new());
+    for recommendation in shown {
+        let mut staged = config.clone();
+        match stage_recommendation(ui, &mut staged, recommendation, &devices) {
+            Ok(words) if !words.is_empty() => {
+                config = staged;
+                applied.push(recommendation.what.clone());
+                changes.push(format!("{}\n  {}", recommendation.what, words.join("\n  ")));
+            }
+            Ok(_) => left.push(format!(
+                "  {}: you kept what it does now",
+                recommendation.what
+            )),
+            Err(error) => left.push(format!("  {}: {error}", recommendation.what)),
+        }
+    }
+    if applied.is_empty() {
+        choose(
+            ui,
+            &format!("Nothing to apply; nothing saved.\n{}", left.join("\n")),
+            &options(&["Back"]),
+        )?;
+        return Ok(Vec::new());
+    }
+    let left = if left.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nLeft out:\n{}", left.join("\n"))
+    };
+    if question(
+        ui,
+        &format!(
+            "Apply all {} recommendations?\n\n{}{left}",
+            applied.len(),
+            changes.join("\n")
+        ),
+        &options(&["Cancel", "Save all"]),
+    )? != Some(1)
+    {
+        return Ok(Vec::new());
+    }
+    mappings::save_config(path, &config)?;
+    Ok(applied)
 }
 /// v7.7 ticket 171: one recommendation's change, reviewed like any AI reply: a Default
 /// mapping (its replacement needs its yes) or an app profile; true when saved.
@@ -8849,7 +8935,7 @@ fn review_profile(
         let rows = profile
             .mappings
             .iter()
-            .filter(|m| m.context == device.context)
+            .filter(|m| device.holds(m.context))
             .map(|m| format!("  {}: {}\n", m.label, m.action_label()))
             .collect::<String>();
         if !rows.is_empty() {
@@ -16001,6 +16087,122 @@ mod tests {
         let a =
             mappings::default_on(&config, mappings::GAMEPAD_CONTEXT, Control::button(0)).unwrap();
         assert_eq!(a.keys.join("+"), "Ctrl+T");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    /// v7.7 ticket 266: A applies every recommendation in one review and one save: a stick
+    /// direction, one in another Xbox program, and an app profile; a refused one is listed
+    /// with its reason and left out; Cancel saves nothing.
+    #[test]
+    fn recommendations_apply_all_in_one_save() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-recs-all-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let mut config = mappings::Config::default();
+        config.look.share_usage = true;
+        mappings::save_config(&path, &config).unwrap();
+        let usage = dir.join("usage");
+        let mut day = crate::usage::Day::default();
+        day.add("press", "Xbox D-pad down", 2047);
+        crate::usage::flush(&usage, crate::usage::today(), &day).unwrap();
+        let file = |name: &str, apps: Vec<String>, m: Mapping| {
+            format!(
+                "```\n{}```\n",
+                mappings::export_profile(&mappings::Profile {
+                    name: name.into(),
+                    apps,
+                    mappings: vec![m],
+                })
+                .unwrap()
+            )
+        };
+        let right_down = Control::button(crate::gamepad::STICK_BASE + 5);
+        let mut browser = Mapping::new(Control::button(0), "Ctrl+T", "hold").unwrap();
+        browser.context = mappings::xbox_context(5, false);
+        let command = Mapping::new_action(
+            Control::button(2),
+            mappings::Input::Pad,
+            crate::actions::Action::Command {
+                window: "c".into(),
+                dir: "/tmp".into(),
+                line: "rm -rf ~".into(),
+            },
+        )
+        .unwrap();
+        let reply = format!(
+            "recommendation\tPut Page Down on Xbox Right stick down\tYou pressed D-pad down 2047 times\n{}recommendation\tNew tab on A in Browser\tProgram 5 is your browser\n{}recommendation\tA Firefox profile\tPad 1 closes tabs there\n{}recommendation\tClean up\tIt's quicker\n{}",
+            file(
+                "AI",
+                vec![],
+                Mapping::new(right_down, "PageDown", "hold").unwrap()
+            ),
+            file("AI", vec![], browser),
+            file(
+                "Firefox",
+                vec!["firefox.desktop".into()],
+                Mapping::new(Control::from_note(10, 36).unwrap(), "Ctrl+W", "hold").unwrap()
+            ),
+            file("AI", vec![], command),
+        );
+        let run = |keys: Vec<Key>| {
+            let mut ui = Script {
+                keys: keys.into(),
+                usage: Some(usage.clone()),
+                claude: reply.clone(),
+                ..Default::default()
+            };
+            ask_for(&mut ui, &path, AskKind::Recommendations).unwrap();
+            assert!(ui.keys.is_empty());
+            ui.screens
+        };
+        // Cancel: nothing saved, all four still listed.
+        let screens = run(vec![Character(b'a'), Enter, Escape]);
+        let review = screens
+            .iter()
+            .find(|s| s.starts_with("Apply all 3 recommendations?"))
+            .unwrap_or_else(|| panic!("one review for all: {screens:#?}"));
+        assert!(
+            review.contains("Put Page Down on Xbox Right stick down"),
+            "{review}"
+        );
+        assert!(
+            review.contains("Xbox Right stick down: PageDown (was empty)"),
+            "{review}"
+        );
+        assert!(review.contains("New tab on A in Browser"), "{review}");
+        assert!(review.contains("A Firefox profile"), "{review}");
+        assert!(
+            review.contains("Left out:\n  Clean up:") && review.contains("terminal command"),
+            "{review}"
+        );
+        let unchanged = mappings::load_config(&path).unwrap();
+        assert!(unchanged.mappings.is_empty() && unchanged.profiles.is_empty());
+        // Save all: one save holds every change; the applied ones leave the list.
+        let screens = run(vec![Character(b'a'), Down, Enter, Escape]);
+        let config = mappings::load_config(&path).unwrap();
+        let stick = mappings::default_on(&config, mappings::GAMEPAD_CONTEXT, right_down).unwrap();
+        assert_eq!(stick.keys.join("+"), "PageDown");
+        let tab = mappings::default_on(
+            &config,
+            mappings::xbox_context(5, false),
+            Control::button(0),
+        )
+        .unwrap();
+        assert_eq!(tab.keys.join("+"), "Ctrl+T");
+        assert!(config.profile("Firefox").is_some());
+        assert!(
+            mappings::default_on(&config, mappings::GAMEPAD_CONTEXT, Control::button(2)).is_none()
+        );
+        let last = screens
+            .iter()
+            .rev()
+            .find(|s| s.starts_with("AI Recommendations"))
+            .unwrap();
+        assert!(
+            last.contains("Clean up") && !last.contains("Put Page Down"),
+            "{last}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
     /// v7.7 ticket 175: 3 Agents › Default agent cycles through agents on a fake PATH that

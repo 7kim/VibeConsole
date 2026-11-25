@@ -1022,7 +1022,9 @@ pub fn import_profile(text: &str, config: &Config) -> Result<Profile> {
             .next()
             .ok_or("fewer overrides than the profile line says")?;
         profile.mappings.push(
-            parse_mapping_line(line, 16, &config.midi_devices)
+            // v7.7 ticket 266: read as this build writes them (Xbox programs 2–8, newer
+            // actions); every line is still checked in full.
+            parse_mapping_line(line, CONFIG_VERSION, &config.midi_devices)
                 .map_err(|e| format!("override {}: {e}", n + 1))?,
         );
     }
@@ -1059,6 +1061,13 @@ pub struct ProfileDevice {
     pub name: &'static str,
     pub context: u8,
     pub controls: Vec<(Control, String)>,
+}
+impl ProfileDevice {
+    /// v7.7 ticket 266: whether an override in `context` is on this device: the Akai's
+    /// program, or any Xbox program and layer for the Xbox controller.
+    pub fn holds(&self, context: u8) -> bool {
+        self.context == context || (gamepad_context(self.context) && gamepad_context(context))
+    }
 }
 pub const AKAI_NAME: &str = "Akai MPK mini 3";
 pub const XBOX_NAME: &str = "Xbox controller";
@@ -1100,7 +1109,8 @@ pub fn profile_devices(
             mapped
         }
     };
-    let xbox = (0..crate::gamepad::BUTTONS.len() as u8)
+    // v7.7 ticket 266: the buttons, then the stick directions.
+    let xbox = (0..crate::gamepad::STICK_BASE + 8)
         .map(Control::button)
         .filter(|c| !crate::gamepad::is_reserved(*c))
         .map(|c| (c, c.label()))
@@ -1646,7 +1656,7 @@ pub fn check_profile_controls(profile: &mut Profile, devices: &[ProfileDevice]) 
     for (n, mapping) in profile.mappings.iter_mut().enumerate() {
         let name = devices
             .iter()
-            .filter(|d| d.context == mapping.context)
+            .filter(|d| d.holds(mapping.context))
             .flat_map(|d| &d.controls)
             .find(|(c, _)| *c == mapping.control)
             .map(|(_, name)| name.clone())
@@ -3515,6 +3525,8 @@ pub(crate) fn mapping_line(mapping: &Mapping) -> Result<String> {
 }
 
 /// The configuration file's text, checked by parsing it back.
+/// The configuration version this build writes (and reads mapping lines as).
+const CONFIG_VERSION: u32 = 34;
 pub fn serialize_config(config: &Config) -> Result<String> {
     config.idle.validate()?;
     validate_agents(&config.agents)?;
@@ -3522,7 +3534,7 @@ pub fn serialize_config(config: &Config) -> Result<String> {
     validate_variables(&config.vars, "user")?;
     config.validate_references()?;
     let mut contents = format!(
-        "vibeconsole-mappings-v34\nidle\t{}\t{}\t{}\n",
+        "vibeconsole-mappings-v{CONFIG_VERSION}\nidle\t{}\t{}\t{}\n",
         opt_text(config.idle.octave),
         opt_text(config.idle.tempo),
         arp_text(config.idle.arp)
@@ -5702,6 +5714,31 @@ mod tests {
             error.starts_with("override 3:") && error.contains("chosen devices"),
             "{error}"
         );
+        // v7.7 ticket 266: the stick directions are Xbox controls too, in every Xbox program
+        // and layer; the layer key and the Xbox button stay out.
+        assert!(request.contains("- Xbox Right stick down: "), "{request}");
+        let stick = |id: u8, context: u8| {
+            let mut m = Mapping::new(Control::button(id), "PageDown", "hold").unwrap();
+            m.context = context;
+            m
+        };
+        let right_down = crate::gamepad::STICK_BASE + 5;
+        let mut sticks = Profile {
+            name: "AI".into(),
+            apps: Vec::new(),
+            mappings: vec![
+                stick(right_down, GAMEPAD_CONTEXT),
+                stick(right_down, xbox_context(2, false)),
+                stick(right_down, xbox_context(5, true)),
+            ],
+        };
+        check_profile_controls(&mut sticks, &devices).unwrap();
+        assert_eq!(sticks.mappings[1].label, "Xbox Right stick down");
+        let mut layer_key = Profile {
+            mappings: vec![stick(4, xbox_context(2, false))],
+            ..sticks.clone()
+        };
+        assert!(check_profile_controls(&mut layer_key, &devices).is_err());
     }
 
     /// Review fix: a v16 file written before devices, profiles, the lock or favourites
