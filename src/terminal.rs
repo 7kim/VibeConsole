@@ -3106,6 +3106,15 @@ impl Terminal {
                             "Start or repair Wispr Flow · output pauses meanwhile".into(),
                             Some(12),
                         ),
+                        // v7.8 ticket 25 (developer test 25: it was missing from this pane).
+                        head("Sound"),
+                        one(
+                            format!(
+                                "Sound combos ({}) · speaker, mic and card mode",
+                                config.sound_combos.len()
+                            ),
+                            Some(SETTING + 12),
+                        ),
                         head("Variables"),
                         one(
                             format!(
@@ -18998,7 +19007,7 @@ mod tests {
         let commands = [
             0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 19, 20, 21, 23, 24,
         ];
-        let settings = [0, 2, 3, 4, 5, 6, 7, 11].map(|row| SETTING + row); // v7.8 18: no 10
+        let settings = [0, 2, 3, 4, 5, 6, 7, 11, 12].map(|row| SETTING + row); // v7.8 18: no 10
         // Each agent, then Add agent, the two hooks rows and Status lights; no prompts,
         // sequences or profiles, so each of those lists is its "New …" row.
         let agents = mappings::load_config(&dir.join("mappings.tsv"))
@@ -19563,6 +19572,24 @@ mod tests {
         assert!(row(&mut ui, Some(true)).ends_with("Start at login · On"));
         assert!(row(&mut ui, Some(false)).ends_with("Start at login · Off"));
         assert!(row(&mut ui, None).ends_with("Start at login · unknown"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    /// v7.8 ticket 25 (developer test 25): 8 System's pane has the Sound combos row, with the
+    /// number of combos saved.
+    #[test]
+    fn system_tab_shows_the_sound_combos_row() {
+        let (dir, mut ui, _ran, _) = configure_session("sound-row");
+        ui.tab = 7;
+        ui.read_view(None);
+        let rows = (ui.tab_panes(7, 120, usize::MAX).into_iter())
+            .flat_map(|(_, entries)| entries)
+            .map(|(lines, _)| lines[0].clone())
+            .collect::<Vec<_>>();
+        assert!(
+            rows.iter()
+                .any(|l| l.ends_with("Sound combos (0) · speaker, mic and card mode")),
+            "{rows:?}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
     /// v7.7 ticket 183: every kind's request carries its own skill (never another's) for any

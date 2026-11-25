@@ -30,7 +30,7 @@ TABS = {
     # v7.7 ticket 152: 3 Agents, 4 Prompts, 6 and 7 list the config's own items; no scenario opens them.
     b"5": ["/prog-select", "/program-name", "/feedback-idle", "/feedback-check", "/prog-select (Xbox)",
            "/program-name (Xbox)", "/detect", "/get", "MIDI device"],
-    b"8": ["Start at login", "Start Wispr Flow with VibeConsole", "Start or repair Wispr Flow", "Startup variables", "User variables"],
+    b"8": ["Start at login", "Start Wispr Flow with VibeConsole", "Start or repair Wispr Flow", "Sound combos", "Startup variables", "User variables"],
 }
 # A connected Xbox controller (or any input device) must not reach a scenario: it could run
 # the session and send real shortcuts. bwrap hides /dev/input from the app (v7.7 ticket 150).
