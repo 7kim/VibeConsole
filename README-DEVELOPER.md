@@ -238,6 +238,8 @@ Plug an Xbox controller in over USB. `gilrs` reads it (evdev underneath); MIDI a
 | Xbox driver (xpad is the default) | After a confirm, switches between the **installed** `xpad` and `xone` drivers as root through pkexec (`vibeconsole xbox-driver <xpad\|xone>`). It unbinds the controller, binds the new driver, writes only `/etc/modprobe.d/vibeconsole-xbox-driver.conf`, and rolls back on a failed load. VibeConsole never installs, builds or signs a driver |
 | Test speaker / Test mic | Plays a test sound, or records 5 s and plays it back, through the headset (xone only) |
 | Xbox button light rule | Installs or removes the udev rule that makes xone's Xbox button light writable (`vibeconsole xbox-light-rule <install\|remove>`) |
+| Layer 2 button | The button held for layer 2: LB by default, any but the Xbox button, View and Menu; a button with assignments is refused until they're moved |
+| Rumble strength / Rumble length / Test rumble | Light, medium (default) or strong; 100–2000 ms (default 300; a long pattern is three times it); Test plays one rumble with them on the controller this session owns |
 
 Headset audio over the 3.5 mm jack needs `xone`; under `xpad` it's reported as unavailable. Bluetooth controllers are not supported yet. Unplugging releases held keys; after replugging, only the next fresh press fires.
 
