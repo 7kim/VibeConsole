@@ -552,6 +552,8 @@ struct Terminal {
     insights_at: Option<Instant>,
     /// v7 ticket 86: each device's switch and patterns; None while Status lights is off.
     device_lights: Option<crate::status::DevicePatterns>,
+    /// v7.8 ticket 28: devices following an agent that isn't in the Agents list (named once).
+    unknown_follows: Vec<String>,
     /// Agents' status-light settings, in `agent_states` order; None while Status lights is Off.
     light_agents: Option<Vec<mappings::Agent>>,
     /// Ticket 16: busy folder sources from sessions VibeConsole did not start
@@ -1626,6 +1628,7 @@ impl Terminal {
             insights: Vec::new(),
             insights_at: None,
             device_lights: None,
+            unknown_follows: Vec::new(),
             light_agents: None,
             light_sessions: Vec::new(),
             light_patterns: crate::status::Patterns::default(),
@@ -3447,6 +3450,23 @@ impl Terminal {
         let before = self.alert_states();
         self.light_agents = config.status_lights.then(|| config.agents.clone());
         self.device_lights = config.status_lights.then(|| config.device_lights.clone());
+        // v7.8 ticket 28: an unknown agent loads as every agent, said once.
+        let unknown = (crate::status::FOLLOWERS
+            .iter()
+            .zip(&config.device_lights.follows))
+        .filter_map(|((_, device), name)| {
+            let name = name.as_deref()?;
+            (!config.agents.iter().any(|a| a.name == name))
+                .then(|| format!("{device} follows {name}"))
+        })
+        .collect::<Vec<_>>();
+        if unknown != self.unknown_follows && !unknown.is_empty() {
+            self.notice = format!(
+                "Lights: {}, not in the Agents list: showing every agent",
+                unknown.join(", ")
+            );
+        }
+        self.unknown_follows = unknown;
         // Settings -> Xbox tuning applies within a status refresh; a stick mode change is a
         // transition (v7 ticket 75).
         // v7.8 ticket 23: so is a new layer 2 button (layer 1 again, held keys released).
@@ -3582,13 +3602,16 @@ impl Terminal {
     /// v7 tickets 11 and 86: rumble as a source newly enters a state whose Xbox pattern
     /// rumbles, under the Status lights and Xbox switches.
     fn rumble_since(&mut self, before: &[(String, &'static str)]) {
-        let rumble = self
-            .device_lights
-            .as_ref()
-            .filter(|p| p.on[1])
-            .map_or(crate::status::Rumble::Off, |p| {
-                crate::status::rumble_for(before, &self.alert_states(), p)
-            });
+        let rumble = self.device_lights.as_ref().filter(|p| p.on[1]).map_or(
+            crate::status::Rumble::Off,
+            |p| {
+                crate::status::rumble_for(
+                    &self.states_for(1, before),
+                    &self.states_for(1, &self.alert_states()),
+                    p,
+                )
+            },
+        );
         if let Some(pad) = &mut self.gamepad {
             if let Err(error) = pad.rumble(rumble) {
                 self.notice = error.to_string();
@@ -3660,6 +3683,32 @@ impl Terminal {
             )
             .collect()
     }
+    /// v7.8 ticket 28: the agent light device `device` (`status::FOLLOWERS` order) follows,
+    /// when it's in the Agents list; else None: every agent, as before.
+    fn follows(&self, device: usize) -> Option<&str> {
+        let name = self.device_lights.as_ref()?.follows[device].as_deref()?;
+        (self.light_agents.as_ref()?.iter())
+            .any(|a| a.name == name)
+            .then_some(name)
+    }
+    /// v7.8 ticket 28: of `all` (source, state), what device `device` shows: its agent's
+    /// alone (none while that agent has no session: the device rests), or every source's.
+    /// Test the lights reaches every device.
+    fn states_for(
+        &self,
+        device: usize,
+        all: &[(String, &'static str)],
+    ) -> Vec<(String, &'static str)> {
+        match self.follows(device).filter(|_| self.light_test.is_none()) {
+            Some(name) => all.iter().filter(|(s, _)| s == name).cloned().collect(),
+            None => all.to_vec(),
+        }
+    }
+    fn device_states(&self, device: usize) -> Vec<&'static str> {
+        (self.states_for(device, &self.alert_states()).into_iter())
+            .map(|(_, state)| state)
+            .collect()
+    }
     /// Attending to an agent (its tmux window, or a mapping sent to it) clears its finished state.
     fn clear_finished(&mut self, agents: &[String]) {
         for (name, _, state) in &mut self.agent_states {
@@ -3700,15 +3749,18 @@ impl Terminal {
                 self.lights_since.elapsed().as_millis(),
             );
         }
+        // v7.8 ticket 28: following one agent, only its octave light (no folder sessions).
+        let follows = self.follows(0);
         let states = self
             .agent_states
             .iter()
             .zip(agents)
             .filter(|((name, _, _), agent)| *name == agent.name)
+            .filter(|((name, _, _), _)| follows.is_none_or(|f| name == f))
             .map(|((_, _, state), agent)| (*state, agent.octave))
             .chain(
-                self.light_sessions
-                    .iter()
+                (self.light_sessions.iter())
+                    .filter(|_| follows.is_none())
                     .map(|(_, state, octave)| (*state, *octave)),
             )
             .collect::<Vec<_>>();
@@ -4729,8 +4781,7 @@ impl Terminal {
     /// `ms` drives the tempo patterns (v7 ticket 134), which VibeConsole switches itself.
     fn show_button_light_at(&mut self, ms: u64) {
         use crate::gamepad::Light;
-        let states = self.alert_states();
-        let states = states.iter().map(|(_, s)| *s).collect::<Vec<_>>();
+        let states = self.device_states(1); // v7.8 ticket 28
         let pattern = self
             .device_lights
             .as_ref()
@@ -4758,8 +4809,7 @@ impl Terminal {
     /// output runs and the keyboard switch is on; otherwise (paused, nothing busy, switched
     /// off) it shows what it showed before. A failure gives the LED up and says why.
     fn show_lock_light(&mut self) {
-        let states = self.alert_states();
-        let states = states.iter().map(|(_, s)| *s).collect::<Vec<_>>();
+        let states = self.device_states(2); // v7.8 ticket 28
         let pattern = self
             .device_lights
             .as_ref()
@@ -4865,8 +4915,10 @@ impl Terminal {
         };
         // v7.7 ticket 199: each device shows its own set, else the shared one.
         let keyboard = lights.as_ref().filter(|p| p.rgb_devices[0].on);
-        let frame =
-            keyboard.is_some_and(|p| framed(crate::status::rgb_for(&states, &p.rgb_set(0))));
+        // v7.8 ticket 28: each RGB device its own agent's states (FOLLOWERS 3–6).
+        let followed = (3..7).map(|d| self.device_states(d)).collect::<Vec<_>>();
+        let states = &followed[0];
+        let frame = keyboard.is_some_and(|p| framed(crate::status::rgb_for(states, &p.rgb_set(0))));
         let (open, began) = (self.rgb.is_some(), Instant::now());
         drive_rgb(
             (&mut self.rgb, &mut self.rgb_failed, &mut self.notice),
@@ -4875,8 +4927,8 @@ impl Terminal {
             keyboard.filter(|_| running).map(|p| {
                 let set = p.rgb_set(0);
                 // v7.7 ticket 209: the most urgent state's own brightness.
-                let level = crate::status::busy_index(&states).map_or(0, |i| p.rgb_brightness[i]);
-                (step(crate::status::rgb_for(&states, &set)), level, set.rest)
+                let level = crate::status::busy_index(states).map_or(0, |i| p.rgb_brightness[i]);
+                (step(crate::status::rgb_for(states, &set)), level, set.rest)
             }),
             keyboard.map(|p| p.rgb_set(0).rest),
             |rest| RgbKeyboards::open(std::path::Path::new(crate::keyboard::RAZER), rest),
@@ -4893,7 +4945,8 @@ impl Terminal {
                 .as_ref()
                 .filter(|p| p.rgb_devices[1 + i].on)
                 .map(|p| p.rgb_set(1 + i));
-            let frame = accessory.is_some_and(|set| framed(crate::status::rgb_for(&states, &set)));
+            let states = &followed[1 + i];
+            let frame = accessory.is_some_and(|set| framed(crate::status::rgb_for(states, &set)));
             let (open, began) = (self.accessories[i].is_some(), Instant::now());
             drive_rgb(
                 (
@@ -4905,7 +4958,7 @@ impl Terminal {
                 // Brightness is left alone on accessories (RgbKeyboards::open_accessory).
                 accessory
                     .filter(|_| running)
-                    .map(|set| (step(crate::status::rgb_for(&states, &set)), 255, set.rest)),
+                    .map(|set| (step(crate::status::rgb_for(states, &set)), 255, set.rest)),
                 accessory.map(|set| set.rest),
                 |rest| {
                     let driver = std::path::Path::new(crate::keyboard::RAZER_ACCESSORY);
@@ -4915,7 +4968,7 @@ impl Terminal {
             );
             slow_frame(&mut self.notice, open && frame && running, began, label);
         }
-        self.show_mouse(&states, running);
+        self.show_mouse(&followed[3], running);
     }
     /// v7.7 ticket 190: while running, the G502 logo shows the most urgent state's effect as
     /// a logirgb preview; idle, paused or switched off, the mouse's own stored lighting goes
@@ -7884,7 +7937,13 @@ fn agent_choice(ui: &mut impl Ui, path: &Path, index: usize) -> Result<()> {
             &strings(&["Cancel", "Remove"]),
         )? == Some(1)
         {
-            config.agents.remove(index);
+            let removed = config.agents.remove(index);
+            // v7.8 ticket 28: its devices go back to every agent, in the same save.
+            for follows in &mut config.device_lights.follows {
+                if follows.as_deref() == Some(removed.name.as_str()) {
+                    *follows = None;
+                }
+            }
             if let Err(error) = mappings::save_config(path, &config) {
                 not_saved(ui, &error)?;
             }
@@ -8000,7 +8059,13 @@ fn agent_choice(ui: &mut impl Ui, path: &Path, index: usize) -> Result<()> {
             )
             .into());
         }
-        if existing.is_some() {
+        if let Some(old) = &existing {
+            // v7.8 ticket 28: a rename keeps the devices that follow it, in the same save.
+            for follows in &mut config.device_lights.follows {
+                if follows.as_deref() == Some(old.name.as_str()) {
+                    *follows = Some(agent.name.clone());
+                }
+            }
             config.agents[index] = agent;
         } else {
             config.agents.push(agent);
@@ -10865,6 +10930,50 @@ fn test_lights(ui: &mut impl Ui, d: &crate::status::DevicePatterns) -> Result<()
     ui.light_test(None)?;
     result
 }
+/// v7.8 ticket 28: each light device follows every agent (the most urgent state wins) or one
+/// agent from the Agents list, whatever hosts it; saved atomically.
+fn follows_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
+    loop {
+        let mut config = mappings::load_config(path)?;
+        let rows = (crate::status::FOLLOWERS
+            .iter()
+            .zip(&config.device_lights.follows))
+        .map(|((_, device), name)| {
+            format!("{device}: {}", name.as_deref().unwrap_or("Every agent"))
+        })
+        .collect::<Vec<_>>();
+        let Some(device) = choose(
+            ui,
+            "Each device follows (one agent: only its state, and while it has no session the device rests)",
+            &rows,
+        )?
+        else {
+            return Ok(());
+        };
+        let mut options = vec!["Every agent (the most urgent state)".to_string()];
+        options.extend(config.agents.iter().map(|a| a.name.clone()));
+        let saved = match &config.device_lights.follows[device] {
+            None => Some(0),
+            Some(name) => config
+                .agents
+                .iter()
+                .position(|a| &a.name == name)
+                .map(|i| i + 1),
+        };
+        let Some(pick) = choose_saved(
+            ui,
+            &format!("{} follows", crate::status::FOLLOWERS[device].1),
+            options,
+            saved,
+        )?
+        else {
+            continue;
+        };
+        config.device_lights.follows[device] =
+            pick.checked_sub(1).map(|i| config.agents[i].name.clone());
+        mappings::save_config(path, &config)?;
+    }
+}
 fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
     const NAMES: [&str; 4] = [
         "Needs a decision (Claude asks a multiple-choice question)",
@@ -10930,6 +11039,16 @@ fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
             0,
             "Test the lights: each state for 10 seconds on every light".into(),
         );
+        // v7.8 ticket 28: last, so every other row keeps its number.
+        let following = (devices.follows.iter()).filter(|f| f.is_some()).count();
+        let follows_row = rows.len();
+        rows.push(format!(
+            "Each device follows: {}",
+            match following {
+                0 => "every agent".to_owned(),
+                n => format!("{n} follow one agent"),
+            }
+        ));
         let blind = NAMES
             .iter()
             .zip(patterns.states)
@@ -10955,6 +11074,12 @@ fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
         };
         if index == 0 {
             test_lights(ui, &devices)?; // changes nothing saved
+            continue;
+        }
+        if index == follows_row {
+            if let Err(error) = follows_menu(ui, path) {
+                not_saved(ui, &error)?;
+            }
             continue;
         }
         let index = index - 1;
@@ -27706,6 +27831,7 @@ mod tests {
         let mut script = Script {
             keys: [
                 Key::Up,
+                Key::Up, // v7.8 ticket 28: Each device follows is the last row now
                 Key::Enter,
                 Key::Up,
                 Key::Up,
@@ -28450,6 +28576,109 @@ mod tests {
                 entry.path()
             );
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.8 ticket 28: with claude thinking and codex needing input, a device following
+    /// claude shows thinking, one following codex needs input, every agent the most urgent
+    /// (needs input); one following an agent with no session rests; Test the lights reaches
+    /// all of them; an agent not in the list counts as every agent.
+    #[test]
+    fn each_device_shows_the_agent_it_follows() {
+        let (dir, mut ui, _ran, _) = configure_session("follows");
+        let agent = |name: &str| mappings::Agent::new(name, name, name).unwrap();
+        ui.light_agents = Some(vec![agent("claude"), agent("codex"), agent("orca-claude")]);
+        ui.agent_states = vec![
+            ("claude".into(), "claude".into(), "thinking"),
+            ("codex".into(), "codex".into(), "needs-input"),
+        ];
+        let mut lights = mappings::Config::default().device_lights;
+        lights.follows[1] = Some("codex".into()); // Xbox
+        lights.follows[2] = Some("claude".into()); // keyboard LEDs
+        lights.follows[4] = Some("orca-claude".into()); // speakers: no session
+        lights.follows[5] = Some("gone".into()); // mousepad: not an agent
+        ui.device_lights = Some(lights.clone());
+        assert_eq!(ui.device_states(2), ["thinking"]);
+        assert_eq!(ui.device_states(1), ["needs-input"]);
+        assert_eq!(
+            ui.device_states(4),
+            Vec::<&str>::new(),
+            "no session: it rests"
+        );
+        assert_eq!(
+            crate::status::rgb_for(&ui.device_states(4), &lights.rgb_set(1)),
+            None
+        );
+        for every in [0, 3, 5] {
+            let states = ui.device_states(every);
+            assert_eq!(states, ["thinking", "needs-input"], "device {every}");
+            assert_eq!(
+                crate::status::busy_index(&states),
+                crate::status::busy_index(&["needs-input"]),
+                "the most urgent"
+            );
+        }
+        ui.light_test = Some("finished");
+        assert_eq!(
+            ui.device_states(2),
+            ["finished"],
+            "Test the lights reaches it"
+        );
+        ui.light_test = None;
+        // The Akai following claude lights only claude's octave (+1), with codex and a
+        // folder session (−3) needing input too.
+        ui.agent_states[0].2 = "needs-input";
+        ui.light_sessions = vec![("/work/app".into(), "needs-input", -3)];
+        (ui.context_verified, ui.feedback_allowed) = (true, true);
+        ui.device_lights.as_mut().unwrap().follows[0] = Some("claude".into());
+        for _ in 0..3 {
+            assert_eq!(ui.wanted_lights().map(|s| s.octave), Some(Some(1)));
+        }
+        ui.agent_states[0].2 = "idle";
+        assert_eq!(
+            ui.wanted_lights(),
+            None,
+            "claude idle: the program's own feedback"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.8 ticket 28: renaming an agent keeps the devices that follow it; removing it puts
+    /// them back on every agent, in the same save.
+    #[test]
+    fn renaming_or_removing_an_agent_carries_its_devices() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-follows-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let mut config = mappings::Config::default();
+        config.agents = vec![mappings::Agent::new("claude", "claude", "claude").unwrap()];
+        config.device_lights.follows[2] = Some("claude".into());
+        mappings::save_config(&path, &config).unwrap();
+        // Edit -> name "claude" + "2", then Enter through host, launch, window, folder, octave.
+        let mut keys = vec![Enter, Character(b'2')];
+        keys.extend([Enter; 6]);
+        let mut ui = Script {
+            keys: keys.into(),
+            ..Default::default()
+        };
+        agent_choice(&mut ui, &path, 0).unwrap();
+        assert!(ui.keys.is_empty(), "{}", ui.screens.join("\n----\n"));
+        let saved = mappings::load_config(&path).unwrap();
+        assert_eq!(
+            saved.agents[0].name,
+            "claude2",
+            "{}",
+            ui.screens.join("\n----\n")
+        );
+        assert_eq!(saved.device_lights.follows[2].as_deref(), Some("claude2"));
+        // Remove -> Remove.
+        ui.keys = [Down, Enter, Down, Enter].into();
+        agent_choice(&mut ui, &path, 0).unwrap();
+        let saved = mappings::load_config(&path).unwrap();
+        assert!(saved.agents.is_empty());
+        assert!(saved.device_lights.follows.iter().all(Option::is_none));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

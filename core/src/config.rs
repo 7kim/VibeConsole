@@ -14,8 +14,9 @@ pub const VERSION: u64 = 1;
 /// v7.7 ticket 209: lights.json's own version: 2 holds the keyboard RGB brightness per
 /// state; a version 1 file's single brightness loads into all four. Ticket 212: 3 holds
 /// `rgb_in_step`; older files load it on (the shipped default). Ticket 237: 4 holds
-/// `rgb_step_period` (ms); older files load 4000.
-pub const LIGHTS_VERSION: u64 = 4;
+/// `rgb_step_period` (ms); older files load 4000. v7.8 ticket 28: 5 holds `follows` (each
+/// device's agent, or "all"); older files load "all".
+pub const LIGHTS_VERSION: u64 = 5;
 /// v7.8: mappings.json's own version: 2 holds v7.8's new action words (ticket 10: `media:…`);
 /// a version 1 file loads as it is (it has none of them). An older VibeConsole refuses a
 /// version 2 file by its version, not by an unknown word.
@@ -1116,6 +1117,11 @@ fn lights(config: &Config) -> Value {
         "speakers_rgb": device(1),
         "mousepad_rgb": device(2),
         "mouse_rgb": device(3),
+        "follows": crate::status::FOLLOWERS
+            .iter()
+            .zip(&d.follows)
+            .map(|((key, _), follows)| (key.to_string(), json!(follows.as_deref().unwrap_or("all"))))
+            .collect::<Map<_, _>>(),
     })
 }
 
@@ -1138,6 +1144,7 @@ impl Lights {
             "speakers_rgb",
             "mousepad_rgb",
             "mouse_rgb",
+            "follows",
         ])?;
         let rgb = |at: &Obj, key: &str| at.check(key, crate::status::parse_rgb(at.str(key)?));
         // v7.7 ticket 199: a set: the resting effect and one effect per state.
@@ -1287,6 +1294,20 @@ impl Lights {
                 }
                 period
             },
+            // v7.8 ticket 28: versions 1–4 had none: every agent.
+            follows: if at.int::<u64>("version")? < 5 {
+                Default::default()
+            } else {
+                let follows = at.obj("follows")?;
+                let keys = crate::status::FOLLOWERS.map(|(key, _)| key);
+                follows.only(&keys)?;
+                let mut out: [Option<String>; 7] = Default::default();
+                for (slot, key) in out.iter_mut().zip(keys) {
+                    let name = follows.str(key)?;
+                    *slot = (name != "all").then(|| name.to_owned());
+                }
+                out
+            },
         };
         at.check("xbox", devices.validate())?;
         Ok(Self {
@@ -1326,6 +1347,42 @@ mod tests {
         config.start_flow = false;
         config.env = vec![("EDITOR".into(), "hx".into()), ("A_1".into(), "x y".into())];
         config
+    }
+
+    /// v7.8 ticket 28: lights.json v5 keeps which agent each device follows ("all" for every
+    /// agent); a v4 file (none) loads every agent; a bad name is refused.
+    #[test]
+    fn lights_follows_round_trips_and_older_files_follow_every_agent() {
+        let dir = folder("follows");
+        let path = dir.join("mappings.tsv");
+        let mut config = Config::default();
+        config.device_lights.follows[2] = Some("claude".into());
+        config.device_lights.follows[4] = Some("orca-claude".into());
+        mappings::save_config(&path, &config).unwrap();
+        let text = fs::read_to_string(dir.join("lights.json")).unwrap();
+        let saved: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(saved["version"], 5);
+        assert_eq!(saved["follows"]["keyboard_leds"], "claude");
+        assert_eq!(saved["follows"]["speakers_rgb"], "orca-claude");
+        assert_eq!(saved["follows"]["mpk"], "all");
+        assert_eq!(
+            mappings::load_config(&path).unwrap().device_lights,
+            config.device_lights
+        );
+        let mut bad = config.clone();
+        bad.device_lights.follows[0] = Some("../x".into());
+        assert!(mappings::save_config(&path, &bad).is_err());
+        assert_eq!(
+            fs::read_to_string(dir.join("lights.json")).unwrap(),
+            text,
+            "kept"
+        );
+        let start = text.find(",\n  \"follows\"").unwrap();
+        let v4 = format!("{}\n}}\n", &text[..start]).replace("\"version\": 5", "\"version\": 4");
+        fs::write(dir.join("lights.json"), v4).unwrap();
+        let older = mappings::load_config(&path).unwrap().device_lights.follows;
+        assert!(older.iter().all(Option::is_none), "{older:?}");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     /// v7.8 ticket 24: devices.json v3 keeps the rumble strength and length; a v2 file (none)
@@ -1659,7 +1716,7 @@ mod tests {
         // v7.7 ticket 209: a version 1 file's one keyboard brightness loads into all four
         // states, and the next save writes version 2 with one per state.
         let v1 = good
-            .replace("\"version\": 4", "\"version\": 1")
+            .replace("\"version\": 5", "\"version\": 1")
             .replace("  \"rgb_in_step\": false,\n", "")
             .replace("  \"rgb_step_period\": 6000,\n", "");
         let at = v1.find("\"brightness\": {").unwrap();
@@ -1671,7 +1728,7 @@ mod tests {
         mappings::save_config(&path, &old).unwrap();
         let saved = fs::read_to_string(&file).unwrap();
         assert!(
-            saved.contains("\"version\": 4") && saved.contains("\"thinking\": 77"),
+            saved.contains("\"version\": 5") && saved.contains("\"thinking\": 77"),
             "{saved}"
         );
         // v7.7 ticket 212: a version 2 file (no rgb_in_step) loads it on, and the next save
@@ -1681,7 +1738,7 @@ mod tests {
             "the test's own value"
         );
         let v2 = good
-            .replace("\"version\": 4", "\"version\": 2")
+            .replace("\"version\": 5", "\"version\": 2")
             .replace("  \"rgb_in_step\": false,\n", "")
             .replace("  \"rgb_step_period\": 6000,\n", "");
         fs::write(&file, &v2).unwrap();
@@ -1690,14 +1747,14 @@ mod tests {
         mappings::save_config(&path, &old).unwrap();
         let saved = fs::read_to_string(&file).unwrap();
         assert!(
-            saved.contains("\"version\": 4") && saved.contains("\"rgb_in_step\": true"),
+            saved.contains("\"version\": 5") && saved.contains("\"rgb_in_step\": true"),
             "{saved}"
         );
         // v7.7 ticket 237: a version 3 file (no rgb_step_period) loads 4000; a version 4
         // file with 25000, or without it, is refused naming the field.
         assert!(good.contains("  \"rgb_step_period\": 6000,\n"), "{good}");
         let v3 = good
-            .replace("\"version\": 4", "\"version\": 3")
+            .replace("\"version\": 5", "\"version\": 3")
             .replace("  \"rgb_step_period\": 6000,\n", "");
         fs::write(&file, &v3).unwrap();
         assert_eq!(

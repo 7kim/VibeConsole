@@ -633,7 +633,21 @@ pub struct DevicePatterns {
     /// v7.7 ticket 237 (lights.json v4): the in-step cycle, in ms (1000–20000), for a breath
     /// or spectrum that sets none.
     pub rgb_step_period: u16,
+    /// v7.8 ticket 28 (lights.json v5): the agent each light device follows, in `FOLLOWERS`
+    /// order; None: every agent (the most urgent state wins, as before).
+    pub follows: [Option<String>; 7],
 }
+/// v7.8 ticket 28: the light devices that can follow one agent: (lights.json key, name).
+pub const FOLLOWERS: [(&str, &str); 7] = [
+    ("mpk", "Akai"),
+    ("xbox", "Xbox light and rumble"),
+    ("keyboard_leds", "Keyboard LEDs"),
+    ("keyboard_rgb", "Keyboard RGB"),
+    ("speakers_rgb", "Speakers"),
+    ("mousepad_rgb", "Mousepad"),
+    ("mouse_rgb", "Mouse"),
+];
+
 /// v7.7 ticket 212: the cycle of an in-step breath or spectrum that sets none, so the
 /// Razer frames and the G502 run at the same speed. Ticket 237: the shipped default of the
 /// Status light patterns setting, and what older lights.json files load.
@@ -1125,6 +1139,15 @@ pub fn keyboard_light_error(word: &str) -> String {
 }
 impl DevicePatterns {
     pub fn validate(&self) -> Result<()> {
+        // v7.8 ticket 28: an agent's name (an unknown one shows every agent, with a notice).
+        if let Some(name) = self
+            .follows
+            .iter()
+            .flatten()
+            .find(|n| !crate::mappings::simple_name(n))
+        {
+            return Err(format!("lights: follows {name:?}: not an agent name").into());
+        }
         if let Some(l) = self
             .keyboard
             .iter()

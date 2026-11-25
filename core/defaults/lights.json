@@ -1,5 +1,5 @@
 {
-  "version": 4,
+  "version": 5,
   "status_lights": true,
   "folders": [],
   "other": {
@@ -123,5 +123,14 @@
   "mouse_rgb": {
     "on": false,
     "own": null
+  },
+  "follows": {
+    "mpk": "all",
+    "xbox": "all",
+    "keyboard_leds": "all",
+    "keyboard_rgb": "all",
+    "speakers_rgb": "all",
+    "mousepad_rgb": "all",
+    "mouse_rgb": "all"
   }
 }
