@@ -1453,6 +1453,19 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                 }
             ));
             out.push(format!("Agent terminals: tmux attach -t vibe"));
+            // v7.8 ticket 71: Orca is asked only when an agent is hosted there.
+            if let Ok(config) = crate::mappings::load_config(&crate::mappings::config_path()?) {
+                if config
+                    .agents
+                    .iter()
+                    .any(|a| a.host == crate::mappings::Host::Orca)
+                {
+                    out.extend(orca_doctor(
+                        &config,
+                        crate::terminal::orca_live().as_deref(),
+                    ));
+                }
+            }
             for codex in [false, true] {
                 out.push(format!("{}", crate::status::hooks_status(codex)));
             }
@@ -1506,9 +1519,99 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// v7.8 ticket 71: one line per Orca agent: the live pane it matched, or why none did,
+/// from the Agents pane's own matching. Workspace paths only.
+fn orca_doctor(
+    config: &crate::mappings::Config,
+    live: Option<&[crate::status::OrcaSession]>,
+) -> Vec<String> {
+    use crate::terminal::OrcaPlace;
+    let places = crate::terminal::orca_places(config, live, &[]);
+    config
+        .agents
+        .iter()
+        .filter(|a| a.host == crate::mappings::Host::Orca)
+        .map(|agent| {
+            let kind = &agent.launch;
+            let why = match places.get(&agent.name) {
+                _ if live.is_none() => {
+                    "Orca unavailable: no answer from `orca worktree ps --json`".to_owned()
+                }
+                Some(OrcaPlace::Live(pane, _)) => format!(
+                    "live in {} ({})",
+                    pane.workspace,
+                    crate::terminal::state_word(pane.state)
+                ),
+                Some(OrcaPlace::NotRunning) => format!("not running (no live {kind} pane in Orca)"),
+                Some(OrcaPlace::OtherFolder(workspaces)) => format!(
+                    "running only in another folder: {} (its folder is {})",
+                    workspaces.join(", "),
+                    config
+                        .agent_directory(agent)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default()
+                ),
+                Some(OrcaPlace::Several(workspaces)) => format!(
+                    "status unknown: more than one live {kind} pane ({}); {} its folder",
+                    workspaces.join(", "),
+                    if agent.dir.is_some() { "narrow" } else { "set" }
+                ),
+                Some(OrcaPlace::Unknown) | None => match config.agent_directory(agent) {
+                    Err(error) => format!("status unknown: its folder: {error}"),
+                    Ok(_) => "status unknown".to_owned(),
+                },
+            };
+            format!("Orca agent {}: {why}", agent.name)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v7.8 ticket 71: `doctor --all` says which live Orca pane each Orca agent matched, or
+    /// why none did, from the same matching as the Agents pane.
+    #[test]
+    fn doctor_names_each_orca_agents_pane_or_why_none_matched() {
+        let mut config = crate::mappings::Config::default();
+        config.agents = [
+            ("orca-claude", "claude", Some("/x/Documents")),
+            ("orca-codex", "codex", None),
+            ("orca-omp", "omp", Some("/x/Elsewhere")),
+            ("orca-opencode", "opencode", None),
+        ]
+        .map(|(name, kind, dir)| {
+            let mut agent = crate::mappings::Agent::new(name, kind, name).unwrap();
+            agent.host = crate::mappings::Host::Orca;
+            agent.dir = dir.map(Into::into);
+            agent
+        })
+        .to_vec();
+        let reply = r#"{"result":{"hostScope":{"hostIds":["local"]},"worktrees":[
+            {"hostId":"local","path":"/x/Documents/VibeConsole","repo":"VibeConsole","agents":[
+                {"agentType":"claude","paneKey":"a:claude","state":"working","hasLivePty":true},
+                {"agentType":"omp","paneKey":"a:omp","state":"idle","hasLivePty":true},
+                {"agentType":"opencode","paneKey":"a:opencode","state":"idle","hasLivePty":true}]},
+            {"hostId":"local","path":"/x/Trading","repo":"Trading","agents":[
+                {"agentType":"opencode","paneKey":"b:opencode","state":"idle","hasLivePty":true}]}
+        ]}}"#;
+        let live = crate::status::orca_live_sessions(reply).unwrap();
+        assert_eq!(
+            orca_doctor(&config, Some(&live)),
+            [
+                "Orca agent orca-claude: live in /x/Documents/VibeConsole (WORKING)",
+                "Orca agent orca-codex: not running (no live codex pane in Orca)",
+                "Orca agent orca-omp: running only in another folder: /x/Documents/VibeConsole (its folder is /x/Elsewhere)",
+                "Orca agent orca-opencode: status unknown: more than one live opencode pane (/x/Documents/VibeConsole, /x/Trading); set its folder",
+            ]
+        );
+        assert_eq!(
+            orca_doctor(&config, None)[0],
+            "Orca agent orca-claude: Orca unavailable: no answer from `orca worktree ps --json`"
+        );
+    }
 
     /// v7.8 ticket 08: doctor's checklist from fixture checks:
     /// each area's 🟢/🟡/🔴 with its own reason or fix, and only what the checks said.

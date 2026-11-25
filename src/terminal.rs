@@ -8362,7 +8362,7 @@ impl AgentRow {
     }
 }
 /// A state as a word, never colour alone (v7.7 spec, 1 Live).
-fn state_word(state: &str) -> &'static str {
+pub(crate) fn state_word(state: &str) -> &'static str {
     match state {
         "needs-input" => "NEEDS INPUT",
         "needs-decision" => "DECISION",
@@ -8390,11 +8390,14 @@ fn project_of(folder: &str) -> String {
         )
 }
 
-enum OrcaPlace {
+pub(crate) enum OrcaPlace {
     Live(crate::status::OrcaSession, Option<String>),
     NotRunning,
     /// v7.8 ticket 70: live panes of its kind, all outside its folder (their workspaces).
     OtherFolder(Vec<String>),
+    /// v7.8 ticket 71: more than one live pane matched (their workspaces); never a guess.
+    Several(Vec<String>),
+    /// Orca didn't answer, or the agent's folder is invalid.
     Unknown,
 }
 
@@ -8408,7 +8411,7 @@ impl OrcaPlace {
 }
 
 /// Resolve an Orca entry by agent kind and, if set explicitly, workspace.
-fn orca_places(
+pub(crate) fn orca_places(
     config: &mappings::Config,
     live: Option<&[crate::status::OrcaSession]>,
     hooks: &[crate::status::Session],
@@ -8456,8 +8459,9 @@ fn orca_place(
             OrcaPlace::OtherFolder(elsewhere)
         };
     };
-    if panes.next().is_some() {
-        return OrcaPlace::Unknown;
+    let others = panes.map(|p| p.workspace.clone()).collect::<Vec<_>>();
+    if !others.is_empty() {
+        return OrcaPlace::Several([vec![pane.workspace.clone()], others].concat());
     }
     let mut folders = hooks.iter().filter_map(|hook| {
         (hook.pane.as_deref() == Some(&pane.pane)
@@ -8486,22 +8490,23 @@ fn orca_snapshot() -> Option<Vec<crate::status::OrcaSession>> {
     {
         cache.0 = Some(Instant::now());
         std::thread::spawn(|| {
-            let sessions = crate::actions::orca_program()
-                .ok()
-                .and_then(|program| {
-                    vibeconsole_core::program("timeout")
-                        .args(["--kill-after=1", "2", &program, "worktree", "ps", "--json"])
-                        .output()
-                        .ok()
-                })
-                .filter(|output| output.status.success())
-                .and_then(|output| {
-                    crate::status::orca_live_sessions(&String::from_utf8_lossy(&output.stdout))
-                });
+            let sessions = orca_live();
             CACHE.lock().unwrap_or_else(|e| e.into_inner()).1 = sessions;
         });
     }
     cache.1.clone()
+}
+
+/// Orca's live agent panes, or None when its CLI is missing, slow, fails or answers
+/// something invalid. Blocks up to 3 s.
+pub(crate) fn orca_live() -> Option<Vec<crate::status::OrcaSession>> {
+    let program = crate::actions::orca_program().ok()?;
+    let output = vibeconsole_core::program("timeout")
+        .args(["--kill-after=1", "2", &program, "worktree", "ps", "--json"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    crate::status::orca_live_sessions(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// A failed press stays failed until the next press; otherwise the derived state wins, so a
