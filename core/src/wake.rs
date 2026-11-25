@@ -1,6 +1,7 @@
 //! v7.7 ticket 225: one pipe that ends the terminal's wait for a key as soon as a MIDI or
-//! Xbox event arrives, instead of after up to 50 ms. Only a terminal run asks for it
-//! (`fd`); until then `wake` does nothing, so the login service never fills it.
+//! Xbox event arrives, instead of after up to 50 ms. Until a run asks for it (`fd`) `wake`
+//! does nothing. v7.8 ticket 27: the login service asks too (`wait`), so it handles a press
+//! as it arrives instead of after up to 20 ms.
 
 use std::os::fd::RawFd;
 use std::sync::OnceLock;
@@ -69,6 +70,28 @@ pub fn wake() {
     }
 }
 
+/// v7.8 ticket 27: the login service's wait between turns: until an event's wake or
+/// `timeout`, whichever is first (the loop's timers keep their timing). True when woken. With
+/// no pipe it sleeps the timeout, as before.
+pub fn wait(timeout: std::time::Duration) -> bool {
+    let Some(fd) = fd() else {
+        std::thread::sleep(timeout);
+        return false;
+    };
+    let mut poll = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+    // SAFETY: one valid pollfd; no ownership transfer. An interrupted poll is a short turn.
+    let woken = unsafe { libc::poll(&mut poll, 1, ms) } == 1 && poll.revents & libc::POLLIN != 0;
+    if woken {
+        drain();
+    }
+    woken
+}
+
 /// Empty the pipe after a wake, so the next wait blocks again.
 pub fn drain() {
     if let Some(Some([read, _])) = PIPE.get() {
@@ -84,6 +107,39 @@ pub fn drain() {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+    /// The tests share the one pipe: one at a time.
+    static PIPE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// v7.8 ticket 27: the login service's wait: an event's wake ends it at once (a thread
+    /// stands in for the MIDI callback); with none it lasts its timeout, so timers still fire.
+    #[test]
+    fn the_service_wait_ends_on_a_wake_and_otherwise_times_out() {
+        let _one = PIPE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        super::drain();
+        let start = Instant::now();
+        assert!(!super::wait(Duration::from_millis(30)), "nothing woke it");
+        assert!(
+            start.elapsed() >= Duration::from_millis(25),
+            "it waited its timeout"
+        );
+        let event = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(10));
+            super::wake();
+        });
+        let start = Instant::now();
+        assert!(super::wait(Duration::from_secs(5)), "the event woke it");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "without the timeout"
+        );
+        event.join().unwrap();
+        assert!(
+            !super::wait(Duration::ZERO),
+            "drained: the next wait blocks again"
+        );
+    }
+
     /// v7.7 ticket 250: the line names a failed open's reason.
     #[test]
     fn the_wake_line_names_why_it_is_unavailable() {
@@ -96,6 +152,7 @@ mod tests {
     /// A wake makes the read end readable at once; draining makes it wait again.
     #[test]
     fn a_wake_ends_the_wait_and_a_drain_resets_it() {
+        let _one = PIPE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let fd = super::fd().expect("pipe");
         let ready = |timeout| {
             let mut poll = libc::pollfd {

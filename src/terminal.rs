@@ -16069,7 +16069,8 @@ pub fn daemon(path: &Path, current: Vec<Mapping>) -> Result<()> {
             }
             stated = state;
         }
-        std::thread::sleep(Duration::from_millis(20));
+        // v7.8 ticket 27: a MIDI or Xbox event ends the wait at once; else the next turn in 20 ms.
+        crate::wake::wait(Duration::from_millis(20));
     }
     if let Ok(file) = &state_file {
         let _ = std::fs::remove_file(file); // stopped: nothing to report
