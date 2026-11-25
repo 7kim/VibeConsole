@@ -169,6 +169,12 @@ pub enum Action {
     Media(Media),
     /// v7.8 ticket 12: a Fedora System action: one fixed command (or the Print key).
     System(System),
+    /// v7.8 ticket 14: a browser's tab keys (sent only while it is focused), or a URL opened
+    /// in it.
+    Browser {
+        browser: Browser,
+        what: BrowserDo,
+    },
     /// Start Wispr Flow when it is not running; repair (quit and reopen) it once when it is.
     Flow,
     /// v7 ticket 15: bring Orca's tab for `agent` working in `folder` to the front. The
@@ -239,6 +245,130 @@ impl Media {
         }
     }
 }
+/// v7.8 ticket 14: the browsers the Browser family drives.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Browser {
+    Firefox,
+    Chrome,
+}
+/// v7.8 ticket 14: what a Browser action does.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BrowserDo {
+    NewTab,
+    ReopenTab,
+    NextTab,
+    PreviousTab,
+    /// Firefox only: Chrome's shortcut page documents none.
+    SearchTabs,
+    OpenUrl(String),
+}
+impl Browser {
+    pub const ALL: [Browser; 2] = [Self::Firefox, Self::Chrome];
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Firefox => "firefox",
+            Self::Chrome => "chrome",
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Firefox => "Firefox",
+            Self::Chrome => "Google Chrome",
+        }
+    }
+    /// Its desktop IDs (rpm and Flatpak), as the window extension names the focused app.
+    pub fn ids(self) -> &'static [&'static str] {
+        match self {
+            Self::Firefox => &["firefox.desktop", "org.mozilla.firefox.desktop"],
+            Self::Chrome => &["google-chrome.desktop", "com.google.Chrome.desktop"],
+        }
+    }
+    /// The shortcut for `what` (from Chrome's and Firefox's own shortcut definitions, 25 Nov
+    /// 2026); None: it has none (Chrome's tab search), or it isn't a key (a URL).
+    pub fn keys(self, what: &BrowserDo) -> Option<&'static [&'static str]> {
+        Some(match what {
+            BrowserDo::NewTab => &["Ctrl", "T"],
+            BrowserDo::ReopenTab => &["Ctrl", "Shift", "T"],
+            BrowserDo::NextTab => &["Ctrl", "PageDown"],
+            BrowserDo::PreviousTab => &["Ctrl", "PageUp"],
+            BrowserDo::SearchTabs if self == Self::Firefox => &["Ctrl", "Shift", "A"],
+            BrowserDo::SearchTabs | BrowserDo::OpenUrl(_) => return None,
+        })
+    }
+    /// The program (and its first arguments) that opens a URL in it: the rpm when installed,
+    /// else its Flatpak; None when neither is there.
+    pub fn launcher(self, installed: &dyn Fn(&str) -> bool) -> Option<(&'static str, Vec<String>)> {
+        let (binary, flatpak) = match self {
+            Self::Firefox => ("firefox", "org.mozilla.firefox"),
+            Self::Chrome => ("google-chrome", "com.google.Chrome"),
+        };
+        if installed(binary) {
+            Some((binary, Vec::new()))
+        } else if installed("flatpak") {
+            Some(("flatpak", strings(&["run", flatpak])))
+        } else {
+            None
+        }
+    }
+}
+impl BrowserDo {
+    pub fn word(&self) -> String {
+        match self {
+            Self::NewTab => "new-tab".into(),
+            Self::ReopenTab => "reopen-tab".into(),
+            Self::NextTab => "next-tab".into(),
+            Self::PreviousTab => "previous-tab".into(),
+            Self::SearchTabs => "search-tabs".into(),
+            Self::OpenUrl(url) => format!("open-url:{url}"),
+        }
+    }
+    pub fn label(&self) -> String {
+        match self {
+            Self::NewTab => "New tab".into(),
+            Self::ReopenTab => "Reopen the last closed tab".into(),
+            Self::NextTab => "Next tab".into(),
+            Self::PreviousTab => "Previous tab".into(),
+            Self::SearchTabs => "Search tabs".into(),
+            Self::OpenUrl(url) => format!("Open {url}"),
+        }
+    }
+}
+/// v7.8 ticket 14: an http(s) URL on one line, at most 2048 characters.
+pub fn web_url(url: &str) -> bool {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"));
+    rest.is_some_and(|host| !host.is_empty() && !host.starts_with('/'))
+        && url.len() <= 2048
+        && !url.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+/// v7.8 ticket 14: a browser's keys, tapped only while that browser is the focused app;
+/// another app focused sends nothing; an unknown focus sends nothing and says so.
+pub fn browser_keys(
+    browser: Browser,
+    what: &BrowserDo,
+    focused: Result<Option<String>>,
+    tap: &dyn Fn(Vec<evdev::KeyCode>) -> Result<()>,
+) -> Result<String> {
+    let keys = browser.keys(what).ok_or_else(|| {
+        format!(
+            "{}: {} has no shortcut for it",
+            what.label(),
+            browser.name()
+        )
+    })?;
+    let focused = focused
+        .map_err(|_| format!("{}: focused app unavailable; nothing sent", browser.name()))?;
+    if !focused.is_some_and(|id| browser.ids().contains(&id.as_str())) {
+        return Ok(format!("{} isn't focused; nothing sent", browser.name()));
+    }
+    tap(keys
+        .iter()
+        .map(|k| crate::keyboard::key_code(k))
+        .collect::<Result<_>>()?)?;
+    Ok(format!("{}: {}", browser.name(), what.label()))
+}
+
 /// v7.8 ticket 12: GNOME Settings panels `gnome-control-center <panel>` opens; the names its
 /// installed panels have on Fedora 44 (`/usr/share/applications/gnome-*-panel.desktop`).
 pub const SETTINGS_PANELS: [&str; 27] = [
@@ -794,6 +924,9 @@ impl Action {
             Self::OutputMute => "output-mute".into(),
             Self::Media(media) => format!("media:{}", media.word()),
             Self::System(system) => format!("system:{}", system.word()),
+            Self::Browser { browser, what } => {
+                format!("browser:{}:{}", browser.word(), what.word())
+            }
             Self::Nothing => "nothing".into(),
             Self::SavedSequence(name) => format!("saved-sequence:{name}"),
             Self::MicrophoneMute => "microphone-mute".into(),
@@ -904,6 +1037,30 @@ impl Action {
                 }
             }
             "output-mute" => Self::OutputMute,
+            _ if value.starts_with("browser:") => {
+                let rest = &value["browser:".len()..];
+                let (browser, what) = rest.split_once(':').ok_or("invalid browser action")?;
+                let browser = *Browser::ALL
+                    .iter()
+                    .find(|b| b.word() == browser)
+                    .ok_or("browser must be firefox or chrome")?;
+                let what = match what {
+                    "new-tab" => BrowserDo::NewTab,
+                    "reopen-tab" => BrowserDo::ReopenTab,
+                    "next-tab" => BrowserDo::NextTab,
+                    "previous-tab" => BrowserDo::PreviousTab,
+                    "search-tabs" => BrowserDo::SearchTabs,
+                    _ => match what.strip_prefix("open-url:") {
+                        Some(url) if web_url(url) => BrowserDo::OpenUrl(url.into()),
+                        Some(_) => return Err("a browser URL must be http(s), one line".into()),
+                        None => return Err("unknown browser action".into()),
+                    },
+                };
+                if what == BrowserDo::SearchTabs && browser.keys(&what).is_none() {
+                    return Err(format!("{} has no tab search shortcut", browser.name()).into());
+                }
+                Self::Browser { browser, what }
+            }
             _ if value.starts_with("system:") => {
                 Self::System(System::parse(&value["system:".len()..])?)
             }
@@ -1063,6 +1220,7 @@ impl Action {
             Self::OutputMute => "Toggle default output mute".into(),
             Self::Media(media) => format!("Media key: {}", media.label()),
             Self::System(system) => system.label(),
+            Self::Browser { browser, what } => format!("{}: {}", browser.name(), what.label()),
             Self::Nothing => "No action (built-in default silenced)".into(),
             Self::SavedSequence(name) => format!("Saved prompt sequence {name} (one step per tap)"),
             Self::MicrophoneMute => "Toggle default microphone mute".into(),
@@ -2948,6 +3106,18 @@ fn perform(
             tap(vec![media.key()])?;
             Ok(format!("{} sent", media.label()))
         }
+        Action::Browser { browser, what } => match what {
+            BrowserDo::OpenUrl(url) => {
+                let installed = |p: &str| crate::emulated().is_some() || on_path(p);
+                let (program, mut args) = browser
+                    .launcher(&installed)
+                    .ok_or_else(|| format!("{}: unavailable: not installed", browser.name()))?;
+                args.push(url.clone()); // one argument, never through a shell
+                command(program, &args, &cancelled)?;
+                Ok(format!("{}: opened {url}", browser.name()))
+            }
+            _ => browser_keys(*browser, what, focused_app(gdbus_output), tap),
+        },
         Action::System(action) => system(
             action,
             |p| crate::emulated().is_some() || on_path(p),
@@ -3272,6 +3442,7 @@ impl Action {
             Self::MicrophoneMute => "microphone-mute",
             Self::Media(_) => "media",
             Self::System(_) => "system",
+            Self::Browser { .. } => "browser",
             Self::Flow => "flow",
             Self::OrcaJump { .. } => "orca-jump",
             Self::AppToggleQuit(_) => "app-toggle-quit",
@@ -4438,6 +4609,79 @@ mod tests {
         assert!(Action::parse("system:settings-../../etc").is_err());
         assert!(Action::parse("system:reboot").is_err());
         assert!(System::Suspend.risky() && !System::Lock.risky());
+    }
+
+    /// v7.8 ticket 14: a browser's keys go only to that browser when it is focused; another
+    /// app focused gets nothing; an unknown focus says so; only http(s) URLs are taken, and a
+    /// URL opens through the browser's rpm, else its Flatpak, as one argument.
+    #[test]
+    fn browser_keys_only_reach_the_focused_browser() {
+        use evdev::KeyCode as K;
+        let send = |browser, what: &BrowserDo, focused: Result<Option<String>>| {
+            let taps = std::cell::RefCell::new(Vec::new());
+            let notice = browser_keys(browser, what, focused, &|k| {
+                taps.borrow_mut().push(k);
+                Ok(())
+            });
+            (notice, taps.into_inner())
+        };
+        let firefox = Ok(Some("org.mozilla.firefox.desktop".to_string()));
+        let (notice, taps) = send(Browser::Firefox, &BrowserDo::NewTab, firefox);
+        assert_eq!(taps, [vec![K::KEY_LEFTCTRL, K::KEY_T]]);
+        assert_eq!(notice.unwrap(), "Firefox: New tab");
+        let (_, taps) = send(
+            Browser::Chrome,
+            &BrowserDo::ReopenTab,
+            Ok(Some("com.google.Chrome.desktop".into())),
+        );
+        assert_eq!(taps, [vec![K::KEY_LEFTCTRL, K::KEY_LEFTSHIFT, K::KEY_T]]);
+        let terminal = Ok(Some("org.gnome.Ptyxis.desktop".to_string()));
+        let (notice, taps) = send(Browser::Firefox, &BrowserDo::NewTab, terminal);
+        assert!(taps.is_empty());
+        assert_eq!(notice.unwrap(), "Firefox isn't focused; nothing sent");
+        let (notice, taps) = send(Browser::Firefox, &BrowserDo::NextTab, Ok(None));
+        assert!(taps.is_empty() && notice.unwrap().contains("nothing sent"));
+        let (notice, taps) = send(
+            Browser::Firefox,
+            &BrowserDo::NewTab,
+            Err("no extension".into()),
+        );
+        assert!(taps.is_empty());
+        assert!(
+            notice
+                .unwrap_err()
+                .to_string()
+                .contains("focused app unavailable")
+        );
+        // Chrome's shortcut page has no tab search: refused, never guessed.
+        assert!(Action::parse("browser:chrome:search-tabs").is_err());
+        assert!(Action::parse("browser:firefox:search-tabs").is_ok());
+        // URLs: http(s), one line.
+        for bad in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "https://a b",
+            "ftp://x",
+            "https://",
+        ] {
+            assert!(
+                Action::parse(&format!("browser:firefox:open-url:{bad}")).is_err(),
+                "{bad}"
+            );
+        }
+        let ok = Action::parse("browser:chrome:open-url:https://example.com/a?b=c:d").unwrap();
+        assert_eq!(Action::parse(&ok.encode()).unwrap(), ok);
+        // The rpm when installed, else the Flatpak; neither: unavailable.
+        let only = |have: &'static [&'static str]| move |p: &str| have.contains(&p);
+        assert_eq!(
+            Browser::Firefox.launcher(&only(&["firefox"])),
+            Some(("firefox", vec![]))
+        );
+        assert_eq!(
+            Browser::Chrome.launcher(&only(&["flatpak"])),
+            Some(("flatpak", strings(&["run", "com.google.Chrome"])))
+        );
+        assert_eq!(Browser::Chrome.launcher(&only(&[])), None);
     }
 
     /// v7.8 ticket 13: a paired device connects and disconnects with its address as one

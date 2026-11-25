@@ -11794,6 +11794,68 @@ Media keys go to the player that is playing; with none, nothing happens.",
     }
 }
 
+/// v7.8 ticket 14: the Browser family: which browser, then what (tab keys are sent only while
+/// that browser is focused), or a URL to open in it.
+fn browser_action(
+    ui: &mut impl Ui,
+    saved: Option<&crate::actions::Action>,
+) -> Result<Option<crate::actions::Action>> {
+    use crate::actions::{Action, Browser, BrowserDo};
+    let (saved_browser, saved_what) = match saved {
+        Some(Action::Browser { browser, what }) => (Some(*browser), Some(what.clone())),
+        _ => (None, None),
+    };
+    let names = Browser::ALL.map(|b| b.name().to_string()).to_vec();
+    let at = saved_browser.and_then(|b| Browser::ALL.iter().position(|x| *x == b));
+    let Some(b) = choose_saved(ui, "Which browser?", names, at)? else {
+        return Ok(None);
+    };
+    let browser = Browser::ALL[b];
+    let mut whats = vec![
+        BrowserDo::NewTab,
+        BrowserDo::ReopenTab,
+        BrowserDo::NextTab,
+        BrowserDo::PreviousTab,
+    ];
+    if browser.keys(&BrowserDo::SearchTabs).is_some() {
+        whats.push(BrowserDo::SearchTabs);
+    }
+    let mut rows = whats.iter().map(BrowserDo::label).collect::<Vec<_>>();
+    rows.push("Open a URL…".into());
+    let at = match &saved_what {
+        Some(BrowserDo::OpenUrl(_)) => Some(rows.len() - 1),
+        Some(w) => whats.iter().position(|x| x == w),
+        None => None,
+    };
+    let title = format!(
+        "{}: tab keys go to it only while it is focused",
+        browser.name()
+    );
+    let Some(row) = choose_saved(ui, &title, rows, at)? else {
+        return Ok(None);
+    };
+    if let Some(what) = whats.get(row) {
+        return Ok(Some(Action::Browser {
+            browser,
+            what: what.clone(),
+        }));
+    }
+    let old = match &saved_what {
+        Some(BrowserDo::OpenUrl(url)) => url.clone(),
+        _ => "https://".into(),
+    };
+    let Some(url) = text_entry(ui, "URL to open (http or https)", &old)? else {
+        return Ok(None);
+    };
+    if !crate::actions::web_url(url.trim()) {
+        return Err("validation: a URL must start with http:// or https:// and be one line".into());
+    }
+    Ok(Some(Action::Browser {
+        browser,
+        what: BrowserDo::OpenUrl(url.trim().into()),
+    }))
+}
+
 /// v7.8 ticket 12: the ready-made updates, as terminal commands (visible, hold 1 second).
 const UPDATES: [(&str, &str); 2] = [
     (
@@ -12116,6 +12178,7 @@ fn families(input: mappings::Input) -> Vec<usize> {
         offered.push(14);
         offered.push(15); // v7.7 ticket 182
         offered.push(17); // v7.8 ticket 12
+        offered.push(18); // v7.8 ticket 14
     }
     offered
 }
@@ -12144,6 +12207,7 @@ fn action_family(mapping: &Mapping) -> usize {
         Action::PromptSequence(_) | Action::SavedSequence(_) => 11,
         Action::Media(_) => 2,
         Action::System(_) => 17,
+        Action::Browser { .. } => 18,
         action if action.audio() => 2,
         _ => 1, // launchers, hold to quit, Wispr Flow
     }
@@ -12203,7 +12267,7 @@ fn favourite_mapping(
     Ok(Some(copy))
 }
 
-const FAMILIES: [&str; 18] = [
+const FAMILIES: [&str; 19] = [
     "Keyboard shortcut",
     "Launch application",
     "Music & Sound", // v7.8 ticket 10: was "Fedora system action" (volume and mute only)
@@ -12222,6 +12286,7 @@ const FAMILIES: [&str; 18] = [
     "tmux agent (go to its window)",
     "Mouse Actions (click, hold to drag, scroll)", // v7.8 ticket 11
     "Fedora System (updates, lock, suspend, Wi-Fi, Bluetooth, …)", // v7.8 ticket 12
+    "Browser (Firefox, Google Chrome: tabs, open a URL)", // v7.8 ticket 14
 ];
 
 fn configure(ui: &mut impl Ui, path: &Path, current: &mut Vec<Mapping>) -> Result<()> {
@@ -13392,6 +13457,11 @@ fn configure_steps(
                 _ => "hold",
             };
             Mapping::new(pad, mappings::MOUSE_KEYS[row].0, behavior).map_err(stage("validation"))?
+        } else if family == 18 {
+            let Some(action) = browser_action(ui, saved.as_ref().map(|m| &m.action))? else {
+                continue;
+            };
+            Mapping::new_action(pad, input, action).map_err(stage("validation"))?
         } else if family == 17 {
             let saved_action = saved.as_ref().map(|m| &m.action);
             let Some(action) = fedora_system(ui, saved_action)? else {
@@ -19470,6 +19540,7 @@ mod tests {
                 // v7.8 ticket 12: the System update (a held terminal command: fire when isn't
                 // asked), then its status feedback.
                 17 => vec![Enter, Enter],
+                18 => vec![Enter; 3], // v7.8 ticket 14: Firefox, New tab, fire when
                 // v7.8 ticket 11: Left click, then what a shortcut asks after its behaviour.
                 16 => match kind {
                     "pad" => vec![Enter; 3],  // click, hardware feedback, fire when
@@ -19500,7 +19571,7 @@ mod tests {
             deadzone: 1024,
             hysteresis: 128,
         };
-        let pressed = vec![0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 16, 13, 14, 15, 17];
+        let pressed = vec![0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 16, 13, 14, 15, 17, 18];
         // (kind, learn page, control, motion, families offered)
         let kinds: Vec<(&str, usize, Control, Option<Input>, Vec<usize>)> = vec![
             (
