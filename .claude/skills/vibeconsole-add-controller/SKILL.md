@@ -1,11 +1,11 @@
 ---
 name: vibeconsole-add-controller
-description: Use when the user wants to add a new controller to VibeConsole (another MIDI keyboard or pad controller, a gamepad, "set up my new controller"): walks them through doctor, Detect, Configure and profile export/import, never by editing config files.
+description: Use when the user wants to add a new controller to VibeConsole (another MIDI keyboard or pad controller, a gamepad, "set up my new controller"): walks them through choosing it, Detect, Configure and profile export/import, never by editing config files.
 ---
 
 # Add a controller
 
-The user does the steps; you say which command or menu row comes next and read back what it shows. Never write `~/.config/vibeconsole/*.json` or `mappings.tsv` yourself, and never guess a control's name: take it from `vibeconsole describe` or Detect.
+The user does the steps; you say which menu row or command comes next and read back what it shows. Never edit the config files (see "Where things live" in the `vibeconsole` hub), and never guess a control's name: take it from Detect.
 
 ## What VibeConsole can use
 
@@ -13,17 +13,21 @@ The user does the steps; you say which command or menu row comes next and read b
 - **A gamepad** Linux reports as one (Xbox, and most others): yes, under the Xbox controller's button names (Ⓐ is the bottom face button).
 - **Any other HID device** (a button box, a foot pedal that isn't MIDI): not yet. Say so; don't work around it.
 
-## Steps
+## A MIDI device
 
-1. **Recheck what is connected.** Ask the user to plug it in, then run `lsusb` (USB) or check Bluetooth, and `vibeconsole doctor`. Read its lines with `vibeconsole-doctor`. A gamepad shows on the Xbox controller line; `vibeconsole doctor --all` lists the MIDI ports it sees.
-2. **See its controls.** `vibeconsole describe` lists every device and control by the name the user sees. For live presses: `vibeconsole detect`, or 5 Devices › /detect in the session. Pressing each control shows its name; nothing fires there.
-3. **A MIDI device: choose it.** 5 Devices › MIDI device, pick it (it is added to the list). It takes effect at the next launch: quit and start VibeConsole again (`vibeconsole startup-stop`, then `vibeconsole startup-start` for the login service).
-4. **A gamepad:** nothing to choose. 7 Xbox › Xbox tuning sets sticks, triggers and rumble. Its built-in default buttons are listed in 2 Mappings › /configure › Edit saved assignment.
-5. **Assign controls.** `vibeconsole configure`, or 2 Mappings › /configure in the session: press the control, pick the action. Use `vibeconsole-recipes` or `vibeconsole-profiles` for what to put where.
-6. **Check what was saved.** `vibeconsole list` (no MIDI needed).
-7. **Share or move the setup.** 6 Apps & profiles › App profiles › a profile › Export to a file writes it to the `profiles/` folder beside the config; on another machine, App profiles › Import a profile file. 2 Mappings › Presets saves or loads the whole setup by name.
+1. **Plug it in, then choose it.** In the session: 5 Devices › MIDI device lists the MIDI devices connected now (and ones used before, marked "not connected"). Pick it; it is added to the list. `vibeconsole doctor` checks only the Akai's MIDI, so this list is where a new device shows.
+2. **Relaunch.** The choice takes effect at the next launch: quit the session and open it again (for the login service, `vibeconsole startup-stop`, then `vibeconsole startup-start`).
+3. **See its controls.** 5 Devices › /detect in the session shows each press and knob by name; nothing fires there. (`vibeconsole detect` from the command line opens the Akai only.)
+4. **Assign controls.** 2 Mappings › /configure: press the control, pick the action. Use `vibeconsole-recipes` or `vibeconsole-profiles` for what to put where.
 
-## If something is missing
+## A gamepad
 
-- Nothing in Detect: the device isn't seen. Recheck the cable and `vibeconsole doctor`; for MIDI also that no other program holds the port (only one VibeConsole runs at a time: `vibeconsole startup-status`).
+1. **Plug it in or pair it** (VibeConsole never pairs devices), then `vibeconsole doctor`: it shows on the Xbox controller line. If that line says "gilrs default mapping · LT and RT may not register", the triggers may not work on this pad; say so.
+2. **See its controls.** `vibeconsole describe` lists the Xbox controller's controls by name; 5 Devices › /detect shows each press live.
+3. **Tune and assign.** 7 Xbox › Xbox tuning sets sticks, triggers and rumble. 2 Mappings › /configure assigns buttons; its Edit saved assignment lists the built-in default buttons, which can be changed.
+
+## Then
+
+- `vibeconsole list` shows what was saved (no MIDI needed).
+- To share or move the setup: 6 Apps & profiles › App profiles › a profile › Export to a file writes it to the `profiles/` folder beside the config; on another machine, App profiles › Import a profile file. 2 Mappings › Presets saves or loads the whole setup by name.
 - A control that should fire doesn't: load `vibeconsole-why-silent`.

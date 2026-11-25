@@ -441,7 +441,7 @@ pub fn compare_text(rows: &[ModeRow]) -> String {
     text += &format!("\n{n} differences.\n");
     text
 }
-/// v7.7 ticket 158: the VibeConsole skills (ten, and since ticket 184 one per Ask), embedded at build time: (path under
+/// v7.7 ticket 158: the VibeConsole skills (the hub, the focused ones, one per Ask), embedded at build time: (path under
 /// `~/.claude/skills`, text). A test keeps this list equal to the repo's `.claude/skills`.
 pub const SKILLS: [(&str, &str); 30] = [
     // v7.8 ticket 31: adding a new MIDI device or gamepad.
@@ -1674,7 +1674,8 @@ mod tests {
         assert!(!skills_installed(&home));
         let note = install_skills(&home).unwrap();
         assert!(
-            note.contains("30 files written") && note.contains("backed up first"),
+            note.contains(&format!("{} files written", SKILLS.len()))
+                && note.contains("backed up first"),
             "{note}"
         );
         assert!(skills_installed(&home));

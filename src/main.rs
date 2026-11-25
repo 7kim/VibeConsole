@@ -666,7 +666,7 @@ mod tests {
                 "{file} is out of date: run UPDATE_SKILLS=1 cargo test vibeconsole_skills"
             );
         }
-        // The skills (ten, and one per Ask since ticket 184), each a name, a "Use when" description, and links that resolve.
+        // The skills (the hub, the focused ones, one per Ask since ticket 184), each a name, a "Use when" description, and links that resolve.
         let want = [
             "vibeconsole",
             "vibeconsole-add-controller",
