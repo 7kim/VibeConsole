@@ -291,10 +291,11 @@ trait Ui {
     fn paired_bluetooth(&mut self) -> Result<Vec<(String, String)>> {
         Err("Bluetooth devices unavailable".into())
     }
-    /// v7.8 ticket 25: run `pw-dump` or `wpctl` for Settings → Sound (each argument one
-    /// argument, no shell). The session runs it; tests answer from their script.
-    fn sound_tool(&mut self, program: &str, _args: &[String]) -> Result<String> {
-        Err(format!("{program}: unavailable").into())
+    /// v7.8 ticket 25: run `pw-dump` or `wpctl` (`argv`: the program, then one argument
+    /// each, no shell) for 8 System › Sound combos. The session runs it; tests answer from
+    /// their script.
+    fn sound_tool(&mut self, argv: &[&str]) -> Result<String> {
+        Err(format!("{}: unavailable", argv.first().unwrap_or(&"sound")).into())
     }
     /// v7.7 ticket 255: what Quit did about the login service, and why: to the journal now,
     /// and on the terminal once its screen is restored.
@@ -7389,20 +7390,12 @@ impl Ui for Terminal {
             .map_err(|e| format!("Bluetooth devices unavailable: bluetoothctl: {e}"))?;
         Ok(paired_devices(&String::from_utf8_lossy(&out.stdout)))
     }
-    fn sound_tool(&mut self, program: &str, args: &[String]) -> Result<String> {
+    fn sound_tool(&mut self, argv: &[&str]) -> Result<String> {
         #[cfg(test)]
         if self.script.is_some() {
-            return Err(format!("{program}: not run in tests").into());
+            return Err(format!("{}: not run in tests", argv[0]).into());
         }
-        let out = vibeconsole_core::program(program)
-            .args(args)
-            .output()
-            .map_err(|e| format!("{program}: {e}"))?;
-        if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
-            return Err(format!("{program}: {}", err.trim()).into());
-        }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        vibeconsole_core::gamepad::run_program()(argv)
     }
     fn login(&mut self, request: crate::runtime::Login) -> Result<bool> {
         // v7.7 ticket 179: a test asks the scripted login service, never systemctl.
@@ -8858,10 +8851,12 @@ fn setting(ui: &mut impl Ui, path: &Path, choice: usize) -> Result<()> {
     Ok(())
 }
 
-/// v7.8 ticket 25: 8 System › Sound combos: use or delete a saved combo, or make one from
-/// what PipeWire lists now: a speaker, a microphone and, if wanted, one card's mode.
+/// v7.8 ticket 25: 8 System › Sound combos: use or delete a saved combo, or make one: a
+/// card's mode first (set now, so the devices it brings are listed), then a speaker and a
+/// microphone from what PipeWire lists, then a name. A deleted combo a control uses is
+/// refused by the save, naming the control.
 fn sound_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
-    use vibeconsole_core::sound;
+    use vibeconsole_core::sound::{self, CardMode, Combo};
     loop {
         let mut config = mappings::load_config(path)?;
         let mut rows = (config.sound_combos.iter())
@@ -8869,8 +8864,8 @@ fn sound_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 let mode = c
                     .mode
                     .as_ref()
-                    .map_or(String::new(), |(_, m)| format!(" · {m}"));
-                format!("{} · {} · {}{mode}", c.name, c.speaker, c.mic)
+                    .map_or(String::new(), |m| format!(" · {}", m.mode.label));
+                format!("{} · {} · {}{mode}", c.name, c.speaker.label, c.mic.label)
             })
             .collect::<Vec<_>>();
         rows.extend(strings(&["New combo", "Back"]));
@@ -8885,17 +8880,11 @@ fn sound_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
         }
         if pick < count {
             let combo = config.sound_combos[pick].clone();
-            match choose(
-                ui,
-                &format!("Sound combo {}", combo.name),
-                &strings(&["Use now", "Delete", "Back"]),
-            )? {
+            let what = strings(&["Use now", "Delete", "Back"]);
+            match choose(ui, &format!("Sound combo {}", combo.name), &what)? {
                 Some(0) => {
-                    let line =
-                        match sound::apply(&combo, |program, args| ui.sound_tool(program, args)) {
-                            Ok(line) => line,
-                            Err(error) => format!("Sound: {error}"),
-                        };
+                    let line = sound::apply(&combo, &mut |argv| ui.sound_tool(argv))
+                        .unwrap_or_else(|error| error.to_string());
                     choose(ui, &line, &strings(&["Back"]))?;
                 }
                 Some(1) => {
@@ -8906,59 +8895,80 @@ fn sound_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
             }
             continue;
         }
-        let graph = sound::graph(&ui.sound_tool("pw-dump", &[])?);
-        let pick_node = |ui: &mut _, sink: bool, title: &str| -> Result<Option<String>> {
-            let nodes = graph
-                .nodes
-                .iter()
-                .filter(|n| n.sink == sink)
-                .collect::<Vec<_>>();
-            if nodes.is_empty() {
-                return Err(format!(
-                    "no {} in PipeWire (pw-dump)",
-                    if sink { "speakers" } else { "microphones" }
-                )
-                .into());
-            }
-            let labels = nodes.iter().map(|n| n.label.clone()).collect::<Vec<_>>();
-            Ok(choose(ui, title, &labels)?.map(|i| nodes[i].name.clone()))
-        };
-        let Some(speaker) = pick_node(ui, true, "Speaker")? else {
-            continue;
-        };
-        let Some(mic) = pick_node(ui, false, "Microphone")? else {
-            continue;
-        };
-        let modes = (graph.cards.iter())
-            .flat_map(|c| c.modes.iter().map(move |(_, name, label)| (c, name, label)))
+        let mut now = sound::read(&mut |argv| ui.sound_tool(argv))?;
+        let modes = (now.cards.iter())
+            .flat_map(|c| c.modes.iter().map(move |(index, mode)| (c, *index, mode)))
             .collect::<Vec<_>>();
         let mut mode_rows = vec!["Leave every card's mode as it is".to_owned()];
         mode_rows.extend(
             modes
                 .iter()
-                .map(|(c, _, label)| format!("{}: {label}", c.label)),
+                .map(|(c, _, mode)| format!("{}: {}", c.device.label, mode.label)),
         );
-        let Some(mode) = choose(
-            ui,
-            "Card mode (set first, e.g. a headset's speaker and mic mode)",
-            &mode_rows,
-        )?
-        else {
+        let title = "Card mode first (it is set now, so the speaker and mic it brings are listed)";
+        let Some(mode) = choose(ui, title, &mode_rows)? else {
             continue;
         };
-        let mode = mode
-            .checked_sub(1)
-            .map(|i| (modes[i].0.name.clone(), modes[i].1.clone()));
-        let Some(name) = text_entry(ui, "Name (letters, digits, ., - and _)", "")? else {
+        let mode = match mode.checked_sub(1).map(|i| modes[i]) {
+            None => None,
+            Some((card, index, mode)) => {
+                let picked = CardMode {
+                    card: card.device.clone(),
+                    mode: mode.clone(),
+                };
+                if card.current != Some(index) {
+                    sound::set_mode(&mut |argv| ui.sound_tool(argv), card.id, index)?;
+                    #[cfg(not(test))]
+                    std::thread::sleep(Duration::from_millis(500)); // its devices appear
+                    now = sound::read(&mut |argv| ui.sound_tool(argv))?;
+                }
+                Some(picked)
+            }
+        };
+        let mut pick_device = |ui: &mut _, sink: bool| -> Result<Option<sound::Named>> {
+            let nodes = now
+                .nodes
+                .iter()
+                .filter(|n| n.sink == sink)
+                .collect::<Vec<_>>();
+            let what = if sink { "speaker" } else { "microphone" };
+            if nodes.is_empty() {
+                return Err(format!("sound: no {what} in PipeWire").into());
+            }
+            let labels = nodes
+                .iter()
+                .map(|n| n.device.label.clone())
+                .collect::<Vec<_>>();
+            Ok(choose(ui, &format!("Which {what}?"), &labels)?.map(|i| nodes[i].device.clone()))
+        };
+        let Some(speaker) = pick_device(ui, true)? else {
             continue;
         };
-        config.sound_combos.push(sound::Combo {
-            name,
-            speaker,
-            mic,
-            mode,
-        });
-        mappings::save_config(path, &config)?;
+        let Some(mic) = pick_device(ui, false)? else {
+            continue;
+        };
+        // A name that is taken or invalid asks again, keeping the picks.
+        let mut prompt = "Name (letters, digits, ., - and _)".to_owned();
+        loop {
+            let Some(name) = text_entry(ui, &prompt, "")? else {
+                break;
+            };
+            let combo = Combo {
+                name,
+                speaker: speaker.clone(),
+                mic: mic.clone(),
+                mode: mode.clone(),
+            };
+            if let Err(error) = combo.validate() {
+                prompt = format!("{error}. Name");
+            } else if config.sound_combos.iter().any(|c| c.name == combo.name) {
+                prompt = format!("{} is taken. Name", combo.name);
+            } else {
+                config.sound_combos.push(combo);
+                mappings::save_config(path, &config)?;
+                break;
+            }
+        }
     }
 }
 
@@ -13502,9 +13512,11 @@ fn music_rows() -> Vec<String> {
             .iter()
             .map(|m| m.label().to_string()),
     );
-    rows.push("Use sound combo".into()); // v7.8 ticket 25
+    rows.push("Use sound combo".into()); // v7.8 ticket 25: row COMBO_ROW
     rows
 }
+/// v7.8 ticket 25: Music & Sound's "Use sound combo" row: after volume, mutes and media keys.
+const COMBO_ROW: usize = 4 + crate::actions::Media::ALL.len();
 
 /// `second_press`: a launcher pad also chooses minimize or close.
 fn action_menu(
@@ -13606,7 +13618,7 @@ fn action_menu(
         Some(Action::OutputMute) => (Some(2), None),
         Some(Action::MicrophoneMute) => (Some(3), None),
         Some(Action::Media(m)) => (Media::ALL.iter().position(|x| x == m).map(|i| i + 4), None),
-        Some(Action::SoundCombo(_)) => (Some(4 + Media::ALL.len()), None),
+        Some(Action::SoundCombo(_)) => (Some(COMBO_ROW), None),
         _ => (None, None),
     };
     // v7.8 ticket 10: Music & Sound: wpctl's volume and mute, then the media keys.
@@ -13625,9 +13637,10 @@ Media keys go to the player that is playing; with none, nothing happens.",
     if let Some(media) = i.checked_sub(4).and_then(|m| Media::ALL.get(m)) {
         return Ok(Some(Action::Media(*media)));
     }
-    if i == 4 + Media::ALL.len() {
+    if i == COMBO_ROW {
         // v7.8 ticket 25: one of the combos saved in 8 System › Sound combos.
-        let config = mappings::load_config(stars.ok_or("sound combos need the config")?)?;
+        let config =
+            mappings::load_config(stars.ok_or("Music & Sound: sound combos need the config")?)?;
         let names = (config.sound_combos.iter())
             .map(|c| c.name.clone())
             .collect::<Vec<_>>();
@@ -17181,10 +17194,9 @@ mod tests {
         fn paired_bluetooth(&mut self) -> Result<Vec<(String, String)>> {
             Ok(self.paired.clone())
         }
-        fn sound_tool(&mut self, program: &str, args: &[String]) -> Result<String> {
-            self.sound_calls
-                .push(format!("{program} {}", args.join(" ")).trim().to_owned());
-            Ok(if program == "pw-dump" {
+        fn sound_tool(&mut self, argv: &[&str]) -> Result<String> {
+            self.sound_calls.push(argv.join(" "));
+            Ok(if argv[0] == "pw-dump" {
                 self.pw_dump.clone()
             } else {
                 String::new()
@@ -18022,12 +18034,14 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// v7.8 ticket 25: 8 System › Sound combos makes a combo from PipeWire's list (speaker,
-    /// mic, the HyperX card's speaker-and-mic mode) and saves it by name; Use now sets the
-    /// mode by its index, then both defaults; Music & Sound offers it as an action.
+    /// v7.8 ticket 25: 8 System › Sound combos: the card's mode is picked first and set at
+    /// once, then the HyperX speaker and mic, then a name (a bad one asks again, keeping the
+    /// picks); the combo is saved with its labels; Use now sets both defaults last; Music &
+    /// Sound offers it as an action.
     #[test]
     fn sound_combo_made_used_and_offered_in_music_and_sound() {
         use Key::*;
+        use vibeconsole_core::sound::{CardMode, Combo, Named};
         let dir = std::env::temp_dir().join(format!("vibeconsole-sound-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -18050,9 +18064,11 @@ mod tests {
                     "Profile": [{"index": 2}]}}},
         ])
         .to_string();
-        // New combo → HyperX speaker → HyperX mic → HyperX: speaker and mic mode → "headset";
-        // then headset → Use now → Back; Back.
-        let mut keys = vec![Enter, Down, Enter, Enter, Down, Enter];
+        // New combo → HyperX: speaker and mic mode → HyperX speaker → HyperX mic → "../x"
+        // (refused, asked again) → "headset"; then headset → Use now → Back; Back.
+        let mut keys = vec![Enter, Down, Enter, Down, Enter, Enter];
+        keys.extend(typed("../x"));
+        keys.push(Enter);
         keys.extend(typed("headset"));
         keys.extend([Enter, Enter, Enter, Enter, Down, Down, Enter]);
         let mut ui = Script {
@@ -18067,34 +18083,44 @@ mod tests {
             screens.contains("HyperX: Analog Stereo Output + Mono Input"),
             "{screens}"
         );
-        let saved = mappings::load_config(&path).unwrap().sound_combos;
+        assert!(
+            screens.contains("a sound combo's name is letters"),
+            "{screens}"
+        );
+        let named = |name: &str, label: &str| Named {
+            name: name.into(),
+            label: label.into(),
+        };
         assert_eq!(
-            saved,
-            [vibeconsole_core::sound::Combo {
+            mappings::load_config(&path).unwrap().sound_combos,
+            [Combo {
                 name: "headset".into(),
-                speaker: "alsa_output.hyperx".into(),
-                mic: "alsa_input.hyperx".into(),
-                mode: Some((
-                    "alsa_card.hyperx".into(),
-                    "output:analog-stereo+input:mono-fallback".into()
-                )),
+                speaker: named("alsa_output.hyperx", "HyperX Analog Stereo"),
+                mic: named("alsa_input.hyperx", "HyperX Mono"),
+                mode: Some(CardMode {
+                    card: named("alsa_card.hyperx", "HyperX"),
+                    mode: named(
+                        "output:analog-stereo+input:mono-fallback",
+                        "Analog Stereo Output + Mono Input"
+                    ),
+                }),
             }]
         );
+        assert!(
+            screens.contains("headset · HyperX Analog Stereo · HyperX Mono"),
+            "{screens}"
+        );
         assert!(screens.contains("Sound: headset"), "{screens}");
+        // Making it: read, the mode set at once, read again. Using it: the defaults last.
+        let calls = &ui.sound_calls;
+        assert_eq!(calls[..3], ["pw-dump", "wpctl set-profile 45 1", "pw-dump"]);
         assert_eq!(
-            &ui.sound_calls[1..],
-            [
-                "pw-dump",
-                "wpctl set-profile 45 1",
-                "pw-dump",
-                "wpctl set-default 80",
-                "wpctl set-default 81"
-            ]
+            calls[calls.len() - 2..],
+            ["wpctl set-default 80", "wpctl set-default 81"]
         );
         // Music & Sound → Use sound combo → headset.
         ui.screens.clear();
-        let row = 4 + crate::actions::Media::ALL.len();
-        let mut keys = vec![Down; row];
+        let mut keys = vec![Down; COMBO_ROW];
         keys.extend([Enter, Enter]);
         ui.keys = keys.into();
         let action =

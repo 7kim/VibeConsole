@@ -608,10 +608,12 @@ fn devices(config: &Config) -> Value {
         "xbox_programs": config.xbox_names,
         "sound_combos": config.sound_combos.iter().map(|c| json!({
             "name": c.name,
-            "speaker": c.speaker,
-            "mic": c.mic,
-            "card": c.mode.as_ref().map(|m| &m.0),
-            "mode": c.mode.as_ref().map(|m| &m.1),
+            "speaker": named_json(&c.speaker),
+            "mic": named_json(&c.mic),
+            "mode": c.mode.as_ref().map(|m| json!({
+                "card": named_json(&m.card),
+                "mode": named_json(&m.mode),
+            })),
         })).collect::<Vec<_>>(),
         "tuning": {
             "dead_zone": t.dead_zone,
@@ -753,44 +755,57 @@ fn apply_devices(at: &Obj, config: &mut Config) -> Result<()> {
     Ok(())
 }
 
-/// v7.8 ticket 25: devices.json's `sound_combos`, each checked, names once each.
+fn named_json(named: &crate::sound::Named) -> Value {
+    json!({"name": named.name, "label": named.label})
+}
+/// v7.8 ticket 25: devices.json's `sound_combos`, each checked (a name used twice is refused
+/// by `serialize_config`, with the rest of the config).
 fn sound_combos(at: &Obj) -> Result<Vec<crate::sound::Combo>> {
-    let mut combos: Vec<crate::sound::Combo> = Vec::new();
+    use crate::sound::{CardMode, Combo, Named};
+    let mut combos = Vec::new();
     for (i, value) in at.list("sound_combos")?.iter().enumerate() {
         let key = format!("sound_combos[{i}]");
         let err = |what: &str| at.err(&key, what);
-        let field = |name: &str| -> Result<Option<String>> {
-            match &value[name] {
-                Value::Null => Ok(None),
-                Value::String(s) => Ok(Some(s.clone())),
-                _ => Err(err(&format!("`{name}` must be a string"))),
+        let fields = |value: &Value, allowed: &[&str], what: &str| -> Result<()> {
+            let object = value
+                .as_object()
+                .ok_or_else(|| err(&format!("{what} must be an object")))?;
+            match object.keys().find(|k| !allowed.contains(&k.as_str())) {
+                Some(k) => Err(err(&format!("{what}: unknown field `{k}`"))),
+                None => Ok(()),
             }
         };
-        let need = |name: &str| field(name)?.ok_or_else(|| err(&format!("needs `{name}`")));
-        let extra = value
-            .as_object()
-            .ok_or_else(|| err("must be an object"))?
-            .keys()
-            .find(|k| !["name", "speaker", "mic", "card", "mode"].contains(&k.as_str()));
-        if let Some(k) = extra {
-            return Err(err(&format!("unknown field `{k}`")));
-        }
-        let mode = match (field("card")?, field("mode")?) {
-            (Some(card), Some(mode)) => Some((card, mode)),
-            (None, None) => None,
-            _ => return Err(err("`card` and `mode` go together")),
+        let text = |value: &Value, name: &str| -> Result<String> {
+            value[name]
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| err(&format!("needs `{name}` as a string")))
         };
-        let combo = crate::sound::Combo {
-            name: need("name")?,
-            speaker: need("speaker")?,
-            mic: need("mic")?,
+        let named = |value: &Value, what: &str| -> Result<Named> {
+            fields(value, &["name", "label"], what)?;
+            Ok(Named {
+                name: text(value, "name")?,
+                label: text(value, "label")?,
+            })
+        };
+        fields(value, &["name", "speaker", "mic", "mode"], "a combo")?;
+        let mode = match &value["mode"] {
+            Value::Null => None,
+            mode => {
+                fields(mode, &["card", "mode"], "mode")?;
+                Some(CardMode {
+                    card: named(&mode["card"], "mode.card")?,
+                    mode: named(&mode["mode"], "mode.mode")?,
+                })
+            }
+        };
+        let combo = Combo {
+            name: text(value, "name")?,
+            speaker: named(&value["speaker"], "speaker")?,
+            mic: named(&value["mic"], "mic")?,
             mode,
         };
-        at.check(&key, combo.validate())?;
-        if combos.iter().any(|c| c.name == combo.name) {
-            return Err(err(&format!("a second combo named {}", combo.name)));
-        }
-        combos.push(combo);
+        combos.push(at.check(&key, combo.validate().map(|()| combo))?);
     }
     Ok(combos)
 }
@@ -1553,20 +1568,27 @@ mod tests {
         let dir = folder("sound-combos");
         let path = dir.join("mappings.tsv");
         let mut config = Config::default();
+        let named = |name: &str, label: &str| crate::sound::Named {
+            name: name.into(),
+            label: label.into(),
+        };
         config.sound_combos = vec![
             crate::sound::Combo {
                 name: "headset".into(),
-                speaker: "alsa_output.hyperx".into(),
-                mic: "alsa_input.hyperx".into(),
-                mode: Some((
-                    "alsa_card.hyperx".into(),
-                    "output:analog-stereo+input:mono-fallback".into(),
-                )),
+                speaker: named("alsa_output.hyperx", "HyperX Analog Stereo"),
+                mic: named("alsa_input.hyperx", "HyperX Mono"),
+                mode: Some(crate::sound::CardMode {
+                    card: named("alsa_card.hyperx", "HyperX"),
+                    mode: named(
+                        "output:analog-stereo+input:mono-fallback",
+                        "Analog Stereo Output + Mono Input",
+                    ),
+                }),
             },
             crate::sound::Combo {
                 name: "desk".into(),
-                speaker: "alsa_output.nommo".into(),
-                mic: "alsa_input.webcam".into(),
+                speaker: named("alsa_output.nommo", "Nommo Chroma"),
+                mic: named("alsa_input.webcam", "C922"),
                 mode: None,
             },
         ];
@@ -1574,7 +1596,10 @@ mod tests {
         let text = fs::read_to_string(dir.join("devices.json")).unwrap();
         let mut saved: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(saved["version"], 5);
-        assert_eq!(saved["sound_combos"][0]["card"], "alsa_card.hyperx");
+        assert_eq!(
+            saved["sound_combos"][0]["mode"]["card"]["name"],
+            "alsa_card.hyperx"
+        );
         assert_eq!(saved["sound_combos"][1]["mode"], Value::Null);
         assert_eq!(
             mappings::load_config(&path).unwrap().sound_combos,
@@ -1590,6 +1615,24 @@ mod tests {
                 "{bad}"
             );
         }
+        // A pad using the headset combo: deleting the combo is refused, naming the pad.
+        let mut used = config.clone();
+        used.mappings = vec![
+            mappings::Mapping::new_action(
+                crate::Control::from_note(10, 36).unwrap(),
+                mappings::Input::Pad,
+                crate::actions::Action::SoundCombo("headset".into()),
+            )
+            .unwrap(),
+        ];
+        mappings::save_config(&path, &used).unwrap();
+        used.sound_combos.remove(0);
+        let error = mappings::save_config(&path, &used).unwrap_err().to_string();
+        assert!(
+            error.contains("uses sound combo headset, which doesn't exist"),
+            "{error}"
+        );
+        mappings::save_config(&path, &config).unwrap();
         saved["sound_combos"][0]["volume"] = json!(5);
         fs::write(dir.join("devices.json"), saved.to_string()).unwrap();
         let error = mappings::load_config(&path).unwrap_err().to_string();

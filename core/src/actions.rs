@@ -3305,12 +3305,15 @@ fn perform(
             tap(vec![media.key()])?;
             Ok(format!("{} sent", media.label()))
         }
-        // v7.8 ticket 25: the combo as saved now; pw-dump and wpctl, one argument each.
+        // v7.8 ticket 25: the combo as saved now. pw-dump's output is far over the action
+        // output limit, so it runs through the gamepad module's runner (one argument each,
+        // no shell, no limit).
         Action::SoundCombo(name) => {
-            let config = crate::mappings::read_config(&crate::mappings::config_path()?)?;
+            let config = crate::mappings::read_config(&crate::mappings::config_path()?)
+                .map_err(|e| format!("sound combo {name}: config: {e}"))?;
             let combo = (config.sound_combos.iter().find(|c| c.name == *name))
                 .ok_or_else(|| format!("sound combo {name}: unavailable: it was deleted"))?;
-            crate::sound::apply(combo, |program, args| command(program, args, &cancelled))
+            crate::sound::apply(combo, &mut *crate::gamepad::run_program())
         }
         Action::Browser { browser, what } => match what {
             BrowserDo::OpenUrl(url) => {

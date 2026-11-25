@@ -2541,6 +2541,19 @@ impl Config {
                 absolute_directory(dir, self)?;
             }
         }
+        // v7.8 ticket 25: a control's sound combo exists (so a used one can't be deleted).
+        let profiles = self.profiles.iter().flat_map(|p| &p.mappings);
+        for mapping in self.mappings.iter().chain(profiles) {
+            if let crate::actions::Action::SoundCombo(name) = &mapping.action {
+                if !self.sound_combos.iter().any(|c| c.name == *name) {
+                    return Err(format!(
+                        "{} uses sound combo {name}, which doesn't exist",
+                        mapping.control.label()
+                    )
+                    .into());
+                }
+            }
+        }
         Ok(())
     }
     pub fn idle_for(&self, context: u8) -> Settings {
