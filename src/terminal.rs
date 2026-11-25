@@ -397,6 +397,9 @@ struct Terminal {
     pointer_moving: bool,
     /// v7.7 ticket 204: why output was last paused (a key, a click, an event; never prompt text).
     pause_cause: String,
+    /// v7.7 ticket 269: why the pads wait while the program is unverified (ticket 253's
+    /// recovery, or why detection can't run), kept apart from later notices.
+    waiting: String,
     /// v7.7 ticket 255: what Quit did about the login service, printed once the screen is back.
     quit_note: String,
     /// How the last Live row was opened: "Enter", "click", or "Find" (it put the cursor there).
@@ -581,11 +584,21 @@ impl Terminal {
         match label.strip_prefix("RUNNING") {
             Some("") => format!("running ({program})"),
             // v7.7 ticket 253: unverified, the notice says why and how to recover.
-            Some(more) if !self.context_verified && !self.notice.is_empty() => format!(
-                "running ({program}; {}): {}",
-                more.trim().trim_matches(['(', ')']),
-                self.notice
-            ),
+            // v7.7 ticket 269: the kept reason first, whatever notice came after it.
+            Some(more)
+                if !self.context_verified
+                    && !(self.waiting.is_empty() && self.notice.is_empty()) =>
+            {
+                format!(
+                    "running ({program}; {}): {}",
+                    more.trim().trim_matches(['(', ')']),
+                    if self.waiting.is_empty() {
+                        &self.notice
+                    } else {
+                        &self.waiting
+                    }
+                )
+            }
             Some(more) => format!(
                 "running ({program}; {})",
                 more.trim().trim_matches(['(', ')'])
@@ -1197,6 +1210,7 @@ impl Terminal {
             rgb_step: (None, Instant::now()),
             pointer_moving: false,
             pause_cause: String::new(),
+            waiting: String::new(),
             quit_note: String::new(),
             opened_by: "Enter",
             flow_rescue: None,
@@ -5052,6 +5066,7 @@ impl Terminal {
 
     fn abandon_program(&mut self) -> Result<()> {
         self.resolver = None;
+        self.waiting.clear(); // v7.7 ticket 269: a new detection gives its own reason
         self.suspend()?; // release keys before joining any controller work
         self.context_verified = false;
         self.feedback_allowed = false;
@@ -5076,6 +5091,7 @@ impl Terminal {
             if let Err(error) = self.controller() {
                 self.follow_retry = Instant::now() + Duration::from_secs(1);
                 self.notice = format!("Waiting to detect controller program: {error}");
+                self.waiting = self.notice.clone();
                 return Ok(());
             }
         }
@@ -5141,11 +5157,13 @@ impl Terminal {
                     } else {
                         "Current RAM matches no single stored program, so output stays inactive. To fix it: select Program 1 on the Akai (Prog Select), or use /prog-select."
                     }.into();
+                    self.waiting = self.notice.clone();
                     return Ok(());
                 };
                 self.context = context;
                 self.program_snapshot = Some(payload);
                 self.context_verified = true;
+                self.waiting.clear();
                 self.feedback_allowed = true;
                 self.error.clear();
                 let config = mappings::load_config(&self.path)?;
@@ -22739,6 +22757,13 @@ mod tests {
         assert!(
             state.starts_with("running (Program 1 unverified; detecting program; actions inactive): Current RAM matches no single stored program")
                 && state.ends_with(fix),
+            "{state}"
+        );
+        // v7.7 ticket 269: a later notice (an app profile focused) doesn't hide it.
+        ui.notice = "Profile: Firefox".into();
+        let state = ui.run_state();
+        assert!(
+            state.contains("Current RAM matches no single stored program") && state.ends_with(fix),
             "{state}"
         );
         ui.observe_program(Changed).unwrap(); // Prog Select on the device changed the RAM
