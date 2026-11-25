@@ -2546,11 +2546,13 @@ impl Config {
         for mapping in self.mappings.iter().chain(profiles) {
             if let crate::actions::Action::SoundCombo(name) = &mapping.action {
                 if !self.sound_combos.iter().any(|c| c.name == *name) {
-                    return Err(format!(
-                        "{} uses sound combo {name}, which doesn't exist",
-                        mapping.control.label()
-                    )
-                    .into());
+                    // The name the user sees ("Bank A Pad 5"), never a raw note number.
+                    let control = Some(mapping.label.clone())
+                        .filter(|l| !l.is_empty())
+                        .unwrap_or_else(|| mapping.control.label());
+                    return Err(
+                        format!("{control} uses sound combo {name}, which doesn't exist").into(),
+                    );
                 }
             }
         }

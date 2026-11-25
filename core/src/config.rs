@@ -1628,8 +1628,12 @@ mod tests {
         mappings::save_config(&path, &used).unwrap();
         used.sound_combos.remove(0);
         let error = mappings::save_config(&path, &used).unwrap_err().to_string();
+        let pad = used.mappings[0].label.clone();
+        assert!(!pad.is_empty() && !pad.contains("note"), "{pad}");
         assert!(
-            error.contains("uses sound combo headset, which doesn't exist"),
+            error.contains(&format!(
+                "{pad} uses sound combo headset, which doesn't exist"
+            )),
             "{error}"
         );
         mappings::save_config(&path, &config).unwrap();
