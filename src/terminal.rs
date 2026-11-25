@@ -14639,11 +14639,8 @@ fn name_windows(mapping: &mut Mapping, program: Option<&(u8, crate::feedback::Pa
     }
 }
 
-/// v7.8 ticket 20: Edit → Change mapped input. Learn the new control, show "old → new", ask
-/// before replacing what it does now, then save both controls in one atomic write and run a
-/// transition (held keys released; the new control fires from its next press). The old
-/// control does nothing after; one with a built-in Xbox default is saved as "nothing", so the
-/// default doesn't come back on its own.
+/// Edit → Change mapped input. A move or swap saves both controls together, then
+/// releases held keys and reloads the assignments before the next press.
 fn change_input(
     ui: &mut impl Ui,
     path: &Path,
@@ -14653,15 +14650,18 @@ fn change_input(
     from_context: u8,
 ) -> Result<()> {
     use mappings::Input;
-    let Some(mut moved) = current
-        .iter()
-        .find(|m| m.context == from_context && m.control == from)
+    let saved = |control, context| {
+        current
+            .iter()
+            .find(|m| m.context == context && m.control == control)
+    };
+    let Some(original) = saved(from, from_context)
         .cloned()
         .or_else(|| builtin_default(profile, from_context, from))
     else {
         return Err("validation: that assignment is gone; reopen Edit saved assignment".into());
     };
-    let page = match moved.input {
+    let page = match original.input {
         Input::Piano => 1,
         Input::Knob { .. } | Input::RelativeKnob { .. } => 2,
         Input::Joystick { .. } => 3,
@@ -14674,9 +14674,7 @@ fn change_input(
     let (to, to_context) = (target.control, target.context);
     let program = ui.program();
     let name = |control, context| {
-        current
-            .iter()
-            .find(|m| m.context == context && m.control == control)
+        saved(control, context)
             .map(|m| m.name(program.as_ref()))
             .unwrap_or_else(|| mappings::control_name(control, None, context, program.as_ref()))
     };
@@ -14684,50 +14682,64 @@ fn change_input(
     if (to, to_context) == (from, from_context) {
         return Err(format!("validation: the assignment is on {to_name} already").into());
     }
-    let input = match (
-        moved.input,
-        target.motion.as_ref().map(|(_, input, _)| *input),
-    ) {
-        // A knob moved to another knob keeps its step.
-        (Input::Knob { step }, Some(Input::Knob { .. })) => Input::Knob { step },
-        (Input::RelativeKnob { step }, Some(Input::RelativeKnob { .. })) => {
-            Input::RelativeKnob { step }
+
+    let move_to = |mut mapping: Mapping,
+                   (control, context, input): (Control, u8, Input),
+                   name: &str,
+                   label: String|
+     -> Result<Mapping> {
+        let input = match (mapping.input, input) {
+            // A knob assignment keeps its step on another knob of the same kind.
+            (previous @ Input::Knob { .. }, Input::Knob { .. })
+            | (previous @ Input::RelativeKnob { .. }, Input::RelativeKnob { .. }) => previous,
+            (_, input) => input,
+        };
+        let what = mapping.action_label();
+        if !families(input).contains(&action_family(&mapping)) {
+            return Err(format!(
+                "validation: {what} can't go on {name}: that kind of control takes other actions"
+            )
+            .into());
         }
-        (_, Some(input)) => input,
-        (_, None) if target.page == 1 => Input::Piano,
-        (_, None) => Input::Pad,
+        if mapping.risky && !matches!(input, Input::Pad | Input::Piano) {
+            return Err(format!("validation: {what} fires after a one-second hold; only a pad, key or button can be held, not {name}").into());
+        }
+        if input == Input::Piano
+            && let Some(refused) = piano_refusal(path, current, context)?
+        {
+            return Err(format!("{refused} Cannot move {what} to {name}.").into());
+        }
+        mapping.control = control;
+        mapping.context = context;
+        mapping.input = input;
+        mapping.label = label;
+        // Pad lights only where a shortcut pad can show them (as a new assignment).
+        if mapping.action != crate::actions::Action::Shortcut
+            || input != Input::Pad
+            || context > 7
+            || profile.is_some()
+        {
+            mapping.feedback = crate::feedback::Feedback::default();
+        }
+        name_windows(&mut mapping, program.as_ref());
+        mapping
+            .validate()
+            .map_err(|error| format!("validation: {what} can't go on {name}: {error}"))?;
+        Ok(mapping)
     };
-    let what = moved.action_label();
-    if !families(input).contains(&action_family(&moved)) {
-        return Err(format!(
-            "validation: {what} can't go on {to_name}: that kind of control takes other actions"
-        )
-        .into());
-    }
-    if moved.risky && !matches!(input, Input::Pad | Input::Piano) {
-        return Err(format!("validation: {what} fires after a one-second hold; only a pad, key or button can be held, not {to_name}").into());
-    }
-    if input == Input::Piano {
-        if let Some(refused) = piano_refusal(path, current, to_context)? {
-            return Err(refused.into());
-        }
-    }
-    let replaced = current
-        .iter()
-        .find(|m| m.context == to_context && m.control == to)
-        .map(Mapping::action_label)
-        .or_else(|| {
-            builtin_default(profile, to_context, to)
-                .map(|d| format!("{} (default)", d.action_label()))
-        });
-    moved.label = match (
-        &target.motion,
-        current
-            .iter()
-            .find(|m| m.context == to_context && m.control == to),
-    ) {
+
+    let occupied = saved(to, to_context)
+        .cloned()
+        .map(|m| (m, false))
+        .or_else(|| builtin_default(profile, to_context, to).map(|m| (m, true)));
+    let input = match &target.motion {
+        Some((_, input, _)) => *input,
+        None if target.page == 1 => Input::Piano,
+        None => Input::Pad,
+    };
+    let to_label = match (&target.motion, &occupied) {
         (Some((_, _, label)), _) => label.clone(),
-        (None, Some(old)) => old.label.clone(),
+        (None, Some((old, _))) => old.label.clone(),
         (None, None) if input == Input::Piano => {
             format!("Piano channel {} note {}", to.channel, to.id)
         }
@@ -14736,37 +14748,40 @@ fn change_input(
             None => return Ok(()),
         },
     };
-    moved.control = to;
-    moved.context = to_context;
-    moved.input = input;
-    // Pad lights only where a shortcut pad can show them (as a new assignment).
-    if moved.action != crate::actions::Action::Shortcut
-        || input != Input::Pad
-        || to_context > 7
-        || profile.is_some()
-    {
-        moved.feedback = crate::feedback::Feedback::default();
-    }
-    name_windows(&mut moved, program.as_ref());
-    moved.validate().map_err(stage("validation"))?;
-    let (ask, yes) = match &replaced {
-        Some(now) => (
-            format!("{from_name} → {to_name}: {what}\n{to_name} does {now} now; it is replaced."),
-            "Replace",
-        ),
-        None => (format!("{from_name} → {to_name}: {what}"), "Move"),
+    let (from_input, from_label) = (original.input, original.label.clone());
+    let what = original.action_label();
+    let moved = move_to(original, (to, to_context, input), &to_name, to_label)?;
+    let summary = format!("{from_name} → {to_name}: {what}");
+    let choice = match &occupied {
+        Some((other, default)) => {
+            let now = other.action_label();
+            let suffix = if *default { " (default)" } else { "" };
+            question(
+                ui,
+                &format!(
+                    "{summary}\n{to_name} does {now}{suffix} now. Swap moves it to {from_name}."
+                ),
+                &strings(&["Cancel", "Replace", "Swap"]),
+            )?
+        }
+        None => question(ui, &summary, &strings(&["Cancel", "Move"]))?,
     };
-    if question(ui, &ask, &strings(&["Cancel", yes]))? != Some(1) {
-        return Ok(());
-    }
-    let left = match builtin_default(profile, from_context, from) {
-        Some(_) => {
+    let left = match (choice, occupied) {
+        (Some(2), Some((other, _))) => Some(move_to(
+            other,
+            (from, from_context, from_input),
+            &from_name,
+            from_label,
+        )?),
+        (Some(1), _) if builtin_default(profile, from_context, from).is_some() => {
+            // A move off a built-in default must leave silence in its old slot.
             let mut silent = Mapping::new_action(from, Input::Pad, crate::actions::Action::Nothing)
                 .map_err(stage("validation"))?;
             silent.context = from_context;
             Some(silent)
         }
-        None => None,
+        (Some(1), _) => None,
+        _ => return Ok(()),
     };
     commit_all(
         path,
@@ -21726,7 +21741,7 @@ mod tests {
         assert!(
             ui.screens
                 .iter()
-                .any(|s| s.contains(&format!("{} does Enter now; it is replaced.", n(37)))),
+                .any(|s| s.contains(&format!("{} does Enter now.", n(37)))),
             "{}",
             ui.screens.join("\n----\n")
         );
@@ -21786,6 +21801,128 @@ mod tests {
         };
         assert_eq!(on(south), Some(Action::Nothing), "{saved:?}");
         assert_eq!(on(free), Some(Action::Shortcut));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn change_mapped_input_swaps_two_pads_in_one_transition() {
+        use Key::*;
+        let (dir, _ui, _ran, [a, b, ..]) = configure_session("swap-pads");
+        let path = dir.join("mappings.tsv");
+        let mut first = Mapping::new(a, "Shift", "hold").unwrap();
+        first.label = "First pad".into();
+        first.risky = true;
+        let mut second = Mapping::new(b, "Enter", "tap").unwrap();
+        second.label = "Second pad".into();
+        let mut current = vec![first.clone(), second.clone()];
+        mappings::save(&path, &current).unwrap();
+        let mut ui = Script {
+            keys: [Tab, Enter, Enter, Down, Enter, Down, Down, Enter, Escape].into(),
+            pads: [b].into(),
+            ..Default::default()
+        };
+        configure(&mut ui, &path, &mut current).unwrap();
+        assert!(ui.keys.is_empty());
+        assert_eq!(ui.applied, 1);
+        std::mem::swap(&mut first.control, &mut second.control);
+        std::mem::swap(&mut first.label, &mut second.label);
+        assert_eq!(current, [second, first]);
+        assert_eq!(mappings::load(&path).unwrap(), current);
+
+        let before = config_bytes(&path);
+        block_saves(&path);
+        let expected = current.clone();
+        let mut ui = Script {
+            keys: [Down, Down, Enter].into(),
+            pads: [b].into(),
+            ..Default::default()
+        };
+        let error = change_input(&mut ui, &path, &mut current, None, a, 0).unwrap_err();
+        assert!(error.to_string().starts_with("file I/O: "));
+        assert_eq!(config_bytes(&path), before);
+        assert_eq!(current, expected);
+        assert_eq!(ui.applied, 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn change_mapped_input_swaps_an_xbox_default_as_an_override() {
+        use Key::*;
+        let (dir, _ui, _ran, [pad, ..]) = configure_session("swap-xbox-default");
+        let path = dir.join("mappings.tsv");
+        let mut current = vec![Mapping::new(pad, "F2", "tap").unwrap()];
+        mappings::save(&path, &current).unwrap();
+        let button = Control::button(0); // Xbox A defaults to Enter.
+        let mut ui = Script {
+            keys: [Enter, Down, Down, Enter].into(), // Layer 1, then Swap.
+            pads: [button].into(),
+            xbox: true,
+            xbox_program: 3,
+            ..Default::default()
+        };
+        change_input(&mut ui, &path, &mut current, None, pad, 0).unwrap();
+        let saved = mappings::load(&path).unwrap();
+        assert_eq!(ui.applied, 1);
+        assert_eq!(saved.len(), 2);
+        assert_eq!((saved[0].control, saved[0].context), (pad, 0));
+        assert_eq!(saved[0].keys, ["Enter"]);
+        assert_eq!(saved[0].behavior, mappings::Behavior::Hold);
+        assert_eq!(
+            (saved[1].control, saved[1].context),
+            (button, mappings::xbox_context(3, false))
+        );
+        assert_eq!(saved[1].keys, ["F2"]);
+        assert_eq!(saved[1].behavior, mappings::Behavior::Tap);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn change_mapped_input_refuses_a_swap_when_the_reverse_move_is_unsafe() {
+        use crate::actions::Action;
+        use Key::*;
+        use mappings::Input;
+        let (dir, _ui, _ran, _) = configure_session("swap-refused");
+        let path = dir.join("mappings.tsv");
+        let (context, program) = recorded_program();
+        let pad = mappings::pad_controls(&program)[0].unwrap();
+        let knob = Control {
+            channel: program[0x10] + 1,
+            id: program[0x55],
+            message: crate::Message::Cc,
+            direction: 1,
+        };
+        let mut knob_mapping = Mapping::new_action(
+            knob,
+            Input::Knob { step: 4 },
+            Action::Volume { up: false, step: 5 },
+        )
+        .unwrap();
+        knob_mapping.context = context;
+        let mut pad_mapping =
+            Mapping::new_action(pad, Input::Pad, Action::Volume { up: true, step: 5 }).unwrap();
+        pad_mapping.context = context;
+        pad_mapping.risky = true;
+        let mut current = vec![knob_mapping, pad_mapping];
+        mappings::save(&path, &current).unwrap();
+        let before = config_bytes(&path);
+        let expected = current.clone();
+        let mut ui = Script {
+            keys: [Down, Down, Enter].into(),
+            pads: [pad].into(),
+            context,
+            program: Some((context, program)),
+            ..Default::default()
+        };
+        let error = change_input(&mut ui, &path, &mut current, None, knob, context)
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("validation: "), "{error}");
+        assert!(error.contains("one-second hold"), "{error}");
+        assert!(error.contains("Knob 1"), "{error}");
+        assert!(ui.keys.is_empty());
+        assert_eq!(ui.applied, 0);
+        assert_eq!(current, expected);
+        assert_eq!(config_bytes(&path), before);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
