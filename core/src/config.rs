@@ -21,7 +21,8 @@ pub const LIGHTS_VERSION: u64 = 4;
 /// version 2 file by its version, not by an unknown word.
 pub const MAPPINGS_VERSION: u64 = 2;
 /// devices.json: v2 (v7.8 ticket 23) adds the tuning's `layer_button`; v1 loads with LB.
-pub const DEVICES_VERSION: u64 = 2;
+/// v3 (v7.8 ticket 24) adds `rumble_strength` and `rumble_ms`; older ones load medium, 300 ms.
+pub const DEVICES_VERSION: u64 = 3;
 /// The files, in the order they are applied: each one's references (variables, MIDI
 /// devices, idle settings) are in place before it is checked.
 pub const FILES: [&str; 5] = [
@@ -612,6 +613,8 @@ fn devices(config: &Config) -> Value {
             "layer_button": crate::gamepad::BUTTONS
                 .get(usize::from(t.layer))
                 .map_or("LB", |(_, name)| *name),
+            "rumble_strength": t.rumble_strength.word(),
+            "rumble_ms": t.rumble_ms,
         },
     })
 }
@@ -672,6 +675,8 @@ fn apply_devices(at: &Obj, config: &mut Config) -> Result<()> {
         "sticks",
         "headset",
         "layer_button",
+        "rumble_strength",
+        "rumble_ms",
     ])?;
     let sticks = t.list("sticks")?;
     let stick = |i: usize| -> Result<mappings::StickMode> {
@@ -692,6 +697,15 @@ fn apply_devices(at: &Obj, config: &mut Config) -> Result<()> {
         mouse: t.pick("mouse", &MOUSE)?,
         sticks: [stick(0)?, stick(1)?],
         headset: t.bool("headset")?,
+        // v7.8 ticket 24: v1 and v2 files have none: medium, 300 ms, as before.
+        rumble_strength: match at.int::<u64>("version")? {
+            ..=2 => mappings::RumbleStrength::Medium,
+            _ => t.pick("rumble_strength", &mappings::RUMBLE_STRENGTHS)?,
+        },
+        rumble_ms: match at.int::<u64>("version")? {
+            ..=2 => 300,
+            _ => t.int("rumble_ms")?,
+        },
         // v7.8 ticket 23: v1 files have none: LB, as before.
         layer: match at.int::<u64>("version")? {
             1 => crate::gamepad::LAYER_DEFAULT,
@@ -1314,6 +1328,40 @@ mod tests {
         config
     }
 
+    /// v7.8 ticket 24: devices.json v3 keeps the rumble strength and length; a v2 file (none)
+    /// loads medium, 300 ms; an out-of-range length is refused and the file kept.
+    #[test]
+    fn rumble_tuning_saves_loads_and_older_files_get_the_defaults() {
+        let dir = folder("rumble-tuning");
+        let path = dir.join("mappings.tsv");
+        let mut config = Config::default();
+        config.tuning.rumble_strength = mappings::RumbleStrength::Strong;
+        config.tuning.rumble_ms = 1200;
+        mappings::save_config(&path, &config).unwrap();
+        let text = fs::read_to_string(dir.join("devices.json")).unwrap();
+        let saved: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(saved["version"], 3);
+        assert_eq!(saved["tuning"]["rumble_strength"], "strong");
+        assert_eq!(saved["tuning"]["rumble_ms"], 1200);
+        assert_eq!(mappings::load_config(&path).unwrap().tuning, config.tuning);
+        let mut long = config.clone();
+        long.tuning.rumble_ms = 5000;
+        assert!(mappings::save_config(&path, &long).is_err());
+        assert_eq!(fs::read_to_string(dir.join("devices.json")).unwrap(), text);
+        let v2 = text.replace("\"version\": 3", "\"version\": 2").replace(
+            ",\n    \"rumble_strength\": \"strong\",\n    \"rumble_ms\": 1200",
+            "",
+        );
+        assert!(!v2.contains("rumble_ms"), "{v2}");
+        fs::write(dir.join("devices.json"), v2).unwrap();
+        let older = mappings::load_config(&path).unwrap().tuning;
+        assert_eq!(
+            (older.rumble_strength, older.rumble_ms),
+            (mappings::RumbleStrength::Medium, 300)
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     /// v7.8 ticket 23: devices.json v2 keeps the layer 2 button; a v1 file loads with LB;
     /// with RB as the layer button LB is mappable and RB is refused by name, as are the Xbox
     /// button, View and Menu as the layer button. A refused save keeps the files.
@@ -1335,7 +1383,7 @@ mod tests {
         mappings::save_config(&path, &config).unwrap();
         let saved: Value =
             serde_json::from_str(&fs::read_to_string(dir.join("devices.json")).unwrap()).unwrap();
-        assert_eq!(saved["version"], 2);
+        assert_eq!(saved["version"], DEVICES_VERSION);
         assert_eq!(saved["tuning"]["layer_button"], "RB");
         let loaded = mappings::load_config(&path).unwrap();
         assert_eq!(loaded.tuning.layer, 5);
@@ -1369,8 +1417,12 @@ mod tests {
         // An older devices.json (v1, no layer_button) loads with LB.
         let v1 = fs::read_to_string(dir.join("devices.json"))
             .unwrap()
-            .replace("\"version\": 2", "\"version\": 1")
-            .replace(",\n    \"layer_button\": \"RB\"", "");
+            .replace(&format!("\"version\": {DEVICES_VERSION}"), "\"version\": 1")
+            .replace(",\n    \"layer_button\": \"RB\"", "")
+            .replace(
+                ",\n    \"rumble_strength\": \"medium\",\n    \"rumble_ms\": 300",
+                "",
+            );
         assert!(!v1.contains("layer_button"));
         fs::write(dir.join("devices.json"), v1).unwrap();
         let mut older = mappings::load_config(&path);

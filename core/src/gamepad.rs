@@ -178,6 +178,21 @@ pub fn default_layout() -> Vec<Mapping> {
     })
     .collect()
 }
+/// v7.8 ticket 24: what a rumble pattern plays with Xbox tuning: the strong motor's
+/// magnitude for the strength, and the length (a long pattern three times it, as v7 ticket
+/// 86's 300/900 ms). None: no rumble.
+pub fn rumble_effect(
+    rumble: crate::status::Rumble,
+    tuning: &crate::mappings::Tuning,
+) -> Option<(u16, u64)> {
+    let ms = u64::from(tuning.rumble_ms);
+    let ms = match rumble {
+        crate::status::Rumble::Off => return None,
+        crate::status::Rumble::Short => ms,
+        crate::status::Rumble::Long => ms * 3,
+    };
+    Some((tuning.rumble_strength.magnitude(), ms))
+}
 /// The layer key's default, LB (v7 ticket 09), as a [`BUTTONS`] index.
 pub const LAYER_DEFAULT: u8 = 4;
 /// The layer key (v7 ticket 09; v7.8 ticket 23: `layer`, Xbox tuning's [`BUTTONS`] index):
@@ -1614,15 +1629,24 @@ impl Pad {
     /// v7 ticket 86: a short (300 ms) or long (900 ms) rumble; Off, or rumble turned off in
     /// Xbox tuning, plays nothing.
     pub fn rumble(&mut self, rumble: crate::status::Rumble) -> crate::Result<()> {
-        use gilrs::ff::{BaseEffect, BaseEffectType, EffectBuilder, Repeat, Replay, Ticks};
-        let ms = match rumble {
-            crate::status::Rumble::Off => return Ok(()),
-            crate::status::Rumble::Short => 300,
-            crate::status::Rumble::Long => 900,
-        };
         if !self.tuning.rumble {
             return Ok(());
         }
+        match rumble_effect(rumble, &self.tuning) {
+            Some((magnitude, ms)) => self.play(magnitude, ms),
+            None => Ok(()),
+        }
+    }
+    /// v7.8 ticket 24: Xbox tuning's Test: one short rumble with `tuning`'s strength and
+    /// length, even while rumble for agents is off (only while VibeConsole owns the pad).
+    pub fn test_rumble(&mut self, tuning: &crate::mappings::Tuning) -> crate::Result<()> {
+        match rumble_effect(crate::status::Rumble::Short, tuning) {
+            Some((magnitude, ms)) => self.play(magnitude, ms),
+            None => Ok(()),
+        }
+    }
+    fn play(&mut self, magnitude: u16, ms: u64) -> crate::Result<()> {
+        use gilrs::ff::{BaseEffect, BaseEffectType, EffectBuilder, Repeat, Replay, Ticks};
         let ids = self
             .gilrs
             .gamepads()
@@ -1632,10 +1656,10 @@ impl Pad {
         if ids.is_empty() {
             return Ok(());
         }
-        let length = Ticks::from_ms(ms);
+        let length = Ticks::from_ms(u32::try_from(ms).unwrap_or(u32::MAX));
         let effect = EffectBuilder::new()
             .add_effect(BaseEffect {
-                kind: BaseEffectType::Strong { magnitude: 40_000 },
+                kind: BaseEffectType::Strong { magnitude },
                 scheduling: Replay {
                     play_for: length,
                     ..Default::default()
@@ -2068,6 +2092,8 @@ mod tests {
     fn triggers_fire_at_the_tuned_point_and_sticks_ignore_their_dead_zone() {
         let tuning = crate::mappings::Tuning {
             layer: LAYER_DEFAULT,
+            rumble_strength: crate::mappings::RumbleStrength::Medium,
+            rumble_ms: 300,
             dead_zone: 15,
             trigger: 30,
             ..Default::default()
@@ -2096,6 +2122,8 @@ mod tests {
         // A 3% fire point still releases at rest.
         let low = crate::mappings::Tuning {
             layer: LAYER_DEFAULT,
+            rumble_strength: crate::mappings::RumbleStrength::Medium,
+            rumble_ms: 300,
             trigger: 3,
             ..Default::default()
         };
@@ -2384,6 +2412,8 @@ mod tests {
     fn mouse_stick_moves_by_push_past_the_dead_zone_and_keeps_fractions() {
         let tuning = crate::mappings::Tuning {
             layer: LAYER_DEFAULT,
+            rumble_strength: crate::mappings::RumbleStrength::Medium,
+            rumble_ms: 300,
             dead_zone: 15,
             mouse_speed: 10,
             mouse: crate::mappings::MouseStick::Left,
@@ -3264,6 +3294,41 @@ mod tests {
             }
         }
         assert_eq!(xbox_program(5), None);
+    }
+
+    /// v7.8 ticket 24: Xbox tuning's strength and length are what a rumble plays (a long
+    /// pattern three times the length); the defaults play what v7 did (40 000, 300/900 ms);
+    /// lengths outside 100–2000 ms are refused.
+    #[test]
+    fn rumble_plays_the_tuned_strength_and_length() {
+        use crate::mappings::{RumbleStrength, Tuning};
+        use crate::status::Rumble;
+        let tuning = Tuning::default();
+        assert_eq!(rumble_effect(Rumble::Short, &tuning), Some((40_000, 300)));
+        assert_eq!(rumble_effect(Rumble::Long, &tuning), Some((40_000, 900)));
+        assert_eq!(rumble_effect(Rumble::Off, &tuning), None);
+        for (strength, magnitude) in [
+            (RumbleStrength::Light, 20_000),
+            (RumbleStrength::Strong, u16::MAX),
+        ] {
+            let tuned = Tuning {
+                rumble_strength: strength,
+                rumble_ms: 1500,
+                ..tuning.clone()
+            };
+            assert_eq!(
+                rumble_effect(Rumble::Short, &tuned),
+                Some((magnitude, 1500))
+            );
+            assert_eq!(rumble_effect(Rumble::Long, &tuned), Some((magnitude, 4500)));
+        }
+        for (ms, ok) in [(99, false), (100, true), (2000, true), (2001, false)] {
+            let tuned = Tuning {
+                rumble_ms: ms,
+                ..tuning.clone()
+            };
+            assert_eq!(tuned.validate().is_ok(), ok, "{ms} ms");
+        }
     }
 
     /// v7 ticket 115: the built-in defaults apply in every Xbox program; a saved button

@@ -1965,6 +1965,40 @@ pub struct Tuning {
     /// v7.8 ticket 23 (devices.json v2): the layer 2 button, a `gamepad::BUTTONS` index
     /// (LB by default); never the Xbox button, View or Menu.
     pub layer: u8,
+    /// v7.8 ticket 24 (devices.json v3): how hard and how long the controller rumbles for
+    /// agents (a long pattern is three times `rumble_ms`). Medium, 300 ms by default.
+    pub rumble_strength: RumbleStrength,
+    pub rumble_ms: u16,
+}
+/// v7.8 ticket 24: the strong motor's strength.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RumbleStrength {
+    Light,
+    Medium,
+    Strong,
+}
+pub const RUMBLE_STRENGTHS: [(&str, RumbleStrength); 3] = [
+    ("light", RumbleStrength::Light),
+    ("medium", RumbleStrength::Medium),
+    ("strong", RumbleStrength::Strong),
+];
+/// v7.8 ticket 24: a rumble's length, in milliseconds.
+pub const RUMBLE_MS: std::ops::RangeInclusive<u16> = 100..=2000;
+impl RumbleStrength {
+    /// gilrs's `Strong` magnitude; medium is what v7 played (40 000).
+    pub fn magnitude(self) -> u16 {
+        match self {
+            Self::Light => 20_000,
+            Self::Medium => 40_000,
+            Self::Strong => u16::MAX,
+        }
+    }
+    pub fn word(self) -> &'static str {
+        RUMBLE_STRENGTHS
+            .iter()
+            .find(|(_, s)| *s == self)
+            .map_or("medium", |(w, _)| w)
+    }
 }
 /// How a stick fires (v7 ticket 75). Linear: up/down/left/right, each on its own axis.
 /// Angle: the stick's angle (0° = up, clockwise) picks one of its ranges, each a control.
@@ -2077,6 +2111,14 @@ impl Default for Tuning {
 }
 impl Tuning {
     pub fn validate(self) -> Result<Self> {
+        if !RUMBLE_MS.contains(&self.rumble_ms) {
+            return Err(format!(
+                "tuning: rumble length must be {}–{} ms",
+                RUMBLE_MS.start(),
+                RUMBLE_MS.end()
+            )
+            .into());
+        }
         // v7.8 ticket 23: the Xbox button cycles profiles and locks; View and Menu, held, pick
         // Xbox programs (so they never reach the layer switch).
         match crate::gamepad::BUTTONS
@@ -2141,6 +2183,8 @@ impl Config {
             light_patterns: lights.patterns,
             tuning: Tuning {
                 layer: crate::gamepad::LAYER_DEFAULT,
+                rumble_strength: RumbleStrength::Medium,
+                rumble_ms: 300,
                 dead_zone: 0,
                 trigger: 0,
                 mouse_speed: 0,
@@ -3244,7 +3288,9 @@ pub(crate) fn parse_config(contents: &str) -> Result<Config> {
             return Err("expected tuning dead-zone/trigger/mouse-speed/rumble/mouse fields".into());
         };
         Tuning {
-            layer: crate::gamepad::LAYER_DEFAULT, // devices.json v2 only
+            layer: crate::gamepad::LAYER_DEFAULT,    // devices.json v2 only
+            rumble_strength: RumbleStrength::Medium, // devices.json v3 only
+            rumble_ms: 300,
             dead_zone: dead_zone.parse()?,
             trigger: trigger.parse()?,
             mouse_speed: speed.parse()?,
@@ -4502,6 +4548,8 @@ mod tests {
             config.tuning,
             Tuning {
                 layer: crate::gamepad::LAYER_DEFAULT,
+                rumble_strength: RumbleStrength::Medium,
+                rumble_ms: 300,
                 dead_zone: 15,
                 trigger: 30,
                 mouse_speed: 10,
@@ -4524,6 +4572,8 @@ mod tests {
         let mut tuned = config.clone();
         tuned.tuning = Tuning {
             layer: crate::gamepad::LAYER_DEFAULT,
+            rumble_strength: RumbleStrength::Medium,
+            rumble_ms: 300,
             dead_zone: 20,
             trigger: 60,
             mouse_speed: 25,

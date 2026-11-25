@@ -233,6 +233,11 @@ trait Ui {
     fn layer_button(&self) -> &'static str {
         "LB"
     }
+    /// v7.8 ticket 24: Xbox tuning's Test: one rumble with `tuning`, on the controller this
+    /// session owns; what was done, in words (never that it was felt).
+    fn test_rumble(&mut self, _tuning: &mappings::Tuning) -> Result<String> {
+        Ok("No controller open in this session: nothing played".into())
+    }
     /// The Xbox program in use (v7 ticket 115): Learn saves an Xbox button there.
     fn xbox_program(&self) -> u8 {
         1
@@ -6780,6 +6785,17 @@ impl Ui for Terminal {
     fn light_rule(&self) -> bool {
         crate::gamepad::light_rule_installed()
     }
+    fn test_rumble(&mut self, tuning: &mappings::Tuning) -> Result<String> {
+        let Some(pad) = self.gamepad.as_mut().filter(|p| !p.connected().is_empty()) else {
+            return Ok("No controller connected: nothing played".into());
+        };
+        pad.test_rumble(tuning)?;
+        Ok(format!(
+            "Rumble sent: {}, {} ms (a controller without rumble plays nothing)",
+            tuning.rumble_strength.word(),
+            tuning.rumble_ms
+        ))
+    }
     fn layer_button(&self) -> &'static str {
         layer_label(
             (self.gamepad.as_ref()).map_or(crate::gamepad::LAYER_DEFAULT, |p| p.tuning.layer),
@@ -9978,6 +9994,14 @@ fn tuning_items(ui: &impl Ui, tuning: &mappings::Tuning) -> Vec<String> {
             "Layer 2 button (hold for layer 2): {}",
             layer_label(tuning.layer)
         ),
+        // v7.8 ticket 24
+        format!("Rumble strength: {}", tuning.rumble_strength.word()),
+        format!(
+            "Rumble length: {} ms (long patterns {} ms)",
+            tuning.rumble_ms,
+            u32::from(tuning.rumble_ms) * 3
+        ),
+        "Test rumble (one rumble with these settings)".into(),
     ]
 }
 
@@ -10047,6 +10071,42 @@ fn tuning_choice(ui: &mut impl Ui, path: &Path, choice: usize) -> Result<()> {
                 return Ok(());
             };
             config.tuning.layer = offered[i];
+        }
+        // v7.8 ticket 24: strength, length (refused outside 100–2000 ms), and a test.
+        Some(13) => {
+            let Some(i) = choose_saved(
+                ui,
+                "Rumble strength (for agents and the Test)",
+                mappings::RUMBLE_STRENGTHS
+                    .iter()
+                    .map(|(w, _)| w.to_string())
+                    .collect(),
+                mappings::RUMBLE_STRENGTHS
+                    .iter()
+                    .position(|(_, s)| *s == tuning.rumble_strength),
+            )?
+            else {
+                return Ok(());
+            };
+            config.tuning.rumble_strength = mappings::RUMBLE_STRENGTHS[i].1;
+        }
+        Some(14) => {
+            let Some(value) = number(
+                ui,
+                "Rumble length in milliseconds (100–2000); a long pattern is three times it",
+                i32::from(tuning.rumble_ms),
+                i32::from(*mappings::RUMBLE_MS.start()),
+                i32::from(*mappings::RUMBLE_MS.end()),
+            )?
+            else {
+                return Ok(());
+            };
+            config.tuning.rumble_ms = u16::try_from(value)?;
+        }
+        Some(15) => {
+            let said = ui.test_rumble(&tuning).map_err(stage("controller I/O"))?;
+            choose(ui, &said, &strings(&["Back"]))?;
+            return Ok(());
         }
         Some(3) => {
             let Some(stick) = choose(
@@ -11861,13 +11921,17 @@ fn choose_saved(
 
 fn number(ui: &mut impl Ui, title: &str, initial: i32, min: i32, max: i32) -> Result<Option<i32>> {
     let mut value = initial;
+    // v7.8 ticket 24: Left/Right take bigger steps (a rumble length runs 100–2000 ms).
+    let big = if max - min > 200 { 100 } else { 10 };
     loop {
         ui.draw(&format!(
-            "{title}\nValue: {value}\nUp/Down: adjust | Enter: confirm | Esc: cancel"
+            "{title}\nValue: {value}\nUp/Down: adjust | Left/Right: ±{big} | Enter: confirm | Esc: cancel"
         ))?;
         match ui.key()? {
             Some(Key::Up) => value = (value + 1).min(max),
             Some(Key::Down) => value = (value - 1).max(min),
+            Some(Key::Right) => value = (value + big).min(max),
+            Some(Key::Left) => value = (value - big).max(min),
             Some(Key::Enter) => return Ok(Some(value)),
             Some(Key::Escape) => return Ok(None),
             _ => {}
@@ -15884,6 +15948,8 @@ mod tests {
         rule: bool,
         /// v7.8 ticket 20: transitions run after a save (the session releases held keys).
         applied: usize,
+        /// v7.8 ticket 24: each Test rumble asked for (strength, length).
+        rumbles: Vec<(mappings::RumbleStrength, u16)>,
     }
     impl Ui for Script {
         fn height(&self) -> usize {
@@ -15915,6 +15981,11 @@ mod tests {
         fn applied(&mut self) -> Result<()> {
             self.applied += 1;
             Ok(())
+        }
+        fn test_rumble(&mut self, tuning: &mappings::Tuning) -> Result<String> {
+            self.rumbles
+                .push((tuning.rumble_strength, tuning.rumble_ms));
+            Ok("Rumble sent".into())
         }
         fn xbox_program(&self) -> u8 {
             self.xbox_program.max(1)
@@ -16719,6 +16790,40 @@ mod tests {
             ["Enter"],
             "Program 1 keeps it"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.8 ticket 24: Xbox tuning → Rumble strength and length save the pick (the length
+    /// stops at 2000 ms), and Test plays with what was saved.
+    #[test]
+    fn rumble_strength_length_and_test_in_xbox_tuning() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-rumble-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut ui = Script::default();
+        let rows = tuning_items(&ui, &mappings::load_config(&path).unwrap().tuning);
+        let row = |start: &str| rows.iter().position(|r| r.starts_with(start)).unwrap();
+        assert_eq!(rows[row("Rumble strength")], "Rumble strength: medium");
+        assert_eq!(
+            rows[row("Rumble length")],
+            "Rumble length: 300 ms (long patterns 900 ms)"
+        );
+        ui.keys = [Down, Enter].into(); // medium -> strong
+        tuning_choice(&mut ui, &path, row("Rumble strength")).unwrap();
+        ui.keys = [vec![Right; 25], vec![Enter]].concat().into(); // +100 each, stops at 2000
+        tuning_choice(&mut ui, &path, row("Rumble length")).unwrap();
+        let tuning = mappings::load_config(&path).unwrap().tuning;
+        assert_eq!(
+            (tuning.rumble_strength, tuning.rumble_ms),
+            (mappings::RumbleStrength::Strong, 2000)
+        );
+        ui.keys = [Enter].into();
+        tuning_choice(&mut ui, &path, row("Test rumble")).unwrap();
+        assert_eq!(ui.rumbles, [(mappings::RumbleStrength::Strong, 2000)]);
+        assert!(ui.screens.last().unwrap().starts_with("Rumble sent"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

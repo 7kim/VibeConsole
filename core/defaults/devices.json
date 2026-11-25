@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "midi_devices": [],
   "midi_active": null,
   "idle": {
@@ -65,6 +65,8 @@
       "linear"
     ],
     "headset": false,
-    "layer_button": "LB"
+    "layer_button": "LB",
+    "rumble_strength": "medium",
+    "rumble_ms": 300
   }
 }
