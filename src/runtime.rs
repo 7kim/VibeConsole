@@ -636,6 +636,9 @@ pub fn statusline() -> Result<()> {
     let Ok(theirs) = fs::read_to_string(statusline_saved()?) else {
         return Ok(());
     };
+    if crate::status::is_statusline(&theirs) {
+        return Ok(()); // saved by an older install: running it would call this again
+    }
     // Their command is the one Claude Code ran as a shell line before; it runs the same way.
     let mut child = Command::new("sh")
         .arg("-c")

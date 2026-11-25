@@ -462,8 +462,9 @@ pub fn analog(
             let percent = value * 100.0;
             let fire = f32::from(tuning.trigger);
             let held = down.contains(&control);
+            // Release 5% under the fire point, but above rest: a 1–5% fire point still lets go.
             let on = if held {
-                percent >= fire - 5.0
+                percent >= (fire - 5.0).max(fire / 2.0)
             } else {
                 percent >= fire
             };
@@ -1785,6 +1786,26 @@ mod tests {
         assert_eq!(
             feed(Motion::Trigger(gilrs::Button::LeftTrigger2, 0.31)),
             [Change::Event(Event::Press(lt))]
+        );
+        // A 3% fire point still releases at rest.
+        let low = crate::mappings::Tuning {
+            trigger: 3,
+            ..Default::default()
+        };
+        let (mut low_pad, mut low_down) = (Analog::default(), HashSet::new());
+        let rt = control(gilrs::Button::RightTrigger2).unwrap();
+        let mut pull = |v| {
+            analog(
+                &mut low_down,
+                &mut low_pad,
+                Motion::Trigger(gilrs::Button::RightTrigger2, v),
+                &low,
+            )
+        };
+        assert_eq!(pull(0.5), [Change::Event(Event::Press(rt))]);
+        assert_eq!(
+            pull(0.0),
+            [Change::Event(Event::Release(rt, ReleaseType::ButtonUp))]
         );
         let up = Control::button(STICK_BASE); // Left stick up
         let down_dir = Control::button(STICK_BASE + 1);

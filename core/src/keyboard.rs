@@ -218,11 +218,14 @@ impl Keyboard {
                     })
                 })
                 .collect::<Vec<_>>();
+            // Tracked like `tap`: a failed emit leaves pressed keys for `cleanup` to release.
             for &key in &keys {
+                self.held.insert(key);
                 emit(key, true)?;
             }
             for &key in keys.iter().rev() {
                 emit(key, false)?;
+                self.held.remove(&key);
             }
             return Ok(Some((pad, true)));
         }
@@ -2113,6 +2116,30 @@ mod tests {
             4,
             "one tap, nothing on pause or release: {:?}",
             sent.borrow()
+        );
+    }
+
+    /// A one-tap whose second key-down fails leaves Ctrl for `pause` to release.
+    #[test]
+    fn failed_one_tap_releases_pressed_keys_on_pause() {
+        use evdev::KeyCode as K;
+        let tap = Control::from_note(10, 36).unwrap();
+        let maps = [Mapping::new(tap, "Ctrl+T", "tap").unwrap()];
+        let sent = std::cell::RefCell::new(Vec::new());
+        let mut failing = |key, down| {
+            if key == K::KEY_T {
+                return Err(io::Error::other("uinput"));
+            }
+            sent.borrow_mut().push((key, down));
+            Ok(())
+        };
+        let mut keyboard = Keyboard::new(&maps).unwrap();
+        keyboard.resume();
+        assert!(keyboard.observe(Event::Press(tap), &mut failing).is_err());
+        let _ = keyboard.pause(&mut failing); // T's release fails too; Ctrl's must not be lost
+        assert_eq!(
+            *sent.borrow(),
+            [(K::KEY_LEFTCTRL, true), (K::KEY_LEFTCTRL, false)]
         );
     }
 

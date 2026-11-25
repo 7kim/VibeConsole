@@ -320,7 +320,9 @@ fn sessions_in(dir: &Path, alive: impl Fn(u32) -> bool) -> Vec<Session> {
     };
     let mut found = Vec::new();
     for entry in entries.flatten() {
-        if !entry.file_name().to_string_lossy().starts_with("session-") {
+        // A hook's `write_atomic` staging file is mid-write, not a session.
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("session-") || name.ends_with(".vibeconsole-tmp") {
             continue;
         }
         let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
@@ -1533,6 +1535,13 @@ pub fn transcript_tokens(path: &Path, cache: &mut (u64, u64)) -> std::io::Result
 }
 /// The command VibeConsole puts in Claude Code's `statusLine`.
 pub const STATUSLINE: &str = "vibeconsole statusline";
+/// A command that runs `vibeconsole statusline`, by any path or spacing: saving it as the
+/// user's own line would make the wrapper call itself without end.
+pub fn is_statusline(command: &str) -> bool {
+    let words = command.split_whitespace().collect::<Vec<_>>();
+    matches!(words[..], [.., program, "statusline"]
+        if program == "vibeconsole" || program.ends_with("/vibeconsole"))
+}
 /// v7.7 ticket 162: point Claude Code's `statusLine` at `vibeconsole statusline`, after a
 /// backup. A status line command the user already had is kept in `saved` and the wrapper
 /// runs it and prints its output, so their status line stays as it was.
@@ -1548,7 +1557,7 @@ pub fn install_statusline(settings: &Path, saved: &Path) -> Result<String> {
         None => serde_json::json!({}),
     };
     let current = json["statusLine"]["command"].as_str().map(str::to_owned);
-    if current.as_deref() == Some(STATUSLINE) {
+    if current.as_deref().is_some_and(is_statusline) {
         return Ok("Status line: already installed".into());
     }
     let object = json
@@ -1829,6 +1838,19 @@ mod tests {
                 .contains("already installed")
         );
         assert_eq!(std::fs::read_to_string(&saved).unwrap(), "~/my-line.sh");
+        // Ours by a full path is installed already, never saved as theirs.
+        std::fs::write(
+            &settings,
+            r#"{"statusLine":{"type":"command","command":"~/.local/bin/vibeconsole  statusline"}}"#,
+        )
+        .unwrap();
+        assert!(
+            install_statusline(&settings, &saved)
+                .unwrap()
+                .contains("already installed")
+        );
+        assert_eq!(std::fs::read_to_string(&saved).unwrap(), "~/my-line.sh");
+        assert!(!is_statusline("~/my-line.sh") && !is_statusline("myvibeconsole statusline"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
     /// v7 ticket 86: the Xbox button light shows the most urgent busy state whose pattern

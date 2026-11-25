@@ -5867,13 +5867,10 @@ mod tests {
         assert_eq!(config_bytes(&path), previous);
 
         let temporary = path.with_file_name("mappings.json.tmp");
-        fs::write(&temporary, "occupied staging file").unwrap();
+        fs::create_dir(&temporary).unwrap(); // a leftover file is cleared; a folder blocks
         assert!(save(&path, &[]).is_err());
         assert_eq!(config_bytes(&path), previous);
-        assert_eq!(
-            fs::read_to_string(&temporary).unwrap(),
-            "occupied staging file"
-        );
+        assert!(temporary.is_dir());
 
         for malformed in [
             "",

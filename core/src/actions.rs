@@ -2311,7 +2311,8 @@ pub const QUEUE_FULL: &str = "action queue full; request skipped";
 pub struct Dispatcher {
     requests: mpsc::SyncSender<Job>,
     notices: mpsc::Receiver<(u64, Action, bool, String)>,
-    taps: Option<mpsc::Receiver<TapRequest>>,
+    /// Each with the epoch it was asked in: one asked before a cancel is refused, not typed.
+    taps: Option<mpsc::Receiver<(u64, TapRequest)>>,
     /// Sequences queued or running; a re-press of the same sequence is ignored.
     sequences: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     epoch: Arc<AtomicU64>,
@@ -2322,13 +2323,18 @@ pub struct Dispatcher {
 }
 impl Dispatcher {
     pub fn with(
+        run: impl FnMut(&Action, Option<&Path>, &dyn Fn() -> bool) -> Result<String> + Send + 'static,
+    ) -> Self {
+        Self::build(Arc::new(AtomicU64::new(0)), run)
+    }
+    fn build(
+        epoch: Arc<AtomicU64>,
         mut run: impl FnMut(&Action, Option<&Path>, &dyn Fn() -> bool) -> Result<String>
         + Send
         + 'static,
     ) -> Self {
         let (requests, receiver) = mpsc::sync_channel::<Job>(8);
         let (tx, notices) = mpsc::sync_channel(16);
-        let epoch = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let sequences = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
         let e = epoch.clone();
@@ -2383,9 +2389,11 @@ impl Dispatcher {
         self.busy.load(Ordering::Acquire)
     }
     pub fn new() -> Self {
-        let (taps, tap_requests) = mpsc::sync_channel::<TapRequest>(4);
-        let mut dispatcher = Self::with(move |action, node, cancelled| {
-            let tap = |keys: Vec<evdev::KeyCode>| tap(&taps, keys, cancelled);
+        let (taps, tap_requests) = mpsc::sync_channel(4);
+        let epoch = Arc::new(AtomicU64::new(0));
+        let asked = epoch.clone();
+        let mut dispatcher = Self::build(epoch, move |action, node, cancelled| {
+            let tap = |keys: Vec<evdev::KeyCode>| tap(&taps, &asked, keys, cancelled);
             perform(action, node, cancelled, &tap)
         });
         dispatcher.taps = Some(tap_requests);
@@ -2420,10 +2428,19 @@ impl Dispatcher {
     }
     /// Key taps the worker is waiting on; the session answers each on its keyboard.
     pub fn tap_requests(&self) -> Vec<TapRequest> {
-        self.taps
-            .as_ref()
-            .map(|taps| taps.try_iter().collect())
-            .unwrap_or_default()
+        let Some(taps) = &self.taps else {
+            return Vec::new();
+        };
+        let now = self.epoch.load(Ordering::Acquire);
+        taps.try_iter()
+            .filter_map(|(epoch, (keys, reply))| {
+                if epoch == now {
+                    return Some((keys, reply));
+                }
+                let _ = reply.send(Err("cancelled".into()));
+                None
+            })
+            .collect()
     }
     /// A sequence is queued or running (its re-press is ignored meanwhile).
     pub fn sequence_running(&self, action: &Action) -> bool {
@@ -2444,15 +2461,18 @@ impl Dispatcher {
 
 /// Ask the session to tap `keys` and wait for its answer; a pause answers with an error.
 fn tap(
-    taps: &mpsc::SyncSender<TapRequest>,
+    taps: &mpsc::SyncSender<(u64, TapRequest)>,
+    epoch: &AtomicU64,
     keys: Vec<evdev::KeyCode>,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<()> {
+    // Read before the check: if not cancelled after it, this is still the job's epoch.
+    let asked = epoch.load(Ordering::Acquire);
     if cancelled() {
         return Err("cancelled".into());
     }
     let (reply, answer) = mpsc::sync_channel(1);
-    taps.try_send((keys, reply))
+    taps.try_send((asked, (keys, reply)))
         .map_err(|_| "keyboard request queue full")?;
     loop {
         match answer.recv_timeout(Duration::from_millis(20)) {
@@ -3957,15 +3977,26 @@ mod tests {
         dispatch.submit(sequence, None).unwrap(); // after it finished: runs again
         runs.recv_timeout(Duration::from_secs(1)).unwrap();
         // tap() blocks until the session answers, and gives up when cancelled.
-        let (taps, requests) = mpsc::sync_channel::<TapRequest>(4);
+        let epoch = AtomicU64::new(0);
+        let (taps, requests) = mpsc::sync_channel::<(u64, TapRequest)>(4);
         let session = thread::spawn(move || {
-            let (keys, reply) = requests.recv().unwrap();
+            let (_, (keys, reply)) = requests.recv().unwrap();
             reply.send(Ok(())).unwrap();
             keys
         });
-        tap(&taps, vec![evdev::KeyCode::KEY_ENTER], &|| false).unwrap();
+        tap(&taps, &epoch, vec![evdev::KeyCode::KEY_ENTER], &|| false).unwrap();
         assert_eq!(session.join().unwrap(), [evdev::KeyCode::KEY_ENTER]);
-        let (taps, _unanswered) = mpsc::sync_channel::<TapRequest>(4);
+        // A request asked before a cancel is refused, never handed to the keyboard.
+        let mut dispatcher = Dispatcher::with(|_, _, _| Ok(String::new()));
+        let (taps, requests) = mpsc::sync_channel(4);
+        dispatcher.taps = Some(requests);
+        let (reply, answer) = mpsc::sync_channel(1);
+        taps.send((0, (vec![evdev::KeyCode::KEY_V], reply)))
+            .unwrap();
+        dispatcher.cancel();
+        assert!(dispatcher.tap_requests().is_empty());
+        assert!(answer.recv().unwrap().is_err());
+        let (taps, _unanswered) = mpsc::sync_channel::<(u64, TapRequest)>(4);
         let cancel = Arc::new(AtomicBool::new(false));
         let c = cancel.clone();
         thread::spawn(move || {
@@ -3973,7 +4004,7 @@ mod tests {
             c.store(true, Ordering::Release);
         });
         assert!(
-            tap(&taps, vec![evdev::KeyCode::KEY_ENTER], &|| cancel
+            tap(&taps, &epoch, vec![evdev::KeyCode::KEY_ENTER], &|| cancel
                 .load(Ordering::Acquire))
             .is_err()
         );

@@ -3532,27 +3532,32 @@ impl Terminal {
             pad.stop_rumble();
         }
         self.motion = crate::motion::Motion::default();
+        // Every step runs even after one fails, so owned feedback is always restored; the
+        // first error is returned.
+        let mut first: Result<()> = Ok(());
         if let Some(output) = &mut self.output {
             if let Err(error) = output.pause() {
                 self.output = None;
-                self.cancel_actions();
-                return Err(error);
+                first = Err(error);
             }
         }
         self.cancel_actions();
-        let settings = if let Some(resolver) = &mut self.resolver {
-            resolver.clear()?
-        } else {
-            None
+        let settings = match self.resolver.as_mut().map(|r| r.clear()) {
+            Some(Ok(settings)) => settings,
+            Some(Err(error)) => {
+                first = first.and(Err(error));
+                None
+            }
+            None => None,
         };
         if let (Some(controller), Some(settings)) = (&mut self.controller, settings) {
-            controller.set(settings)?;
+            first = first.and(controller.set(settings));
         }
         // Status lights end with the output: the program's feedback goes back on the controller.
         if let Some(controller) = &mut self.controller {
-            controller.light(None)?;
+            first = first.and(controller.light(None));
         }
-        Ok(())
+        first
     }
 
     /// `/configure` from the command list. Entering and leaving are transitions: held keys
@@ -14305,10 +14310,11 @@ mod tests {
     fn saved_text(path: &Path) -> String {
         mappings::serialize_config(&mappings::load_config(path).unwrap()).unwrap()
     }
-    /// Make the next save fail: every config file's staging file is taken.
+    /// Make the next save fail: every config file's staging path is a folder (a leftover
+    /// staging file is cleared, so it no longer blocks).
     fn block_saves(path: &Path) {
         for file in vibeconsole_core::config::FILES {
-            std::fs::write(path.with_file_name(format!("{file}.tmp")), "occupied").unwrap();
+            std::fs::create_dir_all(path.with_file_name(format!("{file}.tmp"))).unwrap();
         }
     }
     /// An install from before v7.7 ticket 194: this `mappings.tsv` and no JSON files yet.

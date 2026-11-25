@@ -189,6 +189,9 @@ fn write_all(files: &[(PathBuf, String)], history: Option<&Path>) -> Result<()> 
             true => path.with_extension("json.tmp"),
             false => path.with_extension("tmp"),
         };
+        // A save killed before its rename leaves this behind; only the owner-lock holder
+        // saves, so it's stale and would block every later save.
+        let _ = fs::remove_file(&temporary);
         if let Err(e) = write_new(&temporary, text.as_bytes()) {
             unstage(&staged);
             return Err(format!(
@@ -204,11 +207,28 @@ fn write_all(files: &[(PathBuf, String)], history: Option<&Path>) -> Result<()> 
         let old = fs::read(path).ok();
         if let Err(e) = fs::rename(temporary, path) {
             unstage(&staged);
+            // Put each renamed file back the same atomic way: stage the old text, rename.
+            let mut unrestored = Vec::new();
             for (path, old) in done.into_iter().rev() {
-                let _ = match old {
-                    Some(old) => fs::write(path, old),
-                    None => fs::remove_file(path),
+                let restored = match old {
+                    Some(old) => {
+                        let back = path.with_extension("restore.tmp");
+                        let _ = fs::remove_file(&back);
+                        write_new(&back, &old).and_then(|()| Ok(fs::rename(&back, path)?))
+                    }
+                    None => fs::remove_file(path).map_err(Into::into),
                 };
+                if let Err(r) = restored {
+                    unrestored.push(format!("{} ({r})", path.display()));
+                }
+            }
+            if !unrestored.is_empty() {
+                return Err(format!(
+                    "cannot save {}: {e}; could not put back {}",
+                    path.display(),
+                    unrestored.join(", ")
+                )
+                .into());
             }
             return Err(format!(
                 "cannot save {}: {e}; saved config unchanged",
@@ -1338,6 +1358,17 @@ mod tests {
         assert_eq!(loaded.env, vec![("EDITOR".into(), "vim".into())]);
     }
 
+    /// A staging file left by a save killed before its rename doesn't block the next save.
+    #[test]
+    fn a_leftover_staging_file_does_not_block_saving() {
+        let dir = folder("leftover");
+        let path = dir.join("mappings.tsv");
+        fs::write(dir.join("settings.json.tmp"), "half").unwrap();
+        mappings::save_config(&path, &changed()).unwrap();
+        assert_eq!(mappings::load_config(&path).unwrap().look.theme, "Nord");
+        assert!(!dir.join("settings.json.tmp").exists());
+    }
+
     /// Ticket 194: an invalid settings.json is refused naming the file and the field, and
     /// stays as it was; a failed save keeps the last valid files; a failed move writes
     /// nothing.
@@ -1372,14 +1403,14 @@ mod tests {
         fs::write(&file, &good).unwrap();
 
         // A save that can't be staged changes no file.
-        fs::write(dir.join("settings.json.tmp"), "stale").unwrap();
+        fs::create_dir(dir.join("settings.json.tmp")).unwrap();
         let mut next = changed();
         next.look.theme = "Dracula".into();
         next.start_flow = true;
         assert!(mappings::save_config(&path, &next).is_err());
         assert_eq!(fs::read_to_string(&file).unwrap(), good);
         assert!(!path.exists(), "mappings.tsv is never written (ticket 197)");
-        fs::remove_file(dir.join("settings.json.tmp")).unwrap();
+        fs::remove_dir(dir.join("settings.json.tmp")).unwrap();
         mappings::save_config(&path, &next).unwrap();
         assert_eq!(mappings::load_config(&path).unwrap(), next);
 
