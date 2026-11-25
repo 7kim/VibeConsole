@@ -12305,27 +12305,39 @@ fn commit(
     replacement: Option<Mapping>,
     profile: Option<&str>,
 ) -> Result<()> {
+    commit_all(path, current, vec![(pad, context, replacement)], profile)
+}
+
+/// `commit` for several controls in one atomic save (v7.8 ticket 20: a move).
+fn commit_all(
+    path: &Path,
+    current: &mut Vec<Mapping>,
+    changes: Vec<(Control, u8, Option<Mapping>)>,
+    profile: Option<&str>,
+) -> Result<()> {
     let mut next = current.clone();
-    next.retain(|mapping| mapping.context != context || mapping.control != pad);
-    if let Some(mapping) = &replacement {
-        if matches!(
-            mapping.input,
-            mappings::Input::Knob { .. }
-                | mappings::Input::RelativeKnob { .. }
-                | mappings::Input::Joystick { .. }
-        ) {
-            for other in &mut next {
-                if other.context == context
-                    && other.control.message == pad.message
-                    && other.control.channel == pad.channel
-                    && other.control.id == pad.id
-                {
-                    other.input = mapping.input;
+    for (pad, context, replacement) in changes {
+        next.retain(|mapping| mapping.context != context || mapping.control != pad);
+        if let Some(mapping) = &replacement {
+            if matches!(
+                mapping.input,
+                mappings::Input::Knob { .. }
+                    | mappings::Input::RelativeKnob { .. }
+                    | mappings::Input::Joystick { .. }
+            ) {
+                for other in &mut next {
+                    if other.context == context
+                        && other.control.message == pad.message
+                        && other.control.channel == pad.channel
+                        && other.control.id == pad.id
+                    {
+                        other.input = mapping.input;
+                    }
                 }
             }
         }
+        next.extend(replacement);
     }
-    next.extend(replacement);
     next.sort_by_key(|mapping| (mapping.context, mapping.control));
     match profile {
         // v7 ticket 12: a profile's overrides are saved into that profile.
@@ -13229,6 +13241,266 @@ fn learn_on(ui: &mut impl Ui, page: usize) -> Result<Option<Learned>> {
 /// note is a pad or a piano key by the verified program's pad table; a knob or the joystick
 /// moved on a press page is calibrated on its own page. Without a program, a note keeps the
 /// pad or piano page it was pressed on; anything the program can't place is refused by name.
+/// What a Learn page settled on: its kind (the page), the control, its context, and a
+/// knob's or the joystick's calibration.
+struct Target {
+    page: usize,
+    control: Control,
+    context: u8,
+    motion: Option<(Control, mappings::Input, String)>,
+}
+
+/// v7 ticket 45: learn on `page`, settle to the kind pressed or moved; an Xbox button's layer
+/// is asked next (ticket 97), showing what each layer does now. None: cancelled.
+fn learn_target(
+    ui: &mut impl Ui,
+    page: usize,
+    current: &[Mapping],
+    profile: Option<&str>,
+) -> Result<Option<Target>> {
+    let Some(learned) = learn_on(ui, page)? else {
+        return Ok(None);
+    };
+    let Some((page, learned)) = settle(ui, page, learned)? else {
+        return Ok(None);
+    };
+    let (control, motion) = match learned {
+        Learned::Press(control) => match range_or_gesture(ui, control)? {
+            Some(control) => (control, None),
+            None => return Ok(None),
+        },
+        Learned::Motion(control, input, label) => (control, Some((control, input, label))),
+    };
+    let context = if control.message == crate::Message::Button {
+        let now = |context| {
+            current
+                .iter()
+                .find(|m| m.context == context && m.control == control)
+                .map(Mapping::action_label)
+                .or_else(|| {
+                    builtin_default(profile, context, control)
+                        .map(|d| format!("{} (default)", d.action_label()))
+                })
+                .unwrap_or_else(|| "free".into())
+        };
+        let layers = vec![
+            format!(
+                "Layer 1 (normal): {}",
+                now(mappings::xbox_context(ui.xbox_program(), false))
+            ),
+            format!(
+                "Layer 2 (while LB is held): {}",
+                now(mappings::xbox_context(ui.xbox_program(), true))
+            ),
+        ];
+        match choose(
+            ui,
+            &format!("Which layer is {} on?", control.label()),
+            &layers,
+        )? {
+            Some(1) => mappings::xbox_context(ui.xbox_program(), true),
+            Some(_) => mappings::xbox_context(ui.xbox_program(), false),
+            None => return Ok(None),
+        }
+    } else {
+        ui.context()
+    };
+    Ok(Some(Target {
+        page,
+        control,
+        context,
+        motion,
+    }))
+}
+
+/// v7 ticket 111: an Xbox button's built-in default (Default mappings, layer 1 only).
+fn builtin_default(profile: Option<&str>, context: u8, control: Control) -> Option<Mapping> {
+    (profile.is_none() && mappings::xbox_program(context).is_some_and(|(_, layer2)| !layer2))
+        .then(|| {
+            crate::gamepad::default_layout()
+                .into_iter()
+                .find(|d| d.control == control)
+        })
+        .flatten()
+}
+
+/// Why piano keys can't be mapped in `context` (its octave/tempo/arpeggiator feedback comes
+/// from something), naming what to change; None when they can.
+fn piano_refusal(path: &Path, current: &[Mapping], context: u8) -> Result<Option<String>> {
+    let config = mappings::load_config(path).map_err(stage("file I/O"))?;
+    let mut fed = current
+        .iter()
+        .filter(|m| m.context == context && m.feedback.enabled())
+        .map(|m| m.label.clone())
+        .collect::<Vec<_>>();
+    if config.idle_for(context).enabled() {
+        fed.insert(0, "the idle settings".into());
+    }
+    Ok((!fed.is_empty()).then(|| format!(
+        "validation: piano keys cannot be mapped in {}: octave/tempo/arpeggiator feedback comes from {}. Remove that feedback or use another program.",
+        mappings::program_label(context),
+        fed.join(", ")
+    )))
+}
+
+/// A terminal command's tmux window is named after its control (also inside a sequence).
+fn name_windows(mapping: &mut Mapping, program: Option<&(u8, crate::feedback::Payload)>) {
+    let name = window_name(&mapping.name(program));
+    match &mut mapping.action {
+        crate::actions::Action::Command { window, .. } => *window = name,
+        crate::actions::Action::Sequence(steps) | crate::actions::Action::PressSequence(steps) => {
+            for step in steps {
+                if let crate::actions::Step::Do(crate::actions::Action::Command {
+                    window, ..
+                }) = step
+                {
+                    *window = name.clone();
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// v7.8 ticket 20: Edit → Change mapped input. Learn the new control, show "old → new", ask
+/// before replacing what it does now, then save both controls in one atomic write and run a
+/// transition (held keys released; the new control fires from its next press). The old
+/// control does nothing after; one with a built-in Xbox default is saved as "nothing", so the
+/// default doesn't come back on its own.
+fn change_input(
+    ui: &mut impl Ui,
+    path: &Path,
+    current: &mut Vec<Mapping>,
+    profile: Option<&str>,
+    from: Control,
+    from_context: u8,
+) -> Result<()> {
+    use mappings::Input;
+    let Some(mut moved) = current
+        .iter()
+        .find(|m| m.context == from_context && m.control == from)
+        .cloned()
+        .or_else(|| builtin_default(profile, from_context, from))
+    else {
+        return Err("validation: that assignment is gone; reopen Edit saved assignment".into());
+    };
+    let page = match moved.input {
+        Input::Piano => 1,
+        Input::Knob { .. } | Input::RelativeKnob { .. } => 2,
+        Input::Joystick { .. } => 3,
+        Input::Pad if from.message == crate::Message::Button => 4,
+        Input::Pad => 0,
+    };
+    let Some(target) = learn_target(ui, page, current, profile)? else {
+        return Ok(());
+    };
+    let (to, to_context) = (target.control, target.context);
+    let program = ui.program();
+    let name = |control, context| {
+        current
+            .iter()
+            .find(|m| m.context == context && m.control == control)
+            .map(|m| m.name(program.as_ref()))
+            .unwrap_or_else(|| mappings::control_name(control, None, context, program.as_ref()))
+    };
+    let (from_name, to_name) = (name(from, from_context), name(to, to_context));
+    if (to, to_context) == (from, from_context) {
+        return Err(format!("validation: the assignment is on {to_name} already").into());
+    }
+    let input = match (
+        moved.input,
+        target.motion.as_ref().map(|(_, input, _)| *input),
+    ) {
+        // A knob moved to another knob keeps its step.
+        (Input::Knob { step }, Some(Input::Knob { .. })) => Input::Knob { step },
+        (Input::RelativeKnob { step }, Some(Input::RelativeKnob { .. })) => {
+            Input::RelativeKnob { step }
+        }
+        (_, Some(input)) => input,
+        (_, None) if target.page == 1 => Input::Piano,
+        (_, None) => Input::Pad,
+    };
+    let what = moved.action_label();
+    if !families(input).contains(&action_family(&moved)) {
+        return Err(format!(
+            "validation: {what} can't go on {to_name}: that kind of control takes other actions"
+        )
+        .into());
+    }
+    if moved.risky && !matches!(input, Input::Pad | Input::Piano) {
+        return Err(format!("validation: {what} fires after a one-second hold; only a pad, key or button can be held, not {to_name}").into());
+    }
+    if input == Input::Piano {
+        if let Some(refused) = piano_refusal(path, current, to_context)? {
+            return Err(refused.into());
+        }
+    }
+    let replaced = current
+        .iter()
+        .find(|m| m.context == to_context && m.control == to)
+        .map(Mapping::action_label)
+        .or_else(|| {
+            builtin_default(profile, to_context, to)
+                .map(|d| format!("{} (default)", d.action_label()))
+        });
+    moved.label = match (
+        &target.motion,
+        current
+            .iter()
+            .find(|m| m.context == to_context && m.control == to),
+    ) {
+        (Some((_, _, label)), _) => label.clone(),
+        (None, Some(old)) => old.label.clone(),
+        (None, None) if input == Input::Piano => {
+            format!("Piano channel {} note {}", to.channel, to.id)
+        }
+        (None, None) => match ui.label(to, current)? {
+            Some(label) => label,
+            None => return Ok(()),
+        },
+    };
+    moved.control = to;
+    moved.context = to_context;
+    moved.input = input;
+    // Pad lights only where a shortcut pad can show them (as a new assignment).
+    if moved.action != crate::actions::Action::Shortcut
+        || input != Input::Pad
+        || to_context > 7
+        || profile.is_some()
+    {
+        moved.feedback = crate::feedback::Feedback::default();
+    }
+    name_windows(&mut moved, program.as_ref());
+    moved.validate().map_err(stage("validation"))?;
+    let (ask, yes) = match &replaced {
+        Some(now) => (
+            format!("{from_name} → {to_name}: {what}\n{to_name} does {now} now; it is replaced."),
+            "Replace",
+        ),
+        None => (format!("{from_name} → {to_name}: {what}"), "Move"),
+    };
+    if question(ui, &ask, &strings(&["Cancel", yes]))? != Some(1) {
+        return Ok(());
+    }
+    let left = match builtin_default(profile, from_context, from) {
+        Some(_) => {
+            let mut silent = Mapping::new_action(from, Input::Pad, crate::actions::Action::Nothing)
+                .map_err(stage("validation"))?;
+            silent.context = from_context;
+            Some(silent)
+        }
+        None => None,
+    };
+    commit_all(
+        path,
+        current,
+        vec![(from, from_context, left), (to, to_context, Some(moved))],
+        profile,
+    )
+    .map_err(stage("file I/O"))?;
+    ui.applied().map_err(stage("controller I/O"))
+}
+
 fn settle(
     ui: &mut impl Ui,
     mut page: usize,
@@ -13348,69 +13620,18 @@ fn configure_steps(
         let mut page = action;
         let mut motion = None;
         let learned = if page < 5 {
-            let Some(learned) = learn_on(ui, page)? else {
+            let Some(target) = learn_target(ui, page, current, profile)? else {
                 continue;
             };
-            let Some((settled, learned)) = settle(ui, page, learned)? else {
-                continue;
-            };
-            page = settled;
-            match learned {
-                Learned::Press(control) => {
-                    let Some(control) = range_or_gesture(ui, control)? else {
-                        continue;
-                    };
-                    Some(control)
-                }
-                Learned::Motion(control, input, label) => {
-                    motion = Some((control, input, label));
-                    Some(control)
-                }
-            }
+            page = target.page;
+            motion = target.motion;
+            Some((target.control, target.context))
         } else {
             None
         };
         let mut chose_default = false;
-        let (pad, pad_context) = if let Some(pad) = learned {
-            // v7 ticket 97: an Xbox button's layer comes first, showing what each layer does
-            // now, so only the chosen layer's assignment is looked up (and replaced).
-            let context = if pad.message == crate::Message::Button {
-                let now = |context| {
-                    let default = (profile.is_none()
-                        && mappings::xbox_program(context).is_some_and(|(_, layer2)| !layer2))
-                    .then(|| {
-                        crate::gamepad::default_layout()
-                            .into_iter()
-                            .find(|d| d.control == pad)
-                    })
-                    .flatten()
-                    .map(|d| format!("{} (default)", d.action_label()));
-                    current
-                        .iter()
-                        .find(|m| m.context == context && m.control == pad)
-                        .map(Mapping::action_label)
-                        .or(default)
-                        .unwrap_or_else(|| "free".into())
-                };
-                let layers = vec![
-                    format!(
-                        "Layer 1 (normal): {}",
-                        now(mappings::xbox_context(ui.xbox_program(), false))
-                    ),
-                    format!(
-                        "Layer 2 (while LB is held): {}",
-                        now(mappings::xbox_context(ui.xbox_program(), true))
-                    ),
-                ];
-                match choose(ui, &format!("Which layer is {} on?", pad.label()), &layers)? {
-                    Some(1) => mappings::xbox_context(ui.xbox_program(), true),
-                    Some(_) => mappings::xbox_context(ui.xbox_program(), false),
-                    None => continue,
-                }
-            } else {
-                ui.context()
-            };
-            (pad, context)
+        let (pad, pad_context) = if let Some(learned) = learned {
+            learned
         } else {
             let favourites = mappings::load_config(path)
                 .map(|c| c.favourites)
@@ -13496,17 +13717,25 @@ fn configure_steps(
                 let name = mappings::control_name(pad, None, ui.context(), ui.program().as_ref());
                 format!("{name}: unassigned")
             });
+        // v7.8 ticket 20: Edit asks what changes: the action (as before) or the control.
+        if action == 5 {
+            match choose(
+                ui,
+                &format!("Edit {existing}"),
+                &strings(&["Change action", "Change mapped input"]),
+            )? {
+                Some(0) => {}
+                Some(_) => {
+                    change_input(ui, path, current, profile, pad, pad_context)?;
+                    continue;
+                }
+                None => continue,
+            }
+        }
         if action == 6 {
             // v7 ticket 111: removing a built-in default silences it (saved as no action);
             // removing a changed button that has a default brings the default back.
-            let default = (profile.is_none()
-                && mappings::xbox_program(pad_context).is_some_and(|(_, layer2)| !layer2))
-            .then(|| {
-                crate::gamepad::default_layout()
-                    .into_iter()
-                    .find(|d| d.control == pad)
-            })
-            .flatten();
+            let default = builtin_default(profile, pad_context, pad);
             if chose_default {
                 let keys = default
                     .as_ref()
@@ -13573,27 +13802,9 @@ fn configure_steps(
             return Err("validation: pad/piano source collision; this emitted note is already assigned as another control family".into());
         }
         if input == mappings::Input::Piano {
-            let config = mappings::load_config(path).map_err(stage("file I/O"))?;
-            // Name what carries the octave/tempo/arpeggiator feedback, so the user knows what to change.
-            let mut fed = current
-                .iter()
-                .filter(|m| m.context == ui.context() && m.feedback.enabled())
-                .map(|m| m.label.clone())
-                .collect::<Vec<_>>();
-            if config.idle_for(ui.context()).enabled() {
-                fed.insert(0, "the idle settings".into());
-            }
-            if !fed.is_empty() {
+            if let Some(refused) = piano_refusal(path, current, ui.context())? {
                 // Refused before any change: a note, not an operation failure that pauses.
-                choose(
-                    ui,
-                    &format!(
-                        "Not saved: validation: piano keys cannot be mapped in {}: octave/tempo/arpeggiator feedback comes from {}. Remove that feedback or use another program.",
-                        mappings::program_label(ui.context()),
-                        fed.join(", ")
-                    ),
-                    &strings(&["Back"]),
-                )?;
+                choose(ui, &format!("Not saved: {refused}"), &strings(&["Back"]))?;
                 continue;
             }
         }
@@ -13918,23 +14129,7 @@ fn configure_steps(
             continue;
         };
         mapping.feedback = feedback;
-        let name = window_name(&mapping.name(ui.program().as_ref()));
-        match &mut mapping.action {
-            crate::actions::Action::Command { window, .. } => *window = name,
-            crate::actions::Action::Sequence(steps)
-            | crate::actions::Action::PressSequence(steps) => {
-                for step in steps {
-                    if let crate::actions::Step::Do(crate::actions::Action::Command {
-                        window,
-                        ..
-                    }) = step
-                    {
-                        *window = name.clone();
-                    }
-                }
-            }
-            _ => {}
-        }
+        name_windows(&mut mapping, ui.program().as_ref());
         // v7 ticket 23: a terminal command (sudo and the like) is a risky control: it fires
         // only after a one-second hold, in a visible terminal where sudo asks for the password.
         if family == 12 || (matches!(family, 5 | 17) && must_hold(&mapping.action)) {
@@ -15143,6 +15338,8 @@ mod tests {
         run_error: Option<String>,
         xone_missing: bool,
         rule: bool,
+        /// v7.8 ticket 20: transitions run after a save (the session releases held keys).
+        applied: usize,
     }
     impl Ui for Script {
         fn height(&self) -> usize {
@@ -15170,6 +15367,10 @@ mod tests {
         }
         fn xbox_connected(&self) -> bool {
             self.xbox
+        }
+        fn applied(&mut self) -> Result<()> {
+            self.applied += 1;
+            Ok(())
         }
         fn xbox_program(&self) -> u8 {
             self.xbox_program.max(1)
@@ -16426,7 +16627,7 @@ mod tests {
         mappings::save(&path, &current).unwrap();
         let mut ui = Script {
             keys: [
-                Tab, Enter, Enter, // Edit -> saved pad
+                Tab, Enter, Enter, Enter, // Edit -> saved pad -> Change action
                 Enter, // family: keyboard shortcut (saved)
                 Enter, Enter, Enter, Up,
                 Enter, // keep Shift: Select keys -> Modifiers -> back -> Done
@@ -16452,7 +16653,7 @@ mod tests {
         );
         ui.screens.clear();
         ui.keys = [
-            Tab, Enter, Enter, Enter, Enter, Enter, Enter, Up, Enter, Escape, Escape, Escape,
+            Tab, Enter, Enter, Enter, Enter, Enter, Enter, Enter, Up, Enter, Escape, Escape, Escape,
         ]
         .into();
         configure(&mut ui, &path, &mut current).unwrap();
@@ -16479,7 +16680,7 @@ mod tests {
         let saved = config_bytes(&path);
         let mut ui = Script {
             keys: [
-                Tab, Enter, Enter, // Edit -> saved pad
+                Tab, Enter, Enter, Enter, // Edit -> saved pad -> Change action
                 Down, Up, Enter, // family: mark stays while the cursor moves
                 Enter, Enter, Enter, Up, Enter,  // Select keys -> Modifiers -> back -> Done
                 Enter,  // behavior: saved hold
@@ -16555,7 +16756,7 @@ mod tests {
         assert_eq!(current[1].behavior, mappings::Behavior::Trigger);
         // Editing opens the family menu on the saved "Launch application"; one Down reaches system.
         ui.keys = [
-            Tab, Enter, Down, Enter, Down, Enter, Enter, Enter, Enter, Down, Enter,
+            Tab, Enter, Down, Enter, Enter, Down, Enter, Enter, Enter, Enter, Down, Enter,
         ]
         .into();
         configure(&mut ui, &path, &mut current).unwrap();
@@ -19854,9 +20055,9 @@ mod tests {
                     // v7 ticket 109: an Xbox button and the starred Akai pad are listed apart;
                     // the device comes first, then the Xbox list holds only the copy.
                     let pick = if kind == "Xbox button" {
-                        vec![Enter, Down, Enter, Enter]
+                        vec![Enter, Down, Enter, Enter, Enter] // v7.8 ticket 20: Change action
                     } else {
-                        vec![Enter, Enter] // v7.8 ticket 18: nothing starred, the copy is first
+                        vec![Enter, Enter, Enter] // v7.8 ticket 18: nothing starred, the copy is first
                     };
                     let mut edit = Script {
                         keys: [vec![Down; 5], pick, vec![Escape, Escape]].concat().into(),
@@ -19948,6 +20149,151 @@ mod tests {
             "{titles:?}"
         );
         assert!(saved[0].risky, "the hold was dropped: {titles:?}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.8 ticket 20: Edit → Change mapped input moves an assignment to a free control in
+    /// one save and runs one transition; to a used control it asks first, and Cancel keeps
+    /// both; a pad moves onto an Xbox button (replacing its default), and a moved button with
+    /// a default leaves "nothing" behind so the default doesn't come back.
+    #[test]
+    fn change_mapped_input_moves_and_asks_before_replacing() {
+        use crate::actions::Action;
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-move-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let [a, b, c] = [36, 37, 38].map(|n| Control::from_note(10, n).unwrap());
+        let shift = Mapping::new(a, "Shift", "hold").unwrap();
+        let enter = Mapping::new(b, "Enter", "tap").unwrap();
+        let mut current = vec![shift.clone(), enter.clone()];
+        mappings::save(&path, &current).unwrap();
+        // Edit, the first saved pad (A), Change mapped input, press C, Move.
+        let edit_a = [Tab, Enter, Enter, Down, Enter];
+        let mut ui = Script {
+            keys: [&edit_a[..], &[Down, Enter, Escape]].concat().into(),
+            pads: [c].into(),
+            ..Default::default()
+        };
+        configure(&mut ui, &path, &mut current).unwrap();
+        assert!(ui.keys.is_empty());
+        let screens = ui.screens.join("\n----\n");
+        let n = |note| format!("Note ch10 #{note} (Program 1 unverified)");
+        assert!(
+            screens.contains(&format!("{} → {}: Shift", n(36), n(38))),
+            "{screens}"
+        );
+        let saved = mappings::load(&path).unwrap();
+        assert_eq!(saved, current);
+        assert!(
+            !saved.iter().any(|m| m.control == a),
+            "A is free: {saved:?}"
+        );
+        let moved = saved.iter().find(|m| m.control == c).unwrap();
+        assert_eq!(moved.keys, shift.keys);
+        assert_eq!(moved.behavior, shift.behavior);
+        assert_eq!(ui.applied, 1, "one transition after the save");
+
+        // To a used control (B, Enter): it asks; Cancel changes nothing.
+        let before = config_bytes(&path);
+        let edit_c = [Tab, Enter, Down, Enter, Down, Enter]; // C is listed after B
+        ui.screens.clear();
+        ui.keys = [&edit_c[..], &[Enter, Escape]].concat().into();
+        ui.pads = [b].into();
+        configure(&mut ui, &path, &mut current).unwrap();
+        assert!(ui.keys.is_empty());
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains(&format!("{} does Enter now; it is replaced.", n(37)))),
+            "{}",
+            ui.screens.join("\n----\n")
+        );
+        assert_eq!(config_bytes(&path), before, "Cancel keeps both");
+        assert_eq!(ui.applied, 1, "no transition on Cancel");
+        // Replace: B does Shift, C is free, nothing else is left.
+        ui.keys = [&edit_c[..], &[Down, Enter, Escape]].concat().into();
+        ui.pads = [b].into();
+        configure(&mut ui, &path, &mut current).unwrap();
+        let saved = mappings::load(&path).unwrap();
+        assert_eq!(saved.len(), 1, "{saved:?}");
+        assert_eq!(
+            (saved[0].control, saved[0].keys.clone()),
+            (b, shift.keys.clone())
+        );
+
+        // A pad onto an Xbox button with a built-in default: asked, replaced, layer 1.
+        let south = crate::gamepad::default_layout()[0].control;
+        ui.screens.clear();
+        ui.keys = [Tab, Enter, Enter, Down, Enter, Enter, Down, Enter, Escape].into();
+        ui.pads = [south].into();
+        configure(&mut ui, &path, &mut current).unwrap();
+        assert!(ui.keys.is_empty(), "{}", ui.screens.join("\n----\n"));
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains("does Enter (default) now"))
+        );
+        let saved = mappings::load(&path).unwrap();
+        assert_eq!(saved.len(), 1, "{saved:?}");
+        assert_eq!(
+            (saved[0].control, saved[0].context, saved[0].keys.clone()),
+            (south, mappings::GAMEPAD_CONTEXT, shift.keys.clone())
+        );
+        // And on to a free button: South is saved as "nothing", so Enter doesn't come back.
+        let free = (0..64)
+            .map(Control::button)
+            .find(|c| {
+                !crate::gamepad::is_reserved(*c)
+                    && !crate::gamepad::default_layout()
+                        .iter()
+                        .any(|d| d.control == *c)
+            })
+            .unwrap();
+        ui.keys = [Tab, Enter, Enter, Down, Enter, Enter, Down, Enter, Escape].into();
+        ui.pads = [free].into();
+        configure(&mut ui, &path, &mut current).unwrap();
+        let saved = mappings::load(&path).unwrap();
+        let on = |c| {
+            saved
+                .iter()
+                .find(|m| m.control == c)
+                .map(|m| m.action.clone())
+        };
+        assert_eq!(on(south), Some(Action::Nothing), "{saved:?}");
+        assert_eq!(on(free), Some(Action::Shortcut));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.8 ticket 20: a move onto the control it's on already is refused by name and saves
+    /// nothing (a stage-named note; /configure goes on).
+    #[test]
+    fn change_mapped_input_refuses_what_the_new_control_cant_do() {
+        use Key::*;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-move-refused-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let a = Control::from_note(10, 36).unwrap();
+        let mut current = vec![Mapping::new(a, "Shift", "hold").unwrap()];
+        mappings::save(&path, &current).unwrap();
+        let before = config_bytes(&path);
+        let mut ui = Script {
+            keys: [Tab, Enter, Enter, Down, Enter, Enter, Tab, Tab, Enter].into(),
+            pads: [a].into(),
+            ..Default::default()
+        };
+        configure(&mut ui, &path, &mut current).unwrap();
+        assert!(ui.keys.is_empty(), "{}", ui.screens.join("\n----\n"));
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.starts_with("Not saved: validation: the assignment is on Note ch10 #36"))
+        );
+        assert_eq!(config_bytes(&path), before);
+        assert_eq!(ui.applied, 0);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -27037,6 +27383,84 @@ mod tests {
         ui.reload_keyboard().unwrap();
         ui.handle_events(vec![Event::Press(shift)]).unwrap();
         assert_eq!(shifts(&ui), 2, "Shift fires in Run after configure");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.8 ticket 20: a move is a transition in the running session: a held key is released,
+    /// the new pad fires its action on the first press after, and the old pad fires nothing.
+    #[test]
+    fn a_moved_assignment_fires_from_its_new_pad_and_held_keys_are_released() {
+        use crate::actions::Action;
+        let (dir, mut ui, ran, [mute, _, _, shift]) = configure_session("configure-move");
+        let path = dir.join("mappings.tsv");
+        let new = Control::from_note(10, 40).unwrap();
+        ui.handle_events(vec![Event::Press(shift)]).unwrap();
+        assert_eq!(shifts(&ui), 1, "Shift is held");
+        let keys = |keys: &[Key]| {
+            keys.iter()
+                .map(|k| Step::Key(k.clone()))
+                .collect::<Vec<_>>()
+        };
+        let mut steps = keys(&[Key::Tab, Key::Enter, Key::Enter, Key::Down, Key::Enter]);
+        steps.extend([
+            Step::Events(vec![Event::Press(new)]), // learned, fires nothing
+            Step::Events(vec![Event::Release(new, crate::ReleaseType::NoteOff)]),
+        ]);
+        // Use observed control, its label, Move, leave configure.
+        steps.extend(keys(&[
+            Key::Down,
+            Key::Enter,
+            Key::Enter,
+            Key::Down,
+            Key::Enter,
+            Key::Escape,
+        ]));
+        ui.script = Some(Play {
+            steps: steps.into(),
+            ..Play::default()
+        });
+        let mut current = mappings::load_config(&path).unwrap().mappings;
+        ui.configure(&path, &mut current).unwrap();
+        let play = ui.script.take().unwrap();
+        assert!(play.steps.is_empty(), "{}", play.screens.join("\n----\n"));
+        let recorded = &ui.output.as_ref().unwrap().recorded;
+        assert!(
+            recorded
+                .iter()
+                .any(|(key, down)| *key == evdev::KeyCode::KEY_LEFTSHIFT && !*down),
+            "the held Shift was released"
+        );
+        let saved = mappings::load_config(&path).unwrap().mappings;
+        assert!(
+            saved
+                .iter()
+                .any(|m| m.control == new && m.action == Action::OutputMute)
+        );
+        assert!(!saved.iter().any(|m| m.control == mute), "{saved:?}");
+        assert!(
+            ran.recv_timeout(Duration::from_millis(300)).is_err(),
+            "learning fired nothing"
+        );
+        resume(&mut ui);
+        ui.handle_events(vec![
+            Event::Press(mute),
+            Event::Release(mute, crate::ReleaseType::NoteOff),
+        ])
+        .unwrap();
+        assert!(
+            ran.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the old pad fires nothing"
+        );
+        ui.handle_events(vec![
+            Event::Press(new),
+            Event::Release(new, crate::ReleaseType::NoteOff),
+        ])
+        .unwrap();
+        assert_eq!(
+            ran.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Action::OutputMute,
+            "the first press on the new pad fires"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
