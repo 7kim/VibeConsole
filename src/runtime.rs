@@ -584,14 +584,7 @@ pub fn install_skills(home: &Path) -> Result<String> {
         }
         let folder = target.parent().ok_or("install skills: no folder")?;
         fs::create_dir_all(folder)?;
-        let temporary = folder.join(format!(
-            ".{}.vibeconsole-tmp",
-            target.file_name().unwrap_or_default().to_string_lossy()
-        ));
-        fs::write(&temporary, text)?;
-        fs::rename(&temporary, &target).inspect_err(|_| {
-            let _ = fs::remove_file(&temporary);
-        })?;
+        crate::actions::write_atomic(&target, text)?;
         written += 1;
     }
     Ok(match (written, backups.is_empty()) {

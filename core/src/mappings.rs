@@ -3789,18 +3789,14 @@ pub(crate) fn history_in(dir: &Path) -> Vec<(PathBuf, u64)> {
     entries.sort_by(|a, b| b.0.file_stem().cmp(&a.0.file_stem()));
     entries
 }
-/// v7.7 ticket 197: the config before the save that wrote this history entry, given the
-/// config after that save.
-pub fn before(entry: &Path, after: &Config) -> Result<Config> {
-    crate::config::before(entry, after)
-}
 /// v7.7 ticket 163: put the setup back to before a history entry's save: each newer entry
 /// is undone first, the result validated in full like a load, then saved atomically (so
 /// the restore lands in history and can itself be undone).
 pub fn restore(path: &Path, from: &Path) -> Result<()> {
     let mut config = load_config(path)?;
     for (entry, _) in history(path) {
-        config = before(&entry, &config).map_err(|e| format!("{e}; nothing restored"))?;
+        config =
+            crate::config::before(&entry, &config).map_err(|e| format!("{e}; nothing restored"))?;
         if entry == from {
             return save_config(path, &config);
         }
@@ -3907,7 +3903,7 @@ mod tests {
         save_config(&path, &config).unwrap();
         let after = config_bytes(&path);
         let (newest, _) = history(&path).remove(0);
-        let older = super::before(&newest, &config).unwrap();
+        let older = crate::config::before(&newest, &config).unwrap();
         assert_eq!(
             older,
             Config::default(),

@@ -138,10 +138,7 @@ pub fn flush(dir: &Path, day: i64, pending: &Day) -> Result<()> {
         Err(e) => return Err(e.into()),
     };
     total.merge(pending);
-    let temporary = path.with_extension("tsv.tmp");
-    std::fs::write(&temporary, total.text())?;
-    std::fs::rename(&temporary, &path)?;
-    Ok(())
+    crate::actions::write_atomic(&path, &total.text())
 }
 
 /// The last `count` days up to `today`, oldest first, each with its counts (a missing day

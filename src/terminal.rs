@@ -1939,7 +1939,7 @@ impl Terminal {
         match &problem.fix {
             Fix::Run { args, ask } => {
                 let text = format!("{}\n\n{ask}", problem.message);
-                if question(self, &text, &options(&["Cancel", "Fix"]))? == Some(1) {
+                if question(self, &text, &crate::actions::strings(&["Cancel", "Fix"]))? == Some(1) {
                     let args = args.iter().map(String::as_str).collect::<Vec<_>>();
                     Ui::run(self, &args).map_err(|e| format!("{}: {e}", problem.stage))?;
                     self.notice = format!("{}: fix run", problem.stage);
@@ -1950,7 +1950,7 @@ impl Terminal {
                 choose(
                     self,
                     &format!("{}\n\n{text}", problem.message),
-                    &options(&["Back"]),
+                    &crate::actions::strings(&["Back"]),
                 )?;
             }
             Fix::Flow => {
@@ -1961,7 +1961,7 @@ impl Terminal {
                 if question(
                     self,
                     &text,
-                    &options(&["Cancel", "Start or repair Wispr Flow"]),
+                    &crate::actions::strings(&["Cancel", "Start or repair Wispr Flow"]),
                 )? == Some(1)
                 {
                     self.start_flow()
@@ -4856,7 +4856,7 @@ impl Terminal {
                     "Rename {} to {name:?}?\nOnly the stored name changes. Reselect via /prog-select to refresh current RAM.",
                     names[context]
                 ),
-                &options(&["Cancel", "Rename"]),
+                &crate::actions::strings(&["Cancel", "Rename"]),
             )? == Some(1);
             Ok(sure.then_some((context, name)))
         })?;
@@ -4884,7 +4884,7 @@ impl Terminal {
         if question(
             self,
             "Program 1 hardware check. Changes musical settings, not independent LEDs.\nSelect the trial's Program 1/current note-mode setup on the controller.\nProgram queries cannot establish physical program selection.",
-            &options(&["Cancel", "Use this intended Program 1 setup"]),
+            &crate::actions::strings(&["Cancel", "Use this intended Program 1 setup"]),
         )? != Some(1)
         {
             return Ok(());
@@ -4920,7 +4920,7 @@ impl Terminal {
                     &format!(
                         "Original: {baseline}\nUpdates are bounded and read back. Finish/Esc restores owned fields."
                     ),
-                    &options(&[
+                    &crate::actions::strings(&[
                         "Set absolute octave",
                         "Set tempo (enables arpeggiator)",
                         "Set arpeggiator",
@@ -4973,7 +4973,7 @@ impl Terminal {
                         let Some(index) = choose_at(
                             self,
                             "Arpeggiator",
-                            &options(&["Off", "On"]),
+                            &crate::actions::strings(&["Off", "On"]),
                             usize::from(trial.arp.unwrap_or(baseline.arp)),
                         )?
                         else {
@@ -5041,7 +5041,7 @@ impl Terminal {
                 choose(
                     self,
                     "Update requested; status shows transmission/read-back separately.\nObserve the indicators. Persistence across unplug/reboot remains unmeasured.",
-                    &options(&["Continue"]),
+                    &crate::actions::strings(&["Continue"]),
                 )?;
             }
             Ok(())
@@ -5696,7 +5696,10 @@ impl Terminal {
                 "Piano mappings use emitted notes, not fixed physical positions.
 Arpeggiator must be OFF. Transposing requires pausing and relearning.
 Changing musical settings while running is unsupported.",
-                &options(&["Cancel", "Confirm arpeggiator OFF and intended octave"]),
+                &crate::actions::strings(&[
+                    "Cancel",
+                    "Confirm arpeggiator OFF and intended octave",
+                ]),
             )? != Some(1)
             {
                 return Ok(());
@@ -5829,7 +5832,11 @@ Changing musical settings while running is unsupported.",
 
     fn learn_motion(&mut self, knob: bool) -> Result<Option<Learned>> {
         let relative = if knob {
-            match choose(self, "Knob mode", &options(&["Absolute", "Relative"]))? {
+            match choose(
+                self,
+                "Knob mode",
+                &crate::actions::strings(&["Absolute", "Relative"]),
+            )? {
                 Some(mode) => mode == 1,
                 None => return Ok(None),
             }
@@ -5889,7 +5896,7 @@ Changing musical settings while running is unsupported.",
                             &format!(
                                 "Not saved: {error}\nNothing changed. Move the control again?"
                             ),
-                            &options(&["Retry", "Cancel"]),
+                            &crate::actions::strings(&["Retry", "Cancel"]),
                         )? != Some(0)
                         {
                             return Ok(None);
@@ -5928,7 +5935,7 @@ Changing musical settings while running is unsupported.",
                 "Switch Program {} Knob {knob} (CC {cc}) to Relative?",
                 context + 1
             ),
-            &options(&["Cancel", "Switch and capture ticks"]),
+            &crate::actions::strings(&["Cancel", "Switch and capture ticks"]),
         )? != Some(1)
         {
             return Ok(None);
@@ -5970,7 +5977,7 @@ Changing musical settings while running is unsupported.",
             let Some(direction) = choose(
                 self,
                 "Physical direction for this assignment",
-                &options(&[
+                &crate::actions::strings(&[
                     "Clockwise / positive ticks",
                     "Counterclockwise / negative ticks",
                 ]),
@@ -6088,7 +6095,7 @@ Changing musical settings while running is unsupported.",
                             control.message.text(),
                             control.id,
                         ),
-                        &options(&["Cancel", "Use observed control"]),
+                        &crate::actions::strings(&["Cancel", "Use observed control"]),
                     )? == Some(1)
                     {
                         return Ok(Some(control));
@@ -6680,7 +6687,7 @@ fn choice_menu(
             .enumerate()
             .map(|(i, c)| format!("Zone {}: {}", i + 1, c.description()))
             .collect::<Vec<_>>();
-        rows.extend(options(&["Add choice", "Done", "Cancel"]));
+        rows.extend(crate::actions::strings(&["Add choice", "Done", "Cancel"]));
         let Some(index) = choose(
             ui,
             "Choice knob: the knob range is split into equal zones; resting 300 ms in a new zone sends its prompt",
@@ -6705,7 +6712,7 @@ fn choice_menu(
             None => match choose(
                 ui,
                 &format!("Zone {}: {}", index + 1, choices[index].description()),
-                &options(&["Move up", "Move down", "Remove", "Back"]),
+                &crate::actions::strings(&["Move up", "Move down", "Remove", "Back"]),
             )? {
                 Some(0) if index > 0 => choices.swap(index, index - 1),
                 Some(1) if index + 1 < choices.len() => choices.swap(index, index + 1),
@@ -6785,7 +6792,7 @@ fn sequence_menu(
             .enumerate()
             .map(|(i, step)| format!("{}. {}", i + 1, step.description()))
             .collect::<Vec<_>>();
-        rows.extend(options(&["Add step", "Done", "Cancel"]));
+        rows.extend(crate::actions::strings(&["Add step", "Done", "Cancel"]));
         let Some(index) = choose(
             ui,
             "Sequence steps (run in order; a failing step stops the rest)",
@@ -6799,7 +6806,7 @@ fn sequence_menu(
                 let Some(kind) = choose(
                     ui,
                     "Step",
-                    &options(&[
+                    &crate::actions::strings(&[
                         "Ensure agent running",
                         "Prompt",
                         "Command",
@@ -6839,7 +6846,7 @@ fn sequence_menu(
             None => match choose(
                 ui,
                 &format!("Step {}: {}", index + 1, steps[index].description()),
-                &options(&["Move up", "Move down", "Remove", "Back"]),
+                &crate::actions::strings(&["Move up", "Move down", "Remove", "Back"]),
             )? {
                 Some(0) if index > 0 => steps.swap(index, index - 1),
                 Some(1) if index + 1 < steps.len() => steps.swap(index, index + 1),
@@ -6895,7 +6902,7 @@ fn clock(secs: u64) -> String {
 /// v7.7 ticket 163: the newest history entry against `current`: `14:02 · <what changed>`.
 fn last_change(path: &Path, current: &mappings::Config) -> Option<String> {
     let (file, secs) = mappings::history(path).into_iter().next()?;
-    let older = mappings::before(&file, current).ok()?;
+    let older = vibeconsole_core::config::before(&file, current).ok()?;
     Some(format!(
         "{} · {}",
         clock(secs),
@@ -6916,13 +6923,17 @@ fn undo_last(path: &Path) -> Result<String> {
 fn history_menu(ui: &mut impl Ui, path: &Path) -> Result<Option<String>> {
     let entries = mappings::history(path);
     if entries.is_empty() {
-        choose(ui, "History: no saves yet.", &options(&["Back"]))?;
+        choose(
+            ui,
+            "History: no saves yet.",
+            &crate::actions::strings(&["Back"]),
+        )?;
         return Ok(None);
     }
     let mut newer = mappings::load_config(path)?;
     let mut rows = Vec::new();
     for (file, secs) in &entries {
-        let older = mappings::before(file, &newer).unwrap_or_default();
+        let older = vibeconsole_core::config::before(file, &newer).unwrap_or_default();
         rows.push(format!(
             "{} · {}",
             clock(*secs),
@@ -7183,7 +7194,7 @@ fn agents_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 format!("{} | {host} | {}", a.name, crate::status::read(&a.name))
             })
             .collect::<Vec<_>>();
-        choices.extend(options(&[
+        choices.extend(crate::actions::strings(&[
             "Add agent",
             "Claude Code status hooks",
             "Codex status hooks",
@@ -7229,7 +7240,11 @@ fn agent_choice(ui: &mut impl Ui, path: &Path, index: usize) -> Result<()> {
         match question(
             ui,
             &text,
-            &options(&["Install (merge, with backup)", "Copy with wl-copy", "Back"]),
+            &crate::actions::strings(&[
+                "Install (merge, with backup)",
+                "Copy with wl-copy",
+                "Back",
+            ]),
         )? {
             Some(0) => match crate::status::install_hooks(codex).and_then(|note| {
                 if codex {
@@ -7244,7 +7259,7 @@ fn agent_choice(ui: &mut impl Ui, path: &Path, index: usize) -> Result<()> {
                 Ok(format!("{note}\n{line}"))
             }) {
                 Ok(note) => {
-                    choose(ui, &note, &options(&["Back"]))?;
+                    choose(ui, &note, &crate::actions::strings(&["Back"]))?;
                 }
                 Err(error) => not_saved(ui, &error)?,
             },
@@ -7255,7 +7270,11 @@ fn agent_choice(ui: &mut impl Ui, path: &Path, index: usize) -> Result<()> {
     }
     let existing = config.agents.get(index).cloned();
     let operation = if existing.is_some() {
-        choose(ui, "Agent", &options(&["Edit", "Remove", "Back"]))?
+        choose(
+            ui,
+            "Agent",
+            &crate::actions::strings(&["Edit", "Remove", "Back"]),
+        )?
     } else {
         Some(0)
     };
@@ -7263,7 +7282,7 @@ fn agent_choice(ui: &mut impl Ui, path: &Path, index: usize) -> Result<()> {
         if question(
             ui,
             "Remove this agent? Its prompt mappings become invalid.",
-            &options(&["Cancel", "Remove"]),
+            &crate::actions::strings(&["Cancel", "Remove"]),
         )? == Some(1)
         {
             config.agents.remove(index);
@@ -7289,7 +7308,7 @@ fn agent_choice(ui: &mut impl Ui, path: &Path, index: usize) -> Result<()> {
     let Some(host) = choose_saved(
         ui,
         "Where does this agent live?",
-        options(&[
+        crate::actions::strings(&[
             "tmux (VibeConsole starts it in its own tmux window)",
             "Orca (a terminal in an Orca workspace; started with orca agent launch)",
             "herdr (an agent herdr runs, by its herdr name; start it in herdr)",
@@ -7397,7 +7416,11 @@ fn agent_choice(ui: &mut impl Ui, path: &Path, index: usize) -> Result<()> {
 
 /// A rejected Settings/Agents/Prompts entry: nothing changed, so a note, not a failure that pauses.
 fn not_saved(ui: &mut impl Ui, error: &dyn std::fmt::Display) -> Result<()> {
-    choose(ui, &format!("Not saved: {error}"), &options(&["Back"]))?;
+    choose(
+        ui,
+        &format!("Not saved: {error}"),
+        &crate::actions::strings(&["Back"]),
+    )?;
     Ok(())
 }
 
@@ -7539,7 +7562,7 @@ fn profiles_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
         items.push("New profile".into());
         items.push(format!(
             "Import a profile file (from {})",
-            profiles_dir(path).display()
+            beside(path, "profiles").display()
         ));
         items.push("Ask Claude for a profile…".into());
         let Some(choice) = choose(
@@ -7582,9 +7605,6 @@ fn pick_app(ui: &mut impl Ui) -> Result<Option<String>> {
         .map(Some)
         .ok_or_else(|| "that app has no desktop ID".into())
 }
-fn presets_dir(path: &Path) -> PathBuf {
-    path.parent().unwrap_or(Path::new(".")).join("presets")
-}
 /// Settings -> Presets (v7 tickets 25, 47): a program preset is the selected program's
 /// mappings and loads back into the selected program only; an all-programs preset is the
 /// whole setup (mappings, app profiles and their MIDI devices) and replaces it, keeping
@@ -7592,7 +7612,7 @@ fn presets_dir(path: &Path) -> PathBuf {
 fn presets_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
     const PROGRAM: &str = ".program-preset";
     loop {
-        let dir = presets_dir(path);
+        let dir = beside(path, "presets");
         let mut files = std::fs::read_dir(&dir)
             .map(|entries| {
                 entries
@@ -7678,7 +7698,7 @@ fn presets_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                     choose(
                         ui,
                         &format!("Loaded {name} preset successfully"),
-                        &options(&["Back"]),
+                        &crate::actions::strings(&["Back"]),
                     )?;
                     Ok(())
                 })(),
@@ -7748,11 +7768,12 @@ fn favourites_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
 
 /// Profile files are shared through one folder beside the config (v7 ticket 14); names
 /// come from its listing, never typed paths.
-fn profiles_dir(path: &Path) -> PathBuf {
-    path.parent().unwrap_or(Path::new(".")).join("profiles")
+/// `presets`, `profiles` or `families`, next to the config.
+fn beside(path: &Path, folder: &str) -> PathBuf {
+    path.parent().unwrap_or(Path::new(".")).join(folder)
 }
 fn import_profile_file(ui: &mut impl Ui, path: &Path) -> Result<()> {
-    let dir = profiles_dir(path);
+    let dir = beside(path, "profiles");
     let mut files = std::fs::read_dir(&dir)
         .map(|entries| {
             entries
@@ -7952,7 +7973,7 @@ fn ask_recommendations(ui: &mut impl Ui, path: &Path) -> Result<()> {
         let consent = question(
             ui,
             &format!("Share usage counts?\n\n{SHARE_TEXT}"),
-            &options(&["No, send nothing", "Yes, share the counts"]),
+            &crate::actions::strings(&["No, send nothing", "Yes, share the counts"]),
         )?;
         if consent != Some(1) {
             return Ok(());
@@ -7964,7 +7985,7 @@ fn ask_recommendations(ui: &mut impl Ui, path: &Path) -> Result<()> {
         choose(
             ui,
             "No usage counted yet: use VibeConsole for a while first.",
-            &options(&["Back"]),
+            &crate::actions::strings(&["Back"]),
         )?;
         return Ok(());
     };
@@ -7986,7 +8007,7 @@ fn ask_recommendations(ui: &mut impl Ui, path: &Path) -> Result<()> {
                     choose(
                         ui,
                         "No usage counted yet: use VibeConsole for a while first.",
-                        &options(&["Back"]),
+                        &crate::actions::strings(&["Back"]),
                     )?;
                     return Ok(());
                 }
@@ -8135,7 +8156,7 @@ fn apply_all_recommendations(
         choose(
             ui,
             &format!("Nothing to apply; nothing saved.\n{}", left.join("\n")),
-            &options(&["Back"]),
+            &crate::actions::strings(&["Back"]),
         )?;
         return Ok(Vec::new());
     }
@@ -8152,7 +8173,7 @@ fn apply_all_recommendations(
             if applied.len() == 1 { "" } else { "s" },
             changes.join("\n")
         ),
-        &options(&["Cancel", "Save all"]),
+        &crate::actions::strings(&["Cancel", "Save all"]),
     )? != Some(1)
     {
         return Ok(Vec::new());
@@ -8194,7 +8215,7 @@ fn review_recommendation(
             recommendation.why,
             words.join("\n")
         ),
-        &options(&["Cancel", "Save"]),
+        &crate::actions::strings(&["Cancel", "Save"]),
     )? != Some(1)
     {
         return Ok(false);
@@ -8213,7 +8234,7 @@ fn install_agent(ui: &mut impl Ui, index: usize) -> Result<()> {
         choose(
             ui,
             &format!("{name} is installed ({binary} on PATH)."),
-            &options(&["Back"]),
+            &crate::actions::strings(&["Back"]),
         )?;
         return Ok(());
     }
@@ -8222,7 +8243,7 @@ fn install_agent(ui: &mut impl Ui, index: usize) -> Result<()> {
         &format!(
             "Install {name}?\n\nThis runs in a visible terminal, where you see every line and answer any password prompt:\n  {install}"
         ),
-        &options(&["Cancel", "Install in a terminal"]),
+        &crate::actions::strings(&["Cancel", "Install in a terminal"]),
     )? != Some(1)
     {
         return Ok(());
@@ -8238,7 +8259,7 @@ fn install_agent(ui: &mut impl Ui, index: usize) -> Result<()> {
         &format!(
             "{shown}.\nWhen it finishes, 3 Agents shows {name} as installed if {binary} is on PATH."
         ),
-        &options(&["Back"]),
+        &crate::actions::strings(&["Back"]),
     )?;
     Ok(())
 }
@@ -8258,7 +8279,7 @@ fn next_agent(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 "No other installed agent has a one-shot command; {} stays the default. Install one in 3 Agents › Install agents.",
                 config.look.agent_label()
             ),
-            &options(&["Back"]),
+            &crate::actions::strings(&["Back"]),
         )?;
         return Ok(());
     }
@@ -8386,7 +8407,7 @@ fn ask_mappings(ui: &mut impl Ui, path: &Path, kind: AskKind) -> Result<()> {
             if !mappings::valid_profile_name(&name) {
                 return Err("a preset name is 1–32 printable characters; nothing saved".into());
             }
-            let file = presets_dir(path).join(mappings::preset_file_name(&name));
+            let file = beside(path, "presets").join(mappings::preset_file_name(&name));
             if file.exists() {
                 return Err(format!("preset {name} exists; nothing saved").into());
             }
@@ -8457,7 +8478,11 @@ fn ask_mappings(ui: &mut impl Ui, path: &Path, kind: AskKind) -> Result<()> {
         }
     }
     if words.is_empty() {
-        choose(ui, "Nothing to change; nothing saved.", &options(&["Back"]))?;
+        choose(
+            ui,
+            "Nothing to change; nothing saved.",
+            &crate::actions::strings(&["Back"]),
+        )?;
         return Ok(());
     }
     let sent = devices
@@ -8481,14 +8506,14 @@ fn ask_mappings(ui: &mut impl Ui, path: &Path, kind: AskKind) -> Result<()> {
             },
             sent_skill(kind)
         ),
-        &options(&["Cancel", "Save"]),
+        &crate::actions::strings(&["Cancel", "Save"]),
     )? != Some(1)
     {
         return Ok(());
     }
     match preset {
         Some(file) => {
-            std::fs::create_dir_all(presets_dir(path))?;
+            std::fs::create_dir_all(beside(path, "presets"))?;
             mappings::save_config(&file, &config)
         }
         None => mappings::save_config(path, &config),
@@ -8513,7 +8538,7 @@ fn merge_default(
                     && question(
                         ui,
                         &format!("Replace?\n{change}"),
-                        &options(&["Keep what it does now", "Replace it"]),
+                        &crate::actions::strings(&["Keep what it does now", "Replace it"]),
                     )? != Some(1)
                 {
                     continue;
@@ -8561,7 +8586,7 @@ fn ask_setup_agents(ui: &mut impl Ui, path: &Path) -> Result<()> {
             folders.len(),
             sent_skill(AskKind::SetupAgents)
         ),
-        &options(&["Cancel", "Save"]),
+        &crate::actions::strings(&["Cancel", "Save"]),
     )? != Some(1)
     {
         return Ok(());
@@ -8624,7 +8649,7 @@ fn ask_prompt(ui: &mut impl Ui, path: &Path) -> Result<()> {
             mappings::load_config(path)?.look.default_agent,
             sent_skill(AskKind::Prompt)
         ),
-        &options(&["Cancel", "Name it, then open it in $EDITOR"]),
+        &crate::actions::strings(&["Cancel", "Name it, then open it in $EDITOR"]),
     )? != Some(1)
     {
         return Ok(());
@@ -8716,7 +8741,7 @@ fn ask_sequence(ui: &mut impl Ui, path: &Path) -> Result<()> {
             config.look.default_agent,
             sent_skill(AskKind::Sequence)
         ),
-        &options(&["Cancel", "Pick where it sends, then Save"]),
+        &crate::actions::strings(&["Cancel", "Pick where it sends, then Save"]),
     )? != Some(1)
     {
         return Ok(());
@@ -8758,9 +8783,6 @@ fn ask_sequence(ui: &mut impl Ui, path: &Path) -> Result<()> {
     result
 }
 /// v7.7 ticket 169: the action families made with 0 AI, beside the config.
-fn families_dir(path: &Path) -> PathBuf {
-    path.parent().unwrap_or(Path::new(".")).join("families")
-}
 /// v7.7 ticket 169: a family file's actions, checked in full like an import.
 fn read_family(path: &Path, file: &Path) -> Result<mappings::Profile> {
     let mut bare = mappings::load_config(path)?;
@@ -8825,7 +8847,7 @@ fn ask_family(ui: &mut impl Ui, path: &Path) -> Result<()> {
     bare.profiles.clear();
     let family = mappings::import_profile(&text, &bare).map_err(refused)?;
     mappings::refuse_risky(&family.mappings).map_err(refused)?;
-    let file = families_dir(path).join(mappings::family_file_name(&family.name));
+    let file = beside(path, "families").join(mappings::family_file_name(&family.name));
     if file.exists() {
         return Err(format!("a family named {} exists; nothing saved", family.name).into());
     }
@@ -8844,12 +8866,12 @@ fn ask_family(ui: &mut impl Ui, path: &Path) -> Result<()> {
             file.display(),
             sent_skill(AskKind::Family)
         ),
-        &options(&["Cancel", "Save"]),
+        &crate::actions::strings(&["Cancel", "Save"]),
     )? != Some(1)
     {
         return Ok(());
     }
-    std::fs::create_dir_all(families_dir(path))?;
+    std::fs::create_dir_all(beside(path, "families"))?;
     crate::actions::write_atomic(&file, &mappings::export_profile(&family)?)
 }
 /// v7.7 ticket 169: /configure's "Your families": one action of a family made with 0 AI,
@@ -8860,7 +8882,7 @@ fn family_mapping(
     pad: Control,
     input: mappings::Input,
 ) -> Result<Option<Mapping>> {
-    let dir = families_dir(path);
+    let dir = beside(path, "families");
     let mut files = std::fs::read_dir(&dir)
         .into_iter()
         .flatten()
@@ -8959,7 +8981,7 @@ fn ask_improve(ui: &mut impl Ui, _path: &Path) -> Result<()> {
             "{shown}.\nClaude Code is open on a clone of {SOURCE_URL} in {dir}, with your wish as its first message. {} VibeConsole saved nothing.",
             sent_skill(AskKind::Improve)
         ),
-        &options(&["Back"]),
+        &crate::actions::strings(&["Back"]),
     )?;
     Ok(())
 }
@@ -9006,7 +9028,7 @@ fn review_profile(
             profile.name,
             profile.apps.join(", ")
         ),
-        &options(&["Cancel", "Save this profile"]),
+        &crate::actions::strings(&["Cancel", "Save this profile"]),
     )? != Some(1)
     {
         return Ok(false);
@@ -9031,7 +9053,7 @@ fn new_profile(ui: &mut impl Ui, path: &Path) -> Result<()> {
     mappings::save_config(path, &config)
 }
 fn profile_menu(ui: &mut impl Ui, path: &Path, name: &str) -> Result<()> {
-    let items = options(&[
+    let items = crate::actions::strings(&[
         "Edit its pads and buttons",
         "Add an app",
         "Delete profile",
@@ -9067,7 +9089,7 @@ fn profile_menu(ui: &mut impl Ui, path: &Path, name: &str) -> Result<()> {
             if question(
                 ui,
                 &format!("Delete profile {name}? Its apps go back to Default."),
-                &options(&["Cancel", "Delete profile"]),
+                &crate::actions::strings(&["Cancel", "Delete profile"]),
             )? != Some(1)
             {
                 return Ok(());
@@ -9083,14 +9105,14 @@ fn profile_menu(ui: &mut impl Ui, path: &Path, name: &str) -> Result<()> {
                     .profile(name)
                     .ok_or("this profile no longer exists")?,
             )?;
-            let dir = profiles_dir(path);
+            let dir = beside(path, "profiles");
             std::fs::create_dir_all(&dir)?;
             let file = dir.join(mappings::profile_file_name(name));
             crate::actions::write_atomic(&file, &text)?;
             choose(
                 ui,
                 &format!("Exported to {}", file.display()),
-                &options(&["Back"]),
+                &crate::actions::strings(&["Back"]),
             )?;
             Ok(())
         }
@@ -9109,7 +9131,7 @@ fn driver_menu(ui: &mut impl Ui) -> Result<()> {
             "Xbox driver (now: {}). xpad: no headset, no button light. xone: headset and light.",
             now.unwrap_or("no controller connected")
         ),
-        &options(&["xpad", "xone", "Back"]),
+        &crate::actions::strings(&["xpad", "xone", "Back"]),
         usize::from(now == Some("xone")),
     )?
     else {
@@ -9124,7 +9146,7 @@ fn driver_menu(ui: &mut impl Ui) -> Result<()> {
         choose(
             ui,
             &format!("{driver} already holds the controller."),
-            &options(&["Back"]),
+            &crate::actions::strings(&["Back"]),
         )?;
         return Ok(());
     }
@@ -9132,7 +9154,7 @@ fn driver_menu(ui: &mut impl Ui) -> Result<()> {
         choose(
             ui,
             "xone: unavailable: it isn't installed. Install it yourself (github.com/dlundqvist/xone, its README), then come back.",
-            &options(&["Back"]),
+            &crate::actions::strings(&["Back"]),
         )?;
         return Ok(());
     }
@@ -9148,7 +9170,7 @@ fn driver_menu(ui: &mut impl Ui) -> Result<()> {
     if question(
         ui,
         &confirm,
-        &options(&[&yes, "Back (discard: nothing changes)"]),
+        &crate::actions::strings(&[&yes, "Back (discard: nothing changes)"]),
     )? != Some(0)
     {
         return Ok(());
@@ -9173,7 +9195,7 @@ fn driver_menu(ui: &mut impl Ui) -> Result<()> {
             _ => format!("Switched to {driver}. Replug the controller so {driver} picks it up."),
         },
     };
-    choose(ui, &message, &options(&["Back"]))?;
+    choose(ui, &message, &crate::actions::strings(&["Back"]))?;
     Ok(())
 }
 /// v7 ticket 130: install or remove the udev rule that lets the user write xone's Xbox
@@ -9205,7 +9227,7 @@ fn light_rule_menu(ui: &mut impl Ui) -> Result<()> {
     if question(
         ui,
         &format!("{what}{note}"),
-        &options(&[&yes, "Back (discard: nothing changes)"]),
+        &crate::actions::strings(&[&yes, "Back (discard: nothing changes)"]),
     )? != Some(0)
     {
         return Ok(());
@@ -9228,7 +9250,7 @@ fn light_rule_menu(ui: &mut impl Ui) -> Result<()> {
         }
         Err(error) => format!("Not changed: {error}"),
     };
-    choose(ui, &message, &options(&["Back"]))?;
+    choose(ui, &message, &crate::actions::strings(&["Back"]))?;
     Ok(())
 }
 /// v7 ticket 129: Test speaker / Test mic on the controller headset, xone only. The card id
@@ -9293,7 +9315,7 @@ fn audio_test(ui: &mut impl Ui, mic: bool) -> Result<()> {
         }
         _ => "unavailable: needs xone and a headset in the controller".into(),
     };
-    choose(ui, &message, &options(&["Back"]))?;
+    choose(ui, &message, &crate::actions::strings(&["Back"]))?;
     Ok(())
 }
 
@@ -9442,7 +9464,7 @@ fn tuning_choice(ui: &mut impl Ui, path: &Path, choice: usize) -> Result<()> {
             let Some(stick) = choose(
                 ui,
                 "Which stick moves the pointer? Its directions stop firing while it does.",
-                &options(&["Off", "Left stick", "Right stick"]),
+                &crate::actions::strings(&["Off", "Left stick", "Right stick"]),
             )?
             else {
                 return Ok(());
@@ -9471,7 +9493,11 @@ fn tuning_choice(ui: &mut impl Ui, path: &Path, choice: usize) -> Result<()> {
             let Some(mode) = choose(
                 ui,
                 "Stick mode: Linear fires up, down, left and right; Angle fires the range the stick points into (0° = up, clockwise)",
-                &options(&["Linear", "Angle: 8 sectors of 45°", "Angle: my own ranges"]),
+                &crate::actions::strings(&[
+                    "Linear",
+                    "Angle: 8 sectors of 45°",
+                    "Angle: my own ranges",
+                ]),
             )?
             else {
                 return Ok(());
@@ -10014,7 +10040,7 @@ fn pick_number(
     current: Option<u8>,
 ) -> Result<Option<Option<u8>>> {
     let start = current.map_or(0, usize::from).min(rows.len() - 1);
-    Ok(choose_at(ui, title, &options(rows), start)?
+    Ok(choose_at(ui, title, &crate::actions::strings(rows), start)?
         .map(|i| (i > 0).then(|| u8::try_from(i).unwrap_or(1))))
 }
 /// v7.7 ticket 199: the G502 logo's breathe or cycle timing; each "as the mouse has it"
@@ -10146,11 +10172,15 @@ fn test_lights(ui: &mut impl Ui, d: &crate::status::DevicePatterns) -> Result<()
     // v7.7 ticket 236: paused, the lights show nothing: offer Run first (its own gates).
     if ui.paused() {
         let ask = "Paused: lights show only while running. Run now?";
-        if question(ui, ask, &options(&["Cancel", "Run"]))? != Some(1) {
+        if question(ui, ask, &crate::actions::strings(&["Cancel", "Run"]))? != Some(1) {
             return Ok(());
         }
         if let Err(error) = ui.run_now() {
-            choose(ui, &format!("Run: {error}"), &options(&["Back"]))?;
+            choose(
+                ui,
+                &format!("Run: {error}"),
+                &crate::actions::strings(&["Back"]),
+            )?;
             return Ok(());
         }
     }
@@ -10295,7 +10325,7 @@ fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 let Some(t) = choose_at(
                     ui,
                     &format!("{}: tempo light", NAMES[index]),
-                    &options(&tempos),
+                    &crate::actions::strings(&tempos),
                     crate::status::TEMPOS
                         .iter()
                         .position(|(_, v)| *v == tempo)
@@ -10311,7 +10341,7 @@ fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                         "{}: octave light (alternate = its octave and the opposite, twice a second)",
                         NAMES[index]
                     ),
-                    &options(&octaves),
+                    &crate::actions::strings(&octaves),
                     crate::status::OCTAVES
                         .iter()
                         .position(|(_, v)| *v == octave)
@@ -10343,7 +10373,7 @@ fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 let Some(l) = choose_at(
                     ui,
                     &format!("Keyboard · {}: LED", NAMES[state]),
-                    &options(&lights),
+                    &crate::actions::strings(&lights),
                     keyboard
                         .iter()
                         .position(|(_, v)| *v == devices.keyboard[state])
@@ -10360,7 +10390,7 @@ fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 let Some(l) = choose_at(
                     ui,
                     &format!("Xbox · {}: button light", NAMES[state]),
-                    &options(&lights),
+                    &crate::actions::strings(&lights),
                     crate::status::LIGHTS
                         .iter()
                         .position(|(_, v)| *v == light)
@@ -10384,7 +10414,7 @@ fn light_patterns_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                         "Xbox · {}: rumble as it begins{same_as_paused}",
                         NAMES[state]
                     ),
-                    &options(&rumbles),
+                    &crate::actions::strings(&rumbles),
                     crate::status::RUMBLES
                         .iter()
                         .position(|(_, v)| *v == rumble)
@@ -10489,7 +10519,7 @@ fn light_sources_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 match choose(
                     ui,
                     "Every other session (no folder matches it, including this editor's agents)",
-                    &options(&[
+                    &crate::actions::strings(&[
                         if config.light_other_on {
                             "Turn Off"
                         } else {
@@ -10527,7 +10557,11 @@ fn light_sources_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 config.light_folders.push((folder, octave));
             } else {
                 let (folder, octave) = config.light_folders[index - 1].clone();
-                match choose(ui, &folder, &options(&["Edit octave", "Remove", "Back"]))? {
+                match choose(
+                    ui,
+                    &folder,
+                    &crate::actions::strings(&["Edit octave", "Remove", "Back"]),
+                )? {
                     Some(0) => match edit_octave(ui, &folder, octave)? {
                         Some(octave) => config.light_folders[index - 1].1 = octave,
                         None => return Ok(()),
@@ -10568,7 +10602,11 @@ fn variables_menu(ui: &mut impl Ui, path: &Path, user: bool) -> Result<()> {
         };
         let current = (index < count).then(|| list[index].clone());
         if current.is_some() {
-            match choose(ui, &rows[index], &options(&["Edit", "Remove", "Back"]))? {
+            match choose(
+                ui,
+                &rows[index],
+                &crate::actions::strings(&["Edit", "Remove", "Back"]),
+            )? {
                 Some(0) => {}
                 Some(1) => {
                     let list = if user {
@@ -10694,12 +10732,17 @@ fn prompt_choice(ui: &mut impl Ui, path: &Path, index: usize) -> Result<()> {
         match choose(
             ui,
             &format!("Prompt {name}"),
-            &options(&["Read", "Edit", "Delete", "Back"]),
+            &crate::actions::strings(&["Read", "Edit", "Delete", "Back"]),
         )? {
             Some(0) => {
                 let text = std::fs::read_to_string(dir.join(name))
                     .unwrap_or_else(|e| format!("(unreadable: {e})"));
-                choose(ui, &format!("{name}\n\n{text}"), &options(&["Back"])).map(drop)
+                choose(
+                    ui,
+                    &format!("{name}\n\n{text}"),
+                    &crate::actions::strings(&["Back"]),
+                )
+                .map(drop)
             }
             Some(1) => edit_prompt(ui, &dir, name),
             Some(2) => {
@@ -10721,7 +10764,7 @@ fn prompt_choice(ui: &mut impl Ui, path: &Path, index: usize) -> Result<()> {
                 if question(
                     ui,
                     &format!("Delete prompt {name}?\n{warning}"),
-                    &options(&["Cancel", "Delete"]),
+                    &crate::actions::strings(&["Cancel", "Delete"]),
                 )? == Some(1)
                 {
                     std::fs::remove_file(dir.join(name)).map_err(stage("file I/O"))
@@ -10779,7 +10822,7 @@ fn prompt_action(
         || question(
             ui,
             "Edit prompt in external editor?",
-            &options(&["Use existing", "Edit"]),
+            &crate::actions::strings(&["Use existing", "Edit"]),
         )? == Some(1)
     {
         if let Err(error) = edit_prompt(ui, &dir, &file) {
@@ -10829,7 +10872,7 @@ fn prompt_target(
     let Some(mode) = choose(
         ui,
         "Submit prompt?",
-        &options(&["Paste only", "Paste and Enter"]),
+        &crate::actions::strings(&["Paste only", "Paste and Enter"]),
     )?
     else {
         return Ok(None);
@@ -11052,10 +11095,6 @@ fn choose_saved(
     choose_at(ui, title, &mark_saved(options, saved), saved.unwrap_or(0))
 }
 
-fn options(items: &[&str]) -> Vec<String> {
-    items.iter().map(|s| s.to_string()).collect()
-}
-
 fn number(ui: &mut impl Ui, title: &str, initial: i32, min: i32, max: i32) -> Result<Option<i32>> {
     let mut value = initial;
     loop {
@@ -11139,7 +11178,7 @@ fn shortcut(ui: &mut impl Ui, saved: &[String]) -> Result<Option<Vec<String>>> {
         match choose(
             ui,
             &format!("Shortcut input{saved_line}"),
-            &options(&["Select keys", "Record shortcut", "Cancel"]),
+            &crate::actions::strings(&["Select keys", "Record shortcut", "Cancel"]),
         )? {
             Some(0) => return select_keys(ui, saved),
             Some(1) => loop {
@@ -11151,7 +11190,7 @@ fn shortcut(ui: &mut impl Ui, saved: &[String]) -> Result<Option<Vec<String>>> {
                             &format!(
                                 "Capture failed: {error}\nMapping unchanged; Select keys remains available."
                             ),
-                            &options(&["Back"]),
+                            &crate::actions::strings(&["Back"]),
                         )?;
                         break;
                     }
@@ -11159,7 +11198,7 @@ fn shortcut(ui: &mut impl Ui, saved: &[String]) -> Result<Option<Vec<String>>> {
                 match question(
                     ui,
                     &format!("Captured: {}{saved_line}", keys.join("+")),
-                    &options(&["Use", "Record again", "Cancel"]),
+                    &crate::actions::strings(&["Use", "Record again", "Cancel"]),
                 )? {
                     Some(0) => return Ok(Some(keys)),
                     Some(1) => continue,
@@ -11199,7 +11238,7 @@ fn feedback_menu(
                 "Optional hardware feedback"
             }
         );
-        let items = options(&[
+        let items = crate::actions::strings(&[
             "No hardware feedback",
             "Octave",
             "Tempo",
@@ -11216,9 +11255,9 @@ fn feedback_menu(
             0 => return Ok(Some(Feedback::default())),
             1 => {
                 let modes = if idle {
-                    options(&["Unchanged", "Absolute octave"])
+                    crate::actions::strings(&["Unchanged", "Absolute octave"])
                 } else {
-                    options(&[
+                    crate::actions::strings(&[
                         "Unchanged",
                         "Absolute octave",
                         "Offset from session baseline (not accumulated)",
@@ -11252,7 +11291,7 @@ fn feedback_menu(
                 ui,
                 "Tempo",
                 &mark_saved(
-                    options(&["Unchanged", "Set BPM (enables arpeggiator)"]),
+                    crate::actions::strings(&["Unchanged", "Set BPM (enables arpeggiator)"]),
                     mark(usize::from(initial.tempo.is_some())),
                 ),
                 usize::from(feedback.tempo.is_some()),
@@ -11278,7 +11317,7 @@ fn feedback_menu(
                     ui,
                     "Arpeggiator",
                     &mark_saved(
-                        options(&["Unchanged", "Off", "On"]),
+                        crate::actions::strings(&["Unchanged", "Off", "On"]),
                         mark(index(initial.arp)),
                     ),
                     index(feedback.arp),
@@ -11287,7 +11326,7 @@ fn feedback_menu(
                         choose(
                             ui,
                             "Tempo blinking requires arpeggiator On. Remove tempo first to select Off.",
-                            &options(&["Back"]),
+                            &crate::actions::strings(&["Back"]),
                         )?;
                     } else {
                         feedback.arp = match choice {
@@ -11403,7 +11442,7 @@ fn calibrate_motion(
             &format!(
                 "Observed CC{id} channel {channel}, values {min}..{max}.\nOnly non-wrapping ABSOLUTE knobs are supported.\nConfirm values track position and stop rather than wrap; relative encodings are unsupported."
             ),
-            &options(&[
+            &crate::actions::strings(&[
                 "Cancel / unsupported encoding",
                 "Confirm absolute position, no wrap",
             ]),
@@ -11414,7 +11453,7 @@ fn calibrate_motion(
         let Some(direction) = choose(
             ui,
             "Observed value direction",
-            &options(&["Increasing values", "Decreasing values"]),
+            &crate::actions::strings(&["Increasing values", "Decreasing values"]),
         )?
         else {
             return Ok(None);
@@ -11445,7 +11484,7 @@ fn calibrate_motion(
             "Observed {} channel {channel} id {id}: {min}..{max}, final {center}.\nConfirm BOTH endpoints were reached and the FINAL value is released neutral.\nAxes act independently: diagonals hold both mapped axes.\nA one-sided CC axis cannot distinguish physical Up from Down.",
             message.text()
         ),
-        &options(&[
+        &crate::actions::strings(&[
             "Cancel / recalibrate",
             "Confirm endpoints, neutral, independent axes",
         ]),
@@ -11500,9 +11539,9 @@ fn calibrate_motion(
         return Ok(None);
     };
     let labels = if center == min || center == max {
-        options(&["Joystick excursion (one-sided axis; directions share values)"])
+        crate::actions::strings(&["Joystick excursion (one-sided axis; directions share values)"])
     } else {
-        options(&[
+        crate::actions::strings(&[
             "Joystick Left",
             "Joystick Right",
             "Joystick Up",
@@ -11620,7 +11659,7 @@ fn action_menu(
         let Some(close) = choose_saved(
             ui,
             "Second press while the app is focused (needs the VibeConsole window extension; see README)",
-            options(&[
+            crate::actions::strings(&[
                 "Minimize",
                 "Close",
                 "Minimize; hold 1 second to quit (when a window is open, not minimized)",
@@ -11648,7 +11687,7 @@ fn action_menu(
         ui,
         "Native audio actions; default device resolved at activation.
 Requires wpctl in your desktop session. Brightness/media/lock and absolute volume are not enabled.",
-        options(&[
+        crate::actions::strings(&[
             "Output volume up",
             "Output volume down",
             "Output mute",
@@ -12084,7 +12123,7 @@ fn sequence_choice(ui: &mut impl Ui, path: &Path, index: usize) -> Result<()> {
         match choose(
             ui,
             &format!("Saved sequence {name}"),
-            &options(&["Edit", "Rename", "Delete", "Back"]),
+            &crate::actions::strings(&["Edit", "Rename", "Delete", "Back"]),
         )? {
             Some(0) => {
                 let steps = Action::PromptSequence(config.sequences[index].1.clone());
@@ -12129,7 +12168,7 @@ fn sequence_choice(ui: &mut impl Ui, path: &Path, index: usize) -> Result<()> {
                 if question(
                     ui,
                     &format!("Delete sequence {name}? No pad uses it."),
-                    &options(&["Cancel", "Delete"]),
+                    &crate::actions::strings(&["Cancel", "Delete"]),
                 )? == Some(1)
                 {
                     config.sequences.remove(index);
@@ -12214,7 +12253,7 @@ fn prompt_sequence_action(
             let picked = choose(
                 ui,
                 &format!("Step {}: {}", choice + 1, steps[choice].description()),
-                &options(&items),
+                &crate::actions::strings(&items),
             )?
             .map(|i| items[i]);
             match picked {
@@ -12244,7 +12283,7 @@ fn prompt_sequence_action(
                         &format!(
                             "Drop this step's own text? The step then sends the saved prompt {file}."
                         ),
-                        &options(&["Cancel", "Discard"]),
+                        &crate::actions::strings(&["Cancel", "Discard"]),
                     )?;
                     if confirm == Some(1) {
                         steps[choice] = saved_step(&steps[choice]);
@@ -12256,7 +12295,7 @@ fn prompt_sequence_action(
                         &format!(
                             "Write this step's text to the saved prompt {file}? Every pad using {file} then sends it."
                         ),
-                        &options(&["Cancel", &format!("Update {file}")]),
+                        &crate::actions::strings(&["Cancel", &format!("Update {file}")]),
                     )?;
                     if confirm == Some(1) {
                         // Atomic: a failed write keeps the old prompt and the edited step.
@@ -12511,7 +12550,7 @@ fn t3_action(ui: &mut impl Ui) -> Result<Option<crate::actions::Action>> {
             &format!(
                 "T3 has no key for {name}. Add the free {shown} to T3's key file? A backup is made first; your own keys stay."
             ),
-            &options(&["Cancel", &format!("Add {shown} for {name}")]),
+            &crate::actions::strings(&["Cancel", &format!("Add {shown} for {name}")]),
         )? != Some(1)
         {
             return Ok(None);
@@ -12521,7 +12560,7 @@ fn t3_action(ui: &mut impl Ui) -> Result<Option<crate::actions::Action>> {
         choose(
             ui,
             &format!("Added {shown} for {name}. Backup: {backup}"),
-            &options(&["Continue"]),
+            &crate::actions::strings(&["Continue"]),
         )?;
     }
     Ok(Some(crate::actions::Action::T3(command.clone())))
@@ -12970,7 +13009,7 @@ fn configure_steps(
                         "Silence {} (built-in default: {keys})? It then does nothing until you change it or reset it to default.",
                         pad.label()
                     ),
-                    &options(&["Cancel", "Silence it"]),
+                    &crate::actions::strings(&["Cancel", "Silence it"]),
                 )? == Some(1)
                 {
                     let silent = Mapping::new_action(
@@ -12992,7 +13031,7 @@ fn configure_steps(
             if question(
                 ui,
                 &format!("Remove {existing}?"),
-                &options(&["Cancel", remove.as_str()]),
+                &crate::actions::strings(&["Cancel", remove.as_str()]),
             )? == Some(1)
             {
                 commit(path, current, pad, pad_context, None, profile)
@@ -13044,7 +13083,7 @@ fn configure_steps(
                         mappings::program_label(ui.context()),
                         fed.join(", ")
                     ),
-                    &options(&["Back"]),
+                    &crate::actions::strings(&["Back"]),
                 )?;
                 continue;
             }
@@ -13057,7 +13096,7 @@ fn configure_steps(
                 &format!(
                     "Already assigned: {existing}\nReplace it? Nothing changes until you save."
                 ),
-                &options(&["Cancel", "Replace"]),
+                &crate::actions::strings(&["Cancel", "Replace"]),
             )? != Some(1)
         {
             continue;
@@ -13103,7 +13142,11 @@ fn configure_steps(
                     let Some(b) = choose_saved(
                         ui,
                         "Activation behavior",
-                        options(&["hold", "toggle", "one tap (once per press, never repeats)"]),
+                        crate::actions::strings(&[
+                            "hold",
+                            "toggle",
+                            "one tap (once per press, never repeats)",
+                        ]),
                         saved_behavior,
                     )?
                     else {
@@ -13309,7 +13352,7 @@ fn configure_steps(
             let Some(risky) = choose_saved(
                 ui,
                 "Fire when",
-                options(&[
+                crate::actions::strings(&[
                     "Pressed",
                     "Held for 1 second (risky; early release sends nothing)",
                 ]),
@@ -13326,7 +13369,7 @@ fn configure_steps(
             let Some(status) = choose_saved(
                 ui,
                 "Status feedback in the live pane (sent, running, stopped, failed)",
-                options(&["Off", "On"]),
+                crate::actions::strings(&["Off", "On"]),
                 saved.as_ref().map(|m| usize::from(m.status)),
             )?
             else {
@@ -13346,7 +13389,7 @@ fn configure_steps(
                 "Review: {}",
                 mapping_label(&mapping, ui.program().as_ref(), Some(&config.agents))
             ),
-            &options(&["Save and configure another", "Save and finish", "Cancel"]),
+            &crate::actions::strings(&["Save and configure another", "Save and finish", "Cancel"]),
         )? {
             Some(choice @ (0 | 1)) => {
                 commit(path, current, pad, mapping.context, Some(mapping), profile)
@@ -14053,7 +14096,7 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
             1 if !ui.context_verified => choose(
                 &mut ui,
                 "Select /prog-select before running.\nChoose the matching hardware program, then select Run. No mapped actions are enabled yet.",
-                &options(&["Back"]),
+                &crate::actions::strings(&["Back"]),
             ).map(|_| ()),
             1 => ui.run(
                 &ui.context_mappings(&current),
@@ -14086,7 +14129,7 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
                         .find(|m| m.context == ui.context() && m.control == pad)
                         .map(|m| mapping_label(m, ui.program().as_ref(), agents.as_deref()))
                         .unwrap_or_else(|| "Unassigned".into());
-                    choose(&mut ui, &text, &options(&["Back"]))?;
+                    choose(&mut ui, &text, &crate::actions::strings(&["Back"]))?;
                 }
                 Ok(())
             }),
@@ -14119,7 +14162,7 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
                     question(
                         ui,
                         &format!("Save idle feedback: {feedback}?"),
-                        &options(&["Cancel", "Save"]),
+                        &crate::actions::strings(&["Cancel", "Save"]),
                     )
                 })? == Some(1)
                 {
@@ -14225,7 +14268,7 @@ Running/paused mode is retained; held keys and toggles start inactive.",
                 }
                 ui.reset_confirmed(&mut current)?;
                 let notice = ui.notice.clone();
-                choose(&mut ui, &notice, &options(&["Continue"]))?;
+                choose(&mut ui, &notice, &crate::actions::strings(&["Continue"]))?;
                 Ok(())
             })(),
             16 => (|| {
@@ -14289,7 +14332,7 @@ Running/paused mode is retained; held keys and toggles start inactive.",
                 "Operation failed: {}\nSaved configuration preserved; held keys released; paused. Fix the cause, then select Run.",
                 ui.error
             );
-            choose(&mut ui, &text, &options(&["Back"]))?;
+            choose(&mut ui, &text, &crate::actions::strings(&["Back"]))?;
         }
     }
 }
@@ -17218,7 +17261,8 @@ mod tests {
         result.unwrap();
         assert!(asked[0].contains("A whole setup saved as a preset for later: streaming"));
         assert!(screens.iter().any(|s| s.contains("not applied")));
-        let preset = mappings::load_config(&presets_dir(&path).join("Stream.preset")).unwrap();
+        let preset =
+            mappings::load_config(&beside(&path, "presets").join("Stream.preset")).unwrap();
         assert_eq!(preset.mappings[0].keys, ["Ctrl", "N"]);
         assert_eq!(config_bytes(&path), before);
         // Whole setup: Cancel saves nothing; Save fills the button.
@@ -17247,13 +17291,13 @@ mod tests {
         let mut keys = typed("browser tabs");
         keys.extend([Enter, Enter]);
         assert!(ask(AskKind::Family, keys.clone(), family.clone()).0.is_ok()); // Cancel
-        assert!(!families_dir(&path).join("Browser.family").exists());
+        assert!(!beside(&path, "families").join("Browser.family").exists());
         keys.pop();
         keys.extend([Down, Enter]);
         let (result, _, asked) = ask(AskKind::Family, keys.clone(), family.clone());
         result.unwrap();
         assert!(asked[0].contains("browser tabs") && asked[0].contains("- app:"));
-        assert!(families_dir(&path).join("Browser.family").exists());
+        assert!(beside(&path, "families").join("Browser.family").exists());
         let mut ui = Script {
             keys: vec![Enter, Down, Enter].into(),
             ..Default::default()
@@ -17285,7 +17329,7 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("would run a terminal command"), "{error}");
-        assert!(!families_dir(&path).join("Bad.family").exists());
+        assert!(!beside(&path, "families").join("Bad.family").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
     /// v7.7 ticket 170: Improve clones the source with the URL as one argument, then shows
@@ -19562,7 +19606,7 @@ mod tests {
         let chosen = choose(
             &mut ui,
             &title,
-            &options(&["Yes, switch to xpad", "Back (discard: nothing changes)"]),
+            &crate::actions::strings(&["Yes, switch to xpad", "Back (discard: nothing changes)"]),
         )
         .unwrap();
         assert_eq!(chosen, Some(1));
@@ -24184,7 +24228,7 @@ mod tests {
                 steps: keys.into_iter().map(Step::Key).collect(),
                 ..Play::default()
             });
-            choose(ui, title, &options(rows)).unwrap()
+            choose(ui, title, &crate::actions::strings(rows)).unwrap()
         };
         let five = ["a", "b", "c", "d", "e"];
         assert_eq!(
@@ -24211,7 +24255,7 @@ mod tests {
                 steps: keys.into_iter().map(Step::Key).collect(),
                 ..Play::default()
             });
-            question(ui, title, &options(rows)).unwrap()
+            question(ui, title, &crate::actions::strings(rows)).unwrap()
         };
         // A question: never remembered, at any length.
         let sure = ["Cancel", "Delete", "Delete all", "Delete and quit"];
@@ -24260,7 +24304,7 @@ mod tests {
         {
             let call = &code[at..(at + 700).min(code.len())];
             let call = &call[..call.find(")?").unwrap_or(call.len())];
-            if let Some(list) = call.find("options(&[") {
+            if let Some(list) = call.find("crate::actions::strings(&[") {
                 let first = call[list + 10..].trim_start();
                 let rows = call[list..].matches(',').count();
                 if rows >= 1 && answers.iter().any(|a| first.starts_with(a)) {

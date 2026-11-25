@@ -948,7 +948,7 @@ fn dispatch(
     }
     result
 }
-fn strings(values: &[&str]) -> Vec<String> {
+pub fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|s| s.to_string()).collect()
 }
 fn audio(action: &Action, mut run: impl FnMut(&[String]) -> Result<String>) -> Result<String> {
@@ -2191,7 +2191,7 @@ fn send_prompt(
 /// Sends a sequence step's own text (v7 ticket 81) like a saved prompt, from a file of its
 /// own in the user's runtime directory, deleted once sent; the saved prompt is never touched.
 fn with_own_text(text: &str, send: impl FnOnce(&Path) -> Result<String>) -> Result<String> {
-    with_own_text_in(&crate::status::dir()?, text, send)
+    with_own_text_in(&crate::status::state_dir()?, text, send)
 }
 /// v7 ticket 94: `dir` holds the step's text while it's sent; tests pass a temporary one.
 fn with_own_text_in(

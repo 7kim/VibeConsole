@@ -15,9 +15,6 @@ pub const AGENT_ENV: &str = "VIBECONSOLE_AGENT";
 
 /// Where agent state and context files live (`$XDG_RUNTIME_DIR/vibeconsole`).
 pub fn state_dir() -> Result<PathBuf> {
-    dir()
-}
-pub(crate) fn dir() -> Result<PathBuf> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .filter(|v| !v.is_empty())
         .ok_or("XDG_RUNTIME_DIR is not set")?;
@@ -42,11 +39,11 @@ fn read_in(dir: &Path, agent: &str) -> &'static str {
 }
 
 pub fn write(agent: &str, state: &str) -> Result<()> {
-    write_in(&dir()?, agent, state)
+    write_in(&state_dir()?, agent, state)
 }
 
 pub fn read(agent: &str) -> &'static str {
-    dir().map_or("idle", |d| read_in(&d, agent))
+    state_dir().map_or("idle", |d| read_in(&d, agent))
 }
 
 /// `agent-status <agent|-> <state> [ignored]`. `-` means "the agent in $VIBECONSOLE_AGENT", and
@@ -101,7 +98,7 @@ fn session_hook(state: &str) -> Result<()> {
         &mut input,
     )?;
     let (pid, kind) = agent_process();
-    session_report(&dir()?, &input, state, pid, kind)
+    session_report(&state_dir()?, &input, state, pid, kind)
 }
 
 /// `kind` is the agent program (`claude`, `codex`) or "" when unknown (v7 ticket 59).
@@ -178,7 +175,7 @@ pub struct Session {
 /// Recorded sessions, dropping those whose agent process is gone, plus Orca's agents in
 /// folders our hooks don't cover (v7 ticket 16).
 pub fn sessions() -> Vec<Session> {
-    let hooks = dir()
+    let hooks = state_dir()
         .map(|d| sessions_in(&d, |pid| Path::new(&format!("/proc/{pid}")).exists()))
         .unwrap_or_default();
     let orca = std::env::var_os("HOME")
@@ -1487,10 +1484,7 @@ pub fn write_context(input: &str, agent: &str, dir: &Path) -> Result<()> {
         transcript.unwrap_or("-")
     );
     std::fs::create_dir_all(dir)?;
-    let temporary = dir.join(format!(".{agent}.context.tmp"));
-    std::fs::write(&temporary, text)?;
-    std::fs::rename(&temporary, context_file(dir, agent))?;
-    Ok(())
+    crate::actions::write_atomic(&context_file(dir, agent), &text)
 }
 /// The context file of `agent`, or `None` when it reports nothing.
 pub fn read_context(dir: &Path, agent: &str) -> Option<Context> {
@@ -1591,9 +1585,7 @@ pub fn install_statusline(settings: &Path, saved: &Path) -> Result<String> {
     if let Some(folder) = settings.parent() {
         std::fs::create_dir_all(folder)?;
     }
-    let temporary = settings.with_extension("json.vibeconsole-tmp");
-    std::fs::write(&temporary, serde_json::to_string_pretty(&json)? + "\n")?;
-    std::fs::rename(&temporary, settings)?;
+    crate::actions::write_atomic(settings, &(serde_json::to_string_pretty(&json)? + "\n"))?;
     Ok(note)
 }
 

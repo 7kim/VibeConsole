@@ -222,19 +222,11 @@ fn write_all(files: &[(PathBuf, String)], history: Option<&Path>) -> Result<()> 
                     unrestored.push(format!("{} ({r})", path.display()));
                 }
             }
-            if !unrestored.is_empty() {
-                return Err(format!(
-                    "cannot save {}: {e}; could not put back {}",
-                    path.display(),
-                    unrestored.join(", ")
-                )
-                .into());
-            }
-            return Err(format!(
-                "cannot save {}: {e}; saved config unchanged",
-                path.display()
-            )
-            .into());
+            let state = match unrestored.is_empty() {
+                true => "saved config unchanged".to_string(),
+                false => format!("could not put back {}", unrestored.join(", ")),
+            };
+            return Err(format!("cannot save {}: {e}; {state}", path.display()).into());
         }
         done.push((path, old));
     }
