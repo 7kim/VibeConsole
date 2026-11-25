@@ -887,6 +887,62 @@ pub fn connection(uuid: [u8; 16]) -> String {
         bus => format!("bus {bus:#06x}"),
     }
 }
+/// v7.8 ticket 06: how a controller is connected and which driver reads it, from its input
+/// bus and the drivers bound above its input device (nearest first). Unknown parts are None,
+/// never guessed: xone's own bus (0x06) is told apart by its wired or dongle driver.
+pub fn link(bus: u16, drivers: &[String]) -> (Option<&'static str>, Option<String>) {
+    let has = |name: &str| drivers.iter().any(|d| d == name);
+    if has("xone-dongle") {
+        return (Some("USB dongle"), Some("xone".into()));
+    }
+    if has("xone-wired") {
+        return (Some("USB"), Some("xone".into()));
+    }
+    let connection = match bus {
+        0x03 => Some("USB"),
+        0x05 => Some("Bluetooth"),
+        _ => None,
+    };
+    (connection, drivers.first().cloned())
+}
+/// [`link`] for the controller named `name` with these ids, read from `sys` (`/sys`).
+pub fn link_at(
+    sys: &std::path::Path,
+    name: &str,
+    vendor: u16,
+    product: u16,
+) -> (Option<&'static str>, Option<String>) {
+    let read = |dir: &std::path::Path, file: &str| {
+        std::fs::read_to_string(dir.join(file)).map(|s| s.trim().to_owned())
+    };
+    let hex = |dir: &std::path::Path, file: &str| {
+        read(dir, file)
+            .ok()
+            .and_then(|v| u16::from_str_radix(&v, 16).ok())
+    };
+    let inputs = std::fs::read_dir(sys.join("class/input"))
+        .map(|d| d.flatten().map(|e| e.path()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    for input in inputs {
+        if read(&input, "name").ok().as_deref() != Some(name)
+            || hex(&input, "id/vendor") != Some(vendor)
+            || hex(&input, "id/product") != Some(product)
+        {
+            continue;
+        }
+        let Ok(dir) = std::fs::canonicalize(&input) else {
+            continue;
+        };
+        let drivers = dir
+            .ancestors()
+            .filter_map(|a| std::fs::read_link(a.join("driver")).ok())
+            .filter_map(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .filter(|d| !d.starts_with("xone-gip-")) // xone's per-device part, not the link
+            .collect::<Vec<_>>();
+        return link(hex(&input, "id/bustype").unwrap_or(0), &drivers);
+    }
+    (None, None)
+}
 /// v7 ticket 129: which driver holds the controller now, from `bound_drivers`.
 pub fn driver_in_use(bound: &[&str]) -> Option<&'static str> {
     if bound.iter().any(|d| d.starts_with("xone")) {
@@ -1483,6 +1539,20 @@ impl Pad {
             .map(|(_, pad)| pad.name().to_owned())
             .collect()
     }
+    /// v7.8 ticket 06: the first controller's connection and driver, from sysfs.
+    pub fn link(&self) -> (Option<&'static str>, Option<String>) {
+        self.gilrs
+            .gamepads()
+            .find(|(_, pad)| crate::ours(pad.os_name()))
+            .map_or((None, None), |(_, pad)| {
+                link_at(
+                    std::path::Path::new("/sys"),
+                    pad.os_name(),
+                    pad.vendor_id().unwrap_or(0),
+                    pad.product_id().unwrap_or(0),
+                )
+            })
+    }
     /// Each controller's name with its connection (v7 ticket 107), for `doctor`.
     pub fn connections(&self) -> Vec<String> {
         self.gilrs
@@ -1683,6 +1753,84 @@ impl Drop for ButtonLight {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v7.8 ticket 06: the link and driver from sysfs fixtures shaped like the real trees
+    /// (xone wired and dongle, xpadneo over Bluetooth, xpad over USB); unknown is left out.
+    #[test]
+    fn link_and_driver_come_from_sysfs() {
+        let root = std::env::temp_dir().join(format!("vibeconsole-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let device = |name: &str,
+                      path: &str,
+                      bus: &str,
+                      product: &str,
+                      drivers: &[(&str, &str)]| {
+            let input = root.join("devices").join(path);
+            std::fs::create_dir_all(input.join("id")).unwrap();
+            std::fs::write(input.join("name"), format!("{name}\n")).unwrap();
+            std::fs::write(input.join("id/bustype"), bus).unwrap();
+            std::fs::write(input.join("id/vendor"), "045e").unwrap();
+            std::fs::write(input.join("id/product"), product).unwrap();
+            for (at, driver) in drivers {
+                let target = root.join("bus/drivers").join(driver);
+                std::fs::create_dir_all(&target).unwrap();
+                std::os::unix::fs::symlink(target, root.join("devices").join(at).join("driver"))
+                    .unwrap();
+            }
+            std::fs::create_dir_all(root.join("class/input")).unwrap();
+            let link = root.join("class/input").join(input.file_name().unwrap());
+            std::os::unix::fs::symlink(&input, link).unwrap();
+        };
+        device(
+            "Wired",
+            "usb3/3-4:1.0/gip0/gip0.0/input/input1",
+            "0006",
+            "0b12",
+            &[
+                ("usb3/3-4:1.0/gip0/gip0.0", "xone-gip-gamepad"),
+                ("usb3/3-4:1.0", "xone-wired"),
+            ],
+        );
+        device(
+            "Dongle",
+            "usb1/1-2:1.0/gip1/gip1.0/input/input2",
+            "0006",
+            "0b12",
+            &[
+                ("usb1/1-2:1.0/gip1/gip1.0", "xone-gip-gamepad"),
+                ("usb1/1-2:1.0", "xone-dongle"),
+            ],
+        );
+        device(
+            "Wireless",
+            "hci0/0005:045E:028E.0001/input/input3",
+            "0005",
+            "028e",
+            &[("hci0/0005:045E:028E.0001", "xpadneo")],
+        );
+        device(
+            "Cable",
+            "usb2/2-1:1.0/input/input4",
+            "0003",
+            "02ea",
+            &[("usb2/2-1:1.0", "xpad")],
+        );
+        device("Odd", "virtual/input/input5", "0006", "0001", &[]);
+        let at = |name, product| link_at(&root, name, 0x045e, product);
+        assert_eq!(at("Wired", 0x0b12), (Some("USB"), Some("xone".into())));
+        assert_eq!(
+            at("Dongle", 0x0b12),
+            (Some("USB dongle"), Some("xone".into()))
+        );
+        assert_eq!(
+            at("Wireless", 0x028e),
+            (Some("Bluetooth"), Some("xpadneo".into()))
+        );
+        assert_eq!(at("Cable", 0x02ea), (Some("USB"), Some("xpad".into())));
+        assert_eq!(at("Odd", 0x0001), (None, None));
+        assert_eq!(at("Missing", 0x0b12), (None, None));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn buttons_press_once_release_only_when_seen_and_unplug_forgets_held_buttons() {

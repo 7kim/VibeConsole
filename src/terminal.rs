@@ -317,6 +317,8 @@ struct Terminal {
     /// v7 ticket 115: the Xbox program in use (1–8), its View/Menu picker, and whether the
     /// last control used was the Xbox controller's (the header names that device's program).
     xbox_program: u8,
+    /// v7.8 ticket 06: " · <link> · <driver>" of the controller in use, read on connect.
+    xbox_link: String,
     program_keys: crate::gamepad::ProgramKeys,
     last_xbox: bool,
     /// v7 ticket 113: the keyboard's lock-key LEDs, opened when first needed; a failure to
@@ -734,8 +736,13 @@ impl Terminal {
             (None, Some(name)) => name.clone(),
             (None, None) => mappings::program_label(self.context),
         };
-        let program = if self.last_xbox && self.gamepad.is_some() {
-            format!("Xbox · {}", self.xbox_program_label()) // v7 ticket 115
+        let xbox = self.last_xbox && self.gamepad.is_some();
+        let program = if xbox {
+            // v7 ticket 115; v7.8 ticket 06: its name (or Program N), link and driver.
+            let name = mappings::load_config(&self.path)
+                .map(|c| mappings::xbox_program_name(&c, self.xbox_program))
+                .unwrap_or_default();
+            xbox_header(&name, self.xbox_program, &self.xbox_link)
         } else if self.context_verified {
             format!("{program} (hardware/RAM verified)")
         } else {
@@ -751,10 +758,18 @@ impl Terminal {
             (None, Some(profile)) => format!("{profile} profile · focused"),
             (None, None) => "Default".into(),
         };
-        let header = format!(
-            "{connection_line}\n{program} | {chip} | {}",
-            state_lines.next().unwrap_or_default()
-        );
+        let header = if xbox {
+            // v7.8 ticket 06: `Xbox · Apps · USB · xone · RUNNING | … | 0 await release`.
+            format!(
+                "{connection_line}\n{program} · {} | {chip}",
+                state_lines.next().unwrap_or_default()
+            )
+        } else {
+            format!(
+                "{connection_line}\n{program} | {chip} | {}",
+                state_lines.next().unwrap_or_default()
+            )
+        };
         let mut live = state_lines.map(String::from).collect::<Vec<_>>();
         let notice = if !self.error.is_empty() {
             format!("Error: {}", self.error.replace('\n', " "))
@@ -1161,6 +1176,7 @@ impl Terminal {
             headset_audio: None,
             layer2: false,
             xbox_program: 1,
+            xbox_link: String::new(),
             program_keys: crate::gamepad::ProgramKeys::default(),
             last_xbox: false,
             lock_lights: None,
@@ -4246,6 +4262,7 @@ impl Terminal {
                 if let Some(name) = pad.connected().first() {
                     self.notice = format!("Xbox controller ready: {name}");
                 }
+                self.xbox_link = link_text(pad.link());
                 self.gamepad = Some(pad);
                 self.open_button_light();
             }
@@ -5578,6 +5595,8 @@ impl Terminal {
                 ) if crate::gamepad::is_layer_key(control) => {}
                 crate::gamepad::Change::Event(event) => self.handle_events(vec![event])?,
                 crate::gamepad::Change::Connected(name) => {
+                    self.xbox_link =
+                        (self.gamepad.as_ref()).map_or_else(String::new, |p| link_text(p.link()));
                     self.gamepad_transition(format!(
                         "Xbox controller connected: {name}; buttons fire on their next press"
                     ))?;
@@ -12645,6 +12664,22 @@ fn configure_for(
     }
 }
 
+/// v7.8 ticket 06: the Xbox header's start: the program's name (`Program N` when unnamed,
+/// never both) and the link from [`link_text`].
+fn xbox_header(name: &str, program: u8, link: &str) -> String {
+    let number = format!("Program {program}");
+    let label = if name.is_empty() { &number } else { name };
+    format!("Xbox · {label}{link}")
+}
+/// " · USB dongle · xone", " · Bluetooth", or "" when nothing is known.
+fn link_text((connection, driver): (Option<&str>, Option<String>)) -> String {
+    [connection.map(str::to_owned), driver]
+        .into_iter()
+        .flatten()
+        .map(|part| format!(" · {part}"))
+        .collect()
+}
+
 fn lock_on(profile: Option<&str>) -> mappings::Lock {
     profile.map_or(mappings::Lock::Default, |name| {
         mappings::Lock::Profile(name.to_owned())
@@ -15366,6 +15401,33 @@ mod tests {
             ["Enter"]
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.8 ticket 06: the header names the program (Program N only when unnamed), then the
+    /// link and driver as sysfs gives them (gamepad::link_and_driver_come_from_sysfs).
+    #[test]
+    fn xbox_header_names_program_link_and_driver() {
+        let link = |c: &'static str, d: &str| link_text((Some(c), Some(d.into())));
+        assert_eq!(
+            xbox_header("Apps", 1, &link("USB", "xone")),
+            "Xbox · Apps · USB · xone"
+        );
+        assert_eq!(
+            xbox_header("Apps", 1, &link("USB dongle", "xone")),
+            "Xbox · Apps · USB dongle · xone"
+        );
+        assert_eq!(
+            xbox_header("Browser", 2, &link("Bluetooth", "xpadneo")),
+            "Xbox · Browser · Bluetooth · xpadneo"
+        );
+        assert_eq!(
+            xbox_header("", 3, &link_text((None, None))),
+            "Xbox · Program 3"
+        );
+        assert_eq!(
+            xbox_header("Program 4", 4, &link_text((Some("Bluetooth"), None))),
+            "Xbox · Program 4 · Bluetooth"
+        );
     }
 
     /// v7.7 ticket 267: like the Akai's, the Xbox list holds only the Xbox program in use

@@ -156,9 +156,10 @@ for ending in (*STARTUP, "quit", "sigint", "sigterm", "configuration_error", "cu
         (bin_dir / "systemctl").write_text('#!/bin/sh\necho "$@" >> "$(dirname "$0")/systemctl.log"\nexit 1\n')
         (bin_dir / "systemctl").chmod(0o755)
         if ending == "configuration_error":
-            # Every config file's staging file is taken, so a save fails (v7.7 ticket 197).
+            # Every config file's staging file is taken, so a save fails (v7.7 ticket 197). A
+            # folder, since a save clears a stale staging file but can't remove a folder.
             for name in ("settings", "devices", "lights", "mappings", "agents"):
-                (config / f"{name}.json.tmp").write_text("occupied")
+                (config / f"{name}.json.tmp").mkdir()
         master, slave = pty.openpty()
         original = termios.tcgetattr(slave)
         os.write(master, STARTUP.get(ending, b""))  # typed before the first frame
