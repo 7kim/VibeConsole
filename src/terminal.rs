@@ -235,8 +235,8 @@ trait Ui {
     fn learn_button(&mut self) -> Result<Option<Control>> {
         self.learn()
     }
-    /// Whether an Xbox controller is connected now (v7 ticket 111: its built-in defaults are
-    /// listed for editing only then).
+    /// Whether an Xbox controller is connected now (v7.8 ticket 39: Edit and Remove then ask
+    /// the device first even when no Xbox assignment is saved).
     fn xbox_connected(&self) -> bool {
         false
     }
@@ -15255,7 +15255,10 @@ fn configure_steps(
             // default (they apply to Default only, on layer 1).
             // v7.8 ticket 22: in the Xbox program in use: they apply in every program until a
             // button is saved there (v7 ticket 115, `gamepad::layout_in`).
-            let defaults = if profile.is_none() && ui.xbox_connected() {
+            // v7.8 ticket 39: with or without a controller, so they can be set up before
+            // plugging it in.
+            let is_xbox = |m: &Mapping| m.control.message == crate::Message::Button;
+            let defaults = if profile.is_none() {
                 let context = mappings::xbox_context(ui.xbox_program(), false);
                 crate::gamepad::default_layout()
                     .into_iter()
@@ -15279,12 +15282,14 @@ fn configure_steps(
                 .map(|(m, star)| (m, star, false))
                 .chain(defaults.iter().map(|m| (m, false, true)))
                 .collect::<Vec<_>>();
-            let xbox = |m: &Mapping| m.control.message == crate::Message::Button;
             let (midi_n, xbox_n) = (
-                all.iter().filter(|(m, _, _)| !xbox(m)).count(),
-                all.iter().filter(|(m, _, _)| xbox(m)).count(),
+                all.iter().filter(|(m, _, _)| !is_xbox(m)).count(),
+                all.iter().filter(|(m, _, _)| is_xbox(m)).count(),
             );
-            let want_xbox = if midi_n > 0 && xbox_n > 0 {
+            // v7.8 ticket 39: no controller and no Xbox assignment saved (an Akai-only user):
+            // no device question; the defaults are listed after the MIDI assignments.
+            let ask_device = ui.xbox_connected() || current.iter().any(is_xbox);
+            let want_xbox = if midi_n > 0 && xbox_n > 0 && ask_device {
                 let devices = vec![
                     format!("MIDI keyboard ({midi_n})"),
                     format!("Xbox controller ({xbox_n})"),
@@ -15298,7 +15303,7 @@ fn configure_steps(
             };
             let list = all
                 .into_iter()
-                .filter(|(m, _, _)| want_xbox.is_none_or(|x| xbox(m) == x))
+                .filter(|(m, _, _)| want_xbox.is_none_or(|x| is_xbox(m) == x))
                 .collect::<Vec<_>>();
             let xbox_name = mappings::load_config(path)
                 .map(|c| mappings::xbox_program_name(&c, ui.xbox_program()))
@@ -17593,8 +17598,10 @@ mod tests {
     /// Learn saves into the program in use.
     #[test]
     fn switching_the_xbox_program_loads_its_buttons() {
-        let dir =
-            std::env::temp_dir().join(format!("vibeconsole-xbox-programs-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "vibeconsole-xbox-program-switch-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mappings.tsv");
@@ -17771,6 +17778,78 @@ mod tests {
             does(&saved, 1, a).unwrap().1,
             ["Enter"],
             "Program 1 keeps it"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.8 ticket 39: with no controller connected the Xbox defaults are still listed, and
+    /// one is changed and saved as an override; an Akai-only config (MIDI assignments, no
+    /// Xbox one) gets them below its own, with no device question; with an Xbox assignment
+    /// saved, the device question counts them.
+    #[test]
+    fn xbox_defaults_listed_without_a_controller() {
+        use Key::*;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-defaults-39-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut current = Vec::new();
+        let b = Control::button(1);
+        // Edit -> B (default) -> Change action -> Music & Sound -> Output mute; save, finish.
+        let mut ui = Script {
+            keys: [
+                vec![Tab, Enter, Down, Enter, Enter],
+                vec![Down, Down, Enter, Down, Down, Enter],
+                vec![Enter, Enter, Down, Enter, Escape],
+            ]
+            .concat()
+            .into(),
+            xbox: false,
+            ..Default::default()
+        };
+        configure(&mut ui, &path, &mut current).unwrap();
+        let screens = ui.screens.join("\n----\n");
+        assert!(ui.keys.is_empty(), "{screens}");
+        assert!(
+            screens.contains("(default) Xbox controller | Xbox B"),
+            "{screens}"
+        );
+        let saved = mappings::load(&path).unwrap();
+        assert_eq!(saved.len(), 1, "only the override is saved: {saved:?}");
+        assert_eq!(saved[0].control, b);
+        assert_eq!(saved[0].action, crate::actions::Action::OutputMute);
+        // Akai-only: one MIDI assignment, no Xbox one: no device question; the defaults are
+        // listed after it.
+        let midi = Mapping::new(Control::from_note(10, 36).unwrap(), "F1", "hold").unwrap();
+        current = vec![midi.clone()];
+        mappings::save(&path, &current).unwrap();
+        ui.screens.clear();
+        ui.keys = [Tab, Enter, Escape, Escape].into();
+        configure(&mut ui, &path, &mut current).unwrap();
+        let screens = ui.screens.join("\n----\n");
+        assert!(!screens.contains("which device?"), "{screens}");
+        let list = (ui.screens.iter())
+            .find(|s| s.starts_with("Saved assignments"))
+            .unwrap_or_else(|| panic!("{screens}"));
+        let (pad, a) = (
+            list.find("ch10 #36"),
+            list.find("(default) Xbox controller | Xbox A"),
+        );
+        assert!(pad.is_some() && a.is_some() && pad < a, "{list}");
+        // MIDI and an Xbox assignment saved: the defaults count beside it.
+        let mut y = Mapping::new(Control::button(3), "Space", "tap").unwrap();
+        y.context = mappings::xbox_context(1, false);
+        current = vec![midi, y];
+        mappings::save(&path, &current).unwrap();
+        ui.screens.clear();
+        ui.keys = [Tab, Enter, Escape, Escape].into();
+        configure(&mut ui, &path, &mut current).unwrap();
+        let screens = ui.screens.join("\n----\n");
+        assert!(
+            screens.contains("Xbox controller (9)"),
+            "Y + 8 defaults: {screens}"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -18032,14 +18111,15 @@ mod tests {
         };
         configure(&mut ui, &path, &mut current).unwrap();
         let screens = ui.screens.join("\n----\n");
-        assert!(screens.contains("Xbox controller (2)"), "{screens}");
+        // B and Y, and the 8 built-in defaults B doesn't override (v7.8 ticket 39).
+        assert!(screens.contains("Xbox controller (10)"), "{screens}");
         let xbox = ui
             .screens
             .iter()
             .find(|s| s.starts_with("Saved assignments · Xbox controller · Browser"))
             .unwrap_or_else(|| panic!("{screens}"));
         assert!(
-            xbox.contains("Xbox B") && xbox.contains("Xbox Y") && !xbox.contains("Xbox X"),
+            xbox.contains("Xbox B") && xbox.contains("Xbox Y") && !xbox.contains("F8"),
             "{xbox}"
         );
         // v7.8 ticket 05: Remove lists program 2's own too, and removes nothing on the way out.
@@ -18057,7 +18137,7 @@ mod tests {
             .find(|s| s.contains("Xbox controller · Browser"))
             .unwrap_or_else(|| panic!("{screens}"));
         assert!(
-            xbox.contains("Xbox B") && xbox.contains("Xbox Y") && !xbox.contains("Xbox X"),
+            xbox.contains("Xbox B") && xbox.contains("Xbox Y") && !xbox.contains("F8"),
             "{xbox}"
         );
         assert!(screens.contains("> Remove saved assignment"), "{screens}");
@@ -18143,7 +18223,11 @@ mod tests {
             screens.contains("Saved assignments: which device?"),
             "{screens}"
         );
-        assert!(screens.contains("MIDI keyboard (1)") && screens.contains("Xbox controller (1)"));
+        // v7.8 ticket 39: the built-in defaults count too, with or without a controller.
+        assert!(
+            screens.contains("MIDI keyboard (1)") && screens.contains("Xbox controller (9)"),
+            "{screens}"
+        );
         let xbox = ui
             .screens
             .iter()
