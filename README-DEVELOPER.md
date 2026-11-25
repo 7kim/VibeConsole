@@ -365,7 +365,7 @@ Use `./target/debug/vibeconsole` for the current local build. After installation
 | `vibeconsole configure` | Direct configuration menus; use the interactive session for program-aware setup |
 | `vibeconsole feedback-read` | Read/validate current RAM musical settings without changing them |
 | `vibeconsole agent-status <agent\|-> <state>` | Record `idle`, `thinking`, `needs-input`, `needs-decision`, `finished` or `ended` for an agent (called by hooks; opens no MIDI or keyboard) |
-| `vibeconsole doctor` | Inspect session, device, configuration, prerequisite availability, the window extension, and the Claude Code / Codex status hooks |
+| `vibeconsole doctor` | A checklist, one line per area (🟢 works, 🟡 works with limits, 🔴 missing, with the reason); the first line says whether the installed build matches this source when run in the repo. `doctor --all`: every check's line (session, devices, configuration, prerequisites, the window extension, the Claude Code / Codex status hooks) |
 | `vibeconsole install` | Copy the invoking executable to `~/.local/bin/vibeconsole` |
 | `vibeconsole uninstall` | Remove managed installation/service; preserve mappings |
 | `vibeconsole startup-enable` | Opt into the managed user service without starting it immediately; old flags are accepted and ignored |

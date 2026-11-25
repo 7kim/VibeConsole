@@ -5,7 +5,7 @@ description: Use when the user pastes or asks about `vibeconsole doctor` output,
 
 # Reading `vibeconsole doctor`
 
-Run it, then go line by line. Report only what a line says; never guess.
+`vibeconsole doctor` prints one line per area: 🟢 works, 🟡 works with limits, 🔴 missing, each with its check's own reason. For any 🟡 or 🔴, run `vibeconsole doctor --all` (every check's full line) and go line by line. Report only what a line says; never guess.
 
 | Line | Meaning | Fix |
 |---|---|---|

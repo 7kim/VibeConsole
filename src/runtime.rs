@@ -901,6 +901,215 @@ fn status_outcome(code: Option<i32>) -> Result<()> {
         None => Err("startup-status: systemctl was stopped by a signal".into()),
     }
 }
+/// v7.8 ticket 08: the source tree's commit when `doctor` runs inside VibeConsole's repo, to
+/// say whether the running build matches it; None anywhere else.
+fn here_commit() -> Option<String> {
+    let cargo = std::fs::read_to_string("Cargo.toml").ok()?;
+    if !cargo.contains("name = \"vibeconsole\"") {
+        return None;
+    }
+    let out = vibeconsole_core::program("git")
+        .args(["rev-parse", "--short=7", "HEAD"])
+        .output()
+        .ok()?;
+    let commit = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    (out.status.success() && !commit.is_empty()).then_some(commit)
+}
+
+/// v7.8 ticket 08: `doctor`'s checklist, one line per area, built only from the lines of the
+/// checks just made (`doctor --all` prints those lines): 🟢 works, 🟡 works with limits,
+/// 🔴 missing, with the check's own reason or fix. An area with nothing to say is left out.
+fn checklist(lines: &[String], here: &Option<String>) -> Vec<String> {
+    // What a check said after `prefix: `, for every line that starts with `prefix`.
+    let said = |prefix: &str| -> Vec<&str> {
+        lines
+            .iter()
+            .filter_map(|l| l.strip_prefix(prefix))
+            .map(|rest| {
+                rest.trim_start_matches(|c| c != ':')
+                    .trim_start_matches(':')
+                    .trim()
+            })
+            .collect()
+    };
+    let first = |prefix: &str| said(prefix).first().copied().unwrap_or("");
+    let ok = |text: &str| {
+        [
+            "available",
+            "ready",
+            "installed",
+            "answering",
+            "running",
+            "enabled",
+        ]
+        .iter()
+        .any(|w| text.starts_with(w))
+    };
+    let row = |mark: &str, label: &str, detail: String| format!("{mark} {label:<21} {detail}");
+    let mut out = Vec::new();
+    // Build and service.
+    let version = lines.first().map_or("", String::as_str);
+    let built = version
+        .rsplit_once("commit ")
+        .map(|(_, c)| c.trim_end_matches(')'));
+    let matches = match (built, here) {
+        (Some(b), Some(h)) if h.starts_with(b) || b.starts_with(h.as_str()) => {
+            Some("installed build matches")
+        }
+        (Some(_), Some(_)) => Some("installed build differs from this source (mise run install)"),
+        (None, Some(_)) => Some("a local build (no commit recorded)"),
+        _ => None,
+    };
+    let state = first("Run state");
+    let service = match (first("Login service"), state) {
+        (_, s) if s.starts_with("running") => "login service running",
+        (l, _) if l.starts_with("enabled") => "login service enabled, not running",
+        _ => "login service off (vibeconsole startup-enable)",
+    };
+    let build_mark = match (state.starts_with("running"), matches) {
+        (true, None | Some("installed build matches" | "a local build (no commit recorded)")) => {
+            "🟢"
+        }
+        _ => "🟡",
+    };
+    let mut build = vec![version.trim_start_matches("vibeconsole ").to_owned()];
+    build.extend(matches.map(str::to_owned));
+    build.push(service.to_owned());
+    out.push(row(build_mark, "VibeConsole", build.join(" · ")));
+    // Akai.
+    match (
+        said("MIDI identity").first(),
+        said("MIDI unavailable").first(),
+    ) {
+        (Some(_), _) => {
+            let program = state
+                .split_once('(')
+                .map(|(_, p)| p.trim_end_matches(')'))
+                .filter(|p| p.starts_with("Program"))
+                .map(|p| format!(" · {}", p.to_lowercase().replace("program", "program")))
+                .unwrap_or_default();
+            out.push(row("🟢", "Akai MPK mini 3", format!("connected{program}")));
+        }
+        (None, Some(e)) => out.push(row("🔴", "Akai MPK mini 3", e.to_string())),
+        _ => {}
+    }
+    // Each Xbox controller.
+    for found in said("Xbox controllers") {
+        if found.starts_with("none") {
+            out.push(row("🔴", "Xbox controller", found.to_owned()));
+        } else {
+            for pad in found.split(", ") {
+                let (name, link) = pad.split_once(" (").unwrap_or((pad, ""));
+                let link = link.trim_end_matches(')');
+                out.push(row("🟢", "Xbox controller", format!("{name} · {link}")));
+            }
+        }
+    }
+    // Xbox headset, uinput, window extension, sound: one check each.
+    for (prefix, label, missing) in [
+        ("Xbox headset audio", "Xbox headset audio", "🟡"),
+        ("uinput", "uinput (keys)", "🔴"),
+        ("Window control extension", "Window extension", "🟡"),
+        ("wpctl", "Sound (wpctl)", "🔴"),
+    ] {
+        if let Some(text) = said(prefix).first() {
+            let mark = if ok(text) { "🟢" } else { missing };
+            out.push(row(mark, label, text.to_string()));
+        }
+    }
+    // Keyboard lights and RGB: what is available, by name.
+    let group = |prefixes: &[&str]| -> Vec<(String, bool, String)> {
+        lines
+            .iter()
+            .filter(|l| prefixes.iter().any(|p| l.starts_with(p)))
+            .filter_map(|l| {
+                let (name, text) = l.split_once(": ")?;
+                Some((
+                    name.to_owned(),
+                    text.starts_with("available"),
+                    text.to_owned(),
+                ))
+            })
+            .collect()
+    };
+    for (label, prefixes) in [
+        // The G light is never offered (it turns on Razer game mode): not a limit to report.
+        (
+            "Keyboard lights",
+            &["Keyboard light", "Keyboard M light"][..],
+        ),
+        (
+            "RGB",
+            &[
+                "RGB keyboard",
+                "Speakers RGB",
+                "Mousepad RGB",
+                "Mouse light",
+            ][..],
+        ),
+    ] {
+        let found = group(prefixes);
+        if found.is_empty() {
+            continue;
+        }
+        // A keyboard light's name is the LED its check found: "available (<board>: Scroll Lock)".
+        let led = |name: &String, text: &String| match label {
+            "Keyboard lights" => text
+                .split_once('(')
+                .and_then(|(_, t)| t.split_once(')'))
+                .and_then(|(t, _)| t.rsplit_once(": "))
+                .map_or(name.clone(), |(_, led)| led.to_owned()),
+            _ => name.clone(),
+        };
+        let on = found
+            .iter()
+            .filter(|(_, a, _)| *a)
+            .map(|(n, _, t)| led(n, t))
+            .collect::<Vec<_>>();
+        let off = found.iter().filter(|(_, a, _)| !*a).collect::<Vec<_>>();
+        let (mark, detail) = match (on.is_empty(), off.first()) {
+            (false, None) => ("🟢", on.join(", ")),
+            (false, Some((name, _, _))) => {
+                ("🟡", format!("{} · {name} unavailable", on.join(", ")))
+            }
+            (true, Some((name, _, text))) => ("🔴", format!("{name}: {text}")),
+            (true, None) => continue,
+        };
+        out.push(row(mark, label, detail));
+    }
+    // Agents and hooks.
+    let hooks = group(&["Claude Code status hooks", "Codex status hooks"]);
+    if !hooks.is_empty() {
+        let missing = hooks
+            .iter()
+            .filter(|(_, _, t)| !t.starts_with("installed"))
+            .map(|(n, _, t)| format!("{n}: {t}"))
+            .collect::<Vec<_>>();
+        let names = hooks
+            .iter()
+            .map(|(n, _, _)| n.replace(" status hooks", ""))
+            .collect::<Vec<_>>();
+        out.push(match missing.first() {
+            None => row(
+                "🟢",
+                "Agent hooks",
+                format!("installed: {}", names.join(", ")),
+            ),
+            Some(first) => row("🟡", "Agent hooks", first.clone()),
+        });
+    }
+    // Problems the checks found (config, lights) stay visible.
+    for problem in lines.iter().filter(|l| l.starts_with("Problem · ")) {
+        out.push(row(
+            "🔴",
+            "Problem",
+            problem.trim_start_matches("Problem · ").to_owned(),
+        ));
+    }
+    out.push("More: vibeconsole doctor --all".into());
+    out
+}
+
 /// Setup and login-service commands `main` hands to `command`.
 pub const COMMANDS: [&str; 9] = [
     "install",
@@ -914,12 +1123,14 @@ pub const COMMANDS: [&str; 9] = [
     "startup-disable",
 ];
 pub fn command(command: &str, flags: &[String]) -> Result<()> {
-    if flags
-        .iter()
-        .any(|s| s != "--feedback" && s != "--start-flow")
-        || (!flags.is_empty() && command != "startup-enable")
+    let doctor_all = command == "doctor" && flags == ["--all"]; // v7.8 ticket 08
+    if !doctor_all
+        && (flags
+            .iter()
+            .any(|s| s != "--feedback" && s != "--start-flow")
+            || (!flags.is_empty() && command != "startup-enable"))
     {
-        return Err("flags are supported only by startup-enable: --feedback, --start-flow".into());
+        return Err("flags: doctor --all; startup-enable --feedback, --start-flow".into());
     }
     let binary = binary()?;
     match command {
@@ -1025,43 +1236,46 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
             );
         }
         "doctor" => {
-            println!("{}", crate::version());
-            println!(
+            let mut out: Vec<String> = Vec::new();
+            out.push(format!("{}", crate::version()));
+            out.push(format!(
                 "Session: {} / {}",
                 std::env::var("XDG_SESSION_TYPE").unwrap_or_default(),
                 std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default()
-            );
+            ));
             match OpenOptions::new()
                 .read(true)
                 .write(true)
                 .custom_flags(libc::O_NONBLOCK)
                 .open("/dev/uinput")
             {
-                Ok(_) => println!("uinput read/write: ready (no keyboard created)"),
-                Err(e) => println!(
+                Ok(_) => out.push(format!("uinput read/write: ready (no keyboard created)")),
+                Err(e) => out.push(format!(
                     "uinput permission/device failure: {e}; see README permission commands"
-                ),
+                )),
             }
             match crate::input_port() {
-                Ok(p) => println!("MIDI identity: {p} (no input opened)"),
-                Err(e) => println!("MIDI unavailable: {e}"),
+                Ok(p) => out.push(format!("MIDI identity: {p} (no input opened)")),
+                Err(e) => out.push(format!("MIDI unavailable: {e}")),
             }
             // v7.7 ticket 250: the same open says whether a terminal run's Xbox wake works.
             let opened = match crate::gamepad::Pad::open() {
                 Ok(pad) => {
                     match pad.connections().as_slice() {
-                        [] => println!("Xbox controllers: none connected (USB or Bluetooth)"),
-                        names => println!("Xbox controllers: {}", names.join(", ")),
+                        [] => out.push(format!(
+                            "Xbox controllers: none connected (USB or Bluetooth)"
+                        )),
+                        names => out.push(format!("Xbox controllers: {}", names.join(", "))),
                     }
                     Ok(())
                 }
                 Err(e) => {
-                    println!("Xbox controllers: {e}");
+                    out.push(format!("Xbox controllers: {e}"));
                     Err(e.to_string())
                 }
             };
-            println!("{}", crate::wake::line(opened));
-            println!("{}", crate::gamepad::headset());
+            out.push(format!("{}", crate::wake::line(opened)));
+            out.push(format!("{}", crate::gamepad::headset()));
             // v7.7 ticket 214: the login service's note that Flow can't hear its keyboard.
             let flow = crate::status::state_dir().and_then(|d| {
                 Ok(std::fs::read_to_string(
@@ -1069,7 +1283,7 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                 )?)
             });
             if let Ok(text) = flow {
-                println!("Flow: {}", text.trim());
+                out.push(format!("Flow: {}", text.trim()));
             }
             // v7.7 ticket 192: each light's probe, then its switch in Status light patterns.
             let mut found: Vec<std::result::Result<String, String>> = Vec::new();
@@ -1144,70 +1358,72 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                     None => (light_switches(false, &Default::default())[index].0, None),
                 };
                 let (line, problem) = light_check(label, on, found);
-                println!("{line}");
+                out.push(format!("{line}"));
                 light_problems.extend(problem);
                 if label == "Keyboard M light" {
-                    println!(
+                    out.push(format!(
                         "Keyboard G light: unavailable: lighting it turns on Razer game mode, which turns off the Super key"
-                    );
+                    ));
                 }
             }
             for problem in &light_problems {
-                println!("Problem · {}: {}", problem.stage, problem.message);
+                out.push(format!("Problem · {}: {}", problem.stage, problem.message));
             }
             match crate::recording::permissions() {
-                Ok(n) => {
-                    println!("Physical-key recording: {n} readable keyboard(s); no events captured")
-                }
-                Err(e) => println!("Recording unavailable: {e}; Select keys remains available"),
+                Ok(n) => out.push(format!(
+                    "Physical-key recording: {n} readable keyboard(s); no events captured"
+                )),
+                Err(e) => out.push(format!(
+                    "Recording unavailable: {e}; Select keys remains available"
+                )),
             }
             for program in ["gio", "wpctl", "systemctl", "tmux", "wl-copy"] {
                 let present = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
                     .any(|p| p.join(program).is_file());
-                println!(
+                out.push(format!(
                     "{program}: {}",
                     if present {
                         "available"
                     } else {
                         "missing prerequisite"
                     }
-                );
+                ));
             }
-            println!(
+            out.push(format!(
                 "Applications: {} visible installed entries (none launched)",
                 crate::actions::catalog()?.len()
-            );
+            ));
             // v7.7 ticket 197: each config file and whether it loaded (reads only).
             for line in vibeconsole_core::config::report(&crate::mappings::config_path()?) {
-                println!("{line}");
+                out.push(format!("{line}"));
             }
-            println!("{}", login_doctor(unit()?.is_file(), systemctl));
+            out.push(format!("{}", login_doctor(unit()?.is_file(), systemctl)));
             // v7.7 ticket 247: running or paused, and why, as the service reports it.
             let file = crate::status::state_dir().map(|d| d.join(crate::terminal::RUN_STATE));
-            println!(
+            out.push(format!(
                 "{}",
                 run_doctor(systemctl, file.as_deref().map_err(|e| e.to_string()))
-            );
+            ));
             // v7.7 ticket 203: where status lines go (checked, nothing written).
-            println!(
+            out.push(format!(
                 "{}",
                 if Path::new(JOURNAL).exists() {
                     "Status log: the login service and a terminal run write their status changes to the journal: journalctl --user -t vibeconsole"
                 } else {
                     "Status log: unavailable: no journal (no /run/systemd/journal/socket); a terminal run shows its status on screen only"
                 }
-            );
+            ));
             // v7.7 ticket 208: whether a terminal run can tell its own terminal is focused.
-            println!(
+            out.push(format!(
                 "{}",
                 match crate::actions::focused_title(crate::actions::gdbus_output) {
                     Ok(_) => "Own terminal focus: available (window extension); Shift, Ctrl, Alt or Super alone are held back while VibeConsole's terminal is focused".to_owned(),
                     Err(e) => format!("{e}; Shift, Ctrl, Alt or Super alone stay silent in menus. After vibeconsole install, log out and in once"),
                 }
-            );
-            println!("Agent terminals: tmux attach -t vibe");
+            ));
+            out.push(format!("Agent terminals: tmux attach -t vibe"));
             for codex in [false, true] {
-                println!("{}", crate::status::hooks_status(codex));
+                out.push(format!("{}", crate::status::hooks_status(codex)));
             }
             let answering = vibeconsole_core::program("gdbus")
                 .args([
@@ -1228,9 +1444,9 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                 installed_extension_version(),
                 crate::actions::running_extension_version(crate::actions::gdbus_output),
             ) {
-                println!("{line}");
+                out.push(format!("{line}"));
             }
-            println!(
+            out.push(format!(
                 "Window control extension: {}",
                 if answering {
                     "answering (launcher minimize/close available)".to_string()
@@ -1239,7 +1455,12 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                         "not answering; after vibeconsole install, log out/in and run gnome-extensions enable {EXTENSION_UUID}"
                     )
                 }
-            );
+            ));
+            // v7.8 ticket 08: a checklist by default; every line with --all.
+            match flags {
+                [] => println!("{}", checklist(&out, &here_commit()).join("\n")),
+                _ => println!("{}", out.join("\n")),
+            }
         }
         _ => return Err("unknown setup command".into()),
     }
@@ -1249,6 +1470,78 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v7.8 ticket 08: doctor's checklist from fixture lines (today's `doctor --all` lines):
+    /// each area's 🟢/🟡/🔴 with its own reason or fix, and only what the checks said.
+    #[test]
+    fn doctor_checklist_marks_each_area_from_its_check() {
+        let today = [
+            "vibeconsole 0.7.8 (v7.8 08, commit abc1234)",
+            "Session: wayland / GNOME",
+            "uinput read/write: ready (no keyboard created)",
+            "MIDI identity: MPK mini 3:MPK mini 3 MIDI 1 32:0 (no input opened)",
+            "Xbox controllers: Microsoft Xbox One (Bluetooth · xpadneo)",
+            "Xbox headset audio: unavailable over Bluetooth · use the USB cable with xone",
+            "Keyboard light: available (Razer BlackWidow: Scroll Lock) · on in Status light patterns",
+            "Keyboard G light: unavailable: lighting it turns on Razer game mode, which turns off the Super key",
+            "RGB keyboard: unavailable: OpenRazer's razerkbd driver isn't loaded · install it yourself",
+            "wpctl: available",
+            "Login service: enabled (starts at login)",
+            "Run state: running (Program 1 verified)",
+            "Claude Code status hooks: installed (/h/.claude/settings.json)",
+            "Codex status hooks: installed (/h/.codex/hooks.json)",
+            "Window control extension: answering (launcher minimize/close available)",
+        ]
+        .map(String::from);
+        let list = checklist(&today, &Some("abc1234".into())).join("\n");
+        for line in [
+            "🟢 VibeConsole           0.7.8 (v7.8 08, commit abc1234) · installed build matches · login service running",
+            "🟢 Akai MPK mini 3       connected · program 1 verified",
+            "🟢 Xbox controller       Microsoft Xbox One · Bluetooth · xpadneo",
+            "🟡 Xbox headset audio    unavailable over Bluetooth · use the USB cable with xone",
+            "🟢 uinput (keys)         ready (no keyboard created)",
+            "🟢 Sound (wpctl)         available",
+            "🟢 Keyboard lights       Scroll Lock",
+            "🔴 RGB                   RGB keyboard: unavailable: OpenRazer's razerkbd driver isn't loaded · install it yourself",
+            "🟢 Agent hooks           installed: Claude Code, Codex",
+            "🟢 Window extension      answering (launcher minimize/close available)",
+            "More: vibeconsole doctor --all",
+        ] {
+            assert!(list.contains(line), "{line}\n{list}");
+        }
+        assert!(list.lines().count() <= 15, "{list}");
+        // Missing pieces say why, in the check's own words; a stale build is named.
+        let broken = [
+            "vibeconsole 0.7.7 (v7.7 271, commit 0000000)",
+            "uinput permission/device failure: Permission denied; see README permission commands",
+            "MIDI unavailable: AKAI MPK mini 3 (USB 09e8:1049) is not connected",
+            "Xbox controllers: none connected (USB or Bluetooth)",
+            "Login service: disabled",
+            "Run state: run state unavailable: no file",
+            "Codex status hooks: not installed; Agents → Status hooks installs them",
+            "Window control extension: not answering; after vibeconsole install, log out/in",
+            "Problem · file I/O: lights.json unreadable",
+        ]
+        .map(String::from);
+        let list = checklist(&broken, &Some("abc1234".into())).join("\n");
+        for line in [
+            "🟡 VibeConsole           0.7.7 (v7.7 271, commit 0000000) · installed build differs from this source (mise run install) · login service off (vibeconsole startup-enable)",
+            "🔴 Akai MPK mini 3       AKAI MPK mini 3 (USB 09e8:1049) is not connected",
+            "🔴 Xbox controller       none connected (USB or Bluetooth)",
+            "🔴 uinput (keys)         Permission denied; see README permission commands",
+            "🟡 Agent hooks           Codex status hooks: not installed; Agents → Status hooks installs them",
+            "🟡 Window extension      not answering; after vibeconsole install, log out/in",
+            "🔴 Problem               file I/O: lights.json unreadable",
+        ] {
+            assert!(list.contains(line), "{line}\n{list}");
+        }
+        // Outside the repo the build line doesn't compare.
+        assert!(
+            !checklist(&today, &None)
+                .join("\n")
+                .contains("installed build")
+        );
+    }
     /// v7.7 ticket 187: the same probes for both modes; a program missing from the
     /// service's PATH is a differing row with its cause and how it should be; the by-design
     /// rows are there; reading the service's environment parses `show-environment`.

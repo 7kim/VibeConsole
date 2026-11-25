@@ -1558,7 +1558,27 @@ impl Pad {
         self.gilrs
             .gamepads()
             .filter(|(_, pad)| crate::ours(pad.os_name()))
-            .map(|(_, pad)| format!("{} ({})", pad.name(), connection(pad.uuid())))
+            .map(|(_, pad)| {
+                // v7.8 ticket 08: the link and driver from sysfs, else the bus as before.
+                let (link, driver) = link_at(
+                    std::path::Path::new("/sys"),
+                    pad.os_name(),
+                    pad.vendor_id().unwrap_or(0),
+                    pad.product_id().unwrap_or(0),
+                );
+                let mut parts = [link.map(str::to_owned), driver]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
+                if parts.is_empty() {
+                    parts.push(connection(pad.uuid()));
+                }
+                // v8 idea 139: the name it gives itself; the mapping's name only if it differs.
+                if pad.name() != pad.os_name() {
+                    parts.push(format!("mapped as {}", pad.name()));
+                }
+                format!("{} ({})", pad.os_name(), parts.join(" · "))
+            })
             .collect()
     }
 }
