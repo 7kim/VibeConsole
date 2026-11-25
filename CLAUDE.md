@@ -50,7 +50,7 @@ Rules:
 - Recheck the connected device and desktop session before hardware or keyboard-output experiments; ports and permissions change.
 - Follow the spec's controller-write and restoration gates before sending device-specific messages.
 - Keep automated checks free of real desktop shortcut injection.
-- Report hardware and desktop effects only when seen; a build or simulated test is not a pass. Record unsupported or inconclusive results honestly.
+- Report hardware and desktop effects only when seen; a build or simulated test is not a pass, except an emulator run that shows every box of a developer test (agreed 25 Nov 2026). Record unsupported or inconclusive results honestly.
 - Held keys are released before every transition (start, pause, resume, reconnect, program change, quit, error).
 - A pad fires on the first note-on after a transition; queued MIDI is drained during the transition, and a release whose press wasn't seen is ignored. No replay.
 - Risky controls fire only after a one-second hold, and cancel on release, pause or clear.
@@ -73,12 +73,12 @@ Rules:
 Specs, tickets and tests are markdown under `docs/<version>/` (git-ignored: the repo is public; `docs/README.md` lists versions). Read `docs/agents/issue-tracker.md` before writing one. New work goes in the working version (`tickets use`); start a new version only when I say so. Domain docs: `docs/agents/domain.md`. Triage labels: `docs/agents/triage-labels.md`.
 
 - **Agent tests** (`docs/<version>/agent-tests/`): what you check yourself: `cargo test`, the installed build's output, files on disk.
-- **Developer tests** (`docs/<version>/developer-tests/`): what only I can see: the controller, desktop effects, logins, reboots. Write them when a ticket is code-complete; never ask me to run them. Template and run order: `docs/agents/live-tests.md`.
+- **Developer tests** (`docs/<version>/developer-tests/`): write them when a ticket is code-complete. Then run every box you can yourself (the emulators in `scripts/emulate/` for every device that has one, the PTY checks, the installed build's output, files on disk) and close each test your run fully shows: boxes ticked, `done <date>`, its Result naming the run. Hand me only what strictly needs me: real hardware effects (lights, rumble, sound heard, Bluetooth, battery, the real device's own bytes or timing), keys reaching a real app, logins, reboots, and judgement calls. When I ask which test to do, offer only those; never ask me to run them otherwise. Template and run order: `docs/agents/live-tests.md`.
 
 ### Order of work
 
 1. After `approved`, implement the working version's `ready-for-agent` tickets in the order `tickets next` gives (number order, blockers first), without stopping between them. A ticket's own acceptance tests (TDD, `cargo test`) belong to implementing it. Still stop before any controller write or real keyboard output the spec gates.
-2. Only when all are implemented, test: run the agent tests, write the developer tests and their run order, record results. Then `mise run install`: it builds, stops VibeConsole (the login service and any terminal session), installs, and starts the service again. A running VibeConsole is no reason to skip it.
+2. Only when all are implemented, test: run the agent tests, write the developer tests and their run order, run and close every developer test you can (above), record results. Then `mise run install`: it builds, stops VibeConsole (the login service and any terminal session), installs, and starts the service again. A running VibeConsole is no reason to skip it.
 
 ### Closing a ticket (before the next ticket and before committing)
 

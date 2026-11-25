@@ -15,7 +15,7 @@ Read the diff, then ask each question. A "no" is a finding; name the file and li
 6. Does every error name its stage, save nothing partial, release keys and restore feedback?
 7. Are desktop IDs and names validated and never passed through a shell or out of their folder?
 8. Does any automated test inject real desktop shortcuts or start a real app? Tests use an injected runner.
-9. Is a hardware or desktop effect claimed that nobody saw? Reports say "built" or "tested in simulation" until seen.
+9. Is a hardware or desktop effect claimed that nobody saw? Reports say "built" or "tested in simulation" until seen. An emulator run may close a developer test only when it shows every box (its Result names the run).
 10. Was input validation, config integrity or held-key cleanup simplified away?
 
 The rules in full: [Safety Rules](../vibeconsole/reference/safety-rules.md). Run `cargo-gate` (where it isn't installed: `cargo fmt --check`, `cargo check --locked` and `cargo test --locked`) before calling it reviewed.

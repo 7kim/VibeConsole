@@ -11,4 +11,4 @@ These hold for every change and every suggestion.
 - **Identifiers, never commands:** desktop IDs and names are validated and are never run through a shell.
 - **Unprovable desktop behaviour is reported as unavailable,** never guessed.
 - **Automated checks never inject real desktop shortcuts** or start the real apps.
-- **Hardware and desktop effects are reported only when seen.** A build or a simulated test is not a pass.
+- **Hardware and desktop effects are reported only when seen.** A build or a simulated test is not a pass, except an emulator run that shows every box of a developer test.

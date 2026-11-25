@@ -24,4 +24,5 @@ Two kinds of test, never mixed:
 - Follow the controller-write and restoration gates before any device-specific message.
 - Report an effect only when it was seen. A build or a simulated test is not a pass; record unsupported or inconclusive results as such.
 - An emulator run (`scripts/emulate/`) that shows every box may close a developer test; its Result names the run. A box it doesn't show (lights, rumble, sound heard, Bluetooth, keys reaching a real app) stays open, and so does the test.
+- Run every box you can yourself (emulators, PTY checks, the installed build's output, files) and close the test when your run shows every box; hand the user only what strictly needs them.
 - Never delete a test file, even when its ticket is test-only.
