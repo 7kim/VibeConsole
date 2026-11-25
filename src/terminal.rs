@@ -11725,27 +11725,35 @@ fn action_menu(
             close: close == 1,
         }));
     }
+    use crate::actions::Media;
     let (saved, saved_step) = match saved {
         Some(Action::Volume { up, step }) => (Some(usize::from(!up)), Some(*step)),
         Some(Action::OutputMute) => (Some(2), None),
         Some(Action::MicrophoneMute) => (Some(3), None),
+        Some(Action::Media(m)) => (Media::ALL.iter().position(|x| x == m).map(|i| i + 4), None),
         _ => (None, None),
     };
+    // v7.8 ticket 10: Music & Sound: wpctl's volume and mute, then the media keys.
+    let mut rows = strings(&[
+        "Output volume up",
+        "Output volume down",
+        "Output mute",
+        "Microphone mute",
+    ]);
+    rows.extend(Media::ALL.iter().map(|m| m.label().to_string()));
     let Some(i) = choose_saved(
         ui,
-        "Native audio actions; default device resolved at activation.
-Requires wpctl in your desktop session. Brightness/media/lock and absolute volume are not enabled.",
-        strings(&[
-            "Output volume up",
-            "Output volume down",
-            "Output mute",
-            "Microphone mute",
-        ]),
+        "Music & Sound. Volume and mute act on the default device (wpctl, in your desktop session).
+Media keys go to the player that is playing; with none, nothing happens.",
+        rows,
         saved,
     )?
     else {
         return Ok(None);
     };
+    if let Some(media) = i.checked_sub(4).and_then(|m| Media::ALL.get(m)) {
+        return Ok(Some(Action::Media(*media)));
+    }
     if i < 2 {
         let Some(step) = number(
             ui,
@@ -11994,6 +12002,7 @@ fn action_family(mapping: &Mapping) -> usize {
         Action::HerdrFocus(_) => 10,
         Action::TmuxJump(_) => 15,
         Action::PromptSequence(_) | Action::SavedSequence(_) => 11,
+        Action::Media(_) => 2,
         action if action.audio() => 2,
         _ => 1, // launchers, hold to quit, Wispr Flow
     }
@@ -12056,7 +12065,7 @@ fn favourite_mapping(
 const FAMILIES: [&str; 16] = [
     "Keyboard shortcut",
     "Launch application",
-    "Fedora system action",
+    "Music & Sound", // v7.8 ticket 10: was "Fedora system action" (volume and mute only)
     "Prompt",
     "Run command in tmux",
     "Sequence of steps",
@@ -15199,7 +15208,7 @@ mod tests {
         );
 
         // "Learn a pad", then a knob turned: the knob is calibrated and saved as a knob.
-        let mut keys = vec![Enter, Down, Enter, Enter]; // pad page, Fedora system action, volume up
+        let mut keys = vec![Enter, Down, Enter, Enter]; // pad page, Music & Sound, volume up
         keys.extend([Enter]); // step 5
         keys.extend([Enter, Enter, Tab, Tab, Enter]);
         let increase = Control {
@@ -15456,6 +15465,27 @@ mod tests {
             ["Enter"]
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.8 ticket 10: volume, mute and media assignments, old and new, are Music & Sound.
+    #[test]
+    fn volume_mute_and_media_are_music_and_sound() {
+        use crate::actions::{Action, Media};
+        for action in [
+            Action::Volume { up: true, step: 5 },
+            Action::OutputMute,
+            Action::MicrophoneMute,
+            Action::Media(Media::PlayPause),
+            Action::Media(Media::Stop),
+        ] {
+            let mapping = Mapping::new_action(
+                Control::from_note(10, 36).unwrap(),
+                mappings::Input::Pad,
+                action,
+            )
+            .unwrap();
+            assert_eq!(FAMILIES[action_family(&mapping)], "Music & Sound");
+        }
     }
 
     /// v7.8 ticket 07: program select lists both devices' programs by name (each row saying
@@ -18929,7 +18959,7 @@ mod tests {
             if layer == Down {
                 keys.push(Enter);
             }
-            keys.extend([Down, Down, Enter]); // Fedora system action
+            keys.extend([Down, Down, Enter]); // Music & Sound
             keys.extend([Down, Down, Enter]); // Output mute
             keys.extend([Enter, Enter, Tab, Tab, Enter]); // fire when, save, finish
             let mut ui = Script {
@@ -19017,7 +19047,7 @@ mod tests {
         let f8 = Mapping::new(x, "F8", "hold").unwrap(); // layer 1
         mappings::save(&path, &[f8.clone()]).unwrap();
         let mut keys = vec![Enter, Down, Enter]; // learn X, layer 2
-        keys.extend([Down, Down, Enter, Down, Down, Enter]); // Fedora system action, Output mute
+        keys.extend([Down, Down, Enter, Down, Down, Enter]); // Music & Sound, Output mute
         keys.extend([Enter, Enter, Tab, Tab, Enter]); // fire when, save, finish
         let mut ui = Script {
             keys: keys.into(),
@@ -21433,7 +21463,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(menus.len(), 3);
         assert!(!menus[0].contains("Launch") && !menus[0].contains("Prompt")); // joystick
-        assert!(menus[1].contains("Fedora system action") && !menus[1].contains("Prompt")); // knob
+        assert!(menus[1].contains("Music & Sound") && !menus[1].contains("Prompt")); // knob
         assert!(menus[1].contains("Choice knob") && menus[1].contains("Value knob"));
         assert!(menus[2].contains("Prompt") && !menus[2].contains("Choice knob")); // piano
         assert_eq!(current, mappings::load(&path).unwrap());

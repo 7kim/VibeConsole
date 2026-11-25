@@ -164,6 +164,9 @@ pub enum Action {
     },
     OutputMute,
     MicrophoneMute,
+    /// v7.8 ticket 10: a media key, tapped through the virtual keyboard; the desktop hands it
+    /// to whatever player is playing (nothing happens when none is).
+    Media(Media),
     /// Start Wispr Flow when it is not running; repair (quit and reopen) it once when it is.
     Flow,
     /// v7 ticket 15: bring Orca's tab for `agent` working in `folder` to the front. The
@@ -197,6 +200,42 @@ pub enum Action {
     /// v7 ticket 17: a T3 Code command (`chat.new`), pressed with whatever key the user's
     /// own T3 key file binds it to, read at press time.
     T3(String),
+}
+/// v7.8 ticket 10: the media keys a Music & Sound action taps.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Media {
+    PlayPause,
+    Next,
+    Previous,
+    Stop,
+}
+impl Media {
+    pub const ALL: [Media; 4] = [Self::PlayPause, Self::Next, Self::Previous, Self::Stop];
+    /// The config word after `media:`.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::PlayPause => "play-pause",
+            Self::Next => "next",
+            Self::Previous => "previous",
+            Self::Stop => "stop",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::PlayPause => "Play/pause",
+            Self::Next => "Next track",
+            Self::Previous => "Previous track",
+            Self::Stop => "Stop",
+        }
+    }
+    pub fn key(self) -> evdev::KeyCode {
+        match self {
+            Self::PlayPause => evdev::KeyCode::KEY_PLAYPAUSE,
+            Self::Next => evdev::KeyCode::KEY_NEXTSONG,
+            Self::Previous => evdev::KeyCode::KEY_PREVIOUSSONG,
+            Self::Stop => evdev::KeyCode::KEY_STOPCD,
+        }
+    }
 }
 impl Action {
     pub fn flow(&self) -> bool {
@@ -467,6 +506,7 @@ impl Action {
                 format!("volume-{}:{step}", if *up { "up" } else { "down" })
             }
             Self::OutputMute => "output-mute".into(),
+            Self::Media(media) => format!("media:{}", media.word()),
             Self::Nothing => "nothing".into(),
             Self::SavedSequence(name) => format!("saved-sequence:{name}"),
             Self::MicrophoneMute => "microphone-mute".into(),
@@ -577,6 +617,12 @@ impl Action {
                 }
             }
             "output-mute" => Self::OutputMute,
+            _ if value.starts_with("media:") => Self::Media(
+                *Media::ALL
+                    .iter()
+                    .find(|m| m.word() == &value["media:".len()..])
+                    .ok_or("media action must be play-pause, next, previous or stop")?,
+            ),
             "nothing" => Self::Nothing,
             _ if value.starts_with("saved-sequence:") => {
                 let name = &value["saved-sequence:".len()..];
@@ -725,6 +771,7 @@ impl Action {
                 if *up { "up" } else { "down" }
             ),
             Self::OutputMute => "Toggle default output mute".into(),
+            Self::Media(media) => format!("Media key: {}", media.label()),
             Self::Nothing => "No action (built-in default silenced)".into(),
             Self::SavedSequence(name) => format!("Saved prompt sequence {name} (one step per tap)"),
             Self::MicrophoneMute => "Toggle default microphone mute".into(),
@@ -2604,6 +2651,12 @@ fn perform(
         Action::TmuxJump(window) => tmux_jump(window, &mut tmux_status, &mut open_terminal),
         Action::Shortcut => Err("shortcut belongs to keyboard output".into()),
         Action::Nothing => Ok(String::new()), // v7 ticket 111: a silenced default
+        // v7.8 ticket 10: one tap (down, up) of the media key through the session's keyboard;
+        // whether a player took it can't be told, so the notice says only that it was sent.
+        Action::Media(media) => {
+            tap(vec![media.key()])?;
+            Ok(format!("{} sent", media.label()))
+        }
         Action::Choice(_) | Action::Value { .. } => Err("knob actions run in the session".into()),
         _ => audio(action, |args| command("wpctl", args, &cancelled)),
     }
@@ -2920,6 +2973,7 @@ impl Action {
             Self::Volume { .. } => "volume",
             Self::OutputMute => "output-mute",
             Self::MicrophoneMute => "microphone-mute",
+            Self::Media(_) => "media",
             Self::Flow => "flow",
             Self::OrcaJump { .. } => "orca-jump",
             Self::AppToggleQuit(_) => "app-toggle-quit",
@@ -3958,6 +4012,25 @@ mod tests {
             keys.into_inner(),
             [vec![K::KEY_LEFTCTRL, K::KEY_V], vec![K::KEY_ENTER]]
         );
+        // v7.8 ticket 10: each media action asks for one tap of its key and says it was sent.
+        for (media, key) in [
+            (Media::PlayPause, K::KEY_PLAYPAUSE),
+            (Media::Next, K::KEY_NEXTSONG),
+            (Media::Previous, K::KEY_PREVIOUSSONG),
+            (Media::Stop, K::KEY_STOPCD),
+        ] {
+            let keys = std::cell::RefCell::new(Vec::new());
+            let action = Action::Media(media);
+            assert_eq!(Action::parse(&action.encode()).unwrap(), action);
+            let notice = perform(&action, None, &|| false, &|k| {
+                keys.borrow_mut().push(k);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(keys.into_inner(), [vec![key]]);
+            assert_eq!(notice, format!("{} sent", media.label()));
+        }
+        assert!(Action::parse("media:louder").is_err());
     }
     #[test]
     fn repressing_a_running_sequence_is_ignored_and_taps_wait_for_the_session() {

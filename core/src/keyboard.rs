@@ -429,6 +429,10 @@ fn create_output() -> Result<VirtualDevice> {
     for code in 1..=KeyCode::KEY_RIGHTMETA.0 {
         supported.insert(KeyCode(code));
     }
+    // v7.8 ticket 10: the media keys Music & Sound taps.
+    for media in crate::actions::Media::ALL {
+        supported.insert(media.key());
+    }
     let output = VirtualDevice::builder()
         .and_then(|builder| {
             builder
@@ -1298,6 +1302,20 @@ mod tests {
     use super::*;
     use crate::{Detector, ReleaseType};
     use std::sync::mpsc;
+
+    /// v7.8 ticket 10: a media key taps through the keyboard like any key: down, then up,
+    /// once, and nothing stays held.
+    #[test]
+    fn media_keys_tap_down_and_up_once() {
+        for media in crate::actions::Media::ALL {
+            let mut output = Output::recording(&[]).unwrap();
+            output.keyboard.resume();
+            output.tap(&[media.key()]).unwrap();
+            assert_eq!(output.recorded, [(media.key(), true), (media.key(), false)]);
+            output.pause().unwrap();
+            assert_eq!(output.recorded.len(), 2, "pause releases nothing more");
+        }
+    }
 
     #[test]
     fn trigger_pad_piano_knob_duplicates_pause_and_slow_action_never_delay_key_up() {

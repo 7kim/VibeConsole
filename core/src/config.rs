@@ -16,6 +16,10 @@ pub const VERSION: u64 = 1;
 /// `rgb_in_step`; older files load it on (the shipped default). Ticket 237: 4 holds
 /// `rgb_step_period` (ms); older files load 4000.
 pub const LIGHTS_VERSION: u64 = 4;
+/// v7.8: mappings.json's own version: 2 holds v7.8's new action words (ticket 10: `media:…`);
+/// a version 1 file loads as it is (it has none of them). An older VibeConsole refuses a
+/// version 2 file by its version, not by an unknown word.
+pub const MAPPINGS_VERSION: u64 = 2;
 /// The files, in the order they are applied: each one's references (variables, MIDI
 /// devices, idle settings) are in place before it is checked.
 pub const FILES: [&str; 5] = [
@@ -315,10 +319,10 @@ pub fn text(file: &str, config: &Config) -> Result<String> {
 }
 
 fn apply(file: &str, value: &Value, config: &mut Config) -> Result<()> {
-    let at = if file == "lights.json" {
-        Obj::top_of(value, LIGHTS_VERSION)?
-    } else {
-        Obj::top(value)?
+    let at = match file {
+        "lights.json" => Obj::top_of(value, LIGHTS_VERSION)?,
+        "mappings.json" => Obj::top_of(value, MAPPINGS_VERSION)?,
+        _ => Obj::top(value)?,
     };
     match file {
         "settings.json" => apply_settings(&at, config),
@@ -784,7 +788,7 @@ fn mappings_json(config: &Config) -> Result<Value> {
         })
         .collect::<Vec<_>>();
     Ok(json!({
-        "version": VERSION,
+        "version": MAPPINGS_VERSION,
         "vars": pairs_json(&config.vars),
         "mappings": list(&config.mappings)?,
         "profiles": profiles,
@@ -1697,6 +1701,44 @@ mod tests {
     /// Ticket 196: mappings.json and devices.json round-trip, move from a v34 and an older
     /// `mappings.tsv` (byte for byte unchanged), and a broken one is refused by file and
     /// field without being rewritten.
+    #[test]
+    /// v7.8 ticket 10: mappings.json version 1 (before v7.8's words) loads as it is, a media
+    /// action saves as version 2 and loads back, and a version from a newer VibeConsole is
+    /// refused by its version.
+    fn mappings_json_version_2_holds_media_and_loads_version_1() {
+        let dir = folder("media");
+        let path = dir.join("mappings.tsv");
+        let mut config = Config::default();
+        let volume = mappings::Mapping::new_action(
+            crate::Control::from_note(10, 36).unwrap(),
+            mappings::Input::Pad,
+            crate::actions::Action::Volume { up: true, step: 5 },
+        )
+        .unwrap();
+        config.mappings = vec![volume.clone()];
+        mappings::save_config(&path, &config).unwrap();
+        let saved = fs::read_to_string(dir.join("mappings.json")).unwrap();
+        assert!(saved.contains("\"version\": 2"), "{saved}");
+        let old = saved.replace("\"version\": 2", "\"version\": 1");
+        fs::write(dir.join("mappings.json"), &old).unwrap();
+        assert_eq!(
+            mappings::load_config(&path).unwrap().mappings,
+            [volume.clone()]
+        );
+        let mut media = volume.clone();
+        media.action = crate::actions::Action::Media(crate::actions::Media::Next);
+        config.mappings = vec![media.clone()];
+        mappings::save_config(&path, &config).unwrap();
+        let saved = fs::read_to_string(dir.join("mappings.json")).unwrap();
+        assert!(saved.contains("\"media:next\""), "{saved}");
+        assert_eq!(mappings::load_config(&path).unwrap().mappings, [media]);
+        let newer = saved.replace("\"version\": 2", "\"version\": 3");
+        fs::write(dir.join("mappings.json"), newer).unwrap();
+        let error = mappings::load_config(&path).unwrap_err().to_string();
+        assert!(error.contains("newer VibeConsole"), "{error}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn mappings_and_devices_json_round_trip_move_and_refuse() {
         let dir = folder("controls");

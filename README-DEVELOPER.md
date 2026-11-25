@@ -179,7 +179,7 @@ Every screen uses one tiled layout: a header, the Commands pane, a Details pane 
 ## 🎹 Configure controls and shortcuts
 
 1. Open `/configure` and choose Learn a pad, Learn a piano key, Learn a knob, or Learn joystick. Observe the requested press/release or calibration sequence.
-2. Choose the action family: Keyboard shortcut, Launch application, or Fedora system action, where supported.
+2. Choose the action family: Keyboard shortcut, Launch application, Music & Sound (volume, mute, media keys), and the others, where supported.
 3. For a shortcut, use Select keys or Record shortcut. Review the chord, choose the supported behavior and optional feedback, then save.
 4. Save and configure another, or Save and finish. Cancel and failed validation preserve earlier successful saves; removal requires confirmation.
 

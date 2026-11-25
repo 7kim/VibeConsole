@@ -23,10 +23,11 @@ def hide(*nodes):
     return ["bwrap", "--dev-bind", "/", "/", "--tmpfs", "/dev/input", *binds, "--tmpfs", "/run/systemd/journal"]
 
 
-def mapping(context, label, message, channel, id, keys, behavior="hold"):
+def mapping(context, label, message, channel, id, keys, behavior="hold", action="shortcut"):
+    """One mappings.json entry: a shortcut (`keys`), or another action word with no keys."""
     return {"context": context, "label": label, "input": "pad", "message": message, "channel": channel,
             "id": id, "direction": 0, "behavior": behavior, "keys": keys, "octave": None, "tempo": None,
-            "arp": None, "action": "shortcut", "risky": False, "status": False}
+            "arp": None, "action": action, "risky": False, "status": False}
 
 
 def screen(data):

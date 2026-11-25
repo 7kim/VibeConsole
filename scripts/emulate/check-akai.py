@@ -39,7 +39,10 @@ def main():
     with tempfile.TemporaryDirectory() as directory, Akai() as akai:
         akai.program(1)
         pad = mapping(0, "Bank A Pad 1", "note", akai.ram[0x10] + 1, akai.ram[0x24], "F1")
-        with Run(directory, [pad], hide()) as run:
+        # v7.8 ticket 10: a Music & Sound media key.
+        media = mapping(0, "Bank A Pad 2", "note", akai.ram[0x10] + 1, akai.ram[0x27], None, "trigger",
+                        "media:next")
+        with Run(directory, [pad, media], hide()) as run:
             # The run detects the program, then fires on the next press.
             run.read_until("Pads fire on their next press", 15)
             queries = [f for f in akai.received if f[4] == 0x66]
@@ -52,6 +55,10 @@ def main():
             run.wait_recorded("key KEY_F1 up")
             assert run.recorded()[:2] == ["key KEY_F1 down", "key KEY_F1 up"], run.recorded()
             print("ok: akai.pad(1) shows on Live and output.log records F1 down and up")
+            akai.pad(2)
+            run.wait_recorded("key KEY_NEXTSONG up")
+            assert run.recorded()[2:4] == ["key KEY_NEXTSONG down", "key KEY_NEXTSONG up"], run.recorded()
+            print("ok: a pad mapped to Next track taps KEY_NEXTSONG once")
             described = describe(hide()).lower()
             assert "emulator" not in described and "multiple" not in described, described
             print("ok: a normal run ignores the emulator's port")
