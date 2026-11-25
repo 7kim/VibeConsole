@@ -5,8 +5,8 @@
 """v7.8 ticket 02: the real binary, run with --emulated, against the emulated Xbox controller.
 Run after cargo build --locked: uv run scripts/emulate/check-xbox.py
 
-Checks: A (built-in default Enter) records Enter in output.log; RT mapped to F2 and pulled past
-its fire point fires once, however far it goes, and lets go on release; a normal run beside the
+Checks: A (built-in default Enter) records Enter in output.log; RT mapped to F2 and pulled
+straight to full fires once and lets go on release; a normal run beside the
 emulator never lists it. The run sees only the emulator's own event node (bwrap hides the rest).
 The emulator refuses to start while a VibeConsole older than ticket 01 runs (see xbox.py).
 """
@@ -34,15 +34,18 @@ def main():
             run.wait_recorded("key KEY_ENTER up")
             assert run.recorded()[:2] == ["key KEY_ENTER down", "key KEY_ENTER up"], run.recorded()
             print("ok: xbox.tap('A') records Enter in output.log")
-            for pull in (0.1, 0.5, 0.8, 1.0, 0.6):
+            xbox.trigger("RT", 1.0)
+            run.wait_recorded("key KEY_F2 down")
+            for pull in (0.8, 0.6):
                 xbox.trigger("RT", pull)
                 time.sleep(0.1)
             assert run.recorded().count("key KEY_F2 down") == 1, run.recorded()
             assert "key KEY_F2 up" not in run.recorded(), run.recorded()
             xbox.trigger("RT", 0.0)
             run.wait_recorded("key KEY_F2 up")
-            assert run.recorded().count("key KEY_F2 down") == 1, run.recorded()
-            print("ok: RT pulled past its fire point fires once and lets go on release")
+            f2 = [line for line in run.recorded() if line.startswith("key KEY_F2 ")]
+            assert f2 == ["key KEY_F2 down", "key KEY_F2 up"], f2
+            print("ok: RT pulled straight to full fires once and lets go on release")
             # The built-in defaults name each button's key (gamepad::default_layout).
             for button, key in [("B", "ESC"), ("X", "BACKSPACE"), ("Y", "TAB")]:
                 xbox.tap(button)
@@ -61,10 +64,7 @@ def main():
             detect.read_until("Microsoft Xbox One", 15)  # gilrs names the emulator by its ids
             time.sleep(0.5)
             for act, token in [(lambda: xbox.trigger("LT", 0.5), "LT 50%"),
-                               # Through 50%: gilrs 0.11 drops a first pull that lands on
-                               # exactly 1.0 in one report (its pressed state starts at 1.0).
-                               (lambda: (xbox.trigger("RT", 0.5), time.sleep(0.1), xbox.trigger("RT", 1.0)),
-                                "RT 100%"),
+                               (lambda: xbox.trigger("RT", 1.0), "RT 100%"),
                                (lambda: xbox.stick("left", 1.0, 0.0), "Left stick x +1.00 y +0.00"),
                                (lambda: xbox.stick("left", 0.0, 1.0), "Left stick x +0.00 y +1.00"),
                                (lambda: xbox.stick("right", -1.0, 0.0), "Right stick x -1.00"),
@@ -108,8 +108,7 @@ def bluetooth():
             detect.read_until("Xbox One Elite 2", 15)
             time.sleep(0.5)
             for act, token in [(lambda: xbox.trigger("LT", 0.5), "LT 50%"),
-                               (lambda: (xbox.trigger("RT", 0.5), time.sleep(0.1), xbox.trigger("RT", 1.0)),
-                                "RT 100%"),
+                               (lambda: xbox.trigger("RT", 1.0), "RT 100%"),
                                (lambda: xbox.stick("right", -1.0, 0.0), "Right stick x -1.00"),
                                (lambda: xbox.stick("right", 0.0, 1.0), "Right stick x +0.00 y +1.00")]:
                 mark = detect.mark()

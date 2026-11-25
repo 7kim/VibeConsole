@@ -551,6 +551,19 @@ pub enum Motion {
     Trigger(gilrs::Button, f32),
     Axis(gilrs::Axis, f32),
 }
+
+fn trigger_motion(event: gilrs::EventType) -> Option<Motion> {
+    use gilrs::{Button, EventType::*};
+    let (button, value) = match event {
+        ButtonChanged(button, value, _) => (button, value),
+        ButtonPressed(button, _) => (button, 1.0),
+        ButtonReleased(button, _) => (button, 0.0),
+        _ => return None,
+    };
+    matches!(button, Button::LeftTrigger2 | Button::RightTrigger2)
+        .then_some(Motion::Trigger(button, value))
+}
+
 /// A trigger presses at the tuned fire point and releases 5% under it, so resting a
 /// finger on it doesn't chatter. A stick direction presses at half travel (or the dead
 /// zone, if larger) and releases once back inside the dead zone; drift never fires.
@@ -1575,6 +1588,7 @@ pub struct Pad {
     hard_triggers: [bool; 2],
     pulls: [TriggerPull; 2],
     trigger_transition: std::time::SystemTime,
+    buffered_event: Option<gilrs::Event>,
     pending: std::vec::IntoIter<Change>,
     /// v7 ticket 76: stick gestures, timed from `clock`.
     gestures: Gestures,
@@ -1604,6 +1618,7 @@ impl Pad {
             hard_triggers: [false; 2],
             pulls: Default::default(),
             trigger_transition: std::time::SystemTime::now(),
+            buffered_event: None,
             pending: Vec::new().into_iter(),
             gestures: Gestures::default(),
             clock: std::time::Instant::now(),
@@ -1635,9 +1650,31 @@ impl Pad {
     /// zone) and state update, as gilrs does them; while a speed test runs, each right-stick
     /// report's stamp is kept first (X and Y of one report share a stamp: kept once).
     fn next_event(&mut self) -> Option<gilrs::Event> {
+        use gilrs::EventType::*;
         use gilrs::ev::filter::{Filter, Jitter, axis_dpad_to_button, deadzone};
         loop {
-            let raw = self.gilrs.next_event()?;
+            let mut raw = self
+                .buffered_event
+                .take()
+                .or_else(|| self.gilrs.next_event())?;
+            if let ButtonPressed(_, code) | ButtonReleased(_, code) = raw.event
+                && let Some(Motion::Trigger(button, endpoint)) = trigger_motion(raw.event)
+            {
+                // gilrs queues the analog value after a digital edge from the same report.
+                self.gilrs.update(&raw);
+                let next = std::iter::from_fn(|| self.gilrs.next_event())
+                    .find(|event| !matches!(event.event, ForceFeedbackEffectCompleted));
+                if let Some(sample) = next.filter(|sample| {
+                    sample.id == raw.id
+                        && sample.time == raw.time
+                        && matches!(sample.event, ButtonChanged(b, _, c) if b == button && c == code)
+                }) {
+                    raw = sample;
+                } else {
+                    self.buffered_event = next;
+                    raw.event = ButtonChanged(button, endpoint, code);
+                }
+            }
             if let (
                 Some(reports),
                 gilrs::EventType::AxisChanged(
@@ -1652,10 +1689,18 @@ impl Pad {
                     reports.push(raw.time);
                 }
             }
-            let event = Some(raw)
-                .filter_ev(&axis_dpad_to_button, &mut self.gilrs)
-                .filter_ev(&Jitter::new(), &mut self.gilrs)
-                .filter_ev(&deadzone, &mut self.gilrs)?;
+            let event = if matches!(
+                trigger_motion(raw.event),
+                Some(Motion::Trigger(_, 0.0 | 1.0))
+            ) {
+                // The edge can seed gilrs's cache with the endpoint before its value arrives.
+                raw
+            } else {
+                Some(raw)
+                    .filter_ev(&axis_dpad_to_button, &mut self.gilrs)
+                    .filter_ev(&Jitter::new(), &mut self.gilrs)
+                    .filter_ev(&deadzone, &mut self.gilrs)?
+            };
             if event.is_dropped() {
                 continue;
             }
@@ -1673,7 +1718,6 @@ impl Pad {
 
     fn poll_changes(&mut self, selecting_program: bool) -> Vec<Change> {
         let mut changes = Vec::new();
-        let triggers = [gilrs::Button::LeftTrigger2, gilrs::Button::RightTrigger2];
         while changes.is_empty()
             && let Some(event) = self.next_event()
         {
@@ -1683,13 +1727,10 @@ impl Pad {
             if !crate::ours(self.gilrs.gamepad(event.id).os_name()) {
                 continue;
             }
-            let motion = match event.event {
-                gilrs::EventType::ButtonChanged(button, value, _) if triggers.contains(&button) => {
-                    Some(Motion::Trigger(button, value))
-                }
+            let motion = trigger_motion(event.event).or(match event.event {
                 gilrs::EventType::AxisChanged(axis, value, _) => Some(Motion::Axis(axis, value)),
                 _ => None,
-            };
+            });
             if let Some(motion) = motion {
                 let physical = analog(&mut self.down, &mut self.analog, motion, &self.tuning);
                 if let Motion::Trigger(button, value) = motion {
@@ -1745,13 +1786,6 @@ impl Pad {
                 continue;
             }
             let kind = match event.event {
-                // Triggers fire from their analog value, at the tuned point.
-                gilrs::EventType::ButtonPressed(button, _)
-                | gilrs::EventType::ButtonReleased(button, _)
-                    if triggers.contains(&button) =>
-                {
-                    continue;
-                }
                 gilrs::EventType::ButtonPressed(button, _) => Kind::Pressed(button),
                 gilrs::EventType::ButtonReleased(button, _) => Kind::Released(button),
                 gilrs::EventType::Connected => Kind::Connected,
@@ -1795,19 +1829,10 @@ impl Pad {
     pub fn drain(&mut self) {
         self.cancel_trigger_pulls();
         while let Some(event) = self.next_event() {
-            if let gilrs::EventType::ButtonChanged(
-                button @ (gilrs::Button::LeftTrigger2 | gilrs::Button::RightTrigger2),
-                value,
-                _,
-            ) = event.event
+            if let Some(motion) = trigger_motion(event.event)
                 && crate::ours(self.gilrs.gamepad(event.id).os_name())
             {
-                analog(
-                    &mut self.down,
-                    &mut self.analog,
-                    Motion::Trigger(button, value),
-                    &self.tuning,
-                );
+                analog(&mut self.down, &mut self.analog, motion, &self.tuning);
             }
         }
         self.pressed_at.clear();
@@ -2354,6 +2379,45 @@ mod tests {
         pull.cancel();
         assert!(pull.release(rt).is_empty());
         assert_eq!(sent, [(KeyCode::KEY_B, true), (KeyCode::KEY_B, false)]);
+    }
+
+    #[test]
+    fn trigger_edges_without_analog_reports_fire_and_release_once() {
+        use gilrs::{Button, EventType::*};
+        let tuning = crate::mappings::Tuning {
+            trigger: 90,
+            ..Default::default()
+        };
+        let mut down = HashSet::new();
+        let mut pad = Analog::default();
+        let rt = Button::RightTrigger2;
+        let code = rt.to_nec().unwrap();
+        let control = control(rt).unwrap();
+        let mut feed = |event| {
+            trigger_motion(event)
+                .map(|motion| analog(&mut down, &mut pad, motion, &tuning))
+                .unwrap_or_default()
+        };
+        assert!(feed(ButtonReleased(rt, code)).is_empty());
+        assert_eq!(
+            feed(ButtonPressed(rt, code)),
+            [Change::Event(Event::Press(control))]
+        );
+        assert!(feed(ButtonChanged(rt, 1.0, code)).is_empty());
+        assert_eq!(
+            feed(ButtonReleased(rt, code)),
+            [Change::Event(Event::Release(
+                control,
+                ReleaseType::ButtonUp
+            ))]
+        );
+        assert!(feed(ButtonChanged(rt, 0.0, code)).is_empty());
+        assert_eq!(
+            feed(ButtonPressed(rt, code)),
+            [Change::Event(Event::Press(control))]
+        );
+        assert_eq!(pad.rt, 1.0);
+        assert_eq!(pad.trigger_peak[1], 1.0);
     }
 
     /// v7 ticket 08: a trigger fires once at the tuned fire point and re-arms only after it
