@@ -3448,6 +3448,18 @@ impl Terminal {
         self.wanted_run = false;
         self.suspend()
     }
+    /// v7.7 ticket 265: the Akai's program watch failed. Held keys are released (a
+    /// transition), but the run the user wanted stays: the Xbox runs on its own (v7 ticket
+    /// 40) and the pads wait until their program is detected again. A chosen pause stays.
+    fn program_lost(&mut self) -> Result<()> {
+        self.suspend()?;
+        if self.wanted_run {
+            self.notice =
+                "Akai program lost: pads wait until it is detected again; the Xbox keeps running."
+                    .into();
+        }
+        Ok(())
+    }
     /// v7.7 ticket 204: Live's ❚❚ Pause, named by the key, the click, or Find's /pause.
     fn pause_by(&mut self, opened_by: &str) -> Result<()> {
         self.pause(match opened_by {
@@ -5253,7 +5265,7 @@ impl Terminal {
         }
         if let Err(error) = self.follow_controller() {
             self.abandon_program()?;
-            self.pause("controller lost")?;
+            self.program_lost()?;
             self.follow_retry = Instant::now() + Duration::from_secs(1);
             self.error = error.to_string();
             if !self.at_menu {
@@ -5573,7 +5585,7 @@ impl Terminal {
                 self.feedback_allowed = false;
                 self.program_snapshot = None;
                 self.resolver = None;
-                self.pause("controller lost")?;
+                self.program_lost()?;
                 self.error = error.to_string();
                 if let Some(mut controller) = self.controller.take() {
                     match controller.finish() {
@@ -23482,20 +23494,55 @@ mod tests {
 
         resume(&mut ui);
         ui.error.clear();
+        // v7.7 ticket 265: a lost Akai program releases held keys but keeps the run: pads
+        // wait for detection, and the Xbox may run on its own meanwhile.
+        ui.handle_events(vec![Event::Press(shift)]).unwrap();
         ui.controller = Some(crate::feedback::Controller::fake_lost());
         for _ in 0..200 {
             ui.tick().unwrap();
-            if !ui.wanted_run {
+            if ui.controller.is_none() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+        assert!(ui.controller.is_none());
+        assert!(ui.wanted_run && !ui.context_verified);
+        let recorded = &ui.output.as_ref().unwrap().recorded;
+        assert_eq!(
+            (recorded.iter().rev()).find(|(k, _)| *k == evdev::KeyCode::KEY_LEFTSHIFT),
+            Some(&(evdev::KeyCode::KEY_LEFTSHIFT, false)),
+            "held keys released"
+        );
         let state = ui.run_state();
         assert!(
-            state.starts_with("paused: controller lost · Snapshot rejected: device unplugged"),
+            state
+                .starts_with("running (Program 1 unverified; detecting program; actions inactive)"),
             "{state}"
         );
-        assert!(ui.controller.is_none());
+        assert!(
+            ui.error.contains("Snapshot rejected: device unplugged"),
+            "{}",
+            ui.error
+        );
+        ui.gamepad_only(true).unwrap();
+        assert!(!ui.suspended, "the Xbox runs on its own while pads wait");
+
+        // A pause the user chose stays a pause, with its own cause.
+        ui.pause_by("key").unwrap();
+        ui.controller = Some(crate::feedback::Controller::fake_lost());
+        for _ in 0..200 {
+            ui.tick().unwrap();
+            if ui.controller.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!ui.wanted_run);
+        assert!(
+            ui.run_state().starts_with("paused: Enter on Live ❚❚ Pause"),
+            "{}",
+            ui.run_state()
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
