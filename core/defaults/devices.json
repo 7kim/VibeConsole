@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "midi_devices": [],
   "midi_active": null,
   "idle": {
@@ -64,6 +64,7 @@
       "linear",
       "linear"
     ],
-    "headset": false
+    "headset": false,
+    "layer_button": "LB"
   }
 }

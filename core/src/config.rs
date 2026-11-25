@@ -20,6 +20,8 @@ pub const LIGHTS_VERSION: u64 = 4;
 /// a version 1 file loads as it is (it has none of them). An older VibeConsole refuses a
 /// version 2 file by its version, not by an unknown word.
 pub const MAPPINGS_VERSION: u64 = 2;
+/// devices.json: v2 (v7.8 ticket 23) adds the tuning's `layer_button`; v1 loads with LB.
+pub const DEVICES_VERSION: u64 = 2;
 /// The files, in the order they are applied: each one's references (variables, MIDI
 /// devices, idle settings) are in place before it is checked.
 pub const FILES: [&str; 5] = [
@@ -322,6 +324,7 @@ fn apply(file: &str, value: &Value, config: &mut Config) -> Result<()> {
     let at = match file {
         "lights.json" => Obj::top_of(value, LIGHTS_VERSION)?,
         "mappings.json" => Obj::top_of(value, MAPPINGS_VERSION)?,
+        "devices.json" => Obj::top_of(value, DEVICES_VERSION)?,
         _ => Obj::top(value)?,
     };
     match file {
@@ -592,7 +595,7 @@ fn devices(config: &Config) -> Value {
         .map(|c| (c.to_string(), idle_json(config.idle_for(c))))
         .collect::<Map<_, _>>();
     json!({
-        "version": VERSION,
+        "version": DEVICES_VERSION,
         "midi_devices": config.midi_devices,
         "midi_active": config.midi_active,
         "idle": idle_json(config.idle),
@@ -606,6 +609,9 @@ fn devices(config: &Config) -> Value {
             "mouse": t.mouse.text(),
             "sticks": [t.sticks[0].text(), t.sticks[1].text()],
             "headset": t.headset,
+            "layer_button": crate::gamepad::BUTTONS
+                .get(usize::from(t.layer))
+                .map_or("LB", |(_, name)| *name),
         },
     })
 }
@@ -665,6 +671,7 @@ fn apply_devices(at: &Obj, config: &mut Config) -> Result<()> {
         "mouse",
         "sticks",
         "headset",
+        "layer_button",
     ])?;
     let sticks = t.list("sticks")?;
     let stick = |i: usize| -> Result<mappings::StickMode> {
@@ -685,6 +692,16 @@ fn apply_devices(at: &Obj, config: &mut Config) -> Result<()> {
         mouse: t.pick("mouse", &MOUSE)?,
         sticks: [stick(0)?, stick(1)?],
         headset: t.bool("headset")?,
+        // v7.8 ticket 23: v1 files have none: LB, as before.
+        layer: match at.int::<u64>("version")? {
+            1 => crate::gamepad::LAYER_DEFAULT,
+            _ => {
+                let name = t.str("layer_button")?;
+                (crate::gamepad::BUTTONS.iter().position(|(_, n)| *n == name))
+                    .and_then(|i| u8::try_from(i).ok())
+                    .ok_or_else(|| t.err("layer_button", "must name an Xbox button, e.g. LB"))?
+            }
+        },
     };
     config.tuning = at.check("tuning", tuning.validate())?;
     config.midi_devices = midi_devices;
@@ -1295,6 +1312,72 @@ mod tests {
         config.start_flow = false;
         config.env = vec![("EDITOR".into(), "hx".into()), ("A_1".into(), "x y".into())];
         config
+    }
+
+    /// v7.8 ticket 23: devices.json v2 keeps the layer 2 button; a v1 file loads with LB;
+    /// with RB as the layer button LB is mappable and RB is refused by name, as are the Xbox
+    /// button, View and Menu as the layer button. A refused save keeps the files.
+    #[test]
+    fn layer_button_saves_loads_and_refuses_what_it_must() {
+        use crate::{Control, gamepad::LAYER_DEFAULT};
+        let dir = folder("layer-button");
+        let path = dir.join("mappings.tsv");
+        let (lb, rb) = (Control::button(4), Control::button(5));
+        let mut config = Config::default();
+        assert_eq!(config.tuning.layer, LAYER_DEFAULT, "LB by default");
+        config.tuning.layer = 5;
+        let mut on = |control| {
+            let mut m = mappings::Mapping::new(control, "F3", "hold").unwrap();
+            m.context = mappings::GAMEPAD_CONTEXT;
+            m
+        };
+        config.mappings.push(on(lb));
+        mappings::save_config(&path, &config).unwrap();
+        let saved: Value =
+            serde_json::from_str(&fs::read_to_string(dir.join("devices.json")).unwrap()).unwrap();
+        assert_eq!(saved["version"], 2);
+        assert_eq!(saved["tuning"]["layer_button"], "RB");
+        let loaded = mappings::load_config(&path).unwrap();
+        assert_eq!(loaded.tuning.layer, 5);
+        assert_eq!(
+            loaded.mappings[0].control, lb,
+            "the old layer button is mappable"
+        );
+        // RB has an assignment once it's the layer button: refused, nothing written.
+        let before = fs::read(dir.join("devices.json")).unwrap();
+        let mut taken = loaded.clone();
+        taken.mappings.push(on(rb));
+        let error = mappings::save_config(&path, &taken)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("RB is the layer 2 button, but it is assigned in Xbox controller"),
+            "{error}"
+        );
+        assert_eq!(fs::read(dir.join("devices.json")).unwrap(), before);
+        for (layer, name) in [
+            (10, "Xbox button"),
+            (8, "View"),
+            (9, "Menu"),
+            (40, "an Xbox button"),
+        ] {
+            let mut bad = loaded.clone();
+            bad.tuning.layer = layer;
+            let error = mappings::save_config(&path, &bad).unwrap_err().to_string();
+            assert!(error.contains(name), "{name}: {error}");
+        }
+        // An older devices.json (v1, no layer_button) loads with LB.
+        let v1 = fs::read_to_string(dir.join("devices.json"))
+            .unwrap()
+            .replace("\"version\": 2", "\"version\": 1")
+            .replace(",\n    \"layer_button\": \"RB\"", "");
+        assert!(!v1.contains("layer_button"));
+        fs::write(dir.join("devices.json"), v1).unwrap();
+        let mut older = mappings::load_config(&path);
+        // (Its LB mapping is now on the layer button: the file names it rather than load.)
+        let error = older.as_mut().unwrap_err().to_string();
+        assert!(error.contains("LB is the layer 2 button"), "{error}");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     /// Ticket 194: settings.json saves and loads back equal, and holds what it says.

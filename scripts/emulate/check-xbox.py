@@ -74,6 +74,29 @@ def main():
                 detect.read_until(token, 5, since=mark)
             print("ok: Detect reads LT, RT, both sticks (up is up) and the Xbox button")
     bluetooth()
+    layer_button()
+
+
+def layer_button():
+    """v7.8 ticket 23: with RB as the layer 2 button, LB fires its own mapping, RB held gives
+    A its layer 2 mapping, and let go A does its default again."""
+    LB, RB, A, LAYER_2 = 4, 5, 0, 238  # gamepad::BUTTONS indexes; mappings::GAMEPAD_LAYER_2
+    rows = [mapping(GAMEPAD, "Xbox LB", "button", 1, LB, "F3"), mapping(LAYER_2, "Xbox A", "button", 1, A, "F4")]
+    with tempfile.TemporaryDirectory() as directory, Xbox() as xbox:
+        with Run(directory, rows, hide(xbox.node), layer_button="RB") as run:
+            run.read_until("Xbox controller connected", 15)
+            xbox.tap("LB")
+            run.wait_recorded("key KEY_F3 up")
+            xbox.press("RB")
+            time.sleep(0.2)
+            xbox.tap("A")
+            run.wait_recorded("key KEY_F4 up")
+            xbox.release("RB")
+            time.sleep(0.2)
+            xbox.tap("A")
+            run.wait_recorded("key KEY_ENTER up")
+            assert run.recorded().count("key KEY_F4 down") == 1, run.recorded()
+    print("ok: with RB as the layer 2 button, LB fires its mapping and RB held gives layer 2")
 
 
 def bluetooth():

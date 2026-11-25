@@ -193,7 +193,7 @@ pub fn program_label(context: u8) -> String {
             format!("Xbox Program {program}")
         };
         if layer2 {
-            format!("{base}, layer 2 (LB held)")
+            format!("{base}, layer 2")
         } else {
             base
         }
@@ -363,7 +363,8 @@ impl Mapping {
         }
         if (self.context > 16 && self.context < XBOX_LOWEST)
             || gamepad_context(self.context) != (self.control.message == crate::Message::Button)
-            || (gamepad_context(self.context) && crate::gamepad::is_reserved(self.control))
+            // v7.8 ticket 23: the layer button is tuning's, checked with the whole config.
+            || (gamepad_context(self.context) && crate::gamepad::is_guide(self.control))
             || self.label.is_empty()
             || self.label.len() > 80
             || self.label.chars().any(char::is_control)
@@ -1140,7 +1141,7 @@ pub fn profile_devices(
     // v7.7 ticket 266: the buttons, then the stick directions.
     let xbox = (0..crate::gamepad::STICK_BASE + 8)
         .map(Control::button)
-        .filter(|c| !crate::gamepad::is_reserved(*c))
+        .filter(|c| !crate::gamepad::is_reserved(*c, config.tuning.layer))
         .map(|c| (c, c.label()))
         .collect();
     vec![
@@ -1596,7 +1597,7 @@ pub fn programs_summary(
     text += &format!("{XBOX_NAME} (in use: {}):\n", xbox_name(xbox_program));
     for program in 1..=XBOX_PROGRAMS {
         text += &format!(
-            "- context {}: {} (layer 2, LB held: {})\n",
+            "- context {}: {} (layer 2: {})\n",
             xbox_context(program, false),
             xbox_name(program),
             xbox_context(program, true)
@@ -1961,6 +1962,9 @@ pub struct Tuning {
     /// v7 ticket 108 (config v27): make the controller headset the default speaker and mic
     /// while it's plugged in. Off by default.
     pub headset: bool,
+    /// v7.8 ticket 23 (devices.json v2): the layer 2 button, a `gamepad::BUTTONS` index
+    /// (LB by default); never the Xbox button, View or Menu.
+    pub layer: u8,
 }
 /// How a stick fires (v7 ticket 75). Linear: up/down/left/right, each on its own axis.
 /// Angle: the stick's angle (0° = up, clockwise) picks one of its ranges, each a control.
@@ -2073,6 +2077,24 @@ impl Default for Tuning {
 }
 impl Tuning {
     pub fn validate(self) -> Result<Self> {
+        // v7.8 ticket 23: the Xbox button cycles profiles and locks; View and Menu, held, pick
+        // Xbox programs (so they never reach the layer switch).
+        match crate::gamepad::BUTTONS
+            .get(usize::from(self.layer))
+            .map(|(_, name)| *name)
+        {
+            None => return Err("tuning: the layer 2 button must be an Xbox button".into()),
+            Some("Xbox") => {
+                return Err("tuning: the Xbox button can't be the layer 2 button: it cycles profiles and locks".into());
+            }
+            Some(name @ ("View" | "Menu")) => {
+                return Err(format!(
+                    "tuning: {name} can't be the layer 2 button: held, it picks Xbox programs"
+                )
+                .into());
+            }
+            Some(_) => {}
+        }
         for (stick, side, mouse) in [
             (0, "left", MouseStick::Left),
             (1, "right", MouseStick::Right),
@@ -2118,6 +2140,7 @@ impl Config {
             light_other_on: lights.other_on,
             light_patterns: lights.patterns,
             tuning: Tuning {
+                layer: crate::gamepad::LAYER_DEFAULT,
                 dead_zone: 0,
                 trigger: 0,
                 mouse_speed: 0,
@@ -3221,6 +3244,7 @@ pub(crate) fn parse_config(contents: &str) -> Result<Config> {
             return Err("expected tuning dead-zone/trigger/mouse-speed/rumble/mouse fields".into());
         };
         Tuning {
+            layer: crate::gamepad::LAYER_DEFAULT, // devices.json v2 only
             dead_zone: dead_zone.parse()?,
             trigger: trigger.parse()?,
             mouse_speed: speed.parse()?,
@@ -3575,6 +3599,38 @@ pub fn save(path: &Path, mappings: &[Mapping]) -> Result<()> {
     save_config(path, &config)
 }
 
+/// v7.8 ticket 23: nothing is assigned to the layer 2 button in any Xbox program or profile
+/// (it switches layers; the old one is mappable). Names where it is, so they can be moved.
+fn layer_button_free(config: &Config) -> Result<()> {
+    let layer = Control::button(config.tuning.layer);
+    let mut used = config
+        .mappings
+        .iter()
+        .map(|m| (m, None))
+        .chain(
+            config
+                .profiles
+                .iter()
+                .flat_map(|p| p.mappings.iter().map(move |m| (m, Some(&p.name)))),
+        )
+        .filter(|(m, _)| gamepad_context(m.context) && m.control == layer)
+        .map(|(m, profile)| match profile {
+            Some(name) => format!("{} (profile {name})", program_label(m.context)),
+            None => program_label(m.context),
+        })
+        .collect::<Vec<_>>();
+    used.dedup();
+    if used.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} is the layer 2 button, but it is assigned in {}: move or remove those first",
+        layer.label(),
+        used.join(", ")
+    )
+    .into())
+}
+
 pub(crate) fn validate_favourites(favourites: &[String]) -> Result<()> {
     if favourites.len() > 1024 {
         return Err("too many favourites".into());
@@ -3628,6 +3684,7 @@ pub(crate) fn mapping_line(mapping: &Mapping) -> Result<String> {
 const CONFIG_VERSION: u32 = 34;
 pub fn serialize_config(config: &Config) -> Result<String> {
     config.idle.validate()?;
+    layer_button_free(config)?;
     validate_agents(&config.agents)?;
     validate_variables(&config.env, "startup")?;
     validate_variables(&config.vars, "user")?;
@@ -4444,6 +4501,7 @@ mod tests {
         assert_eq!(
             config.tuning,
             Tuning {
+                layer: crate::gamepad::LAYER_DEFAULT,
                 dead_zone: 15,
                 trigger: 30,
                 mouse_speed: 10,
@@ -4465,6 +4523,7 @@ mod tests {
         // Saving writes v16 with the tuning line; it round-trips.
         let mut tuned = config.clone();
         tuned.tuning = Tuning {
+            layer: crate::gamepad::LAYER_DEFAULT,
             dead_zone: 20,
             trigger: 60,
             mouse_speed: 25,

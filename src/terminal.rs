@@ -229,6 +229,10 @@ trait Ui {
     fn xbox_connected(&self) -> bool {
         false
     }
+    /// v7.8 ticket 23: the layer 2 button's name (Xbox tuning; LB by default).
+    fn layer_button(&self) -> &'static str {
+        "LB"
+    }
     /// The Xbox program in use (v7 ticket 115): Learn saves an Xbox button there.
     fn xbox_program(&self) -> u8 {
         1
@@ -3357,10 +3361,11 @@ impl Terminal {
             } else {
                 "View: [Bank A]  Bank B"
             };
+            let button = self.layer_button();
             let layer = if self.map_layer2 {
-                "View: Layer 1  [Layer 2 (LB)]"
+                format!("View: Layer 1  [Layer 2 ({button})]")
             } else {
-                "View: [Layer 1]  Layer 2 (LB)"
+                format!("View: [Layer 1]  Layer 2 ({button})")
             };
             let mut map = vec![
                 one(bank.into(), Some(Open::MapBank)),
@@ -3439,15 +3444,23 @@ impl Terminal {
         self.device_lights = config.status_lights.then(|| config.device_lights.clone());
         // Settings -> Xbox tuning applies within a status refresh; a stick mode change is a
         // transition (v7 ticket 75).
+        // v7.8 ticket 23: so is a new layer 2 button (layer 1 again, held keys released).
+        let layer =
+            (self.gamepad.as_ref()).is_some_and(|pad| pad.tuning.layer != config.tuning.layer);
         let modes = (self.gamepad.as_mut()).is_some_and(|pad| {
             pad.set_gestures(&config.mappings); // v7 ticket 76
             pad.set_tuning(config.tuning.clone())
         });
-        if modes {
-            if let Err(error) =
-                self.gamepad_transition("Stick mode changed: held keys released".into())
-            {
-                self.notice = format!("stick mode change: {error}");
+        if modes || layer {
+            let notice = match layer {
+                true => format!(
+                    "Layer 2 button is now {}: held keys released",
+                    layer_label(config.tuning.layer)
+                ),
+                false => "Stick mode changed: held keys released".into(),
+            };
+            if let Err(error) = self.gamepad_transition(notice) {
+                self.notice = format!("Xbox tuning change: {error}");
             }
         }
         // v7 ticket 108: the controller headset follows its option and the plugged-in card.
@@ -4373,9 +4386,9 @@ impl Terminal {
         if both || self.last_xbox {
             let layout = self.xbox_layer_in(config, self.map_layer2);
             let layer = if self.map_layer2 {
-                "Layer 2 (LB)"
+                format!("Layer 2 ({})", self.layer_button())
             } else {
-                "Layer 1"
+                "Layer 1".into()
             };
             rows.push(format!("── Xbox · {layer}"));
             let cell = width / 8;
@@ -5113,7 +5126,7 @@ impl Terminal {
         self.layer2 = second;
         self.reload_keyboard()?;
         self.notice = if second {
-            "Xbox layer 2 (LB held)".into()
+            format!("Xbox layer 2 ({} held)", self.layer_button())
         } else {
             "Xbox layer 1".into()
         };
@@ -6034,7 +6047,11 @@ impl Terminal {
             match change {
                 crate::gamepad::Change::Event(
                     Event::Press(control) | Event::Release(control, _),
-                ) if crate::gamepad::is_layer_key(control) => {
+                ) if self
+                    .gamepad
+                    .as_ref()
+                    .is_some_and(|p| p.is_layer_key(control)) =>
+                {
                     self.set_layer(
                         self.gamepad
                             .as_ref()
@@ -6043,7 +6060,10 @@ impl Terminal {
                 }
                 crate::gamepad::Change::Event(
                     Event::DuplicatePress(control) | Event::UnmatchedRelease(control),
-                ) if crate::gamepad::is_layer_key(control) => {}
+                ) if self
+                    .gamepad
+                    .as_ref()
+                    .is_some_and(|p| p.is_layer_key(control)) => {}
                 crate::gamepad::Change::Event(event) => self.handle_events(vec![event])?,
                 crate::gamepad::Change::Connected(name) => {
                     self.xbox_link = (self.gamepad.as_ref())
@@ -6759,6 +6779,11 @@ impl Ui for Terminal {
     }
     fn light_rule(&self) -> bool {
         crate::gamepad::light_rule_installed()
+    }
+    fn layer_button(&self) -> &'static str {
+        layer_label(
+            (self.gamepad.as_ref()).map_or(crate::gamepad::LAYER_DEFAULT, |p| p.tuning.layer),
+        )
     }
     fn xbox_connected(&self) -> bool {
         self.gamepad
@@ -9948,7 +9973,19 @@ fn tuning_items(ui: &impl Ui, tuning: &mappings::Tuning) -> Vec<String> {
                 "not installed (Install…)"
             }
         ),
+        // v7.8 ticket 23
+        format!(
+            "Layer 2 button (hold for layer 2): {}",
+            layer_label(tuning.layer)
+        ),
     ]
+}
+
+/// v7.8 ticket 23: a layer button's name (a `gamepad::BUTTONS` index).
+fn layer_label(layer: u8) -> &'static str {
+    crate::gamepad::BUTTONS
+        .get(usize::from(layer))
+        .map_or("LB", |(_, name)| *name)
 }
 /// Xbox tuning row `choice` ([`tuning_items`] order); a change is saved atomically.
 fn tuning_choice(ui: &mut impl Ui, path: &Path, choice: usize) -> Result<()> {
@@ -9987,6 +10024,30 @@ fn tuning_choice(ui: &mut impl Ui, path: &Path, choice: usize) -> Result<()> {
         Some(8) => return driver_menu(ui),
         Some(choice @ (9 | 10)) => return audio_test(ui, choice == 10),
         Some(11) => return light_rule_menu(ui),
+        // v7.8 ticket 23: any button but the Xbox button, View and Menu; the old one becomes
+        // mappable; a button with assignments is refused (by name) until they're moved.
+        Some(12) => {
+            let offered = (0..crate::gamepad::BUTTONS.len() as u8)
+                .filter(|b| {
+                    mappings::Tuning {
+                        layer: *b,
+                        ..tuning.clone()
+                    }
+                    .validate()
+                    .is_ok()
+                })
+                .collect::<Vec<_>>();
+            let Some(i) = choose_saved(
+                ui,
+                "Layer 2 button: held, the other buttons do their layer 2 assignments. (The Xbox button, View and Menu have their own jobs.)",
+                offered.iter().map(|b| layer_label(*b).to_owned()).collect(),
+                offered.iter().position(|b| *b == tuning.layer),
+            )?
+            else {
+                return Ok(());
+            };
+            config.tuning.layer = offered[i];
+        }
         Some(3) => {
             let Some(stick) = choose(
                 ui,
@@ -13733,7 +13794,8 @@ fn learn_target(
                 now(mappings::xbox_context(ui.xbox_program(), false))
             ),
             format!(
-                "Layer 2 (while LB is held): {}",
+                "Layer 2 (while {} is held): {}",
+                ui.layer_button(),
                 now(mappings::xbox_context(ui.xbox_program(), true))
             ),
         ];
@@ -16660,6 +16722,42 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7.8 ticket 23: Xbox tuning → Layer 2 button offers every button but the Xbox button,
+    /// View and Menu, opens on the one in use (LB) and saves the pick.
+    #[test]
+    fn layer_2_button_is_picked_in_xbox_tuning() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-layer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut ui = Script::default();
+        let row = tuning_items(&ui, &mappings::load_config(&path).unwrap().tuning)
+            .iter()
+            .position(|r| r == "Layer 2 button (hold for layer 2): LB")
+            .expect("the row, with LB");
+        ui.keys = [Down, Enter].into(); // LB is selected; one down is RB
+        tuning_choice(&mut ui, &path, row).unwrap();
+        let list = ui.screens.first().unwrap().clone();
+        assert!(
+            list.contains("> LB  [x] (saved)"),
+            "opens on the one in use:\n{list}"
+        );
+        for gone in ["  Xbox", "  View", "  Menu"] {
+            assert!(
+                !list.contains(&format!("{gone}\n")),
+                "{gone} offered:\n{list}"
+            );
+        }
+        assert_eq!(
+            mappings::load_config(&path).unwrap().tuning.layer,
+            5,
+            "RB saved"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// v7.8 ticket 10: volume, mute and media assignments, old and new, are Music & Sound.
     #[test]
     fn volume_mute_and_media_are_music_and_sound() {
@@ -16865,11 +16963,11 @@ mod tests {
             "{sent}"
         );
         assert!(
-            sent.contains("- context 231: Program 5 · Browser (layer 2, LB held: 230)"),
+            sent.contains("- context 231: Program 5 · Browser (layer 2: 230)"),
             "{sent}"
         );
         assert!(
-            sent.contains("- context 239: Program 1 (layer 2, LB held: 238)"),
+            sent.contains("- context 239: Program 1 (layer 2: 238)"),
             "{sent}"
         );
         assert!(
@@ -20854,7 +20952,7 @@ mod tests {
         let free = (0..64)
             .map(Control::button)
             .find(|c| {
-                !crate::gamepad::is_reserved(*c)
+                !crate::gamepad::is_reserved(*c, crate::gamepad::LAYER_DEFAULT)
                     && !crate::gamepad::default_layout()
                         .iter()
                         .any(|d| d.control == *c)

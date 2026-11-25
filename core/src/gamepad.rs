@@ -178,9 +178,12 @@ pub fn default_layout() -> Vec<Mapping> {
     })
     .collect()
 }
-/// LB is the layer key (v7 ticket 09): held, every other button uses layer 2.
-pub fn is_layer_key(control: Control) -> bool {
-    Some(control) == self::control(gilrs::Button::LeftTrigger)
+/// The layer key's default, LB (v7 ticket 09), as a [`BUTTONS`] index.
+pub const LAYER_DEFAULT: u8 = 4;
+/// The layer key (v7 ticket 09; v7.8 ticket 23: `layer`, Xbox tuning's [`BUTTONS`] index):
+/// held, every other button uses layer 2.
+pub fn is_layer_key(control: Control, layer: u8) -> bool {
+    control == Control::button(layer)
 }
 /// The Xbox button (v7 ticket 13): held with the D-pad it cycles profiles; held alone
 /// for a second it toggles the lock. Reserved like LB.
@@ -188,8 +191,8 @@ pub fn is_guide(control: Control) -> bool {
     Some(control) == self::control(gilrs::Button::Mode)
 }
 /// Buttons VibeConsole keeps for itself; they can't be mapped.
-pub fn is_reserved(control: Control) -> bool {
-    is_layer_key(control) || is_guide(control)
+pub fn is_reserved(control: Control, layer: u8) -> bool {
+    is_layer_key(control, layer) || is_guide(control)
 }
 #[derive(Debug, PartialEq)]
 pub enum GuideAction {
@@ -1477,6 +1480,10 @@ impl Pad {
             reports: None,
         })
     }
+    /// v7.8 ticket 23: whether `control` is the layer button Xbox tuning names.
+    pub fn is_layer_key(&self, control: Control) -> bool {
+        is_layer_key(control, self.tuning.layer)
+    }
     /// The gestures the saved mappings use (v7 ticket 76).
     pub fn set_gestures(&mut self, mappings: &[Mapping]) {
         self.gestures.set(mappings, &mut self.analog);
@@ -2060,6 +2067,7 @@ mod tests {
     #[test]
     fn triggers_fire_at_the_tuned_point_and_sticks_ignore_their_dead_zone() {
         let tuning = crate::mappings::Tuning {
+            layer: LAYER_DEFAULT,
             dead_zone: 15,
             trigger: 30,
             ..Default::default()
@@ -2087,6 +2095,7 @@ mod tests {
         );
         // A 3% fire point still releases at rest.
         let low = crate::mappings::Tuning {
+            layer: LAYER_DEFAULT,
             trigger: 3,
             ..Default::default()
         };
@@ -2252,8 +2261,18 @@ mod tests {
         use evdev::KeyCode;
         use std::cell::RefCell;
         let a = control(gilrs::Button::South).unwrap();
-        assert!(is_layer_key(control(gilrs::Button::LeftTrigger).unwrap()));
-        assert!(layer(&[], false).iter().all(|m| !is_layer_key(m.control)));
+        assert!(is_layer_key(
+            control(gilrs::Button::LeftTrigger).unwrap(),
+            LAYER_DEFAULT
+        ));
+        assert!(
+            layer(&[], false)
+                .iter()
+                .all(|m| !is_layer_key(m.control, LAYER_DEFAULT))
+        );
+        // v7.8 ticket 23: with RB (index 5) as the layer button, RB is it and LB isn't.
+        let (lb, rb) = (Control::button(4), Control::button(5));
+        assert!(is_layer_key(rb, 5) && !is_layer_key(lb, 5) && !is_reserved(lb, 5));
         let mut second = Mapping::new(a, "F7", "hold").unwrap();
         second.context = crate::mappings::GAMEPAD_LAYER_2;
         let saved = [second];
@@ -2356,7 +2375,7 @@ mod tests {
         g.event(&Event::Press(guide), ms(6000));
         g.cancel();
         assert_eq!(g.tick(ms(7500)), None, "a pause or clear cancels");
-        assert!(is_reserved(guide) && !is_reserved(a));
+        assert!(is_reserved(guide, LAYER_DEFAULT) && !is_reserved(a, LAYER_DEFAULT));
     }
 
     /// v7 ticket 22: the mouse stick moves the pointer by its push past the dead zone, scaled
@@ -2364,6 +2383,7 @@ mod tests {
     #[test]
     fn mouse_stick_moves_by_push_past_the_dead_zone_and_keeps_fractions() {
         let tuning = crate::mappings::Tuning {
+            layer: LAYER_DEFAULT,
             dead_zone: 15,
             mouse_speed: 10,
             mouse: crate::mappings::MouseStick::Left,
