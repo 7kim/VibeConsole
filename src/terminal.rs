@@ -7571,7 +7571,7 @@ fn choice_menu(
         };
         match index.checked_sub(choices.len()) {
             Some(0) if choices.len() < 16 => {
-                if let Some(prompt) = prompt_action(ui, path, None)? {
+                if let Some(prompt) = prompt_action(ui, path, None, false)? {
                     choices.push(prompt);
                 }
             }
@@ -7709,7 +7709,7 @@ fn sequence_menu(
                             .collect::<Vec<_>>();
                         choose(ui, "Agent", &names)?.map(|i| Step::Agent(names[i].clone()))
                     }
-                    1 => prompt_action(ui, path, None)?.map(Step::Do),
+                    1 => prompt_action(ui, path, None, false)?.map(Step::Do),
                     2 => command_action(ui, None)?.map(Step::Do),
                     3 => action_menu(ui, 1, mappings::Input::Pad, None, false, None)?.map(Step::Do),
                     4 => shortcut(ui, &[])?.map(Step::Keys),
@@ -7726,9 +7726,10 @@ fn sequence_menu(
                     10 => {
                         let any = Control::from_note(vibeconsole_core::PAD_CHANNEL, 36)
                             .ok_or("no pad")?;
-                        orca_mapping(ui, any, mappings::Input::Pad)?.map(|m| Step::Do(m.action))
+                        orca_mapping(ui, any, mappings::Input::Pad, None)?
+                            .map(|m| Step::Do(m.action))
                     }
-                    11 => t3_action(ui)?.map(Step::Do),
+                    11 => t3_action(ui, None)?.map(Step::Do),
                     12 => {
                         let agents = ui.herdr_agents()?;
                         choose(ui, "Focus which herdr agent?", &agents)?
@@ -9761,12 +9762,7 @@ fn ask_family(ui: &mut impl Ui, path: &Path) -> Result<()> {
 }
 /// v7.7 ticket 169: /configure's "Your families": one action of a family made with 0 AI,
 /// copied onto the learned control like a favourite.
-fn family_mapping(
-    ui: &mut impl Ui,
-    path: &Path,
-    pad: Control,
-    input: mappings::Input,
-) -> Result<Option<Mapping>> {
+fn custom_family_files(path: &Path) -> Vec<PathBuf> {
     let dir = beside(path, "families");
     let mut files = std::fs::read_dir(&dir)
         .into_iter()
@@ -9776,19 +9772,31 @@ fn family_mapping(
         .filter(|p| p.extension().is_some_and(|x| x == "family"))
         .collect::<Vec<_>>();
     files.sort();
-    if files.is_empty() {
+    files
+}
+
+fn custom_family_name(file: &Path) -> String {
+    file.file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn family_mapping(
+    ui: &mut impl Ui,
+    path: &Path,
+    pad: Control,
+    input: mappings::Input,
+) -> Result<Option<Mapping>> {
+    let files = custom_family_files(path);
+    if files.is_empty() && JUMP.with(|jump| jump.borrow().is_none()) {
         return Err("validation: no families yet; ask for one in 0 AI".into());
     }
     let names = files
         .iter()
-        .map(|f| {
-            f.file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned()
-        })
+        .map(|f| custom_family_name(f))
         .collect::<Vec<_>>();
-    let Some(index) = choose(ui, "Your families", &names)? else {
+    let Some(index) = family_list(ui, Some(path), 14, "Your families", names.clone(), None)? else {
         return Ok(None);
     };
     let family = read_family(path, &files[index])
@@ -11815,6 +11823,7 @@ fn prompt_action(
     ui: &mut impl Ui,
     path: &Path,
     saved: Option<&crate::actions::Action>,
+    stars: bool,
 ) -> Result<Option<crate::actions::Action>> {
     let dir = crate::actions::prompts_dir_for(path)?;
     let mut files = prompt_files(&dir)?;
@@ -11823,10 +11832,25 @@ fn prompt_action(
         Some(crate::actions::Action::Prompt { file, .. }) => Some(file),
         _ => None,
     };
-    let Some(index) = choose_saved(
+    let Some(index) = family_rows(
         ui,
+        stars.then_some(path),
+        3,
         "Prompt file",
-        files.clone(),
+        files
+            .iter()
+            .enumerate()
+            .map(|(i, label)| {
+                (
+                    label.clone(),
+                    if i + 1 == files.len() {
+                        String::new()
+                    } else {
+                        label.clone()
+                    },
+                )
+            })
+            .collect(),
         saved_file.and_then(|f| files.iter().position(|s| s == f)),
     )?
     else {
@@ -12111,8 +12135,7 @@ fn pick_inner(
 }
 
 thread_local! {
-    /// v7.8 ticket 18: the row a ★ Favourites pick opens: the next starred list holding a row
-    /// with this label picks it at once, so the action's own setup follows.
+    /// The action key picked in ★ Favourites, consumed by the family's first action list.
     static JUMP: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 /// v7.8 ticket 18: star or unstar `key` in the config (saved atomically).
@@ -12135,14 +12158,6 @@ fn choose_starred(
     rows: &[(String, String)],
     mut at: Option<usize>,
 ) -> Result<Option<usize>> {
-    if let Some(row) = JUMP.with(|j| {
-        let want = j.borrow().clone()?;
-        let row = rows.iter().position(|(label, _)| *label == want)?;
-        j.borrow_mut().take();
-        Some(row)
-    }) {
-        return Ok(Some(row));
-    }
     let saved = at; // the saved choice keeps its "(saved)" mark (v7 ticket 55)
     loop {
         let stars = mappings::load_config(path)
@@ -12188,20 +12203,58 @@ fn family_list(
     rows: Vec<String>,
     at: Option<usize>,
 ) -> Result<Option<usize>> {
-    match stars {
-        Some(path) => {
-            let rows = rows
-                .into_iter()
-                .map(|label| {
-                    let key = action_star(family, &label);
-                    (label, key)
-                })
-                .collect::<Vec<_>>();
-            choose_starred(ui, path, title, &rows, at)
-        }
-        None => choose_saved(ui, title, rows, at),
+    if let Some(path) = stars {
+        family_rows(
+            ui,
+            Some(path),
+            family,
+            title,
+            rows.into_iter().map(|row| (row.clone(), row)).collect(),
+            at,
+        )
+    } else {
+        choose_saved(ui, title, rows, at)
     }
 }
+
+/// Rows may show changing details beside their name. An empty name is a setup or status row.
+fn family_rows(
+    ui: &mut impl Ui,
+    path: Option<&Path>,
+    family: usize,
+    title: &str,
+    rows: Vec<(String, String)>,
+    at: Option<usize>,
+) -> Result<Option<usize>> {
+    let Some(path) = path else {
+        return choose_saved(
+            ui,
+            title,
+            rows.into_iter().map(|(label, _)| label).collect(),
+            at,
+        );
+    };
+    let rows = rows
+        .into_iter()
+        .map(|(label, name)| {
+            let key = if name.is_empty() {
+                String::new()
+            } else {
+                action_star(family, &name)
+            };
+            (label, key)
+        })
+        .collect::<Vec<_>>();
+    if let Some(key) = JUMP.with(|j| j.borrow_mut().take()) {
+        if let Some(row) = rows.iter().position(|(_, name)| name == &key) {
+            return Ok(Some(row));
+        }
+        choose(ui, "That favourite is unavailable", &strings(&["Back"]))?;
+        return Ok(None);
+    }
+    choose_starred(ui, path, title, &rows, at)
+}
+
 /// v7.8 ticket 18: the word a family's star is saved under (`family:<word>`).
 const FAMILY_WORDS: [&str; 19] = [
     "shortcut",
@@ -12234,6 +12287,83 @@ fn action_star(family: usize, label: &str) -> String {
 fn starred_action(key: &str) -> Option<(usize, &str)> {
     let (word, label) = key.strip_prefix("action:")?.split_once(':')?;
     Some((FAMILY_WORDS.iter().position(|w| *w == word)?, label))
+}
+
+fn available_favourite_rows(
+    ui: &mut impl Ui,
+    path: &Path,
+    config: &mappings::Config,
+    family: usize,
+) -> Vec<String> {
+    match family {
+        1 => application_rows(ui)
+            .map(|(apps, _)| {
+                apps.into_iter()
+                    .map(|(label, _)| label)
+                    .chain([FLOW_ROW.into()])
+                    .collect()
+            })
+            .unwrap_or_default(),
+        2 => music_rows(),
+        3 => crate::actions::prompts_dir_for(path)
+            .ok()
+            .filter(|dir| dir.is_dir())
+            .and_then(|dir| prompt_files(&dir).ok())
+            .unwrap_or_default(),
+        8 => orca_rows(),
+        9 if ui.t3_key_file().is_ok() => t3_commands().into_iter().map(|(name, _)| name).collect(),
+        10 => ui.herdr_agents().unwrap_or_default(),
+        11 => config
+            .sequences
+            .iter()
+            .map(|(name, _)| format!("Saved: {name}"))
+            .collect(),
+        14 => custom_family_files(path)
+            .into_iter()
+            .map(|file| custom_family_name(&file))
+            .collect(),
+        15 => tmux_rows(config),
+        16 => mappings::MOUSE_KEYS
+            .map(|(_, label)| label.to_owned())
+            .to_vec(),
+        17 => fedora_rows().1,
+        18 => browser_rows(),
+        _ => Vec::new(),
+    }
+}
+
+fn choose_favourite(
+    ui: &mut impl Ui,
+    path: &Path,
+    actions: &[(usize, String)],
+) -> Result<Option<usize>> {
+    let config = mappings::load_config(path).map_err(stage("file I/O"))?;
+    let mut catalogue = BTreeMap::new();
+    let available = actions
+        .iter()
+        .map(|(family, label)| {
+            catalogue
+                .entry(*family)
+                .or_insert_with(|| available_favourite_rows(ui, path, &config, *family))
+                .contains(label)
+        })
+        .collect::<Vec<_>>();
+    let labels = actions
+        .iter()
+        .zip(&available)
+        .map(|((family, label), available)| {
+            let status = if *available { "" } else { "(unavailable) " };
+            format!("{status}{label} · {}", FAMILY_WORDS[*family])
+        })
+        .collect::<Vec<_>>();
+    while let Some(i) = choose(ui, "★ Favourites: opens the action's own setup", &labels)? {
+        if available[i] {
+            let (family, label) = &actions[i];
+            JUMP.with(|j| *j.borrow_mut() = Some(action_star(*family, label)));
+            return Ok(Some(*family));
+        }
+    }
+    Ok(None)
 }
 /// v7.8 ticket 18: v7's stars were on control slots; each one on an assignment becomes a star
 /// on its family (and, for Music & Sound, Mouse Actions and Fedora System, on its action);
@@ -12801,7 +12931,55 @@ fn calibrate_motion(
     )))
 }
 
-/// `second_press`: a launcher pad (not a sequence step) also chooses minimize or close.
+const FLOW_ROW: &str = "Start or repair Wispr Flow";
+
+fn application_rows(ui: &impl Ui) -> Result<(Vec<(String, String)>, Vec<&'static str>)> {
+    use crate::actions::{AGENT_APPS, agent_app, desktop_id};
+    let installed = ui.applications()?;
+    let mut apps = Vec::new();
+    let mut missing = Vec::new();
+    for agent in AGENT_APPS {
+        match installed.iter().find(|(_, p)| agent_app(p) == Some(agent)) {
+            Some(app) => apps.push(app.clone()),
+            None => missing.push(agent),
+        }
+    }
+    let agents = apps.len();
+    apps.extend(
+        installed
+            .into_iter()
+            .filter(|(_, p)| agent_app(p).is_none()),
+    );
+    for (i, (name, path)) in apps.iter_mut().enumerate() {
+        let id = desktop_id(path).unwrap_or_else(|| {
+            Path::new(path)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        });
+        let agent = if i < agents { "Agent app: " } else { "" };
+        *name = format!("{agent}{name} | {id}");
+    }
+    Ok((apps, missing))
+}
+
+fn music_rows() -> Vec<String> {
+    let mut rows = strings(&[
+        "Output volume up",
+        "Output volume down",
+        "Output mute",
+        "Microphone mute",
+    ]);
+    rows.extend(
+        crate::actions::Media::ALL
+            .iter()
+            .map(|m| m.label().to_string()),
+    );
+    rows
+}
+
+/// `second_press`: a launcher pad also chooses minimize or close.
 fn action_menu(
     ui: &mut impl Ui,
     family: usize,
@@ -12823,37 +13001,17 @@ fn action_menu(
     if family == 1 {
         // v7 ticket 48: Orca, T3 Code and herdr first, each shown once (the entry that
         // launches); one that isn't installed says so.
-        use crate::actions::{AGENT_APPS, agent_app};
-        let installed = ui.applications()?;
-        let mut apps = Vec::new();
-        let mut missing = Vec::new();
-        for agent in AGENT_APPS {
-            match installed.iter().find(|(_, p)| agent_app(p) == Some(agent)) {
-                Some(app) => apps.push(app.clone()),
-                None => missing.push(agent),
-            }
-        }
-        let agents = apps.len();
-        apps.extend(
-            installed
-                .into_iter()
-                .filter(|(_, p)| agent_app(p).is_none()),
-        );
-        let mut names = apps
+        let (apps, missing) = application_rows(ui)?;
+        let rows = apps
             .iter()
-            .enumerate()
-            .map(|(i, (n, p))| {
-                let file = Path::new(p).file_name().unwrap_or_default();
-                let agent = if i < agents { "Agent app: " } else { "" };
-                format!("{agent}{n} | {}", file.to_string_lossy())
-            })
-            .collect::<Vec<_>>();
-        names.extend(
-            missing
-                .iter()
-                .map(|a| format!("Agent app: {a} (not installed)")),
-        );
-        names.push("Start or repair Wispr Flow".into());
+            .map(|(label, _)| (label.clone(), label.clone()))
+            .chain(
+                missing
+                    .iter()
+                    .map(|a| (format!("Agent app: {a} (not installed)"), String::new())),
+            )
+            .chain([(FLOW_ROW.into(), FLOW_ROW.into())])
+            .collect();
         let saved_action = saved;
         let saved = match saved {
             Some(Action::Application(path) | Action::AppToggle { path, .. }) => {
@@ -12862,10 +13020,12 @@ fn action_menu(
             Some(Action::Flow) => Some(apps.len() + missing.len()),
             _ => None,
         };
-        let Some(i) = choose_saved(
+        let Some(i) = family_rows(
             ui,
+            stars,
+            1,
             "Installed visible applications (one native launch request per press)",
-            names,
+            rows,
             saved,
         )?
         else {
@@ -12918,20 +13078,13 @@ fn action_menu(
         _ => (None, None),
     };
     // v7.8 ticket 10: Music & Sound: wpctl's volume and mute, then the media keys.
-    let mut rows = strings(&[
-        "Output volume up",
-        "Output volume down",
-        "Output mute",
-        "Microphone mute",
-    ]);
-    rows.extend(Media::ALL.iter().map(|m| m.label().to_string()));
     let Some(i) = family_list(
         ui,
         stars,
         2,
         "Music & Sound. Volume and mute act on the default device (wpctl, in your desktop session).
 Media keys go to the player that is playing; with none, nothing happens.",
-        rows,
+        music_rows(),
         saved,
     )?
     else {
@@ -12966,6 +13119,14 @@ Media keys go to the player that is playing; with none, nothing happens.",
 
 /// v7.8 ticket 14: the Browser family: which browser, then what (tab keys are sent only while
 /// that browser is focused), or a URL to open in it.
+fn browser_rows() -> Vec<String> {
+    let mut names = crate::actions::Browser::ALL
+        .map(|b| b.name().to_string())
+        .to_vec();
+    names.push("Playwright (codegen for a URL, saved scripts)".into());
+    names
+}
+
 fn browser_action(
     ui: &mut impl Ui,
     path: &Path,
@@ -12976,13 +13137,11 @@ fn browser_action(
         Some(Action::Browser { browser, what }) => (Some(*browser), Some(what.clone())),
         _ => (None, None),
     };
-    let mut names = Browser::ALL.map(|b| b.name().to_string()).to_vec();
-    names.push("Playwright (codegen for a URL, saved scripts)".into()); // v7.8 ticket 15
     let at = match saved {
         Some(Action::Playwright(_)) => Some(Browser::ALL.len()),
         _ => saved_browser.and_then(|b| Browser::ALL.iter().position(|x| *x == b)),
     };
-    let Some(b) = family_list(ui, Some(path), 18, "Which browser?", names, at)? else {
+    let Some(b) = family_list(ui, Some(path), 18, "Which browser?", browser_rows(), at)? else {
         return Ok(None);
     };
     let Some(&browser) = Browser::ALL.get(b) else {
@@ -13137,14 +13296,8 @@ fn must_hold(action: &crate::actions::Action) -> bool {
         action => action.must_hold(),
     }
 }
-/// v7.8 ticket 12: the Fedora System family: the updates, then each fixed action, then a
-/// Settings panel.
-fn fedora_system(
-    ui: &mut impl Ui,
-    saved: Option<&crate::actions::Action>,
-    stars: Option<&Path>,
-) -> Result<Option<crate::actions::Action>> {
-    use crate::actions::{Action, SETTINGS_PANELS, System};
+fn fedora_rows() -> (Vec<crate::actions::System>, Vec<String>) {
+    use crate::actions::System;
     let fixed = System::FIXED
         .into_iter()
         .chain([System::EmptyTrash])
@@ -13161,6 +13314,17 @@ fn fedora_system(
         "Disconnect a paired Bluetooth device…",
         "Turn off Xbox controller (Bluetooth disconnect, hold 1 second)",
     ]));
+    (fixed, rows)
+}
+
+/// v7.8 ticket 12: the Fedora System family starts with the updates and fixed actions.
+fn fedora_system(
+    ui: &mut impl Ui,
+    saved: Option<&crate::actions::Action>,
+    stars: Option<&Path>,
+) -> Result<Option<crate::actions::Action>> {
+    use crate::actions::{Action, SETTINGS_PANELS, System};
+    let (fixed, rows) = fedora_rows();
     let panel_row = UPDATES.len() + fixed.len();
     let at = match saved {
         Some(Action::Command { line, .. }) => UPDATES.iter().position(|(l, _)| l == line),
@@ -13177,7 +13341,7 @@ fn fedora_system(
         stars,
         17,
         "Fedora System. Each runs one fixed command; updates and suspend fire after a one-second hold.",
-        rows.clone(),
+        rows,
         at,
     )?
     else {
@@ -13509,16 +13673,16 @@ fn sequence_for_pad(
     saved: Option<&crate::actions::Action>,
 ) -> Result<Option<crate::actions::Action>> {
     let config = mappings::load_config(path).map_err(stage("file I/O"))?;
-    if config.sequences.is_empty() {
+    if config.sequences.is_empty() && JUMP.with(|jump| jump.borrow().is_none()) {
         return prompt_sequence_action(ui, path, saved);
     }
-    let mut items = vec!["A sequence for this pad only".to_string()];
-    items.extend(
-        config
-            .sequences
-            .iter()
-            .map(|(name, steps)| format!("Saved: {name} ({} steps)", steps.len())),
-    );
+    let mut items = vec![("A sequence for this pad only".to_string(), String::new())];
+    items.extend(config.sequences.iter().map(|(name, steps)| {
+        (
+            format!("Saved: {name} ({} steps)", steps.len()),
+            format!("Saved: {name}"),
+        )
+    }));
     let current = match saved {
         Some(crate::actions::Action::SavedSequence(name)) => config
             .sequences
@@ -13528,7 +13692,7 @@ fn sequence_for_pad(
         Some(crate::actions::Action::PromptSequence(_)) => Some(0),
         _ => None,
     };
-    let Some(choice) = choose_saved(ui, "Prompt sequence", items, current)? else {
+    let Some(choice) = family_rows(ui, Some(path), 11, "Prompt sequence", items, current)? else {
         return Ok(None);
     };
     if choice == 0 {
@@ -13692,7 +13856,7 @@ fn prompt_sequence_action(
             return Ok(None);
         };
         if choice == steps.len() {
-            if let Some(step) = prompt_action(ui, path, None)? {
+            if let Some(step) = prompt_action(ui, path, None, false)? {
                 steps.push(step);
             }
         } else if choice == steps.len() + 2 {
@@ -13986,7 +14150,7 @@ fn edit_step(
 
 /// The T3 Code family (v7 ticket 17): each command shows the key T3's own file binds it
 /// to now; the action reads the file again at every press.
-fn t3_action(ui: &mut impl Ui) -> Result<Option<crate::actions::Action>> {
+fn t3_commands() -> Vec<(String, String)> {
     let mut commands = vec![
         ("New chat".to_owned(), "chat.new".to_owned()),
         ("Previous thread".into(), "thread.previous".into()),
@@ -14004,6 +14168,11 @@ fn t3_action(ui: &mut impl Ui) -> Result<Option<crate::actions::Action>> {
         ]
         .map(|(name, command)| (name.to_owned(), command.to_owned())),
     );
+    commands
+}
+
+fn t3_action(ui: &mut impl Ui, stars: Option<&Path>) -> Result<Option<crate::actions::Action>> {
+    let commands = t3_commands();
     let file = ui.t3_key_file()?;
     let items = commands
         .iter()
@@ -14011,10 +14180,18 @@ fn t3_action(ui: &mut impl Ui) -> Result<Option<crate::actions::Action>> {
             let keys = crate::actions::t3_keys(&file, command)
                 .map(|k| k.join("+"))
                 .unwrap_or_else(|_| "not bound".into());
-            format!("{name} ({keys})")
+            (format!("{name} ({keys})"), name.clone())
         })
         .collect::<Vec<_>>();
-    let Some(index) = choose(ui, "T3 Code (keys from your T3 key file)", &items)? else {
+    let Some(index) = family_rows(
+        ui,
+        stars,
+        9,
+        "T3 Code (keys from your T3 key file)",
+        items,
+        None,
+    )?
+    else {
         return Ok(None);
     };
     let (name, command) = &commands[index];
@@ -14053,26 +14230,43 @@ fn orca_needs_me() -> Result<crate::actions::Action> {
     ))
 }
 
-/// The Orca family (v7 ticket 15): Orca's Linux default keys, "needs me" (the jump
-/// palette's first row: the agent waiting on you) and a jump to one agent's tab.
-fn orca_mapping(ui: &mut impl Ui, pad: Control, input: mappings::Input) -> Result<Option<Mapping>> {
-    const SHORTCUTS: [(&str, &str); 5] = [
-        ("Jump palette", "Ctrl+J"),
-        ("Next tab", "Ctrl+Shift+RightBracket"),
-        ("Previous tab", "Ctrl+Shift+LeftBracket"),
-        ("Last tab", "Ctrl+Tab"),
-        ("New terminal tab", "Ctrl+T"),
-    ];
+const ORCA_SHORTCUTS: [(&str, &str); 5] = [
+    ("Jump palette", "Ctrl+J"),
+    ("Next tab", "Ctrl+Shift+RightBracket"),
+    ("Previous tab", "Ctrl+Shift+LeftBracket"),
+    ("Last tab", "Ctrl+Tab"),
+    ("New terminal tab", "Ctrl+T"),
+];
+
+fn orca_rows() -> Vec<String> {
     let mut items = vec![
         "Needs me: the agent waiting on you (Ctrl+J, then Ctrl+1)".to_owned(),
         "Jump to an agent…".to_owned(),
     ];
     items.extend(
-        SHORTCUTS
+        ORCA_SHORTCUTS
             .iter()
             .map(|(name, keys)| format!("{name} ({keys})")),
     );
-    let Some(choice) = choose(ui, "Orca (its Linux default keys)", &items)? else {
+    items
+}
+
+/// The Orca family (v7 ticket 15): Orca's Linux default keys, "needs me" and agent jump.
+fn orca_mapping(
+    ui: &mut impl Ui,
+    pad: Control,
+    input: mappings::Input,
+    stars: Option<&Path>,
+) -> Result<Option<Mapping>> {
+    let Some(choice) = family_list(
+        ui,
+        stars,
+        8,
+        "Orca (its Linux default keys)",
+        orca_rows(),
+        None,
+    )?
+    else {
         return Ok(None);
     };
     let action = match choice {
@@ -14094,7 +14288,7 @@ fn orca_mapping(ui: &mut impl Ui, pad: Control, input: mappings::Input) -> Resul
         }
         // v7 ticket 98: Orca's shortcuts are Orca keys too, sent only while Orca is focused.
         n => crate::actions::Action::OrcaKeys(vec![crate::actions::Step::Keys(
-            mappings::parse_shortcut(SHORTCUTS[n - 2].1)?,
+            mappings::parse_shortcut(ORCA_SHORTCUTS[n - 2].1)?,
         )]),
     };
     Ok(Some(
@@ -14593,6 +14787,15 @@ fn range_or_gesture(ui: &mut impl Ui, control: Control) -> Result<Option<Control
     Ok(choose(ui, &title, &labels)?.map(|i| choices[i].0))
 }
 
+fn tmux_rows(config: &mappings::Config) -> Vec<String> {
+    config
+        .agents
+        .iter()
+        .filter(|agent| agent.host == mappings::Host::Tmux)
+        .map(|agent| agent.window.clone())
+        .collect()
+}
+
 fn configure_steps(
     ui: &mut impl Ui,
     path: &Path,
@@ -14882,16 +15085,10 @@ fn configure_steps(
             continue;
         };
         let family = if top == 1 && row == 0 {
-            let labels = starred_actions
-                .iter()
-                .map(|(f, l)| format!("{l} · {}", FAMILY_WORDS[*f]))
-                .collect::<Vec<_>>();
-            let Some(i) = choose(ui, "★ Favourites: opens the action's own setup", &labels)?
-            else {
+            let Some(family) = choose_favourite(ui, path, &starred_actions)? else {
                 continue;
             };
-            JUMP.with(|j| *j.borrow_mut() = Some(starred_actions[i].1.clone()));
-            starred_actions[i].0
+            family
         } else {
             offered[row - top]
         };
@@ -14978,17 +15175,19 @@ fn configure_steps(
             Mapping::new_action(pad, input, action).map_err(stage("validation"))?
         } else if family == 15 {
             // v7.7 ticket 182: one of 3 Agents' tmux agents, by its window.
-            let windows = mappings::load_config(path)
-                .map_err(stage("file I/O"))?
-                .agents
-                .into_iter()
-                .filter(|a| a.host == mappings::Host::Tmux)
-                .map(|a| a.window)
-                .collect::<Vec<_>>();
-            if windows.is_empty() {
+            let windows = tmux_rows(&mappings::load_config(path).map_err(stage("file I/O"))?);
+            if windows.is_empty() && JUMP.with(|jump| jump.borrow().is_none()) {
                 return Err("validation: no tmux agents in 3 Agents; add one first".into());
             }
-            let Some(index) = choose(ui, "Go to which tmux agent?", &windows)? else {
+            let Some(index) = family_list(
+                ui,
+                Some(path),
+                15,
+                "Go to which tmux agent?",
+                windows.clone(),
+                None,
+            )?
+            else {
                 continue;
             };
             Mapping::new_action(
@@ -14999,10 +15198,18 @@ fn configure_steps(
             .map_err(stage("validation"))?
         } else if family == 10 {
             let agents = ui.herdr_agents()?;
-            if agents.is_empty() {
+            if agents.is_empty() && JUMP.with(|jump| jump.borrow().is_none()) {
                 return Err("validation: herdr has no agents running; start one first".into());
             }
-            let Some(index) = choose(ui, "Focus which herdr agent?", &agents)? else {
+            let Some(index) = family_list(
+                ui,
+                Some(path),
+                10,
+                "Focus which herdr agent?",
+                agents.clone(),
+                None,
+            )?
+            else {
                 continue;
             };
             Mapping::new_action(
@@ -15012,12 +15219,12 @@ fn configure_steps(
             )
             .map_err(stage("validation"))?
         } else if family == 9 {
-            let Some(action) = t3_action(ui)? else {
+            let Some(action) = t3_action(ui, Some(path))? else {
                 continue;
             };
             Mapping::new_action(pad, input, action).map_err(stage("validation"))?
         } else if family == 8 {
-            let Some(mapping) = orca_mapping(ui, pad, input)? else {
+            let Some(mapping) = orca_mapping(ui, pad, input, Some(path))? else {
                 continue;
             };
             mapping
@@ -15025,7 +15232,8 @@ fn configure_steps(
             if !matches!(input, mappings::Input::Pad | mappings::Input::Piano) {
                 return Err("validation: prompts require a pad or piano press".into());
             }
-            let Some(action) = prompt_action(ui, path, saved.as_ref().map(|m| &m.action))? else {
+            let Some(action) = prompt_action(ui, path, saved.as_ref().map(|m| &m.action), true)?
+            else {
                 continue;
             };
             Mapping::new_action(pad, input, action).map_err(stage("validation"))?
@@ -23092,6 +23300,162 @@ mod tests {
             "{}",
             ui.screens.join("\n---\n")
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn configure_stars_and_reopens_actions_from_each_family() {
+        use crate::actions::{Action, Step};
+        use Key::*;
+        let firefox = "/usr/share/applications/firefox.desktop";
+        let cases = [
+            (
+                1,
+                1,
+                "Firefox | firefox.desktop",
+                vec![Enter],
+                Action::AppToggleQuit(firefox.into()),
+            ),
+            (
+                3,
+                1,
+                "review",
+                vec![Enter, Enter, Enter, Enter],
+                Action::Prompt {
+                    file: "review".into(),
+                    target: crate::actions::Target::Agent("claude".into()),
+                    enter: false,
+                },
+            ),
+            (
+                8,
+                3,
+                "Next tab (Ctrl+Shift+RightBracket)",
+                vec![],
+                Action::OrcaKeys(vec![Step::Keys(vec![
+                    "Ctrl".into(),
+                    "Shift".into(),
+                    "RightBracket".into(),
+                ])]),
+            ),
+            (
+                9,
+                2,
+                "Next thread",
+                vec![],
+                Action::T3("thread.next".into()),
+            ),
+            (10, 1, "worker", vec![], Action::HerdrFocus("worker".into())),
+            (15, 1, "codex", vec![], Action::TmuxJump("codex".into())),
+        ];
+        for (family, down, label, setup, expected) in cases {
+            let dir = std::env::temp_dir()
+                .join(format!("vibeconsole-stars-{family}-{}", std::process::id()));
+            std::fs::create_dir(&dir).unwrap();
+            let path = dir.join("mappings.tsv");
+            mappings::save(&path, &[]).unwrap();
+            let prompts = crate::actions::prompts_dir_for(&path).unwrap();
+            std::fs::create_dir_all(&prompts).unwrap();
+            for file in ["draft", "review"] {
+                std::fs::write(prompts.join(file), "Prompt text\n").unwrap();
+            }
+            let mut config = mappings::load_config(&path).unwrap();
+            config.agents = ["claude", "codex"]
+                .map(|name| mappings::Agent::new(name, name, name).unwrap())
+                .into();
+            mappings::save_config(&path, &config).unwrap();
+            let mut ui = Script {
+                apps: vec![
+                    (
+                        "Editor".into(),
+                        "/usr/share/applications/editor.desktop".into(),
+                    ),
+                    ("Firefox".into(), firefox.into()),
+                ],
+                t3: r#"[{"key":"mod+]","command":"thread.next"}]"#.into(),
+                herdr: vec!["builder".into(), "worker".into()],
+                ..Default::default()
+            };
+            let pad = Control::from_note(10, 36).unwrap();
+            let mut keys = vec![Enter];
+            let at = families(mappings::Input::Pad)
+                .iter()
+                .position(|f| *f == family)
+                .unwrap();
+            keys.extend(std::iter::repeat_n(Down, at));
+            keys.push(Enter);
+            keys.extend(std::iter::repeat_n(Down, down));
+            keys.extend([Character(b'f'), Escape, Tab, Tab, Enter]);
+            ui.keys = keys.into();
+            ui.pads = [pad].into();
+            let mut current = vec![];
+            configure(&mut ui, &path, &mut current).unwrap();
+            let star = format!("★ {label}");
+            assert!(
+                ui.screens.iter().any(|screen| screen
+                    .lines()
+                    .filter(|l| !l.is_empty())
+                    .nth(2)
+                    .is_some_and(|top| top.contains(&star))),
+                "{}",
+                ui.screens.join("\n---\n")
+            );
+            assert_eq!(
+                mappings::load_config(&path).unwrap().favourites,
+                [action_star(family, label)]
+            );
+
+            ui.keys = [vec![Enter, Enter, Enter], setup, vec![Enter, Down, Enter]]
+                .concat()
+                .into();
+            ui.pads = [pad].into();
+            ui.screens.clear();
+            ui.t3 = r#"[{"key":"mod+[","command":"thread.next"}]"#.into();
+            configure(&mut ui, &path, &mut current).unwrap();
+            assert!(ui.keys.is_empty(), "{}", ui.screens.join("\n---\n"));
+            assert_eq!(mappings::load(&path).unwrap()[0].action, expected);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn unavailable_starred_actions_do_not_open_another_row() {
+        use Key::*;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-stars-gone-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let mut config = mappings::load_config(&path).unwrap();
+        config.mappings.clear();
+        config.favourites = vec![
+            "action:app:Gone | gone.desktop".into(),
+            "action:prompt:deleted".into(),
+        ];
+        mappings::save_config(&path, &config).unwrap();
+        let mut ui = Script {
+            keys: [Enter, Enter, Enter, Down, Enter, Escape, Tab, Tab, Enter].into(),
+            pads: [Control::from_note(10, 36).unwrap()].into(),
+            apps: vec![(
+                "Editor".into(),
+                "/usr/share/applications/editor.desktop".into(),
+            )],
+            ..Default::default()
+        };
+        configure(&mut ui, &path, &mut vec![]).unwrap();
+        let screens = ui.screens.join("\n---\n");
+        assert!(
+            screens.contains("(unavailable) Gone | gone.desktop · app"),
+            "{screens}"
+        );
+        assert!(
+            screens.contains("(unavailable) deleted · prompt"),
+            "{screens}"
+        );
+        assert!(
+            !screens.contains("Second press while") && !screens.contains("Prompt file"),
+            "{screens}"
+        );
+        assert_eq!(mappings::load_config(&path).unwrap(), config);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -252,7 +252,7 @@ Headset audio over the 3.5 mm jack needs `xone`; under `xpad` it's reported as u
 - **Lock** pins one profile whatever is focused (also the Xbox button held for a second).
 - **Export / import** write and read one file per profile. An import is validated in full before anything is saved.
 
-**Favourites** (★, v7.8): in Configure, press **F** on an action family, or on an action inside Music & Sound, Mouse Actions, Fedora System or Browser, to star it (F again unstars); starred ones come first. **★ Favourites** at the top of the family list lists every starred action and opens its usual setup. Stars are kept in the config, apart from assignments, so removing an assignment never touches them. Press **F** on a profile in App profiles to star it. Stars v7 kept on control slots move once, the first time Configure opens.
+**Favourites** (★, v7.8). In Configure, press **F** on a family or an action row to star it. Press **F** again to unstar it. Starred rows come first. **★ Favourites** opens each action's usual setup and marks missing rows as unavailable. Stars live in the config and survive assignment removal. Press **F** in App profiles to star a profile. Stars from v7 control slots move the first time Configure opens.
 
 **Presets** save the whole setup by name and load it later, for one program or all programs. **Ask Claude for a profile** runs your installed `claude -p` and validates the reply like an import, then shows it for review; nothing is saved unvalidated and no API key is stored.
 
