@@ -4262,7 +4262,7 @@ impl Terminal {
                 if let Some(name) = pad.connected().first() {
                     self.notice = format!("Xbox controller ready: {name}");
                 }
-                self.xbox_link = link_text(pad.link());
+                self.xbox_link = link_text(&pad.details());
                 self.gamepad = Some(pad);
                 self.open_button_light();
             }
@@ -5357,6 +5357,12 @@ impl Terminal {
         }
         if self.status_at.elapsed() >= STATUS_EVERY {
             self.status_at = Instant::now();
+            // v7.8 ticket 09: the battery and profile change while it runs; read while shown.
+            if self.last_xbox {
+                if let Some(pad) = &self.gamepad {
+                    self.xbox_link = link_text(&pad.details());
+                }
+            }
             self.refresh_agent_states();
             self.probe_status();
             if self.follow_apps {
@@ -5595,8 +5601,8 @@ impl Terminal {
                 ) if crate::gamepad::is_layer_key(control) => {}
                 crate::gamepad::Change::Event(event) => self.handle_events(vec![event])?,
                 crate::gamepad::Change::Connected(name) => {
-                    self.xbox_link =
-                        (self.gamepad.as_ref()).map_or_else(String::new, |p| link_text(p.link()));
+                    self.xbox_link = (self.gamepad.as_ref())
+                        .map_or_else(String::new, |p| link_text(&p.details()));
                     self.gamepad_transition(format!(
                         "Xbox controller connected: {name}; buttons fire on their next press"
                     ))?;
@@ -12707,13 +12713,9 @@ fn xbox_header(name: &str, program: u8, link: &str) -> String {
     let label = if name.is_empty() { &number } else { name };
     format!("Xbox · {label}{link}")
 }
-/// " · USB dongle · xone", " · Bluetooth", or "" when nothing is known.
-fn link_text((connection, driver): (Option<&str>, Option<String>)) -> String {
-    [connection.map(str::to_owned), driver]
-        .into_iter()
-        .flatten()
-        .map(|part| format!(" · {part}"))
-        .collect()
+/// " · USB dongle · xone · battery 62%", " · Bluetooth", or "" when nothing is known.
+fn link_text(parts: &[String]) -> String {
+    parts.iter().map(|part| format!(" · {part}")).collect()
 }
 
 fn lock_on(profile: Option<&str>) -> mappings::Lock {
@@ -15503,7 +15505,7 @@ mod tests {
     /// link and driver as sysfs gives them (gamepad::link_and_driver_come_from_sysfs).
     #[test]
     fn xbox_header_names_program_link_and_driver() {
-        let link = |c: &'static str, d: &str| link_text((Some(c), Some(d.into())));
+        let link = |c: &str, d: &str| link_text(&[c.into(), d.into()]);
         assert_eq!(
             xbox_header("Apps", 1, &link("USB", "xone")),
             "Xbox · Apps · USB · xone"
@@ -15516,14 +15518,32 @@ mod tests {
             xbox_header("Browser", 2, &link("Bluetooth", "xpadneo")),
             "Xbox · Browser · Bluetooth · xpadneo"
         );
+        assert_eq!(xbox_header("", 3, &link_text(&[])), "Xbox · Program 3");
         assert_eq!(
-            xbox_header("", 3, &link_text((None, None))),
-            "Xbox · Program 3"
-        );
-        assert_eq!(
-            xbox_header("Program 4", 4, &link_text((Some("Bluetooth"), None))),
+            xbox_header("Program 4", 4, &link_text(&["Bluetooth".into()])),
             "Xbox · Program 4 · Bluetooth"
         );
+        // v7.8 ticket 09: the battery (charging) and xpadneo's profile follow, when reported.
+        let with = |power, profile| {
+            let mut parts = vec!["Bluetooth".to_string(), "xpadneo".into()];
+            parts.extend(crate::gamepad::power_parts(power, profile));
+            xbox_header("Apps", 1, &link_text(&parts))
+        };
+        use crate::gamepad::PowerInfo::*;
+        assert_eq!(
+            with(Discharging(62), None),
+            "Xbox · Apps · Bluetooth · xpadneo · battery 62%"
+        );
+        assert_eq!(
+            with(Charging(40), Some(2)),
+            "Xbox · Apps · Bluetooth · xpadneo · battery 40% charging · profile 2"
+        );
+        assert_eq!(
+            with(Charged, Some(0)),
+            "Xbox · Apps · Bluetooth · xpadneo · battery full · profile 0"
+        );
+        assert_eq!(with(Unknown, None), "Xbox · Apps · Bluetooth · xpadneo");
+        assert_eq!(with(Wired, None), "Xbox · Apps · Bluetooth · xpadneo");
     }
 
     /// v7.7 ticket 267: like the Akai's, the Xbox list holds only the Xbox program in use

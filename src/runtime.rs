@@ -1480,7 +1480,7 @@ mod tests {
             "Session: wayland / GNOME",
             "uinput read/write: ready (no keyboard created)",
             "MIDI identity: MPK mini 3:MPK mini 3 MIDI 1 32:0 (no input opened)",
-            "Xbox controllers: Microsoft Xbox One (Bluetooth · xpadneo)",
+            "Xbox controllers: Xbox Wireless Controller (Bluetooth · xpadneo · battery 62% charging · profile 1 · mapped as Microsoft Xbox One)",
             "Xbox headset audio: unavailable over Bluetooth · use the USB cable with xone",
             "Keyboard light: available (Razer BlackWidow: Scroll Lock) · on in Status light patterns",
             "Keyboard G light: unavailable: lighting it turns on Razer game mode, which turns off the Super key",
@@ -1497,7 +1497,7 @@ mod tests {
         for line in [
             "🟢 VibeConsole           0.7.8 (v7.8 08, commit abc1234) · installed build matches · login service running",
             "🟢 Akai MPK mini 3       connected · program 1 verified",
-            "🟢 Xbox controller       Microsoft Xbox One · Bluetooth · xpadneo",
+            "🟢 Xbox controller       Xbox Wireless Controller · Bluetooth · xpadneo · battery 62% charging · profile 1 · mapped as Microsoft Xbox One",
             "🟡 Xbox headset audio    unavailable over Bluetooth · use the USB cable with xone",
             "🟢 uinput (keys)         ready (no keyboard created)",
             "🟢 Sound (wpctl)         available",

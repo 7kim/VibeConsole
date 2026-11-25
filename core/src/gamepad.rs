@@ -905,13 +905,14 @@ pub fn link(bus: u16, drivers: &[String]) -> (Option<&'static str>, Option<Strin
     };
     (connection, drivers.first().cloned())
 }
-/// [`link`] for the controller named `name` with these ids, read from `sys` (`/sys`).
-pub fn link_at(
+/// The sysfs input folder (canonical) of the controller named `name` with these ids, and its
+/// bus. v7.8 tickets 06, 09.
+fn input_dir(
     sys: &std::path::Path,
     name: &str,
     vendor: u16,
     product: u16,
-) -> (Option<&'static str>, Option<String>) {
+) -> Option<(std::path::PathBuf, u16)> {
     let read = |dir: &std::path::Path, file: &str| {
         std::fs::read_to_string(dir.join(file)).map(|s| s.trim().to_owned())
     };
@@ -933,15 +934,79 @@ pub fn link_at(
         let Ok(dir) = std::fs::canonicalize(&input) else {
             continue;
         };
-        let drivers = dir
-            .ancestors()
-            .filter_map(|a| std::fs::read_link(a.join("driver")).ok())
-            .filter_map(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
-            .filter(|d| !d.starts_with("xone-gip-")) // xone's per-device part, not the link
-            .collect::<Vec<_>>();
-        return link(hex(&input, "id/bustype").unwrap_or(0), &drivers);
+        return Some((dir, hex(&input, "id/bustype").unwrap_or(0)));
     }
-    (None, None)
+    None
+}
+/// [`link`] for the controller named `name` with these ids, read from `sys` (`/sys`).
+pub fn link_at(
+    sys: &std::path::Path,
+    name: &str,
+    vendor: u16,
+    product: u16,
+) -> (Option<&'static str>, Option<String>) {
+    match input_dir(sys, name, vendor, product) {
+        Some((dir, bus)) => {
+            let drivers = dir
+                .ancestors()
+                .filter_map(|a| std::fs::read_link(a.join("driver")).ok())
+                .filter_map(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .filter(|d| !d.starts_with("xone-gip-")) // xone's per-device part, not the link
+                .collect::<Vec<_>>();
+            link(bus, &drivers)
+        }
+        None => (None, None),
+    }
+}
+/// v7.8 ticket 09: xpadneo's selected profile (`ABS_PROFILE`, its raw value) when the device
+/// reports one; read only, from the controller's event device.
+pub fn profile_at(sys: &std::path::Path, name: &str, vendor: u16, product: u16) -> Option<i32> {
+    const ABS_PROFILE: u16 = 0x21;
+    let (dir, _) = input_dir(sys, name, vendor, product)?;
+    let event = std::fs::read_dir(&dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find(|n| n.starts_with("event"))?;
+    let device = evdev::Device::open(std::path::Path::new("/dev/input").join(event)).ok()?;
+    let reports = device
+        .supported_absolute_axes()
+        .is_some_and(|a| a.contains(evdev::AbsoluteAxisCode(ABS_PROFILE)));
+    reports
+        .then(|| device.get_abs_state().ok())??
+        .get(usize::from(ABS_PROFILE))
+        .map(|a| a.value)
+}
+pub use gilrs::PowerInfo;
+/// v7.8 ticket 09: what follows the link: the battery (when the driver reports a level) and
+/// xpadneo's profile (when there is one). Wired or unknown power says nothing.
+pub fn power_parts(power: gilrs::PowerInfo, profile: Option<i32>) -> Vec<String> {
+    let battery = match power {
+        gilrs::PowerInfo::Discharging(n) => Some(format!("battery {n}%")),
+        gilrs::PowerInfo::Charging(n) => Some(format!("battery {n}% charging")),
+        gilrs::PowerInfo::Charged => Some("battery full".into()),
+        gilrs::PowerInfo::Wired | gilrs::PowerInfo::Unknown => None,
+    };
+    battery
+        .into_iter()
+        .chain(profile.map(|p| format!("profile {p}")))
+        .collect()
+}
+/// A controller's link, driver, battery and profile, as the header and doctor show them.
+fn details(pad: gilrs::Gamepad<'_>) -> Vec<String> {
+    let sys = std::path::Path::new("/sys");
+    let ids = (
+        pad.os_name(),
+        pad.vendor_id().unwrap_or(0),
+        pad.product_id().unwrap_or(0),
+    );
+    let (link, driver) = link_at(sys, ids.0, ids.1, ids.2);
+    let profile = profile_at(sys, ids.0, ids.1, ids.2);
+    [link.map(str::to_owned), driver]
+        .into_iter()
+        .flatten()
+        .chain(power_parts(pad.power_info(), profile))
+        .collect()
 }
 /// v7 ticket 129: which driver holds the controller now, from `bound_drivers`.
 pub fn driver_in_use(bound: &[&str]) -> Option<&'static str> {
@@ -1539,19 +1604,12 @@ impl Pad {
             .map(|(_, pad)| pad.name().to_owned())
             .collect()
     }
-    /// v7.8 ticket 06: the first controller's connection and driver, from sysfs.
-    pub fn link(&self) -> (Option<&'static str>, Option<String>) {
+    /// v7.8 tickets 06, 09: the first controller's connection, driver, battery and profile.
+    pub fn details(&self) -> Vec<String> {
         self.gilrs
             .gamepads()
             .find(|(_, pad)| crate::ours(pad.os_name()))
-            .map_or((None, None), |(_, pad)| {
-                link_at(
-                    std::path::Path::new("/sys"),
-                    pad.os_name(),
-                    pad.vendor_id().unwrap_or(0),
-                    pad.product_id().unwrap_or(0),
-                )
-            })
+            .map_or_else(Vec::new, |(_, pad)| details(pad))
     }
     /// Each controller's name with its connection (v7 ticket 107), for `doctor`.
     pub fn connections(&self) -> Vec<String> {
@@ -1559,17 +1617,8 @@ impl Pad {
             .gamepads()
             .filter(|(_, pad)| crate::ours(pad.os_name()))
             .map(|(_, pad)| {
-                // v7.8 ticket 08: the link and driver from sysfs, else the bus as before.
-                let (link, driver) = link_at(
-                    std::path::Path::new("/sys"),
-                    pad.os_name(),
-                    pad.vendor_id().unwrap_or(0),
-                    pad.product_id().unwrap_or(0),
-                );
-                let mut parts = [link.map(str::to_owned), driver]
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>();
+                // v7.8 tickets 08, 09: link, driver, battery, profile; else the bus as before.
+                let mut parts = details(pad);
                 if parts.is_empty() {
                     parts.push(connection(pad.uuid()));
                 }
