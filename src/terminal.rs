@@ -4411,6 +4411,7 @@ impl Terminal {
                 let level = crate::status::busy_index(&states).map_or(0, |i| p.rgb_brightness[i]);
                 (step(crate::status::rgb_for(&states, &set)), level, set.rest)
             }),
+            keyboard.map(|p| p.rgb_set(0).rest),
             |rest| RgbKeyboards::open(std::path::Path::new(crate::keyboard::RAZER), rest),
             "RGB keyboard",
         );
@@ -4438,6 +4439,7 @@ impl Terminal {
                 accessory
                     .filter(|_| running)
                     .map(|set| (step(crate::status::rgb_for(&states, &set)), 255, set.rest)),
+                accessory.map(|set| set.rest),
                 |rest| {
                     let driver = std::path::Path::new(crate::keyboard::RAZER_ACCESSORY);
                     RgbKeyboards::open_accessory(driver, rest, label, model)
@@ -9679,6 +9681,7 @@ fn drive_rgb(
     ),
     switched: bool,
     wanted: Option<(Option<crate::status::Rgb>, u8, crate::status::Rgb)>,
+    resting: Option<crate::status::Rgb>,
     open: impl FnOnce(crate::status::Rgb) -> Result<crate::keyboard::RgbKeyboards>,
     label: &str,
 ) {
@@ -9687,6 +9690,10 @@ fn drive_rgb(
     }
     let Some((effect, brightness, rest)) = wanted else {
         if let Some(rgb) = slot {
+            // v7.7 ticket 271: a resting effect changed meanwhile goes on at once (once).
+            if let Some(rest) = resting {
+                rgb.rest = rest;
+            }
             rgb.restore();
         }
         return;
@@ -25118,6 +25125,78 @@ mod tests {
     /// speakers and mousepad as the same static frame at the same tick, from one clock
     /// counted from when thinking began, repeating every `period=`; the G502 gets that period;
     /// pause stops the frames and the resting effect goes back on every device.
+    /// v7.7 ticket 271: a resting effect changed while output is paused (or a menu holds it)
+    /// is written to every Razer device at once, once, without a Resume.
+    #[test]
+    fn a_changed_resting_effect_shows_at_once_while_paused() {
+        use crate::keyboard::RgbKeyboards;
+        use crate::status::Rgb;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-rgb-rest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let effects = ["none", "spectrum", "wave", "static", "breath", "reactive"];
+        let device = |path: PathBuf, name: &str| {
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("device_type"), format!("{name}\n")).unwrap();
+            std::fs::write(path.join("matrix_brightness"), "200\n").unwrap();
+            for f in effects {
+                std::fs::write(path.join(format!("matrix_effect_{f}")), "").unwrap();
+            }
+            path
+        };
+        let kbd = device(
+            dir.join("razerkbd/0003:1532:021A.0001"),
+            "Razer BlackWidow X Chroma",
+        );
+        let nommo = device(dir.join("acc/0003:1532:0517.000A"), "Razer Nommo Chroma");
+        let firefly = device(dir.join("acc/0003:1532:0C04.0001"), "Razer Firefly V2");
+        let all = [&kbd, &nommo, &firefly];
+        let breaths = || all.map(|d| std::fs::read(d.join("matrix_effect_breath")).unwrap());
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        ui.rgb = Some(RgbKeyboards::open(&dir.join("razerkbd"), Rgb::SPECTRUM).unwrap());
+        let acc = dir.join("acc");
+        ui.accessories[0] = Some(
+            RgbKeyboards::open_accessory(&acc, Rgb::SPECTRUM, "Speakers RGB", "Nommo").unwrap(),
+        );
+        ui.accessories[1] = Some(
+            RgbKeyboards::open_accessory(&acc, Rgb::SPECTRUM, "Mousepad RGB", "Firefly").unwrap(),
+        );
+        let mut patterns = crate::status::DevicePatterns::default();
+        for d in &mut patterns.rgb_devices[..3] {
+            d.on = true;
+        }
+        patterns.rgb_in_step = false;
+        ui.device_lights = Some(patterns.clone());
+        ui.output = Some(crate::keyboard::Output::recording(&[]).unwrap());
+        ui.suspended = false;
+        ui.show_rgb_at(Instant::now()); // running, idle: spectrum rests on all three
+        ui.pause_by("key").unwrap();
+        assert!(ui.suspended);
+        assert_eq!(breaths(), [Vec::<u8>::new(), Vec::new(), Vec::new()]);
+        // Changed in Status light patterns while paused: Breath · Blue.
+        patterns.rgb_shared.rest = Rgb::Breath([0, 0, 255], Default::default());
+        ui.device_lights = Some(patterns);
+        ui.show_rgb_at(Instant::now());
+        let blue = vec![0u8, 0, 255];
+        assert_eq!(
+            breaths(),
+            [blue.clone(), blue.clone(), blue.clone()],
+            "written at once"
+        );
+        for d in all {
+            std::fs::write(d.join("matrix_effect_breath"), "").unwrap();
+        }
+        ui.show_rgb_at(Instant::now());
+        assert_eq!(
+            breaths(),
+            [Vec::<u8>::new(), Vec::new(), Vec::new()],
+            "once, not every tick"
+        );
+        drop(ui);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn rgb_in_step_writes_one_frame_to_every_device_and_stops_on_pause() {
         use crate::status::{Rgb, Timing};
