@@ -173,6 +173,9 @@ pub enum Action {
     /// v7.8 ticket 10: a media key, tapped through the virtual keyboard; the desktop hands it
     /// to whatever player is playing (nothing happens when none is).
     Media(Media),
+    /// v7.8 ticket 25: switch to the sound combo saved by this name (Settings → Sound); read
+    /// at each press, so an edit reaches every control using it.
+    SoundCombo(String),
     /// v7.8 ticket 12: a Fedora System action: one fixed command (or the Print key).
     System(System),
     /// v7.8 ticket 14: a browser's tab keys (sent only while it is focused), or a URL opened
@@ -1066,6 +1069,7 @@ impl Action {
             }
             Self::OutputMute => "output-mute".into(),
             Self::Media(media) => format!("media:{}", media.word()),
+            Self::SoundCombo(name) => format!("sound-combo:{name}"),
             Self::System(system) => format!("system:{}", system.word()),
             Self::Browser { browser, what } => {
                 format!("browser:{}:{}", browser.word(), what.word())
@@ -1224,6 +1228,13 @@ impl Action {
                     .ok_or("media action must be play-pause, next, previous or stop")?,
             ),
             "nothing" => Self::Nothing,
+            _ if value.starts_with("sound-combo:") => {
+                let name = &value["sound-combo:".len()..];
+                if !crate::mappings::simple_name(name) {
+                    return Err("a sound combo's name is letters, digits, ., - and _".into());
+                }
+                Self::SoundCombo(name.into())
+            }
             _ if value.starts_with("saved-sequence:") => {
                 let name = &value["saved-sequence:".len()..];
                 if !crate::mappings::simple_name(name) {
@@ -1381,6 +1392,7 @@ impl Action {
             ),
             Self::OutputMute => "Toggle default output mute".into(),
             Self::Media(media) => format!("Media key: {}", media.label()),
+            Self::SoundCombo(name) => format!("Use sound combo {name}"),
             Self::System(system) => system.label(),
             Self::Browser { browser, what } => format!("{}: {}", browser.name(), what.label()),
             Self::Playwright(action) => action.label(),
@@ -3293,6 +3305,13 @@ fn perform(
             tap(vec![media.key()])?;
             Ok(format!("{} sent", media.label()))
         }
+        // v7.8 ticket 25: the combo as saved now; pw-dump and wpctl, one argument each.
+        Action::SoundCombo(name) => {
+            let config = crate::mappings::read_config(&crate::mappings::config_path()?)?;
+            let combo = (config.sound_combos.iter().find(|c| c.name == *name))
+                .ok_or_else(|| format!("sound combo {name}: unavailable: it was deleted"))?;
+            crate::sound::apply(combo, |program, args| command(program, args, &cancelled))
+        }
         Action::Browser { browser, what } => match what {
             BrowserDo::OpenUrl(url) => {
                 let installed = |p: &str| crate::emulated().is_some() || on_path(p);
@@ -3635,6 +3654,7 @@ impl Action {
             Self::OutputMute => "output-mute",
             Self::MicrophoneMute => "microphone-mute",
             Self::Media(_) => "media",
+            Self::SoundCombo(_) => "sound-combo",
             Self::System(_) => "system",
             Self::Browser { .. } => "browser",
             Self::Playwright(_) => "playwright",

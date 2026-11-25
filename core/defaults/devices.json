@@ -1,5 +1,5 @@
 {
-  "version": 4,
+  "version": 5,
   "midi_devices": [],
   "midi_active": null,
   "idle": {
@@ -54,6 +54,7 @@
     "",
     ""
   ],
+  "sound_combos": [],
   "tuning": {
     "dead_zone": 15,
     "trigger": 30,

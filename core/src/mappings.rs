@@ -637,6 +637,8 @@ pub struct Config {
     pub sequences: Vec<(String, Vec<crate::actions::Action>)>,
     /// v7.7 ticket 149 (config v33): the screen's theme and views, and what the AI tab asks.
     pub look: Look,
+    /// v7.8 ticket 25 (devices.json v5): named speaker, mic and card-mode combos.
+    pub sound_combos: Vec<crate::sound::Combo>,
 }
 /// The 14 themes (v7.7 spec, Themes); the first is the default.
 pub const THEMES: [&str; 14] = [
@@ -2248,6 +2250,7 @@ impl Config {
                 agent_model: String::new(),
                 notice: None,
             },
+            sound_combos: Vec::new(),
         }
     }
 }
@@ -3614,6 +3617,7 @@ pub(crate) fn parse_config(contents: &str) -> Result<Config> {
         favourites,
         sequences,
         look,
+        sound_combos: Vec::new(), // the TSV never held them
     })
 }
 
@@ -3787,6 +3791,16 @@ pub fn serialize_config(config: &Config) -> Result<String> {
     validate_variables(&config.env, "startup")?;
     validate_variables(&config.vars, "user")?;
     config.validate_references()?;
+    // v7.8 ticket 25: each sound combo is valid and named once.
+    for (i, combo) in config.sound_combos.iter().enumerate() {
+        combo.validate()?;
+        if config.sound_combos[..i]
+            .iter()
+            .any(|c| c.name == combo.name)
+        {
+            return Err(format!("a second sound combo named {}", combo.name).into());
+        }
+    }
     let mut contents = format!(
         "vibeconsole-mappings-v{CONFIG_VERSION}\nidle\t{}\t{}\t{}\n",
         opt_text(config.idle.octave),

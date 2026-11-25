@@ -20,12 +20,13 @@ pub const LIGHTS_VERSION: u64 = 5;
 /// v7.8: mappings.json's own version: 2 holds v7.8's new action words (ticket 10: `media:…`);
 /// a version 1 file loads as it is (it has none of them). An older VibeConsole refuses a
 /// version 2 file by its version, not by an unknown word.
-/// v3 adds a trigger's optional hard-press mapping.
-pub const MAPPINGS_VERSION: u64 = 3;
+/// v3 adds a trigger's optional hard-press mapping. v4 (ticket 25) adds `sound-combo:<name>`.
+pub const MAPPINGS_VERSION: u64 = 4;
 /// devices.json: v2 (v7.8 ticket 23) adds the tuning's `layer_button`; v1 loads with LB.
 /// v3 (v7.8 ticket 24) adds `rumble_strength` and `rumble_ms`; older ones load medium, 300 ms.
 /// v4 adds the hard point. Older files keep their fire point and get a compatible default.
-pub const DEVICES_VERSION: u64 = 4;
+/// v5 (v7.8 ticket 25) adds `sound_combos`; older files load none.
+pub const DEVICES_VERSION: u64 = 5;
 /// The files, in the order they are applied: each one's references (variables, MIDI
 /// devices, idle settings) are in place before it is checked.
 pub const FILES: [&str; 5] = [
@@ -605,6 +606,13 @@ fn devices(config: &Config) -> Value {
         "idle": idle_json(config.idle),
         "program_idle": programs,
         "xbox_programs": config.xbox_names,
+        "sound_combos": config.sound_combos.iter().map(|c| json!({
+            "name": c.name,
+            "speaker": c.speaker,
+            "mic": c.mic,
+            "card": c.mode.as_ref().map(|m| &m.0),
+            "mode": c.mode.as_ref().map(|m| &m.1),
+        })).collect::<Vec<_>>(),
         "tuning": {
             "dead_zone": t.dead_zone,
             "trigger": t.trigger,
@@ -630,6 +638,7 @@ fn apply_devices(at: &Obj, config: &mut Config) -> Result<()> {
         "idle",
         "program_idle",
         "xbox_programs",
+        "sound_combos",
         "tuning",
     ])?;
     let strings = |key: &str| -> Result<Vec<String>> {
@@ -732,12 +741,58 @@ fn apply_devices(at: &Obj, config: &mut Config) -> Result<()> {
         },
     };
     config.tuning = at.check("tuning", tuning.validate())?;
+    config.sound_combos = match at.int::<u64>("version")? {
+        ..=4 => Vec::new(),
+        _ => sound_combos(at)?,
+    };
     config.midi_devices = midi_devices;
     config.midi_active = midi_active;
     config.idle = idle_settings;
     config.program_idle = program_idle;
     config.xbox_names = xbox_names;
     Ok(())
+}
+
+/// v7.8 ticket 25: devices.json's `sound_combos`, each checked, names once each.
+fn sound_combos(at: &Obj) -> Result<Vec<crate::sound::Combo>> {
+    let mut combos: Vec<crate::sound::Combo> = Vec::new();
+    for (i, value) in at.list("sound_combos")?.iter().enumerate() {
+        let key = format!("sound_combos[{i}]");
+        let err = |what: &str| at.err(&key, what);
+        let field = |name: &str| -> Result<Option<String>> {
+            match &value[name] {
+                Value::Null => Ok(None),
+                Value::String(s) => Ok(Some(s.clone())),
+                _ => Err(err(&format!("`{name}` must be a string"))),
+            }
+        };
+        let need = |name: &str| field(name)?.ok_or_else(|| err(&format!("needs `{name}`")));
+        let extra = value
+            .as_object()
+            .ok_or_else(|| err("must be an object"))?
+            .keys()
+            .find(|k| !["name", "speaker", "mic", "card", "mode"].contains(&k.as_str()));
+        if let Some(k) = extra {
+            return Err(err(&format!("unknown field `{k}`")));
+        }
+        let mode = match (field("card")?, field("mode")?) {
+            (Some(card), Some(mode)) => Some((card, mode)),
+            (None, None) => None,
+            _ => return Err(err("`card` and `mode` go together")),
+        };
+        let combo = crate::sound::Combo {
+            name: need("name")?,
+            speaker: need("speaker")?,
+            mic: need("mic")?,
+            mode,
+        };
+        at.check(&key, combo.validate())?;
+        if combos.iter().any(|c| c.name == combo.name) {
+            return Err(err(&format!("a second combo named {}", combo.name)));
+        }
+        combos.push(combo);
+    }
+    Ok(combos)
 }
 
 // ---- mappings.json (ticket 196): what each control does: mappings, profiles and the lock,
@@ -1491,6 +1546,69 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7.8 ticket 25: devices.json v5 keeps the sound combos; a v4 file (none) loads none; a
+    /// bad name or a combo named twice is refused and the file kept; a stray field is named.
+    #[test]
+    fn sound_combos_save_load_and_older_files_have_none() {
+        let dir = folder("sound-combos");
+        let path = dir.join("mappings.tsv");
+        let mut config = Config::default();
+        config.sound_combos = vec![
+            crate::sound::Combo {
+                name: "headset".into(),
+                speaker: "alsa_output.hyperx".into(),
+                mic: "alsa_input.hyperx".into(),
+                mode: Some((
+                    "alsa_card.hyperx".into(),
+                    "output:analog-stereo+input:mono-fallback".into(),
+                )),
+            },
+            crate::sound::Combo {
+                name: "desk".into(),
+                speaker: "alsa_output.nommo".into(),
+                mic: "alsa_input.webcam".into(),
+                mode: None,
+            },
+        ];
+        mappings::save_config(&path, &config).unwrap();
+        let text = fs::read_to_string(dir.join("devices.json")).unwrap();
+        let mut saved: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(saved["version"], 5);
+        assert_eq!(saved["sound_combos"][0]["card"], "alsa_card.hyperx");
+        assert_eq!(saved["sound_combos"][1]["mode"], Value::Null);
+        assert_eq!(
+            mappings::load_config(&path).unwrap().sound_combos,
+            config.sound_combos
+        );
+        for bad in ["../up", "desk"] {
+            let mut next = config.clone();
+            next.sound_combos[0].name = bad.into();
+            assert!(mappings::save_config(&path, &next).is_err(), "{bad}");
+            assert_eq!(
+                fs::read_to_string(dir.join("devices.json")).unwrap(),
+                text,
+                "{bad}"
+            );
+        }
+        saved["sound_combos"][0]["volume"] = json!(5);
+        fs::write(dir.join("devices.json"), saved.to_string()).unwrap();
+        let error = mappings::load_config(&path).unwrap_err().to_string();
+        assert!(
+            error.contains("devices.json") && error.contains("volume"),
+            "{error}"
+        );
+        saved["version"] = json!(4);
+        saved.as_object_mut().unwrap().remove("sound_combos");
+        fs::write(dir.join("devices.json"), saved.to_string()).unwrap();
+        assert!(
+            mappings::load_config(&path)
+                .unwrap()
+                .sound_combos
+                .is_empty()
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     /// v7.8 ticket 23: devices.json v2 keeps the layer 2 button; a v1 file loads with LB;
     /// with RB as the layer button LB is mappable and RB is refused by name, as are the Xbox
     /// button, View and Menu as the layer button. A refused save keeps the files.
@@ -1982,8 +2100,9 @@ mod tests {
         config.mappings = vec![volume.clone()];
         mappings::save_config(&path, &config).unwrap();
         let saved = fs::read_to_string(dir.join("mappings.json")).unwrap();
-        assert!(saved.contains("\"version\": 3"), "{saved}");
-        let old = saved.replace("\"version\": 3", "\"version\": 1");
+        let current = format!("\"version\": {MAPPINGS_VERSION}");
+        assert!(saved.contains(&current), "{saved}");
+        let old = saved.replace(&current, "\"version\": 1");
         fs::write(dir.join("mappings.json"), &old).unwrap();
         assert_eq!(
             mappings::load_config(&path).unwrap().mappings,
@@ -1996,7 +2115,7 @@ mod tests {
         let saved = fs::read_to_string(dir.join("mappings.json")).unwrap();
         assert!(saved.contains("\"media:next\""), "{saved}");
         assert_eq!(mappings::load_config(&path).unwrap().mappings, [media]);
-        let newer = saved.replace("\"version\": 3", "\"version\": 4");
+        let newer = saved.replace(&current, &format!("\"version\": {}", MAPPINGS_VERSION + 1));
         fs::write(dir.join("mappings.json"), newer).unwrap();
         let error = mappings::load_config(&path).unwrap_err().to_string();
         assert!(error.contains("newer VibeConsole"), "{error}");

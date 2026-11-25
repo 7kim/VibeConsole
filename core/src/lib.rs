@@ -11,6 +11,7 @@ pub mod motion;
 pub mod owner;
 pub mod recording;
 pub mod screen;
+pub mod sound;
 pub mod speed;
 pub mod status;
 pub mod usage;
