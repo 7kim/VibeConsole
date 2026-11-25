@@ -4774,7 +4774,7 @@ impl Terminal {
             Key::Character(c) => char::from(*c).to_string(),
             _ => String::new(),
         };
-        // Ticket 38: a combination (RT's Ctrl+Tab) arrives as its last key when the terminal
+        // Ticket 38: a combination (RB's built-in Ctrl+Tab) arrives as its last key when the terminal
         // drops the modifiers, or as the form its modifiers give it: a CSI `u`/`~` report
         // (any modifier), Shift+Tab, Ctrl+letter's control byte, Alt's ESC prefix.
         let echo = (self.xbox_sent.as_ref()).is_some_and(|(sent, at)| {
@@ -21205,7 +21205,7 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// v7.8 ticket 38: RT's built-in Ctrl+Tab arrives back as plain Tab (most terminals drop
+    /// v7.8 ticket 38: RB's built-in Ctrl+Tab arrives back as plain Tab (most terminals drop
     /// the Ctrl) or as a key the terminal can't name (a CSI `9;5u`): either echo keeps the
     /// Xbox hints, once; a second key, or one too late, brings the keyboard's back.
     #[test]
@@ -21213,28 +21213,28 @@ mod tests {
         let (dir, mut ui, _ran, _) = configure_session("xbox-combo-echo");
         ui.refresh_hints(&mappings::load_config(&dir.join("mappings.tsv")).unwrap());
         let keyboard = ui.screen("").hints;
-        let rt = crate::gamepad::default_layout()
+        let rb = crate::gamepad::default_layout()
             .into_iter()
             .find(|m| m.keys == ["Ctrl", "Tab"])
-            .expect("RT sends Ctrl+Tab")
+            .expect("RB sends Ctrl+Tab")
             .control;
         for echo in [Key::Tab, Key::Other] {
-            ui.xbox_used(&Event::Press(rt));
+            ui.xbox_used(&Event::Press(rb));
             let xbox = ui.screen("").hints;
             assert_ne!(xbox, keyboard);
             ui.keyboard_used(&echo);
-            assert_eq!(ui.screen("").hints, xbox, "{echo:?} is RT's echo");
+            assert_eq!(ui.screen("").hints, xbox, "{echo:?} is RB's echo");
             ui.keyboard_used(&echo);
             assert_eq!(ui.screen("").hints, keyboard, "only one echo per press");
         }
         // Another key is typed, not an echo: Ctrl+Tab never arrives as Esc or Shift+Tab.
         for typed in [Key::Down, Key::Escape, Key::BackTab] {
-            ui.xbox_used(&Event::Press(rt));
+            ui.xbox_used(&Event::Press(rb));
             ui.keyboard_used(&typed);
             assert_eq!(ui.screen("").hints, keyboard, "{typed:?} was typed");
         }
         // The echo window is 250 ms.
-        ui.xbox_used(&Event::Press(rt));
+        ui.xbox_used(&Event::Press(rb));
         std::thread::sleep(Duration::from_millis(260));
         ui.keyboard_used(&Key::Tab);
         assert_eq!(ui.screen("").hints, keyboard, "too late to be an echo");
