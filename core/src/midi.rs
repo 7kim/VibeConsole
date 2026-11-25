@@ -391,7 +391,7 @@ fn deliver(senders: &mut Senders, stamp_us: u64, message: &[u8]) {
             }
         }
     }
-    crate::wake::wake(); // v7.7 ticket 225: the terminal handles it now, not in 50 ms
+    crate::wake::wake(); // v7.7 ticket 225, v7.8 ticket 27: handled now, not at the next turn
 }
 
 /// The callback instant measures handling delay. Only differences between midir stamps

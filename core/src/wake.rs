@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// v7.7 ticket 249: a byte is already waiting, so more wakes (a held stick reports at its own
-/// rate) write nothing until the terminal drains it: at most one wake per drain.
+/// rate) write nothing until the waiting run drains it: at most one wake per drain.
 static PENDING: AtomicBool = AtomicBool::new(false);
 
 /// The pipe's read and write ends, made non-blocking; None if the pipe couldn't be made.
@@ -16,20 +16,24 @@ static PIPE: OnceLock<Option<[RawFd; 2]>> = OnceLock::new();
 
 /// v7.7 ticket 250: why the Xbox watcher couldn't start, once it has tried.
 static WATCHER: OnceLock<String> = OnceLock::new();
-/// Why Xbox presses can't wake the wait (they then show within 50 ms), if the watcher failed.
+/// Why Xbox presses can't wake the wait (then handled within 50 ms in a terminal run, 20 ms
+/// in the login service), if the watcher failed.
 pub fn watcher_error() -> Option<&'static str> {
     WATCHER.get().map(String::as_str)
 }
 /// v7.7 ticket 250: the line doctor and System show: `Ok` if gilrs opened, else why not.
 pub fn line(opened: std::result::Result<(), String>) -> String {
     match opened {
-        Ok(()) => "Xbox event wake: available (a terminal run shows presses at once)".into(),
-        Err(why) => format!("Xbox presses show within 50 ms (event wake unavailable: {why})"),
+        Ok(()) => "Xbox event wake: available (presses are handled as they arrive)".into(),
+        Err(why) => format!(
+            "Xbox presses are handled within 50 ms in a terminal run, 20 ms in the login service (event wake unavailable: {why})"
+        ),
     }
 }
 /// The read end to poll beside stdin. The first call makes the pipe and starts the Xbox
 /// watcher: a thread with its own read-only gilrs that blocks until any controller event
-/// (none while idle, so no busy loop) and wakes the wait.
+/// (none while idle, so no busy loop; gilrs's own force-feedback thread ticks every 50 ms)
+/// and wakes the wait.
 pub fn fd() -> Option<RawFd> {
     PIPE.get_or_init(|| {
         let mut ends = [0; 2];
@@ -85,7 +89,12 @@ pub fn wait(timeout: std::time::Duration) -> bool {
     };
     let ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
     // SAFETY: one valid pollfd; no ownership transfer. An interrupted poll is a short turn.
-    let woken = unsafe { libc::poll(&mut poll, 1, ms) } == 1 && poll.revents & libc::POLLIN != 0;
+    let ready = unsafe { libc::poll(&mut poll, 1, ms) };
+    if ready < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+        std::thread::sleep(timeout); // a failing poll never spins the loop
+        return false;
+    }
+    let woken = ready == 1 && poll.revents & libc::POLLIN != 0;
     if woken {
         drain();
     }
@@ -99,7 +108,7 @@ pub fn drain() {
         // SAFETY: reads into valid storage from our own non-blocking pipe; stops at empty.
         while unsafe { libc::read(*read, buffer.as_mut_ptr().cast(), buffer.len()) } > 0 {}
         // ponytail: cleared after the read, so a wake landing between the two is dropped and
-        // that event waits for the 50 ms timeout at worst; clearing first could lose every
+        // that event waits for the wait's timeout at worst (50 ms terminal, 20 ms service); clearing first could lose every
         // later wake (the flag set, the pipe empty).
         PENDING.store(false, Ordering::Release);
     }
@@ -145,7 +154,7 @@ mod tests {
     fn the_wake_line_names_why_it_is_unavailable() {
         assert_eq!(
             super::line(Err("udev unavailable".into())),
-            "Xbox presses show within 50 ms (event wake unavailable: udev unavailable)"
+            "Xbox presses are handled within 50 ms in a terminal run, 20 ms in the login service (event wake unavailable: udev unavailable)"
         );
         assert!(super::line(Ok(())).starts_with("Xbox event wake: available"));
     }

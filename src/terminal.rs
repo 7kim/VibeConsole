@@ -16043,6 +16043,8 @@ pub fn daemon(path: &Path, current: Vec<Mapping>) -> Result<()> {
     // v7.7 ticket 224: the run state for `startup-status`, written on each change.
     let state_file = crate::status::state_dir().map(|d| d.join(RUN_STATE));
     let mut stated = String::new();
+    // v7.8 ticket 27: a watcher that couldn't start goes to the journal once.
+    let mut watcher_noted = false;
     while !ui.stop.load(Ordering::Relaxed) {
         if let Err(error) = ui.tick() {
             if ui.stop.load(Ordering::Relaxed) {
@@ -16084,6 +16086,10 @@ pub fn daemon(path: &Path, current: Vec<Mapping>) -> Result<()> {
         }
         // v7.8 ticket 27: a MIDI or Xbox event ends the wait at once; else the next turn in 20 ms.
         crate::wake::wait(Duration::from_millis(20));
+        if let (false, Some(why)) = (watcher_noted, crate::wake::watcher_error()) {
+            eprintln!("{}", crate::wake::line(Err(why.to_owned())));
+            watcher_noted = true;
+        }
     }
     if let Ok(file) = &state_file {
         let _ = std::fs::remove_file(file); // stopped: nothing to report
