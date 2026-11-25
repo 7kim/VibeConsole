@@ -15410,6 +15410,26 @@ mod tests {
             xbox.contains("Xbox B") && xbox.contains("Xbox Y") && !xbox.contains("Xbox X"),
             "{xbox}"
         );
+        // v7.8 ticket 05: Remove lists program 2's own too, and removes nothing on the way out.
+        let mut ui = Script {
+            // Remove -> Xbox -> back; leave
+            keys: [Tab, Down, Enter, Down, Enter, Escape, Escape, Escape].into(),
+            xbox_program: 2,
+            ..Default::default()
+        };
+        configure(&mut ui, &path, &mut current).unwrap();
+        let screens = ui.screens.join("\n----\n");
+        let xbox = ui
+            .screens
+            .iter()
+            .find(|s| s.contains("Xbox controller · Browser"))
+            .unwrap_or_else(|| panic!("{screens}"));
+        assert!(
+            xbox.contains("Xbox B") && xbox.contains("Xbox Y") && !xbox.contains("Xbox X"),
+            "{xbox}"
+        );
+        assert!(screens.contains("> Remove saved assignment"), "{screens}");
+        assert_eq!(current.len(), 4);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
