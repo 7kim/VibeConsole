@@ -4767,13 +4767,22 @@ impl Terminal {
                 return false;
             };
             let has = |m: &str| modifiers.iter().any(|k| k.trim_start_matches("Right") == m);
+            // Ctrl+letter's control byte, read as `key` reads it (Ctrl+I is \t, M and J end
+            // a line, H is Backspace; the rest are InvalidInput).
+            let ctrl_byte = match last.as_bytes() {
+                [letter] if has("Ctrl") && letter.is_ascii_alphabetic() => {
+                    Some(letter.to_ascii_uppercase() & 0x1f)
+                }
+                _ => None,
+            };
             let modified = match key {
                 Key::Other => !modifiers.is_empty(),
                 Key::BackTab => last == "Tab" && has("Shift"),
-                Key::InvalidInput => {
-                    has("Ctrl") && last.len() == 1 && last.as_bytes()[0].is_ascii_alphabetic()
-                }
                 Key::Escape => has("Alt"),
+                Key::Tab => ctrl_byte == Some(b'\t'),
+                Key::Enter => matches!(ctrl_byte, Some(b'\n' | b'\r')),
+                Key::Backspace => ctrl_byte == Some(8),
+                Key::InvalidInput => ctrl_byte.is_some_and(|b| ![8, 9, 10, 13].contains(&b)),
                 _ => false,
             };
             at.elapsed() < Duration::from_millis(250)
@@ -20831,11 +20840,31 @@ mod tests {
         }
         // The echo window is 250 ms.
         ui.xbox_used(&Event::Press(rt));
-        if let Some((_, at)) = &mut ui.xbox_sent {
-            *at -= Duration::from_millis(300);
-        }
+        std::thread::sleep(Duration::from_millis(260));
         ui.keyboard_used(&Key::Tab);
         assert_eq!(ui.screen("").hints, keyboard, "too late to be an echo");
+        // Ctrl+letter arrives as its control byte, and Ctrl+I/M/J/H's bytes are Tab, Enter
+        // and Backspace: each is that combination's echo.
+        let path = dir.join("mappings.tsv");
+        for (keys, echo) in [
+            ("Ctrl+I", Key::Tab),
+            ("Ctrl+M", Key::Enter),
+            ("Ctrl+J", Key::Enter),
+            ("Ctrl+H", Key::Backspace),
+            ("Ctrl+K", Key::InvalidInput),
+        ] {
+            let mut config = mappings::load_config(&path).unwrap();
+            config.mappings.retain(|m| m.control != Control::button(2));
+            let mut m = Mapping::new(Control::button(2), keys, "tap").unwrap();
+            m.context = mappings::xbox_context(1, false);
+            config.mappings.push(m);
+            mappings::save_config(&path, &config).unwrap();
+            ui.refresh_hints(&config);
+            ui.xbox_used(&Event::Press(Control::button(2)));
+            let xbox = ui.screen("").hints;
+            ui.keyboard_used(&echo);
+            assert_eq!(ui.screen("").hints, xbox, "{echo:?} is {keys}'s echo");
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 
