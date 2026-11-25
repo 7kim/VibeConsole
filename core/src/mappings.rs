@@ -1203,6 +1203,23 @@ fn request_parts(
     Ok((names, lines, controls))
 }
 /// v7.7 ticket 168: the Default mapping on a device's control, if any.
+/// v7.7 ticket 268: the built-in Xbox defaults (Program 1, layer 1) the setup hasn't
+/// changed or silenced.
+pub fn builtin_defaults(config: &Config) -> Vec<Mapping> {
+    crate::gamepad::default_layout()
+        .into_iter()
+        .filter(|d| default_on(config, d.context, d.control).is_none())
+        .collect()
+}
+/// v7.7 ticket 268: what a Default control does now: its saved mapping, else its built-in
+/// Xbox default.
+pub fn doing_now(config: &Config, context: u8, control: Control) -> Option<Mapping> {
+    default_on(config, context, control).cloned().or_else(|| {
+        builtin_defaults(config)
+            .into_iter()
+            .find(|d| d.context == context && d.control == control)
+    })
+}
 pub fn default_on(config: &Config, context: u8, control: Control) -> Option<&Mapping> {
     config
         .mappings
@@ -1212,12 +1229,11 @@ pub fn default_on(config: &Config, context: u8, control: Control) -> Option<&Map
 /// v7.7 ticket 168: Ask for mappings: fill the picked devices' empty Default controls; a
 /// control in use says what it does now, and is replaced only when the wish asks for it.
 pub fn mappings_request(wish: &str, devices: &[ProfileDevice], config: &Config) -> Result<String> {
-    let (names, lines, controls) = request_parts("-", devices, |d, c| {
-        match default_on(config, d.context, c) {
+    let (names, lines, controls) =
+        request_parts("-", devices, |d, c| match doing_now(config, d.context, c) {
             Some(m) => format!(" (now: {})", m.action_label()),
             None => " (empty)".into(),
-        }
-    })?;
+        })?;
     Ok(format!(
         "Suggest VibeConsole Default mappings for the {names}. {wish}\n\n\
          Fill the controls marked (empty). Change a control that is in use only when the wish above asks for it; the user confirms each replacement.\n\n\
@@ -1232,12 +1248,11 @@ pub fn map_agents_request(
     devices: &[ProfileDevice],
     config: &Config,
 ) -> Result<String> {
-    let (names, lines, controls) = request_parts("-", devices, |d, c| {
-        match default_on(config, d.context, c) {
+    let (names, lines, controls) =
+        request_parts("-", devices, |d, c| match doing_now(config, d.context, c) {
             Some(m) => format!(" (now: {})", m.action_label()),
             None => " (empty)".into(),
-        }
-    })?;
+        })?;
     let needs_me = crate::actions::Action::OrcaKeys(orca_needs_me_steps()).encode();
     let mut actions = format!("- needs-me (Orca's agent waiting on you): {needs_me}\n");
     for agent in &config.agents {
@@ -1487,9 +1502,12 @@ pub fn recommendations_from_reply(reply: &str) -> Vec<Recommendation> {
 /// control by name with its keys, or only the kind of action (never prompt text, commands,
 /// folders or app paths).
 pub fn mappings_summary(config: &Config) -> String {
+    // v7.7 ticket 268: the built-in Xbox defaults not changed by the user go too, marked.
+    let defaults = builtin_defaults(config);
     config
         .mappings
         .iter()
+        .chain(&defaults)
         .map(|m| {
             let what = if m.action == crate::actions::Action::Shortcut {
                 m.keys.join("+")
@@ -1512,7 +1530,12 @@ pub fn mappings_summary(config: &Config) -> String {
                 }
                 _ => program_label(m.context),
             };
-            format!("- {program} {name}: {what}\n")
+            let builtin = if defaults.iter().any(|d| std::ptr::eq(d, m)) {
+                " (built-in default)"
+            } else {
+                ""
+            };
+            format!("- {program} {name}: {what}{builtin}\n")
         })
         .collect()
 }

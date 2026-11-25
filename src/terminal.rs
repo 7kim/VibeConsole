@@ -8479,7 +8479,8 @@ fn merge_default(
 ) -> Result<Vec<String>> {
     let mut words = Vec::new();
     for m in new {
-        match mappings::default_on(config, m.context, m.control).cloned() {
+        // v7.7 ticket 268: a built-in Xbox default counts as what it does now.
+        match mappings::doing_now(config, m.context, m.control) {
             None => words.push(format!("{}: {} (was empty)", m.label, m.action_label())),
             Some(old) => {
                 let change = format!("{}: {} → {}", m.label, old.action_label(), m.action_label());
@@ -16215,7 +16216,64 @@ mod tests {
             old.replace(&format!("{today}\tPut"), &format!("{}\tPut", today - 30)),
         )
         .unwrap();
-        run(vec![Enter, Down, Enter, Escape]);
+        // v7.7 ticket 268: A's built-in default (Enter) asks Replace? first.
+        run(vec![Enter, Down, Enter, Down, Enter, Escape]);
+        let config = mappings::load_config(&path).unwrap();
+        let a =
+            mappings::default_on(&config, mappings::GAMEPAD_CONTEXT, Control::button(0)).unwrap();
+        assert_eq!(a.keys.join("+"), "Ctrl+T");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    /// v7.7 ticket 268: the built-in Xbox defaults go with the mappings an ask is told about,
+    /// and a recommendation on one reviews as a replacement (old → new), never "was empty".
+    #[test]
+    fn recommendations_know_the_built_in_xbox_defaults() {
+        use Key::*;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-recs-defaults-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        let mut config = mappings::Config::default();
+        config.look.share_usage = true;
+        mappings::save_config(&path, &config).unwrap();
+        let usage = dir.join("usage");
+        let mut day = crate::usage::Day::default();
+        day.add("press", "Xbox A", 40);
+        crate::usage::flush(&usage, crate::usage::today(), &day).unwrap();
+        let reply = format!(
+            "recommendation\tPut Ctrl+T on Xbox A\tYou press A often\n```\n{}```\n",
+            mappings::export_profile(&mappings::Profile {
+                name: "AI".into(),
+                apps: vec![],
+                mappings: vec![Mapping::new(Control::button(0), "Ctrl+T", "hold").unwrap()],
+            })
+            .unwrap()
+        );
+        // Enter: Replace? (Replace it), then Save.
+        let mut ui = Script {
+            keys: [Enter, Down, Enter, Down, Enter, Escape].into(),
+            usage: Some(usage.clone()),
+            claude: reply,
+            ..Default::default()
+        };
+        ask_for(&mut ui, &path, AskKind::Recommendations).unwrap();
+        assert!(ui.keys.is_empty());
+        let sent = &ui.asked[0];
+        assert!(
+            sent.contains("- Xbox controller Xbox A: Enter (built-in default)\n"),
+            "{sent}"
+        );
+        assert!(
+            sent.contains("- Xbox controller Xbox D-pad down: Down (built-in default)\n"),
+            "{sent}"
+        );
+        let screens = ui.screens.join("\n----\n");
+        assert!(
+            screens.contains("Replace?\nXbox A: Enter → Ctrl+T"),
+            "{screens}"
+        );
+        assert!(!screens.contains("Xbox A: Ctrl+T (was empty)"), "{screens}");
         let config = mappings::load_config(&path).unwrap();
         let a =
             mappings::default_on(&config, mappings::GAMEPAD_CONTEXT, Control::button(0)).unwrap();
@@ -16523,7 +16581,7 @@ mod tests {
             mappings::export_profile(&mappings::Profile {
                 name: "AI".into(),
                 apps: vec![],
-                mappings: vec![Mapping::new(Control::button(0), "Ctrl+N", "hold").unwrap()],
+                mappings: vec![Mapping::new(Control::button(6), "Ctrl+N", "hold").unwrap()],
             })
             .unwrap()
         );
@@ -16719,7 +16777,8 @@ mod tests {
         };
         let good = reply(vec![
             Mapping::new(pad, "Ctrl+T", "hold").unwrap(),
-            Mapping::new(Control::button(0), "Ctrl+N", "hold").unwrap(),
+            // v7.7 ticket 268: LT, which has no built-in default, is the empty one.
+            Mapping::new(Control::button(6), "Ctrl+N", "hold").unwrap(),
         ]);
         let run = |claude: &str, then: Vec<Key>| {
             let mut keys = vec![Enter, Space, Down, Space, Enter]; // no wish; both devices
@@ -16736,7 +16795,8 @@ mod tests {
         // Replace, then Cancel: nothing saved.
         let (result, screens, asked) = run(&good, vec![Down, Enter, Enter]);
         result.unwrap();
-        assert!(asked[0].contains("(now: Ctrl+A)") && asked[0].contains("- Xbox A (empty): "));
+        assert!(asked[0].contains("(now: Ctrl+A)") && asked[0].contains("- Xbox LT (empty): "));
+        assert!(asked[0].contains("- Xbox A (now: Enter): "), "{}", asked[0]);
         assert!(
             screens
                 .iter()
@@ -16755,14 +16815,14 @@ mod tests {
             mappings::default_on(&config, context, c).map(|m| m.keys.join("+"))
         };
         assert_eq!(on(pad).as_deref(), Some("Ctrl+A"));
-        assert_eq!(on(Control::button(0)).as_deref(), Some("Ctrl+N"));
+        assert_eq!(on(Control::button(6)).as_deref(), Some("Ctrl+N"));
         // Replace, then Save.
         mappings::save(&path, &[Mapping::new(pad, "Ctrl+A", "hold").unwrap()]).unwrap();
         let (_, screens, _) = run(&good, vec![Down, Enter, Down, Enter]);
         assert!(
             screens
                 .iter()
-                .any(|s| s.contains("Xbox A: Ctrl+N (was empty)"))
+                .any(|s| s.contains("Xbox LT: Ctrl+N (was empty)"))
         );
         let config = mappings::load_config(&path).unwrap();
         let on = |c: Control| {
@@ -16892,7 +16952,7 @@ mod tests {
         mappings::save_config(&path, &config).unwrap();
         let reply = |folder: &str| {
             let jump = Mapping::new_action(
-                Control::button(1),
+                Control::button(8),
                 mappings::Input::Pad,
                 crate::actions::Action::OrcaJump {
                     agent: "claude".into(),
@@ -16925,7 +16985,7 @@ mod tests {
         assert!(asked[0].contains("- needs-me"));
         let config = mappings::load_config(&path).unwrap();
         let jump =
-            mappings::default_on(&config, mappings::GAMEPAD_CONTEXT, Control::button(1)).unwrap();
+            mappings::default_on(&config, mappings::GAMEPAD_CONTEXT, Control::button(8)).unwrap();
         assert_eq!(jump.action.family(), "orca-jump");
         assert_eq!(
             config
@@ -17105,7 +17165,7 @@ mod tests {
             )
         };
         let xbox = file(
-            vec![Mapping::new(Control::button(0), "Ctrl+N", "hold").unwrap()],
+            vec![Mapping::new(Control::button(6), "Ctrl+N", "hold").unwrap()],
             "AI",
         );
         let ask = |kind, keys: Vec<Key>, claude: String| {
@@ -17143,7 +17203,7 @@ mod tests {
         ask(AskKind::Setup, keys, xbox).0.unwrap();
         let config = mappings::load_config(&path).unwrap();
         assert!(
-            mappings::default_on(&config, mappings::GAMEPAD_CONTEXT, Control::button(0)).is_some()
+            mappings::default_on(&config, mappings::GAMEPAD_CONTEXT, Control::button(6)).is_some()
         );
         // Family: saved under families/, then one of its actions copied in /configure.
         let pad = |n| Control::from_note(10, n).unwrap();
