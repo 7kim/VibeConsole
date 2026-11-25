@@ -217,6 +217,11 @@ trait Ui {
     fn login(&mut self, _request: crate::runtime::Login) -> Result<bool> {
         Err("login service unavailable".into())
     }
+    /// v7.8 ticket 13: the paired Bluetooth devices (address, name); read only. The session
+    /// asks bluetoothctl; tests answer from their script.
+    fn paired_bluetooth(&mut self) -> Result<Vec<(String, String)>> {
+        Err("Bluetooth devices unavailable".into())
+    }
     /// v7.7 ticket 255: what Quit did about the login service, and why: to the journal now,
     /// and on the terminal once its screen is restored.
     fn quit_note(&mut self, _line: &str) {}
@@ -6320,6 +6325,17 @@ impl Ui for Terminal {
             .as_ref()
             .is_some_and(|pad| !pad.connected().is_empty())
     }
+    fn paired_bluetooth(&mut self) -> Result<Vec<(String, String)>> {
+        #[cfg(test)]
+        if self.script.is_some() {
+            return Err("Bluetooth: not asked in tests".into());
+        }
+        let out = vibeconsole_core::program("bluetoothctl")
+            .args(["devices", "Paired"])
+            .output()
+            .map_err(|e| format!("Bluetooth devices unavailable: bluetoothctl: {e}"))?;
+        Ok(paired_devices(&String::from_utf8_lossy(&out.stdout)))
+    }
     fn login(&mut self, request: crate::runtime::Login) -> Result<bool> {
         // v7.7 ticket 179: a test asks the scripted login service, never systemctl.
         #[cfg(test)]
@@ -11789,6 +11805,20 @@ const UPDATES: [(&str, &str); 2] = [
         "Flatpak update: flatpak update (visible terminal, hold 1 second)",
     ),
 ];
+/// v7.8 ticket 13: `bluetoothctl devices Paired` lines (`Device <address> <name>`) as
+/// (address, name); anything else is skipped, and only well-formed addresses are kept.
+fn paired_devices(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|line| {
+            let mut parts = line.trim().splitn(3, ' ');
+            (parts.next() == Some("Device")).then_some(())?;
+            let address = parts.next()?.to_uppercase();
+            let name = parts.next().unwrap_or("").trim();
+            crate::actions::bluetooth_address(&address)
+                .then(|| (address, name.chars().filter(|c| !c.is_control()).collect()))
+        })
+        .collect()
+}
 /// v7.8 ticket 12: Fedora System actions that fire only after a one-second hold.
 fn must_hold(action: &crate::actions::Action) -> bool {
     match action {
@@ -11814,9 +11844,20 @@ fn fedora_system(
         .collect::<Vec<_>>();
     rows.extend(fixed.iter().map(System::label));
     rows.push("Open a GNOME Settings panel…".into());
+    // v7.8 ticket 13: paired Bluetooth devices (VibeConsole never pairs), and the controller.
+    rows.extend(strings(&[
+        "Connect a paired Bluetooth device…",
+        "Disconnect a paired Bluetooth device…",
+        "Turn off Xbox controller (Bluetooth disconnect, hold 1 second)",
+    ]));
+    let panel_row = UPDATES.len() + fixed.len();
     let at = match saved {
         Some(Action::Command { line, .. }) => UPDATES.iter().position(|(l, _)| l == line),
-        Some(Action::System(System::Settings(_))) => Some(rows.len() - 1),
+        Some(Action::System(System::Settings(_))) => Some(panel_row),
+        Some(Action::System(System::BluetoothDevice { connect, .. })) => {
+            Some(panel_row + if *connect { 1 } else { 2 })
+        }
+        Some(Action::System(System::ControllerOff)) => Some(panel_row + 3),
         Some(Action::System(s)) => fixed.iter().position(|f| f == s).map(|i| i + UPDATES.len()),
         _ => None,
     };
@@ -11839,6 +11880,29 @@ fn fedora_system(
     }
     if let Some(system) = fixed.get(row - UPDATES.len()) {
         return Ok(Some(Action::System(system.clone())));
+    }
+    if row == panel_row + 3 {
+        return Ok(Some(Action::System(System::ControllerOff)));
+    }
+    if row > panel_row {
+        let connect = row == panel_row + 1;
+        let paired = ui.paired_bluetooth()?;
+        if paired.is_empty() {
+            return Err(
+                "validation: no paired Bluetooth devices; pair one in GNOME Settings first".into(),
+            );
+        }
+        let names = paired
+            .iter()
+            .map(|(a, n)| format!("{n} ({a})"))
+            .collect::<Vec<_>>();
+        let verb = if connect { "Connect" } else { "Disconnect" };
+        return Ok(
+            choose(ui, &format!("{verb} which paired device?"), &names)?.map(|i| {
+                let address = paired[i].0.clone();
+                Action::System(System::BluetoothDevice { address, connect })
+            }),
+        );
     }
     let panels = SETTINGS_PANELS.map(String::from).to_vec();
     let at = match saved {
@@ -14662,6 +14726,8 @@ mod tests {
     }
     #[derive(Default)]
     struct Script {
+        /// v7.8 ticket 13: the paired Bluetooth devices (address, name).
+        paired: Vec<(String, String)>,
         /// v7.7 ticket 146: the usage log a recommendations ask reads.
         usage: Option<PathBuf>,
         /// v7.7 ticket 168: the PATH and home folder Set up agents looks in.
@@ -14798,6 +14864,9 @@ mod tests {
         }
         fn program(&self) -> Option<(u8, crate::feedback::Payload)> {
             self.program
+        }
+        fn paired_bluetooth(&mut self) -> Result<Vec<(String, String)>> {
+            Ok(self.paired.clone())
         }
         fn login(&mut self, request: crate::runtime::Login) -> Result<bool> {
             use crate::runtime::Login;
@@ -21046,6 +21115,71 @@ mod tests {
                 .to_string()
                 .contains("held for one second")
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.8 ticket 13: Fedora System connects a device picked from the paired list (read
+    /// only, by address); Turn off is held 1 second; the list reading skips what isn't a device.
+    #[test]
+    fn fedora_system_bluetooth_rows() {
+        use Key::*;
+        assert_eq!(
+            paired_devices(
+                "Device aa:bb:cc:dd:ee:03 HyperX Cloud\nController 11:22\nDevice bad Name\n"
+            ),
+            [("AA:BB:CC:DD:EE:03".to_string(), "HyperX Cloud".to_string())]
+        );
+        let dir = std::env::temp_dir().join(format!("vibeconsole-bt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let rows = 2 + 14 + 1; // updates, fixed actions, Settings panel
+        let pick = |row: usize, after: &[Key]| {
+            let mut keys = vec![Enter];
+            keys.extend(vec![Down; 15]); // Fedora System
+            keys.push(Enter);
+            keys.extend(vec![Down; row]);
+            keys.push(Enter);
+            keys.extend(after);
+            keys
+        };
+        // Connect → the HyperX → fire when: Pressed → save and finish.
+        let mut ui = Script {
+            keys: pick(rows, &[Enter, Enter, Down, Enter]).into(),
+            pads: [Control::from_note(10, 40).unwrap()].into(),
+            paired: vec![("AA:BB:CC:DD:EE:03".into(), "HyperX Cloud".into())],
+            ..Default::default()
+        };
+        let mut current = Vec::new();
+        configure(&mut ui, &path, &mut current).unwrap();
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains("HyperX Cloud (AA:BB:CC:DD:EE:03)"))
+        );
+        use crate::actions::{Action, System};
+        let address = "AA:BB:CC:DD:EE:03".to_string();
+        assert_eq!(
+            mappings::load(&path).unwrap()[0].action,
+            Action::System(System::BluetoothDevice {
+                address,
+                connect: true
+            })
+        );
+        // Turn off: never asked when it fires, saved held.
+        let mut ui = Script {
+            keys: pick(rows + 2, &[Down, Enter]).into(),
+            pads: [Control::from_note(10, 41).unwrap()].into(),
+            ..Default::default()
+        };
+        configure(&mut ui, &path, &mut current).unwrap();
+        assert!(!ui.screens.iter().any(|s| s.starts_with("Fire when")));
+        let saved = mappings::load(&path).unwrap();
+        let off = saved
+            .iter()
+            .find(|m| m.action == Action::System(System::ControllerOff));
+        assert!(off.is_some_and(|m| m.risky));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

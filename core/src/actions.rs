@@ -284,6 +284,50 @@ pub enum System {
     Bluetooth(bool),
     EmptyTrash,
     Settings(String),
+    /// v7.8 ticket 13: connect (true) or disconnect a paired device by its address.
+    BluetoothDevice {
+        address: String,
+        connect: bool,
+    },
+    /// v7.8 ticket 13: the Xbox controller's Bluetooth disconnect (it then turns itself off);
+    /// over USB unavailable. Held 1 second.
+    ControllerOff,
+}
+/// v7.8 ticket 13: a Bluetooth address as `XX:XX:XX:XX:XX:XX` (hex, upper case kept as given).
+pub fn bluetooth_address(text: &str) -> bool {
+    let parts = text.split(':').collect::<Vec<_>>();
+    parts.len() == 6
+        && parts
+            .iter()
+            .all(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+/// v7.8 ticket 13: the connected Xbox controller's Bluetooth address, from sysfs: an input
+/// device on the Bluetooth bus (5) named like an Xbox controller, its `uniq` an address.
+/// Err says why not (over USB, or none connected).
+pub fn controller_address(sys: &Path) -> Result<String> {
+    let read =
+        |dir: &Path, f: &str| std::fs::read_to_string(dir.join(f)).map(|s| s.trim().to_owned());
+    let mut usb = false;
+    for input in std::fs::read_dir(sys.join("class/input"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let dir = input.path();
+        let name = read(&dir, "name").unwrap_or_default().to_lowercase();
+        if !name.contains("xbox") || crate::is_emulator(&name) {
+            continue;
+        }
+        let uniq = read(&dir, "uniq").unwrap_or_default().to_uppercase();
+        match read(&dir, "id/bustype").as_deref() {
+            Ok("0005") if bluetooth_address(&uniq) => return Ok(uniq),
+            _ => usb = true,
+        }
+    }
+    Err(match usb {
+        true => "Turn off Xbox controller: unavailable over USB (it turns off with the cable out, or by holding its Xbox button)".into(),
+        false => "Turn off Xbox controller: no Xbox controller is connected over Bluetooth".into(),
+    })
 }
 impl System {
     /// Every action but the panel (its rows follow these in Configure).
@@ -318,9 +362,34 @@ impl System {
             Self::Bluetooth(on) => format!("bluetooth-{}", Self::on(*on)),
             Self::EmptyTrash => "empty-trash".into(),
             Self::Settings(panel) => format!("settings-{panel}"),
+            Self::BluetoothDevice { address, connect } => {
+                format!(
+                    "bluetooth-{}-{address}",
+                    if *connect { "connect" } else { "disconnect" }
+                )
+            }
+            Self::ControllerOff => "controller-off".into(),
         }
     }
     pub fn parse(word: &str) -> Result<Self> {
+        for (prefix, connect) in [
+            ("bluetooth-connect-", true),
+            ("bluetooth-disconnect-", false),
+        ] {
+            if let Some(address) = word.strip_prefix(prefix) {
+                if !bluetooth_address(address) {
+                    return Err(format!(
+                        "{address:?} isn't a Bluetooth address (XX:XX:XX:XX:XX:XX)"
+                    )
+                    .into());
+                }
+                let address = address.into();
+                return Ok(Self::BluetoothDevice { address, connect });
+            }
+        }
+        if word == "controller-off" {
+            return Ok(Self::ControllerOff);
+        }
         if let Some(panel) = word.strip_prefix("settings-") {
             return match SETTINGS_PANELS.contains(&panel) {
                 true => Ok(Self::Settings(panel.into())),
@@ -346,11 +415,18 @@ impl System {
             Self::Bluetooth(o) => format!("Bluetooth {}", on(*o)),
             Self::EmptyTrash => "Empty trash".into(),
             Self::Settings(panel) => format!("Open Settings: {panel}"),
+            Self::BluetoothDevice { address, connect } => {
+                format!(
+                    "Bluetooth {} {address}",
+                    if *connect { "connect" } else { "disconnect" }
+                )
+            }
+            Self::ControllerOff => "Turn off Xbox controller (Bluetooth, hold 1 second)".into(),
         }
     }
     /// Risky: fires only after a one-second hold (suspend).
     pub fn risky(&self) -> bool {
-        *self == Self::Suspend
+        matches!(self, Self::Suspend | Self::ControllerOff)
     }
     /// The program and its single arguments; None for the screenshot (a key, not a program).
     pub fn command(&self) -> Option<(&'static str, Vec<String>)> {
@@ -394,6 +470,15 @@ impl System {
             Self::Bluetooth(on) => ("bluetoothctl", strings(&["power", Self::on(*on)])),
             Self::EmptyTrash => ("gio", strings(&["trash", "--empty"])),
             Self::Settings(panel) => ("gnome-control-center", vec![panel.clone()]),
+            Self::BluetoothDevice { address, connect } => (
+                "bluetoothctl",
+                vec![
+                    (if *connect { "connect" } else { "disconnect" }).into(),
+                    address.clone(),
+                ],
+            ),
+            // The address is looked up when pressed (`system`).
+            Self::ControllerOff => ("bluetoothctl", strings(&["disconnect"])),
         })
     }
 }
@@ -405,10 +490,23 @@ pub fn system(
     mut run: impl FnMut(&str, &[String]) -> Result<String>,
     tap: &dyn Fn(Vec<evdev::KeyCode>) -> Result<()>,
 ) -> Result<String> {
-    let Some((program, args)) = action.command() else {
+    system_at(action, Path::new("/sys"), installed, &mut run, tap)
+}
+/// [`system`] with sysfs at `sys` (tests pass a fixture for the controller's address).
+pub fn system_at(
+    action: &System,
+    sys: &Path,
+    installed: impl Fn(&str) -> bool,
+    run: &mut dyn FnMut(&str, &[String]) -> Result<String>,
+    tap: &dyn Fn(Vec<evdev::KeyCode>) -> Result<()>,
+) -> Result<String> {
+    let Some((program, mut args)) = action.command() else {
         tap(vec![evdev::KeyCode::KEY_SYSRQ])?;
         return Ok("Screenshot: Print key sent".into());
     };
+    if *action == System::ControllerOff {
+        args.push(controller_address(sys)?);
+    }
     if !installed(program) {
         return Err(format!("{}: unavailable: {program} isn't installed", action.label()).into());
     }
@@ -4340,6 +4438,95 @@ mod tests {
         assert!(Action::parse("system:settings-../../etc").is_err());
         assert!(Action::parse("system:reboot").is_err());
         assert!(System::Suspend.risky() && !System::Lock.risky());
+    }
+
+    /// v7.8 ticket 13: a paired device connects and disconnects with its address as one
+    /// argument; a malformed address is refused; Turn off finds the controller's Bluetooth
+    /// address in sysfs, and over USB is unavailable (nothing runs). Both are held 1 second.
+    #[test]
+    fn bluetooth_devices_and_turning_the_controller_off() {
+        let run_at = |action: &System, sys: &Path| {
+            let mut ran = Vec::new();
+            let result = system_at(
+                action,
+                sys,
+                |_| true,
+                &mut |p, a| {
+                    ran.push((p.to_owned(), a.to_vec()));
+                    Ok(String::new())
+                },
+                &|_| Ok(()),
+            );
+            (result, ran)
+        };
+        let none = Path::new("/nonexistent");
+        for connect in [true, false] {
+            let action = System::BluetoothDevice {
+                address: "AA:BB:CC:DD:EE:01".into(),
+                connect,
+            };
+            let (result, ran) = run_at(&action, none);
+            result.unwrap();
+            let verb = if connect { "connect" } else { "disconnect" };
+            assert_eq!(
+                ran,
+                [(
+                    "bluetoothctl".to_owned(),
+                    strings(&[verb, "AA:BB:CC:DD:EE:01"])
+                )]
+            );
+            let word = Action::System(action.clone()).encode();
+            assert_eq!(Action::parse(&word).unwrap(), Action::System(action));
+        }
+        for bad in [
+            "AA:BB:CC:DD:EE",
+            "AA:BB:CC:DD:EE:GG",
+            "AA:BB:CC:DD:EE:01; reboot",
+            "",
+        ] {
+            assert!(
+                Action::parse(&format!("system:bluetooth-connect-{bad}")).is_err(),
+                "{bad}"
+            );
+        }
+        // sysfs fixtures: the controller over Bluetooth, then over USB.
+        let root = std::env::temp_dir().join(format!("vibeconsole-btoff-{}", std::process::id()));
+        let input = |bus: &str, uniq: &str| {
+            let _ = std::fs::remove_dir_all(&root);
+            let dir = root.join("class/input/input7");
+            std::fs::create_dir_all(dir.join("id")).unwrap();
+            std::fs::write(dir.join("name"), "Xbox Wireless Controller\n").unwrap();
+            std::fs::write(dir.join("uniq"), format!("{uniq}\n")).unwrap();
+            std::fs::write(dir.join("id/bustype"), format!("{bus}\n")).unwrap();
+        };
+        input("0005", "aa:bb:cc:dd:ee:02");
+        let (result, ran) = run_at(&System::ControllerOff, &root);
+        result.unwrap();
+        assert_eq!(
+            ran,
+            [(
+                "bluetoothctl".to_owned(),
+                strings(&["disconnect", "AA:BB:CC:DD:EE:02"])
+            )]
+        );
+        input("0006", "09700120417550");
+        let (result, ran) = run_at(&System::ControllerOff, &root);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unavailable over USB")
+        );
+        assert!(ran.is_empty());
+        let (result, _) = run_at(&System::ControllerOff, none);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("no Xbox controller")
+        );
+        assert!(System::ControllerOff.risky());
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn repressing_a_running_sequence_is_ignored_and_taps_wait_for_the_session() {
