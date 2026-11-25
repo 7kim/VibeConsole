@@ -118,6 +118,26 @@ enum Learned {
     Motion(Control, mappings::Input, String),
 }
 
+/// v7.8 ticket 19: an Xbox control's name in the hints: Ⓐ Ⓑ Ⓧ Ⓨ, LB, RB, LT, RT, View,
+/// Menu, D-pad (any direction), LS and RS; others (stick directions) by their label.
+fn xbox_hint_name(control: Control) -> String {
+    let name = (control.message == crate::Message::Button)
+        .then(|| crate::gamepad::BUTTONS.get(usize::from(control.id)))
+        .flatten()
+        .map(|(_, name)| *name);
+    match name {
+        Some("A") => "Ⓐ".into(),
+        Some("B") => "Ⓑ".into(),
+        Some("X") => "Ⓧ".into(),
+        Some("Y") => "Ⓨ".into(),
+        Some("Left stick press") => "LS".into(),
+        Some("Right stick press") => "RS".into(),
+        Some(name) if name.starts_with("D-pad") => "D-pad".into(),
+        Some(name) => name.into(),
+        None => control.label(),
+    }
+}
+
 /// v7.8 ticket 26: one device on Detect's speed rows.
 #[derive(Default)]
 struct SpeedDevice {
@@ -355,6 +375,11 @@ struct Terminal {
     xbox_link: String,
     program_keys: crate::gamepad::ProgramKeys,
     last_xbox: bool,
+    /// v7.8 ticket 19: the key VibeConsole sent for the last Xbox press, and when: that key
+    /// arriving back in the terminal keeps the Xbox hints.
+    xbox_sent: Option<(String, Instant)>,
+    /// v7.8 ticket 19: the Xbox hint lines (tab menu, other screens), built with `hint_line`.
+    xbox_hints: [String; 2],
     /// v7 ticket 113: the keyboard's lock-key LEDs, opened when first needed; a failure to
     /// open is said once, not retried every tick.
     lock_lights: Option<crate::keyboard::LockLights>,
@@ -829,7 +854,11 @@ impl Terminal {
                 "Up/Down: move | Enter: confirm | Space: select | Esc: back | Ctrl+C: quit"
             }
         };
-        let hints = if self.at_menu && !self.hint_line.is_empty() {
+        // v7.8 ticket 19: after an Xbox press its buttons; else the Akai's or the keys'.
+        let xbox = &self.xbox_hints[usize::from(!self.at_menu)];
+        let hints = if self.last_xbox && !xbox.is_empty() {
+            xbox
+        } else if self.at_menu && !self.hint_line.is_empty() {
             &self.hint_line
         } else {
             hints
@@ -1478,6 +1507,8 @@ impl Terminal {
             xbox_link: String::new(),
             program_keys: crate::gamepad::ProgramKeys::default(),
             last_xbox: false,
+            xbox_sent: None,
+            xbox_hints: [String::new(), String::new()],
             lock_lights: None,
             lock_failed: false,
             lock_choice: [false; 4],
@@ -3462,7 +3493,7 @@ impl Terminal {
             .gamepad
             .as_ref()
             .is_some_and(|p| !p.connected().is_empty());
-        self.hint_line = self.hints_for(&config);
+        self.refresh_hints(&config);
         if self
             .problems_at
             .is_none_or(|at| at.elapsed() >= Duration::from_secs(30))
@@ -4366,7 +4397,7 @@ impl Terminal {
     /// v7.7 ticket 156: for each screen key, the controls mapped to it on the device used
     /// last (the Xbox's active layer and profile, or the open MIDI program), else the
     /// keyboard key with "(keyboard)". Never fires anything.
-    fn hints_for(&self, config: &mappings::Config) -> String {
+    fn hints_for(&self) -> String {
         const HINTS: [(&str, &[&str], &str); 6] = [
             ("tabs", &["Tab", "Left", "Right"], "1–0 · Tab · ←→"),
             ("find", &["slash", "/"], "/"),
@@ -4375,9 +4406,8 @@ impl Terminal {
             ("select", &["Space"], "Space"),
             ("back", &["Escape", "Esc"], "Esc"),
         ];
-        let (device, mapped) = if self.last_xbox {
-            ("Xbox (used last)", self.xbox_layout_in(config))
-        } else if self.midi_used {
+        // v7.8 ticket 19: the Xbox has its own lines (`xbox_hints_for`), picked when drawn.
+        let (device, mapped) = if self.midi_used {
             ("Akai (used last)", self.run_mappings.clone())
         } else {
             ("Keys", Vec::new())
@@ -4407,6 +4437,91 @@ impl Terminal {
             "quit Ctrl+C (keyboard)".into()
         });
         format!("{device}: {}", parts.join(" | "))
+    }
+    /// v7.8 ticket 19: the hint line while the Xbox is the device used last: each screen
+    /// key's meaning after the buttons the active Xbox program maps to it (Ⓐ confirm), or
+    /// the key's own name when no button sends it. `menu`: the tab menu's keys.
+    fn xbox_hints_for(&self, config: &mappings::Config, menu: bool) -> String {
+        const MENU: [(&str, &[&str], &str); 6] = [
+            ("tabs", &["Tab", "Left", "Right"], "Tab ←→ 1–0"),
+            ("move", &["Up", "Down"], "↑↓"),
+            ("open", &["Enter", "Return"], "Enter"),
+            ("select", &["Space"], "Space"),
+            ("find", &["slash", "/"], "/"),
+            ("back", &["Escape", "Esc"], "Esc"),
+        ];
+        const SCREEN: [(&str, &[&str], &str); 4] = [
+            ("move", &["Up", "Down"], "↑↓"),
+            ("confirm", &["Enter", "Return"], "Enter"),
+            ("select", &["Space"], "Space"),
+            ("back", &["Escape", "Esc"], "Esc"),
+        ];
+        let mapped = self.xbox_layout_in(config);
+        let pairs: &[(&str, &[&str], &str)] = if menu { &MENU } else { &SCREEN };
+        let mut parts = pairs
+            .iter()
+            .map(|(meaning, keys, keyboard)| {
+                let mut names = Vec::new();
+                for m in &mapped {
+                    let sends = m.action == crate::actions::Action::Shortcut
+                        && matches!(m.keys.as_slice(), [key] if keys.iter().any(|k| k.eq_ignore_ascii_case(key)));
+                    let name = xbox_hint_name(m.control);
+                    if sends && !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+                match names.is_empty() {
+                    true => format!("{keyboard} {meaning}"),
+                    false => format!("{} {meaning}", names.join(" / ")),
+                }
+            })
+            .collect::<Vec<_>>();
+        parts.push("Ctrl+C quit".into());
+        parts.join(" · ")
+    }
+    /// The hint lines for each device, rebuilt with the status refresh (never while drawing).
+    fn refresh_hints(&mut self, config: &mappings::Config) {
+        self.hint_line = self.hints_for();
+        self.xbox_hints = [true, false].map(|menu| self.xbox_hints_for(config, menu));
+    }
+    /// v7.8 ticket 19: an Xbox event: the hints follow the Xbox, and a press remembers the
+    /// key its mapping sends, which then arrives back in the terminal.
+    fn xbox_used(&mut self, event: &Event) {
+        self.last_xbox = true;
+        if let Event::Press(control) = event {
+            if let Ok(Some(m)) = self.fired(*control) {
+                if let (crate::actions::Action::Shortcut, [key]) = (&m.action, m.keys.as_slice()) {
+                    self.xbox_sent = Some((key.clone(), Instant::now()));
+                }
+            }
+        }
+    }
+    /// v7.8 ticket 19: a terminal key: the keyboard is the device used last, unless it is
+    /// the key VibeConsole sent for an Xbox press in the last 250 ms.
+    fn keyboard_used(&mut self, key: &Key) {
+        let name = match key {
+            Key::Enter => "Enter".to_owned(),
+            Key::Escape => "Escape".into(),
+            Key::Up => "Up".into(),
+            Key::Down => "Down".into(),
+            Key::Left => "Left".into(),
+            Key::Right => "Right".into(),
+            Key::Tab => "Tab".into(),
+            Key::Space => "Space".into(),
+            Key::Backspace => "Backspace".into(),
+            Key::Character(c) => char::from(*c).to_string(),
+            _ => String::new(),
+        };
+        let echo = (self.xbox_sent.as_ref()).is_some_and(|(sent, at)| {
+            at.elapsed() < Duration::from_millis(250)
+                && (sent.eq_ignore_ascii_case(&name) || (sent == "slash" && name == "/"))
+        });
+        if echo {
+            self.xbox_sent = None; // one echo per press
+        } else {
+            // (The Akai's line, v7.7 ticket 156, stays: its pads' keys echo here too.)
+            self.last_xbox = false;
+        }
     }
     /// The mapping a press fires, as the keyboard has it: the open context's, or for an Xbox
     /// button the Xbox layout's (v7 ticket 43: `run_mappings` holds the MIDI context only).
@@ -5888,7 +6003,7 @@ impl Terminal {
                 }
             }
             if let crate::gamepad::Change::Event(event) = &change {
-                self.last_xbox = true;
+                self.xbox_used(event);
                 // v7 ticket 115: View/Menu held + LB/LT/RB/RT picks an Xbox program; a tap of
                 // View or Menu alone fires its own mapping on release.
                 match self.program_keys.event(event) {
@@ -6771,7 +6886,11 @@ impl Ui for Terminal {
         self.tick()?;
         #[cfg(test)]
         if self.script.is_some() {
-            return self.scripted_key();
+            let key = self.scripted_key()?;
+            if let Some(key) = &key {
+                self.keyboard_used(key);
+            }
+            return Ok(key);
         }
         // v7.7 ticket 225: an event ends the wait at once; a moving stick pointer ticks
         // about every 16 ms (the login service's loop is 20 ms), else 50 ms when idle.
@@ -6810,6 +6929,9 @@ impl Ui for Terminal {
             if repeat {
                 return Ok(None);
             }
+        }
+        if let Some(key) = &key {
+            self.keyboard_used(key);
         }
         // Never confirm an action whose menu cannot be displayed.
         Ok(
@@ -19218,11 +19340,11 @@ mod tests {
         }
         mappings::save_config(&path, &config).unwrap();
         assert!(
-            ui.hints_for(&config)
+            ui.hints_for()
                 .starts_with("Keys: tabs 1–0 · Tab · ←→ | find /")
         );
         ui.midi_used = true;
-        let akai = ui.hints_for(&config);
+        let akai = ui.hints_for();
         assert!(akai.starts_with("Akai (used last): "), "{akai}");
         for part in [
             format!("move {}", ui.name(down)),
@@ -19232,21 +19354,7 @@ mod tests {
         ] {
             assert!(akai.contains(&part), "{part} in {akai}");
         }
-        ui.last_xbox = true;
-        let xbox = ui.hints_for(&config);
-        let (a, r3) = (ui.name(Control::button(0)), ui.name(Control::button(12)));
-        for part in [
-            "Xbox (used last): ".into(),
-            format!("open {a}"),
-            format!("select {r3}"),
-            "find / (keyboard)".into(),
-        ] {
-            assert!(xbox.contains(&part), "{part} in {xbox}");
-        }
-        assert!(
-            !xbox.contains(&ui.name(enter)),
-            "no Akai pad in the Xbox line"
-        );
+        // (The Xbox's own lines: v7.8 ticket 19's test.)
 
         ui.status_at = Instant::now() + Duration::from_secs(3600);
         ui.agent_states = vec![("claude".into(), "w".into(), "needs-input")];
@@ -19254,6 +19362,55 @@ mod tests {
         assert_eq!(ui.screen("").tabs[4], "5 Devices !", "no MIDI device open");
         ui.agent_states[0].2 = "thinking";
         assert_eq!(ui.screen("").tabs[2], "3 Agents", "gone when it clears");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.8 ticket 19: after an Xbox press every screen's hints name the Xbox buttons mapped
+    /// to its keys (a key with none keeps its own name); the key VibeConsole sent for that
+    /// press arriving back keeps them; a typed key brings the keyboard's back; a remapped
+    /// Enter shows its own button.
+    #[test]
+    fn hints_follow_the_xbox_and_go_back_on_a_typed_key() {
+        let (dir, mut ui, _ran, _) = configure_session("xbox-hints");
+        let path = dir.join("mappings.tsv");
+        ui.refresh_hints(&mappings::load_config(&path).unwrap());
+        let keyboard = ui.screen("").hints;
+        assert!(keyboard.contains("Enter: confirm"), "{keyboard}");
+        // The built-in layout: A Enter, B Escape, the D-pad the arrows; nothing sends Space.
+        ui.xbox_used(&Event::Press(Control::button(0)));
+        let xbox = ui.screen("").hints;
+        assert_eq!(
+            xbox,
+            "D-pad move · Ⓐ confirm · Space select · Ⓑ back · Ctrl+C quit"
+        );
+        ui.at_menu = true;
+        let menu = ui.screen("").hints;
+        assert!(
+            menu.starts_with("Ⓨ / D-pad tabs · D-pad move · Ⓐ open"),
+            "{menu}"
+        );
+        assert!(menu.contains("/ find"), "no button sends /: {menu}");
+        ui.at_menu = false;
+        // A's Enter arriving back in the terminal is the Xbox's own: the hints stay.
+        ui.keyboard_used(&Key::Enter);
+        assert_eq!(ui.screen("").hints, xbox, "the echo keeps the Xbox hints");
+        // A key typed on the keyboard brings the keyboard's back.
+        ui.keyboard_used(&Key::Down);
+        assert_eq!(ui.screen("").hints, keyboard);
+        // Enter remapped to Y (A sends Space now): the hints follow the program's buttons.
+        let mut config = mappings::load_config(&path).unwrap();
+        for (button, key) in [(0, "Space"), (3, "Enter")] {
+            let mut m = Mapping::new(Control::button(button), key, "tap").unwrap();
+            m.context = mappings::xbox_context(1, false);
+            config.mappings.push(m);
+        }
+        mappings::save_config(&path, &config).unwrap();
+        ui.refresh_hints(&config);
+        ui.xbox_used(&Event::Press(Control::button(3)));
+        let remapped = ui.screen("").hints;
+        assert!(remapped.contains("Ⓨ confirm"), "{remapped}");
+        assert!(remapped.contains("Ⓐ select"), "{remapped}");
+        assert!(!remapped.contains("Ⓐ confirm"), "{remapped}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
