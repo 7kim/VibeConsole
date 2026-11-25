@@ -1026,6 +1026,34 @@ pub fn connection(uuid: [u8; 16]) -> String {
         bus => format!("bus {bus:#06x}"),
     }
 }
+
+pub use gilrs::MappingSource;
+
+/// A connected controller and its mapping, as reported by the same gilrs handle.
+pub struct ControllerConnection {
+    pub name: String,
+    pub details: String,
+    pub mapping_source: MappingSource,
+    pub uuid: [u8; 16],
+}
+
+impl ControllerConnection {
+    pub fn mapping_warning(&self) -> Option<String> {
+        let reason = match self.mapping_source {
+            MappingSource::SdlMappings => return None,
+            // gilrs 0.11.2 returns Driver when mapping.is_default().
+            MappingSource::Driver => "gilrs default mapping · LT and RT may not register",
+            MappingSource::None => "gilrs mapping source unknown · LT and RT unverified",
+        };
+        // The Linux backend builds the SDL UUID from the kernel's input IDs.
+        let [bus, vendor, product, version] =
+            [0, 4, 8, 12].map(|i| u16::from_le_bytes([self.uuid[i], self.uuid[i + 1]]));
+        Some(format!(
+            "{reason} · bus {bus:04x} · vendor {vendor:04x} · product {product:04x} · version {version:04x}"
+        ))
+    }
+}
+
 /// v7.8 ticket 06: how a controller is connected and which driver reads it, from its input
 /// bus and the drivers bound above its input device (nearest first). Unknown parts are None,
 /// never guessed: xone's own bus (0x06) is told apart by its wired or dongle driver.
@@ -1921,8 +1949,15 @@ impl Pad {
             .find(|(_, pad)| crate::ours(pad.os_name()))
             .map_or_else(Vec::new, |(_, pad)| details(pad))
     }
-    /// Each controller's name with its connection (v7 ticket 107), for `doctor`.
+    /// Each controller's name and connection, for `describe`.
     pub fn connections(&self) -> Vec<String> {
+        self.connection_info()
+            .into_iter()
+            .map(|pad| format!("{} ({})", pad.name, pad.details))
+            .collect()
+    }
+    /// Each controller's connection and mapping source, for `doctor`.
+    pub fn connection_info(&self) -> Vec<ControllerConnection> {
         self.gilrs
             .gamepads()
             .filter(|(_, pad)| crate::ours(pad.os_name()))
@@ -1936,7 +1971,12 @@ impl Pad {
                 if pad.name() != pad.os_name() {
                     parts.push(format!("mapped as {}", pad.name()));
                 }
-                format!("{} ({})", pad.os_name(), parts.join(" · "))
+                ControllerConnection {
+                    name: pad.os_name().into(),
+                    details: parts.join(" · "),
+                    mapping_source: pad.mapping_source(),
+                    uuid: pad.uuid(),
+                }
             })
             .collect()
     }

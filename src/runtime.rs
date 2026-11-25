@@ -1,4 +1,5 @@
 use crate::Result;
+use crate::gamepad::ControllerConnection;
 use std::{
     fs::{self, File, OpenOptions},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -9,6 +10,7 @@ use std::{
 pub use vibeconsole_core::owner::Owner;
 
 const UNIT: &str = "vibeconsole.service";
+const NO_XBOX_CONTROLLER: &str = "none connected (USB or Bluetooth)";
 /// Start the login service when this session closes: set by a handover (ticket 20) or by
 /// Settings -> Login service (ticket 21).
 pub static RUN_ON_QUIT: AtomicBool = AtomicBool::new(false);
@@ -919,7 +921,11 @@ fn here_commit() -> Option<String> {
 /// v7.8 ticket 08: `doctor`'s checklist, one line per area, built only from the lines of the
 /// checks just made (`doctor --all` prints those lines): 🟢 works, 🟡 works with limits,
 /// 🔴 missing, with the check's own reason or fix. An area with nothing to say is left out.
-fn checklist(lines: &[String], here: &Option<String>) -> Vec<String> {
+fn checklist(
+    lines: &[String],
+    here: &Option<String>,
+    controllers: std::result::Result<&[ControllerConnection], &str>,
+) -> Vec<String> {
     // What a check said after `prefix: `, for every line that starts with `prefix`.
     let said = |prefix: &str| -> Vec<&str> {
         lines
@@ -994,14 +1000,19 @@ fn checklist(lines: &[String], here: &Option<String>) -> Vec<String> {
         _ => {}
     }
     // Each Xbox controller.
-    for found in said("Xbox controllers") {
-        if found.starts_with("none") {
-            out.push(row("🔴", "Xbox controller", found.to_owned()));
-        } else {
-            for pad in found.split(", ") {
-                let (name, link) = pad.split_once(" (").unwrap_or((pad, ""));
-                let link = link.trim_end_matches(')');
-                out.push(row("🟢", "Xbox controller", format!("{name} · {link}")));
+    match controllers {
+        Ok([]) => out.push(row("🔴", "Xbox controller", NO_XBOX_CONTROLLER.into())),
+        Err(error) => out.push(row("🔴", "Xbox controller", error.into())),
+        Ok(pads) => {
+            for pad in pads {
+                let mut detail = format!("{} · {}", pad.name, pad.details);
+                let mark = if let Some(warning) = pad.mapping_warning() {
+                    detail.push_str(&format!(" · {warning}"));
+                    "🟡"
+                } else {
+                    "🟢"
+                };
+                out.push(row(mark, "Xbox controller", detail));
             }
         }
     }
@@ -1259,22 +1270,25 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                 Err(e) => out.push(format!("MIDI unavailable: {e}")),
             }
             // v7.7 ticket 250: the same open says whether a terminal run's Xbox wake works.
-            let opened = match crate::gamepad::Pad::open() {
-                Ok(pad) => {
-                    match pad.connections().as_slice() {
-                        [] => out.push(format!(
-                            "Xbox controllers: none connected (USB or Bluetooth)"
-                        )),
-                        names => out.push(format!("Xbox controllers: {}", names.join(", "))),
-                    }
-                    Ok(())
-                }
-                Err(e) => {
-                    out.push(format!("Xbox controllers: {e}"));
-                    Err(e.to_string())
-                }
+            let controllers = crate::gamepad::Pad::open()
+                .map(|pad| pad.connection_info())
+                .map_err(|error| error.to_string());
+            let report = match controllers.as_deref() {
+                Ok([]) => NO_XBOX_CONTROLLER.to_owned(),
+                Err(error) => error.clone(),
+                Ok(pads) => pads
+                    .iter()
+                    .map(|pad| match pad.mapping_warning() {
+                        Some(warning) => format!("{} ({} · {warning})", pad.name, pad.details),
+                        None => format!("{} ({})", pad.name, pad.details),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", "),
             };
-            out.push(format!("{}", crate::wake::line(opened)));
+            out.push(format!("Xbox controllers: {report}"));
+            out.push(crate::wake::line(
+                controllers.as_ref().map(|_| ()).map_err(Clone::clone),
+            ));
             out.push(format!("{}", crate::gamepad::headset()));
             // v7.7 ticket 214: the login service's note that Flow can't hear its keyboard.
             let flow = crate::status::state_dir().and_then(|d| {
@@ -1458,7 +1472,15 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
             ));
             // v7.8 ticket 08: a checklist by default; every line with --all.
             match flags {
-                [] => println!("{}", checklist(&out, &here_commit()).join("\n")),
+                [] => println!(
+                    "{}",
+                    checklist(
+                        &out,
+                        &here_commit(),
+                        controllers.as_deref().map_err(String::as_str)
+                    )
+                    .join("\n")
+                ),
                 _ => println!("{}", out.join("\n")),
             }
         }
@@ -1471,7 +1493,7 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// v7.8 ticket 08: doctor's checklist from fixture lines (today's `doctor --all` lines):
+    /// v7.8 ticket 08: doctor's checklist from fixture checks:
     /// each area's 🟢/🟡/🔴 with its own reason or fix, and only what the checks said.
     #[test]
     fn doctor_checklist_marks_each_area_from_its_check() {
@@ -1480,7 +1502,6 @@ mod tests {
             "Session: wayland / GNOME",
             "uinput read/write: ready (no keyboard created)",
             "MIDI identity: MPK mini 3:MPK mini 3 MIDI 1 32:0 (no input opened)",
-            "Xbox controllers: Xbox Wireless Controller (Bluetooth · xpadneo · battery 62% charging · profile 1 · mapped as Microsoft Xbox One)",
             "Xbox headset audio: unavailable over Bluetooth · use the USB cable with xone",
             "Keyboard light: available (Razer BlackWidow: Scroll Lock) · on in Status light patterns",
             "Keyboard G light: unavailable: lighting it turns on Razer game mode, which turns off the Super key",
@@ -1493,7 +1514,13 @@ mod tests {
             "Window control extension: answering (launcher minimize/close available)",
         ]
         .map(String::from);
-        let list = checklist(&today, &Some("abc1234".into())).join("\n");
+        let pads = [ControllerConnection {
+            name: "Xbox Wireless Controller".into(),
+            details: "Bluetooth · xpadneo · battery 62% charging · profile 1 · mapped as Microsoft Xbox One".into(),
+            mapping_source: crate::gamepad::MappingSource::SdlMappings,
+            uuid: [0; 16],
+        }];
+        let list = checklist(&today, &Some("abc1234".into()), Ok(&pads)).join("\n");
         for line in [
             "🟢 VibeConsole           0.7.8 (v7.8 08, commit abc1234) · installed build matches · login service running",
             "🟢 Akai MPK mini 3       connected · program 1 verified",
@@ -1515,7 +1542,6 @@ mod tests {
             "vibeconsole 0.7.7 (v7.7 271, commit 0000000)",
             "uinput permission/device failure: Permission denied; see README permission commands",
             "MIDI unavailable: AKAI MPK mini 3 (USB 09e8:1049) is not connected",
-            "Xbox controllers: none connected (USB or Bluetooth)",
             "Login service: disabled",
             "Run state: run state unavailable: no file",
             "Codex status hooks: not installed; Agents → Status hooks installs them",
@@ -1523,7 +1549,7 @@ mod tests {
             "Problem · file I/O: lights.json unreadable",
         ]
         .map(String::from);
-        let list = checklist(&broken, &Some("abc1234".into())).join("\n");
+        let list = checklist(&broken, &Some("abc1234".into()), Ok(&[])).join("\n");
         for line in [
             "🟡 VibeConsole           0.7.7 (v7.7 271, commit 0000000) · installed build differs from this source (mise run install) · login service off (vibeconsole startup-enable)",
             "🔴 Akai MPK mini 3       AKAI MPK mini 3 (USB 09e8:1049) is not connected",
@@ -1537,10 +1563,48 @@ mod tests {
         }
         // Outside the repo the build line doesn't compare.
         assert!(
-            !checklist(&today, &None)
+            !checklist(&today, &None, Ok(&pads))
                 .join("\n")
                 .contains("installed build")
         );
+    }
+
+    #[test]
+    fn doctor_warns_for_default_and_unknown_xbox_mappings() {
+        use crate::gamepad::MappingSource;
+        let pad = |name: &str, mapping_source| ControllerConnection {
+            name: name.into(),
+            details: "Bluetooth · xpadneo".into(),
+            mapping_source,
+            uuid: [5, 0, 0, 0, 0x5e, 4, 0, 0, 0x8e, 2, 0, 0, 0x30, 0x11, 0, 0],
+        };
+        let pads = [
+            pad("Xbox, rev B", MappingSource::Driver),
+            pad("Xbox with SDL mapping", MappingSource::SdlMappings),
+            pad("Xbox with unknown mapping", MappingSource::None),
+        ];
+        let list = checklist(&[], &None, Ok(&pads));
+        let xbox = list
+            .iter()
+            .filter(|line| line.contains(" Xbox controller "))
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            xbox,
+            [
+                "🟡 Xbox controller       Xbox, rev B · Bluetooth · xpadneo · gilrs default mapping · LT and RT may not register · bus 0005 · vendor 045e · product 028e · version 1130",
+                "🟢 Xbox controller       Xbox with SDL mapping · Bluetooth · xpadneo",
+                "🟡 Xbox controller       Xbox with unknown mapping · Bluetooth · xpadneo · gilrs mapping source unknown · LT and RT unverified · bus 0005 · vendor 045e · product 028e · version 1130",
+            ]
+        );
+        let unavailable = checklist(
+            &[],
+            &None,
+            Err("Xbox controllers unavailable: access denied"),
+        );
+        assert!(unavailable.iter().any(|line| {
+            line == "🔴 Xbox controller       Xbox controllers unavailable: access denied"
+        }));
     }
     /// v7.7 ticket 187: the same probes for both modes; a program missing from the
     /// service's PATH is a differing row with its cause and how it should be; the by-design
