@@ -6588,6 +6588,42 @@ fn xbox_group(
     )
 }
 
+/// v7.8 ticket 07: a program picked in program select.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Picked {
+    /// The Akai's program (its context, 0–7).
+    Akai(u8),
+    /// The Xbox program (1–8).
+    Xbox(u8),
+}
+/// v7.8 ticket 07: program select: the Akai's programs (`Program N — name` as read) then the
+/// Xbox programs, each by its name; with both devices listed, each row says which.
+fn program_select(
+    ui: &mut impl Ui,
+    akai: &[String],
+    xbox: &[String],
+    at: Picked,
+) -> Result<Option<Picked>> {
+    let both = !akai.is_empty() && !xbox.is_empty();
+    let name = |title: &str, device: &str| {
+        let name = title.split_once(" — ").map_or(title, |(_, name)| name);
+        match both {
+            true => format!("{name} · {device}"),
+            false => name.to_owned(),
+        }
+    };
+    let rows = (akai.iter().enumerate())
+        .map(|(i, t)| (name(t, "Akai"), Picked::Akai(i as u8)))
+        .chain((xbox.iter().enumerate()).map(|(i, t)| (name(t, "Xbox"), Picked::Xbox(i as u8 + 1))))
+        .collect::<Vec<_>>();
+    let labels = rows.iter().map(|(l, _)| l.clone()).collect::<Vec<_>>();
+    let initial = rows.iter().position(|(_, p)| *p == at).unwrap_or(0);
+    let title = "/prog-select — pick a program.
+An Akai program replaces its RAM with the stored preset; an Xbox program switches as View/Menu + bumper does.
+Running/paused mode is retained; held keys and toggles start inactive.";
+    Ok(choose_at(ui, title, &labels, initial)?.map(|i| rows[i].1))
+}
+
 fn choose(ui: &mut impl Ui, title: &str, options: &[String]) -> Result<Option<usize>> {
     choose_at(ui, title, options, 0)
 }
@@ -14211,23 +14247,40 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
                 Ok(())
             })(),
             10 => (|| {
-                ui.program_connection()?;
-                let contexts =
-                    crate::feedback::names(ui.input.as_mut().ok_or("MIDI: disconnected")?)?;
-                ui.program_names = contexts.clone();
-                let selected_program = usize::from(ui.context);
+                // v7.8 ticket 07: the connected devices' programs in one list: the Akai's
+                // (read from it) and the Xbox controller's (named in the config).
+                let xbox = if ui.xbox_connected() {
+                    let config = mappings::load_config(path)?;
+                    (1..=mappings::XBOX_PROGRAMS)
+                        .map(|p| mappings::xbox_program_name(&config, p))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let akai = (|| -> Result<Vec<String>> {
+                    ui.program_connection()?;
+                    crate::feedback::names(ui.input.as_mut().ok_or("MIDI: disconnected")?)
+                })();
+                let akai = match akai {
+                    Ok(names) => names,
+                    Err(_) if !xbox.is_empty() => Vec::new(), // the Xbox's alone
+                    Err(error) => return Err(error),
+                };
+                if !akai.is_empty() {
+                    ui.program_names = akai.clone();
+                }
+                let at = match ui.last_xbox && !xbox.is_empty() {
+                    true => Picked::Xbox(ui.xbox_program),
+                    false => Picked::Akai(ui.context),
+                };
                 // v7 ticket 144: the Xbox fires while the program is chosen; the selection
                 // below writes to the controller with output suspended.
-                let picked = ui.menu_fires(true, |ui| {
-                    choose_at(
-                        ui,
-                        "/prog-select — select the actual hardware preset.
-Selection replaces current RAM with the stored preset.
-Running/paused mode is retained; held keys and toggles start inactive.",
-                        &contexts,
-                        selected_program,
-                    )
-                })?;
+                let picked = ui.menu_fires(true, |ui| program_select(ui, &akai, &xbox, at))?;
+                let picked = match picked {
+                    Some(Picked::Xbox(program)) => return ui.set_xbox_program(program),
+                    Some(Picked::Akai(context)) => Some(usize::from(context)),
+                    None => None,
+                };
                 if let Some(context) = picked {
                     ui.context_verified = false;
                     ui.feedback_allowed = false;
@@ -15401,6 +15454,49 @@ mod tests {
             ["Enter"]
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.8 ticket 07: program select lists both devices' programs by name (each row saying
+    /// which device only when both are there), opens on the one in use, and says what was picked.
+    #[test]
+    fn program_select_lists_both_devices_by_name() {
+        use Key::*;
+        let akai = strings(&["Program 1 — TradingView", "Program 2"]);
+        let xbox = strings(&["Apps", "Program 2"]);
+        let mut ui = Script {
+            keys: [Down, Down, Enter].into(),
+            ..Default::default()
+        };
+        let picked = program_select(&mut ui, &akai, &xbox, Picked::Akai(0)).unwrap();
+        let screen = ui.screens.last().unwrap();
+        for row in [
+            "TradingView · Akai",
+            "Program 2 · Akai",
+            "Apps · Xbox",
+            "Program 2 · Xbox",
+        ] {
+            assert!(screen.contains(row), "{screen}");
+        }
+        assert_eq!(picked, Some(Picked::Xbox(1)));
+        // Only the Xbox connected: its programs alone, no device names; opens on the one in use.
+        let mut ui = Script {
+            keys: [Enter].into(),
+            ..Default::default()
+        };
+        let picked = program_select(&mut ui, &[], &xbox, Picked::Xbox(2)).unwrap();
+        let screen = ui.screens.last().unwrap();
+        assert!(
+            screen.contains("Apps") && !screen.contains("· Xbox") && !screen.contains("· Akai")
+        );
+        assert_eq!(picked, Some(Picked::Xbox(2)));
+        // Only the Akai: its programs alone.
+        let mut ui = Script {
+            keys: [Down, Enter].into(),
+            ..Default::default()
+        };
+        let picked = program_select(&mut ui, &akai, &[], Picked::Akai(0)).unwrap();
+        assert!(!ui.screens.last().unwrap().contains("Apps"));
+        assert_eq!(picked, Some(Picked::Akai(1)));
     }
 
     /// v7.8 ticket 06: the header names the program (Program N only when unnamed), then the
