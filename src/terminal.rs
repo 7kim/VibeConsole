@@ -261,7 +261,7 @@ trait Ui {
     }
     /// herdr's agent names (v7 ticket 18).
     fn herdr_agents(&mut self) -> Result<Vec<String>> {
-        let output = std::process::Command::new("herdr")
+        let output = vibeconsole_core::program("herdr")
             .args(["agent", "list"])
             .output()
             .map_err(|e| format!("herdr isn't available: {e}"))?;
@@ -281,7 +281,7 @@ trait Ui {
     /// Orca's agent terminals as (agent, folder) (v7 ticket 15).
     fn orca_agents(&mut self) -> Result<Vec<(String, String)>> {
         // v7 ticket 102: Orca IDE's CLI, never the screen reader.
-        let output = std::process::Command::new(crate::actions::orca_program()?)
+        let output = vibeconsole_core::program(crate::actions::orca_program()?)
             .args(["terminal", "list", "--json"])
             .output()
             .map_err(|e| format!("Orca CLI unavailable: {e}"))?;
@@ -3712,6 +3712,10 @@ impl Terminal {
         if !self.start_flow_enabled {
             return Ok(());
         }
+        if vibeconsole_core::emulated().is_some() {
+            self.notice = "Wispr Flow: not started in an emulated run.".into(); // v7.8 ticket 01
+            return Ok(());
+        }
         if !crate::actions::flow_installed()? {
             self.flow_missing = true;
             self.notice = "Wispr Flow not installed; automatic startup skipped.".into();
@@ -6322,7 +6326,7 @@ impl Ui for Terminal {
         let editor = editor.to_string_lossy();
         let mut parts = editor.split_whitespace();
         let program = parts.next().ok_or("editor command is empty")?;
-        let result = std::process::Command::new(program)
+        let result = vibeconsole_core::program(program)
             .args(parts)
             .arg(path)
             .status();

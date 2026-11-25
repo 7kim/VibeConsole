@@ -130,6 +130,10 @@ mod tests {
         );
         assert_eq!(device_name("plain name"), "plain name");
         assert!(is_akai("MPK mini 3:MPK mini 3 MIDI 1 16:0"));
+        // v7.8 ticket 01: the emulator's port is never the Akai, nor another MIDI device.
+        let emulator = "VibeConsole emulator · MPK mini 3:VibeConsole emulator · MPK mini 3 131:0";
+        assert!(!is_akai(emulator) && !offered(emulator));
+        assert!(!crate::ours(emulator) && crate::ours("MPK mini 3:MPK mini 3 MIDI 1 32:0"));
         assert!(!is_akai(
             "Launchkey Mini MK3:Launchkey Mini MK3 MIDI 1 24:0"
         ));
@@ -284,7 +288,11 @@ pub fn akai_port<T: midir::MidiIO>(midi: &T) -> crate::Result<(T::Port, String)>
         .into_iter()
         .filter_map(|port| {
             let name = midi.port_name(&port).ok()?;
-            is_akai(&name).then_some((port, name))
+            let akai = match crate::emulated() {
+                Some(_) => crate::is_emulator(&name) && name.to_lowercase().contains("mpk mini 3"),
+                None => is_akai(&name),
+            };
+            akai.then_some((port, name))
         })
         .collect::<Vec<_>>();
     match matches.len() {
@@ -294,8 +302,9 @@ pub fn akai_port<T: midir::MidiIO>(midi: &T) -> crate::Result<(T::Port, String)>
     }
 }
 
+/// v7.8 ticket 01: the emulator's port names the MPK mini 3 too, but is never the Akai.
 pub fn is_akai(port: &str) -> bool {
-    port.to_lowercase().contains("mpk mini 3")
+    port.to_lowercase().contains("mpk mini 3") && !crate::is_emulator(port)
 }
 /// A port's device name: its ALSA name without the trailing `client:port` id, which
 /// changes on every replug.
@@ -340,6 +349,9 @@ pub fn real_midi() -> crate::Result<()> {
 /// Connected other MIDI devices, by device name.
 pub fn other_devices() -> crate::Result<Vec<String>> {
     real_midi()?;
+    if crate::emulated().is_some() {
+        return Ok(Vec::new()); // v7.8 ticket 01: only emulators in an emulated run
+    }
     let midi = midir::MidiInput::new("VibeConsole probe")
         .map_err(|e| format!("MIDI input unavailable: {e}"))?;
     let mut names = midi

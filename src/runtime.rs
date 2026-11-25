@@ -3,7 +3,6 @@ use std::{
     fs::{self, File, OpenOptions},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    process::Command,
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -173,7 +172,7 @@ pub fn journal(line: &str) {
 }
 /// Output is captured: Settings calls this inside the full-screen session.
 fn systemctl(args: &[&str]) -> Result<()> {
-    let output = Command::new("systemctl")
+    let output = vibeconsole_core::program("systemctl")
         .arg("--user")
         .args(args)
         .output()?;
@@ -633,7 +632,7 @@ pub fn statusline() -> Result<()> {
         return Ok(()); // saved by an older install: running it would call this again
     }
     // Their command is the one Claude Code ran as a shell line before; it runs the same way.
-    let mut child = Command::new("sh")
+    let mut child = vibeconsole_core::program("sh")
         .arg("-c")
         .arg(theirs.trim())
         .stdin(std::process::Stdio::piped())
@@ -987,7 +986,7 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
         "startup-start" => systemctl(&["start", "vibeconsole.service"])?,
         "startup-stop" => systemctl(&["stop", "vibeconsole.service"])?,
         "startup-status" => {
-            let status = Command::new("systemctl")
+            let status = vibeconsole_core::program("systemctl")
                 .args(["--user", "status", UNIT, "--no-pager"])
                 .status()
                 .map_err(|e| format!("startup-status: systemctl unavailable: {e}"))?;
@@ -1210,7 +1209,7 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
             for codex in [false, true] {
                 println!("{}", crate::status::hooks_status(codex));
             }
-            let answering = Command::new("gdbus")
+            let answering = vibeconsole_core::program("gdbus")
                 .args([
                     "call",
                     "--session",

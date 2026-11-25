@@ -77,6 +77,10 @@ fn help(color: bool) -> String {
                     "feedback-read",
                     "Read the controller's octave, tempo and arpeggiator".into(),
                 ),
+                (
+                    "--emulated <dir>",
+                    "Before a session command: test against the emulators in scripts/emulate (config in <dir>, output to <dir>/output.log, nothing reaches the desktop)".into(),
+                ),
             ],
         ),
         (
@@ -186,8 +190,68 @@ fn help(color: bool) -> String {
     out
 }
 
+/// v7.8 ticket 01: `--emulated <dir>`. Every config, state and runtime path moves into
+/// `<dir>` (HOME and XDG_RUNTIME_DIR are set before anything reads them), so the run takes
+/// no owner lock and never touches the login service, the real config or a real device.
+fn emulate(dir: &str) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    if dir.is_empty() || dir.starts_with('-') {
+        return Err("Startup: --emulated needs a folder: vibeconsole --emulated <dir>".into());
+    }
+    let run = std::path::Path::new(dir).join("run");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&run)
+        .map_err(|e| format!("Startup: emulated folder {dir}: {e}"))?;
+    let dir = std::fs::canonicalize(dir)?;
+    // SAFETY: called first thing in main, before any thread exists.
+    unsafe {
+        std::env::set_var("HOME", &dir);
+        std::env::set_var("XDG_RUNTIME_DIR", dir.join("run"));
+        for name in [
+            "XDG_CONFIG_HOME",
+            "XDG_STATE_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "CODEX_HOME",
+            "CLAUDE_CONFIG_DIR",
+            "INVOCATION_ID",
+        ] {
+            std::env::remove_var(name);
+        }
+    }
+    vibeconsole_core::set_emulated(dir);
+    Ok(())
+}
+
 fn main() -> Result<()> {
-    let args: Vec<_> = std::env::args().skip(1).collect();
+    let mut args: Vec<_> = std::env::args().skip(1).collect();
+    // v7.8 ticket 01: an emulated run's stand-in for every external program: records the
+    // call in <dir>/tools.log and runs nothing.
+    if args.first().is_some_and(|a| a == "emulated-tool") {
+        let [_, dir, call @ ..] = &args[..] else {
+            return Err("emulated-tool <dir> <program> [args]".into());
+        };
+        if !std::path::Path::new(dir).is_absolute() {
+            return Err("emulated-tool: the folder must be absolute".into());
+        }
+        vibeconsole_core::set_emulated(dir.into());
+        vibeconsole_core::emulated_log("tools.log", &format!("{call:?}"));
+        return Ok(());
+    }
+    let emulated = args.first().is_some_and(|a| a == "--emulated");
+    if emulated {
+        emulate(args.get(1).map_or("", String::as_str))?;
+        args.drain(..2);
+        if args.first().is_some_and(|a| !SESSION.contains(&a.as_str())) {
+            return Err(format!(
+                "Startup: --emulated runs only a session command, not '{}'",
+                args.join(" ")
+            )
+            .into());
+        }
+    }
     if let [arg] = &args[..]
         && ["--version", "-V", "-v", "--v", "version"].contains(&arg.as_str())
     {
@@ -318,9 +382,11 @@ fn main() -> Result<()> {
     let path = config_path()?;
     let mappings = load(&path)?;
     // A running login service is paused for the session and started on quit (ticket 20).
-    let _owner = if args == ["list"] {
-        plain_output();
-        None
+    let _owner = if args == ["list"] || emulated {
+        if args == ["list"] {
+            plain_output();
+        }
+        None // v7.8 ticket 01: an emulated run leaves the login service alone
     } else {
         Some(runtime::session()?)
     };

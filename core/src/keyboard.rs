@@ -463,6 +463,11 @@ fn send(
         Some(device) => device.emit(&[InputEvent::new(EventType::KEY.0, key.0, i32::from(down))]),
         None => {
             recorded.push((key, down));
+            // v7.8 ticket 01: an emulated run's keys, for its checks to read.
+            crate::emulated_log(
+                "output.log",
+                &format!("key {key:?} {}", if down { "down" } else { "up" }),
+            );
             Ok(())
         }
     }
@@ -472,6 +477,14 @@ fn send(
 /// VibeConsole may write to: Scroll Lock where the keyboard has it, else Caps Lock. Only the
 /// LED is lit; the lock state itself is never toggled, so typing is unaffected. Each LED goes
 /// back to what it showed before on `restore` and on drop (pause, error, quit).
+/// v7.8 ticket 01: an emulated run writes to no real light.
+pub fn off_when_emulated(device: &str) -> Result<()> {
+    match crate::emulated() {
+        Some(_) => Err(format!("{device}: unavailable in an emulated run").into()),
+        None => Ok(()),
+    }
+}
+
 pub struct LockLights {
     leds: Vec<Led>,
     lit: Option<bool>,
@@ -543,6 +556,7 @@ impl LockLights {
     /// A chosen light no keyboard offers is named in `missing`; nothing is sent until `show`.
     pub fn open_with(chosen: [bool; 4], razer: &Path) -> Result<Self> {
         use evdev::{EventType, InputEvent, LedCode};
+        off_when_emulated("Keyboard lights")?;
         let auto = chosen == [false; 4];
         let codes = [LedCode::LED_SCROLLL, LedCode::LED_CAPSL, LedCode::LED_NUML];
         let mut leds = Vec::new();
@@ -742,6 +756,7 @@ impl RgbKeyboards {
     /// Every keyboard under `driver` whose brightness can be read and whose effect files can
     /// be written. Nothing is sent until `show`.
     pub fn open(driver: &Path, rest: crate::status::Rgb) -> Result<Self> {
+        off_when_emulated("RGB keyboard")?;
         Self::open_with(driver, rest, None).map_err(|()| {
             "RGB keyboard: unavailable: OpenRazer's razerkbd driver isn't loaded, or its matrix effect files aren't writable (VibeConsole never installs it)".into()
         })
@@ -756,6 +771,7 @@ impl RgbKeyboards {
         label: &str,
         model: &str,
     ) -> Result<Self> {
+        off_when_emulated(label)?;
         Self::open_with(driver, rest, Some(model)).map_err(|()| {
             format!("{label}: unavailable: no Razer {model} under OpenRazer's razeraccessory driver, or its matrix effect files aren't writable (VibeConsole never installs it)").into()
         })
@@ -956,6 +972,7 @@ impl MouseLight {
     /// Reachable only when `logirgb profiles` names the G502's active profile; nothing is
     /// sent until `show`.
     pub fn open(mut run: crate::gamepad::Runner) -> Result<Self> {
+        off_when_emulated("Mouse RGB")?;
         active_profile(&mut run).map_err(|e| {
             format!(
                 "Mouse light (Logitech G502): unavailable: {e} (VibeConsole never installs logirgb)"
@@ -1190,6 +1207,9 @@ impl Drop for RgbKeyboards {
 
 impl Output {
     pub fn new(mappings: &[Mapping]) -> Result<Self> {
+        if crate::emulated().is_some() {
+            return Self::recording(mappings); // v7.8 ticket 01: no uinput keyboard
+        }
         let mut keyboard = Keyboard::new(mappings)?;
         keyboard.running = false;
         let mut device = create_output()?;

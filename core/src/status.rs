@@ -204,7 +204,7 @@ fn herdr_list() -> String {
     }
     if !ASKING.swap(true, Ordering::AcqRel) {
         std::thread::spawn(|| {
-            let answer = std::process::Command::new("timeout")
+            let answer = crate::program("timeout")
                 .args(["2", "herdr", "agent", "list"])
                 .output()
                 .ok()
@@ -438,7 +438,7 @@ fn within(cwd: &str, folder: &str) -> bool {
 /// `session<TAB>window` of the pane in $TMUX_PANE, None when there is no such live pane.
 fn pane_window() -> Option<String> {
     let pane = std::env::var("TMUX_PANE").ok().filter(|p| !p.is_empty())?;
-    let output = std::process::Command::new("tmux")
+    let output = crate::program("tmux")
         .args([
             "display-message",
             "-p",
@@ -489,7 +489,7 @@ pub fn vanished<'a>(
 
 /// Attached flag and active window of session `vibe`, if it exists.
 pub fn tmux_active() -> Option<(bool, String)> {
-    let output = std::process::Command::new("tmux")
+    let output = crate::program("tmux")
         .args([
             "display-message",
             "-p",

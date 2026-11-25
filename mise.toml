@@ -16,12 +16,13 @@ description = "Build the release binary, stop VibeConsole, install it, start the
 run = "scripts/install.sh"
 
 [tasks.pty]
-description = "Debug build, then the isolated PTY and installation checks (Python through uv)"
+description = "Debug build, then the isolated PTY, installation and emulator checks (Python through uv)"
 run = [
   "scripts/needs-bwrap.sh",
   "cargo build --locked",
   "uv run scripts/check-terminal.py",
   "uv run scripts/check-installation.py",
+  "uv run scripts/emulate/check-akai.py",
 ]
 
 [tasks.check]

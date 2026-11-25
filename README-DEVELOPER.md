@@ -461,7 +461,10 @@ cargo test --locked
 cargo build --locked
 uv run scripts/check-terminal.py
 uv run scripts/check-installation.py
+uv run scripts/emulate/check-akai.py
 ```
+
+**Emulators (v7.8 ticket 01).** `scripts/emulate/akai.py` plays an Akai MPK mini 3 from Python (`akai.pad(1)`, `akai.knob(3, 64)`, `akai.joystick(0, 1)`, `akai.key(60)`, `akai.program(2)`) on an ALSA port named `VibeConsole emulator · MPK mini 3`, and answers the program read/write/select SysEx from `testdata/mpk-mini3-programs.hex`. `vibeconsole --emulated <dir> [session command]` is the only run that picks it: HOME and XDG_RUNTIME_DIR move into `<dir>`, no owner lock is taken (the login service keeps running), keys and pointer moves go to `<dir>/output.log`, external programs are recorded in `<dir>/tools.log` instead of run, and no light, LED or rumble reaches a real device. A normal run and the login service never pick the emulator's port. An emulator pass is an agent-test pass only; anything seen on real hardware stays a developer test.
 
 The mise tasks: `install` (build, stop, install, restart the login service), `check`, and `pty` (debug build, then the PTY and installation checks through uv). A git-ignored `mise.local.toml` can add personal tasks.
 

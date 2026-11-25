@@ -1091,7 +1091,7 @@ pub type Runner = Box<dyn FnMut(&[&str]) -> crate::Result<String> + Send>;
 pub fn run_program() -> Runner {
     Box::new(|args: &[&str]| {
         let (program, rest) = args.split_first().ok_or("no program")?;
-        let output = std::process::Command::new(program)
+        let output = crate::program(program)
             .args(rest)
             .stdin(std::process::Stdio::null())
             .output()
@@ -1277,10 +1277,14 @@ pub fn pointer_step(
     step
 }
 /// The virtual pointer the mouse stick moves (created only when Tuning turns it on).
-pub struct Pointer(evdev::uinput::VirtualDevice);
+/// v7.8 ticket 01: None in an emulated run, which records each move in `output.log`.
+pub struct Pointer(Option<evdev::uinput::VirtualDevice>);
 impl Pointer {
     pub fn new() -> crate::Result<Self> {
         use evdev::{AttributeSet, KeyCode, RelativeAxisCode};
+        if crate::emulated().is_some() {
+            return Ok(Self(None));
+        }
         let axes = AttributeSet::from_iter([RelativeAxisCode::REL_X, RelativeAxisCode::REL_Y]);
         // A button makes desktops treat it as a mouse.
         let buttons = AttributeSet::from_iter([KeyCode::BTN_LEFT]);
@@ -1292,14 +1296,18 @@ impl Pointer {
                     .build()
             })
             .map_err(|e| format!("cannot create the pointer through /dev/uinput: {e}"))?;
-        Ok(Self(device))
+        Ok(Self(Some(device)))
     }
     pub fn move_by(&mut self, (dx, dy): (i32, i32)) -> crate::Result<()> {
         use evdev::{EventType, InputEvent, RelativeAxisCode};
         if (dx, dy) == (0, 0) {
             return Ok(());
         }
-        self.0.emit(&[
+        let Some(device) = &mut self.0 else {
+            crate::emulated_log("output.log", &format!("pointer move {dx} {dy}"));
+            return Ok(());
+        };
+        device.emit(&[
             InputEvent::new(EventType::RELATIVE.0, RelativeAxisCode::REL_X.0, dx),
             InputEvent::new(EventType::RELATIVE.0, RelativeAxisCode::REL_Y.0, dy),
         ])?;
@@ -1343,6 +1351,10 @@ impl Pad {
         let mut changes = Vec::new();
         let triggers = [gilrs::Button::LeftTrigger2, gilrs::Button::RightTrigger2];
         while let Some(event) = self.gilrs.next_event() {
+            // v7.8 ticket 01: an emulated run reads only emulators; others never read them.
+            if !crate::ours(self.gilrs.gamepad(event.id).name()) {
+                continue;
+            }
             let motion = match event.event {
                 gilrs::EventType::ButtonChanged(button, value, _) if triggers.contains(&button) => {
                     Some(Motion::Trigger(button, value))
@@ -1432,7 +1444,7 @@ impl Pad {
         let ids = self
             .gilrs
             .gamepads()
-            .filter(|(_, pad)| pad.is_ff_supported())
+            .filter(|(_, pad)| pad.is_ff_supported() && crate::ours(pad.name()))
             .map(|(id, _)| id)
             .collect::<Vec<_>>();
         if ids.is_empty() {
@@ -1465,6 +1477,7 @@ impl Pad {
     pub fn connected(&self) -> Vec<String> {
         self.gilrs
             .gamepads()
+            .filter(|(_, pad)| crate::ours(pad.name()))
             .map(|(_, pad)| pad.name().to_owned())
             .collect()
     }
@@ -1472,6 +1485,7 @@ impl Pad {
     pub fn connections(&self) -> Vec<String> {
         self.gilrs
             .gamepads()
+            .filter(|(_, pad)| crate::ours(pad.name()))
             .map(|(_, pad)| format!("{} ({})", pad.name(), connection(pad.uuid())))
             .collect()
     }
@@ -1513,6 +1527,7 @@ impl ButtonLight {
     /// Finds the lights and checks they can be written, without writing. Err is the reason
     /// the light is unavailable, ready to show.
     pub fn open(leds: &std::path::Path) -> std::result::Result<Self, String> {
+        crate::keyboard::off_when_emulated("Xbox light").map_err(|e| e.to_string())?;
         let mut dirs = std::fs::read_dir(leds)
             .map(|entries| {
                 entries

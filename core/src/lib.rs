@@ -15,6 +15,54 @@ pub mod status;
 pub mod usage;
 pub mod wake;
 
+/// v7.8 ticket 01: the folder of an emulated run (`vibeconsole --emulated <dir>`), set once
+/// at startup. While set, only emulator devices are picked, keys, clicks and scrolls go to
+/// `<dir>/output.log`, external programs are recorded in `<dir>/tools.log` instead of run,
+/// and nothing is written to a real device.
+static EMULATED: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+pub fn set_emulated(dir: std::path::PathBuf) {
+    let _ = EMULATED.set(dir);
+}
+pub fn emulated() -> Option<&'static std::path::Path> {
+    EMULATED.get().map(std::path::PathBuf::as_path)
+}
+/// The name every emulated device carries (an ALSA port, a uinput gamepad).
+pub const EMULATOR: &str = "VibeConsole emulator";
+pub fn is_emulator(name: &str) -> bool {
+    name.to_lowercase().contains(&EMULATOR.to_lowercase())
+}
+/// A device this run may use: emulators in an emulated run, never one otherwise.
+pub fn ours(name: &str) -> bool {
+    emulated().is_some() == is_emulator(name)
+}
+/// v7.8 ticket 01: every external program VibeConsole starts. In an emulated run it is this
+/// binary's own recorder (`emulated-tool`), which writes the call to `<dir>/tools.log` and
+/// runs nothing.
+pub fn program(name: impl AsRef<std::ffi::OsStr>) -> Command {
+    match emulated() {
+        None => Command::new(name),
+        Some(dir) => {
+            let mut command = Command::new("/proc/self/exe");
+            command.arg("emulated-tool").arg(dir).arg(name);
+            command
+        }
+    }
+}
+/// One emulated-run output line appended to `<dir>/<file>`; outside an emulated run, nothing.
+pub fn emulated_log(file: &str, line: &str) {
+    use std::io::Write;
+    if let Some(dir) = emulated() {
+        let written = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(file))
+            .and_then(|mut f| writeln!(f, "{line}"));
+        if let Err(error) = written {
+            eprintln!("emulated run: {file}: {error}");
+        }
+    }
+}
+
 use std::{collections::HashSet, process::Command};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -184,6 +232,9 @@ impl Detector {
 /// The Akai is on USB (`lsusb -d 09e8:1049`), checked before any MIDI port is opened.
 pub fn akai_connected() -> Result<()> {
     midi::real_midi()?; // v7.7 ticket 258: not even lsusb in tests
+    if emulated().is_some() {
+        return Ok(()); // v7.8 ticket 01: the emulator's port is found by name below
+    }
     let usb = Command::new("lsusb").args(["-d", DEVICE]).output()?;
     if !usb.status.success() {
         return Err("AKAI MPK mini 3 (USB 09e8:1049) is unavailable; check lsusb".into());

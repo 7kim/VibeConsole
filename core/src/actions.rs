@@ -867,7 +867,7 @@ pub fn flow_installed() -> Result<bool> {
 
 // Only child dispatch requests are cancellable. Never kill the resulting application.
 fn command(program: &str, args: &[String], cancelled: &impl Fn() -> bool) -> Result<String> {
-    dispatch(Command::new(program), args, cancelled)
+    dispatch(crate::program(program), args, cancelled)
 }
 fn dispatch(
     mut command: Command,
@@ -1195,7 +1195,7 @@ pub fn running(action: &Action, agents: &[(String, String)]) -> Option<bool> {
         } => window(&agents.iter().find(|(name, _)| name == agent)?.1),
         Action::Application(path) | Action::AppToggle { path, .. } => {
             let id = desktop_id(path)?;
-            let output = Command::new("gdbus")
+            let output = crate::program("gdbus")
                 .args(windows_call("State", &[&id]))
                 .output()
                 .ok()
@@ -1259,7 +1259,7 @@ pub fn running_extension_version(
     }
 }
 pub fn gdbus_output(argv: &[String]) -> Result<String> {
-    let output = Command::new("gdbus").args(argv).output()?;
+    let output = crate::program("gdbus").args(argv).output()?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr)
             .trim()
@@ -1736,9 +1736,9 @@ pub fn prompts_dir_for(config: &Path) -> Result<PathBuf> {
 /// server, agents or opened terminals with it.
 fn scoped(program: &str, in_unit: bool) -> Command {
     if !in_unit {
-        return Command::new(program);
+        return crate::program(program);
     }
-    let mut command = Command::new("systemd-run");
+    let mut command = crate::program("systemd-run");
     command.args(["--user", "--scope", "--quiet", "--collect", "--", program]);
     command
 }
