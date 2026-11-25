@@ -39,6 +39,13 @@ for subjects, ticket in [
 ] + ([("mise 10: x\nv7 1 y\n", "mise 10")] if (lookup.parents[1] / "docs/mise/tickets").is_dir() else []):
     found = subprocess.run([lookup], input=subjects, capture_output=True, text=True, check=True).stdout
     assert found.strip() == ticket, (subjects, found)
+# A clone without docs/ (git-ignored) still finds v<number> subjects.
+with tempfile.TemporaryDirectory() as clone:
+    (Path(clone) / "scripts").mkdir()
+    shutil.copy(lookup, Path(clone) / "scripts")
+    found = subprocess.run([Path(clone) / "scripts/build-ticket.sh"], input="v7.8 ticket 38: x\n",
+                           capture_output=True, text=True, check=True).stdout
+    assert found.strip() == "v7.8 ticket 38", found
 with tempfile.TemporaryDirectory(prefix="vibeconsole-install-") as directory:
     root = Path(directory)
     fake = root / "tools"

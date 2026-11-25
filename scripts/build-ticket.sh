@@ -6,7 +6,7 @@
 # git-ignored, so a clone without docs/ matches only v<number>). Prints nothing on no match.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-versions=$(for d in docs/*/tickets; do [ -d "$d" ] && basename "$(dirname "$d")"; done | grep -vx skipped | sed 's/[.]/[.]/g' | paste -sd'|')
+versions=$(for d in docs/*/tickets; do if [ -d "$d" ]; then basename "$(dirname "$d")"; fi; done | { grep -vx skipped || true; } | sed 's/[.]/[.]/g' | paste -sd'|')
 names="v[0-9.]+${versions:+|$versions}"
 # awk reads every line, so `git log` upstream never meets a closed pipe.
 awk -v re="^($names) (tickets? )?[0-9]" '!found && $0 ~ re { print; found = 1 }' |
