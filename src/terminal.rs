@@ -4137,10 +4137,14 @@ impl Terminal {
     /// are held back or let through.
     fn follow_own_focus(&mut self) -> Result<()> {
         let own = self.focused_title().map(|title| title == self.own_title);
-        if own == self.own_focus {
+        // Only a change in what the keyboard holds back is a transition: going from "another
+        // window" to "can't tell" (a title the extension can't report) changes nothing, and
+        // released keys and paused output on every such flip.
+        let before = self.own_focus.unwrap_or(self.configuring);
+        self.own_focus = own;
+        if own.unwrap_or(self.configuring) == before {
             return Ok(());
         }
-        self.own_focus = own;
         self.release_all()?;
         self.reload_keyboard()
     }

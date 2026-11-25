@@ -1232,10 +1232,13 @@ pub fn focused_app(mut gdbus: impl FnMut(&[String]) -> Result<String>) -> Result
 pub fn focused_title(mut gdbus: impl FnMut(&[String]) -> Result<String>) -> Result<String> {
     let reply = gdbus(&windows_call("FocusedTitle", &[]))
         .map_err(|e| format!("own terminal focus unavailable: {e}"))?;
+    // GVariant prints a title holding ' in double quotes; escapes stay (only equality with
+    // our own plain title matters).
+    let reply = reply.trim();
     reply
-        .trim()
         .strip_prefix("('")
         .and_then(|r| r.strip_suffix("',)"))
+        .or_else(|| reply.strip_prefix("(\"")?.strip_suffix("\",)"))
         .map(str::to_owned)
         .ok_or_else(|| "own terminal focus unavailable: unexpected reply".into())
 }
@@ -2940,6 +2943,11 @@ mod tests {
         assert_eq!(
             focused_title(reply("('VibeConsole-42',)\n")).unwrap(),
             "VibeConsole-42"
+        );
+        // A title with an apostrophe comes back double-quoted; it's still read.
+        assert_eq!(
+            focused_title(reply("(\"Don't stop - YouTube\",)\n")).unwrap(),
+            "Don't stop - YouTube"
         );
         let missing = focused_title(|_: &[String]| -> Result<String> {
             Err("No such method 'FocusedTitle'".into())
