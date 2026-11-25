@@ -91,14 +91,19 @@ impl Step {
             Self::Keys(keys) if crate::mappings::parse_shortcut(&keys.join("+"))? != *keys => {
                 Err("invalid step shortcut".into())
             }
+            // v7.8 ticket 16: every action can be a step but knobs and nested sequences (a
+            // shortcut is a Keys step).
             Self::Do(
                 Action::Shortcut
                 | Action::Sequence(_)
+                | Action::PromptSequence(_)
+                | Action::SavedSequence(_)
                 | Action::Choice(_)
-                | Action::Value { .. }
-                | Action::Flow
-                | Action::AppToggle { .. },
-            ) => Err("a step cannot be a mapping shortcut, sequence, knob, launcher toggle, or Flow action".into()),
+                | Action::Value { .. },
+            ) => Err(
+                "a step cannot be a knob action or another sequence (a shortcut is a Keys step)"
+                    .into(),
+            ),
             Self::Do(action) => action.validate(),
             _ => Ok(()),
         }
@@ -758,6 +763,17 @@ pub fn on_path(program: &str) -> bool {
         })
 }
 impl Action {
+    /// v7.8 tickets 12, 16: fires only after a one-second hold: suspend, turning the
+    /// controller off, and a sequence holding one of them.
+    pub fn must_hold(&self) -> bool {
+        match self {
+            Self::System(system) => system.risky(),
+            Self::Sequence(steps) => steps
+                .iter()
+                .any(|step| matches!(step, Step::Do(action) if action.must_hold())),
+            _ => false,
+        }
+    }
     pub fn flow(&self) -> bool {
         *self == Self::Flow
     }
@@ -4533,7 +4549,12 @@ mod tests {
             Action::Sequence(vec![Step::Wait(99)]),
             Action::Sequence(vec![Step::Wait(60001)]),
             Action::Sequence(vec![Step::Do(Action::Sequence(vec![Step::Wait(100)]))]),
-            Action::Sequence(vec![Step::Do(Action::Flow)]),
+            Action::Sequence(vec![Step::Do(Action::Value {
+                path: "/tmp/v".into(),
+                min: 0,
+                max: 10,
+                decimals: 0,
+            })]),
             Action::Sequence(vec![Step::Do(Action::Shortcut)]),
             Action::Sequence(vec![Step::Agent("bad name".into())]),
             Action::Sequence(vec![Step::Wait(100); 33]),
@@ -4798,6 +4819,74 @@ mod tests {
             Some(("flatpak", strings(&["run", "com.google.Chrome"])))
         );
         assert_eq!(Browser::Chrome.launcher(&only(&[])), None);
+    }
+
+    /// v7.8 ticket 16: a sequence mixes families: a launch, a media key, a mouse click and a
+    /// prompt run in order (the keys through the session's taps) and round-trip; a knob or a
+    /// nested sequence is refused; a held step makes the whole sequence held.
+    #[test]
+    fn every_family_but_knobs_and_sequences_can_be_a_step() {
+        let launch =
+            Action::Application("/usr/share/applications/org.gnome.Calculator.desktop".into());
+        let prompt = Action::Prompt {
+            file: "review".into(),
+            target: Target::Focused { shift: false },
+            enter: true,
+        };
+        let steps = vec![
+            Step::Do(launch.clone()),
+            Step::Wait(500),
+            Step::Do(Action::Media(Media::PlayPause)),
+            Step::Keys(vec!["MouseLeft".into()]),
+            Step::Do(Action::System(System::DarkStyle(true))),
+            Step::Do(Action::Browser {
+                browser: Browser::Firefox,
+                what: BrowserDo::NewTab,
+            }),
+            Step::Do(prompt.clone()),
+        ];
+        let sequence = Action::Sequence(steps.clone());
+        sequence.validate().unwrap();
+        assert_eq!(Action::parse(&sequence.encode()).unwrap(), sequence);
+        assert!(!sequence.must_hold());
+        let mut ran = Vec::new();
+        run_sequence(&steps, &|| false, |step| {
+            ran.push(step.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(ran, steps, "in order, each once");
+        // The media and click steps go through the session's taps, in order.
+        let taps = std::cell::RefCell::new(Vec::new());
+        let keys_only = Action::Sequence(steps[2..4].to_vec());
+        perform(&keys_only, None, &|| false, &|k| {
+            taps.borrow_mut().push(k);
+            Ok(())
+        })
+        .unwrap();
+        use evdev::KeyCode as K;
+        assert_eq!(
+            taps.into_inner(),
+            [vec![K::KEY_PLAYPAUSE], vec![K::BTN_LEFT]]
+        );
+        for refused in [
+            Action::Choice(vec![prompt.clone(), prompt.clone()]),
+            Action::Sequence(vec![Step::Wait(100)]),
+            Action::PromptSequence(vec![prompt.clone()]),
+            Action::SavedSequence("daily".into()),
+        ] {
+            assert!(
+                Action::Sequence(vec![Step::Do(refused.clone())])
+                    .validate()
+                    .is_err(),
+                "{refused:?}"
+            );
+        }
+        let held = Action::Sequence(vec![
+            Step::Do(launch),
+            Step::Do(Action::System(System::Suspend)),
+        ]);
+        assert!(held.must_hold());
     }
 
     /// v7.8 ticket 15: codegen and a saved script run in the Playwright folder with the URL

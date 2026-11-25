@@ -6883,6 +6883,7 @@ fn sequence_menu(
         };
         match index.checked_sub(steps.len()) {
             Some(0) if steps.len() < 32 => {
+                // v7.8 ticket 16: every family but knobs and sequences.
                 let Some(kind) = choose(
                     ui,
                     "Step",
@@ -6893,6 +6894,14 @@ fn sequence_menu(
                         "Launch application",
                         "Shortcut",
                         "Wait",
+                        "Music & Sound",
+                        "Mouse action",
+                        "Fedora System",
+                        "Browser or Playwright",
+                        "Orca",
+                        "T3 Code",
+                        "herdr agent",
+                        "tmux agent",
                     ]),
                 )?
                 else {
@@ -6911,8 +6920,35 @@ fn sequence_menu(
                     2 => command_action(ui, None)?.map(Step::Do),
                     3 => action_menu(ui, 1, mappings::Input::Pad, None, false)?.map(Step::Do),
                     4 => shortcut(ui, &[])?.map(Step::Keys),
-                    _ => number(ui, "Wait (milliseconds)", 1000, 100, 60000)?
+                    5 => number(ui, "Wait (milliseconds)", 1000, 100, 60000)?
                         .map(|ms| Step::Wait(ms as u16)),
+                    6 => action_menu(ui, 2, mappings::Input::Pad, None, false)?.map(Step::Do),
+                    7 => {
+                        let rows = mappings::MOUSE_KEYS.map(|(_, l)| l.to_string());
+                        choose(ui, "Mouse action (one click or one scroll step)", &rows)?
+                            .map(|i| Step::Keys(vec![mappings::MOUSE_KEYS[i].0.into()]))
+                    }
+                    8 => fedora_system(ui, None)?.map(Step::Do),
+                    9 => browser_action(ui, path, None)?.map(Step::Do),
+                    10 => {
+                        let any = Control::from_note(vibeconsole_core::PAD_CHANNEL, 36)
+                            .ok_or("no pad")?;
+                        orca_mapping(ui, any, mappings::Input::Pad)?.map(|m| Step::Do(m.action))
+                    }
+                    11 => t3_action(ui)?.map(Step::Do),
+                    12 => {
+                        let agents = ui.herdr_agents()?;
+                        choose(ui, "Focus which herdr agent?", &agents)?
+                            .map(|i| Step::Do(Action::HerdrFocus(agents[i].clone())))
+                    }
+                    _ => {
+                        let windows = (mappings::load_config(path)?.agents.into_iter())
+                            .filter(|a| a.host == mappings::Host::Tmux)
+                            .map(|a| a.window)
+                            .collect::<Vec<_>>();
+                        choose(ui, "Go to which tmux agent?", &windows)?
+                            .map(|i| Step::Do(Action::TmuxJump(windows[i].clone())))
+                    }
                 };
                 if let Some(step) = step {
                     Action::Sequence(vec![step.clone()]).validate()?;
@@ -11957,10 +11993,14 @@ fn paired_devices(text: &str) -> Vec<(String, String)> {
 }
 /// v7.8 ticket 12: Fedora System actions that fire only after a one-second hold.
 fn must_hold(action: &crate::actions::Action) -> bool {
+    use crate::actions::{Action, Step};
     match action {
-        crate::actions::Action::System(system) => system.risky(),
-        crate::actions::Action::Command { line, .. } => UPDATES.iter().any(|(l, _)| l == line),
-        _ => false,
+        Action::Command { line, .. } => UPDATES.iter().any(|(l, _)| l == line),
+        // v7.8 ticket 16: a sequence holding a held step is held too.
+        Action::Sequence(steps) => steps
+            .iter()
+            .any(|step| matches!(step, Step::Do(action) if must_hold(action))),
+        action => action.must_hold(),
     }
 }
 /// v7.8 ticket 12: the Fedora System family: the updates, then each fixed action, then a
@@ -13729,7 +13769,7 @@ fn configure_steps(
         }
         // v7 ticket 23: a terminal command (sudo and the like) is a risky control: it fires
         // only after a one-second hold, in a visible terminal where sudo asks for the password.
-        if family == 12 || (family == 17 && must_hold(&mapping.action)) {
+        if family == 12 || (matches!(family, 5 | 17) && must_hold(&mapping.action)) {
             mapping.risky = true;
         } else if copied {
             // A favourite keeps its "fire when", but only pads and keys can be held.
