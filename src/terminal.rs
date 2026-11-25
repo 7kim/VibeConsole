@@ -12355,30 +12355,32 @@ fn action_menu(
         if !second_press {
             return Ok(Some(Action::Application(path)));
         }
-        let saved_close = match saved_action {
-            Some(Action::AppToggle { close, .. }) => Some(usize::from(*close)),
-            Some(Action::AppToggleQuit(_)) => Some(2),
+        // v7.8 ticket 21: hold-to-quit first (where a new assignment starts), then Minimize,
+        // then Close; a saved assignment opens on its own choice.
+        let saved_choice = match saved_action {
+            Some(Action::AppToggleQuit(_)) => Some(0),
+            Some(Action::AppToggle { close, .. }) => Some(1 + usize::from(*close)),
             _ => None,
         };
-        let Some(close) = choose_saved(
+        let Some(choice) = choose_saved(
             ui,
             "Second press while the app is focused (needs the VibeConsole window extension; see README)",
             strings(&[
+                "Minimize; hold 1 second to quit (when a window is open, not minimized)",
                 "Minimize",
                 "Close",
-                "Minimize; hold 1 second to quit (when a window is open, not minimized)",
             ]),
-            saved_close,
+            saved_choice,
         )?
         else {
             return Ok(None);
         };
-        if close == 2 {
+        if choice == 0 {
             return Ok(Some(Action::AppToggleQuit(path)));
         }
         return Ok(Some(Action::AppToggle {
             path,
-            close: close == 1,
+            close: choice == 2,
         }));
     }
     use crate::actions::Media;
@@ -17169,7 +17171,7 @@ mod tests {
         let mut ui = Script {
             // learn, Launch application, the app, second press Close, fire when pressed, save and finish
             keys: [
-                Enter, Down, Enter, Enter, Down, Enter, Enter, Enter, Down, Enter,
+                Enter, Down, Enter, Enter, Down, Down, Enter, Enter, Enter, Down, Enter,
             ]
             .into(),
             pads: [b].into(),
@@ -20226,7 +20228,7 @@ mod tests {
         let cases: Vec<(&str, Vec<Key>, Vec<Key>, fn(&Action) -> bool)> = vec![
             (
                 "launch, hold to quit",
-                [family(1), vec![Enter, Down, Down, Enter]].concat(),
+                [family(1), vec![Enter, Enter]].concat(), // v7.8 ticket 21: hold to quit first
                 vec![Enter, Enter, Down, Enter], // layer 1, fire when pressed, save and finish
                 |a| matches!(a, Action::AppToggleQuit(_)),
             ),
@@ -21977,6 +21979,73 @@ mod tests {
     }
 
     /// v7 ticket 21: a launcher pad can minimize on a tap and quit on a one-second hold.
+    /// v7.8 ticket 21: the second-press list puts "Minimize; hold 1 second to quit" first
+    /// and selected for a new app toggle, then Minimize, then Close; a saved one opens on its
+    /// own choice and Enter keeps it.
+    #[test]
+    fn second_press_offers_hold_to_quit_first_and_keeps_a_saved_choice() {
+        use crate::actions::Action;
+        let app = "/nonexistent/recorded.desktop".to_string();
+        let second_press = |screens: &[String]| {
+            screens
+                .iter()
+                .find(|s| s.starts_with("Second press"))
+                .cloned()
+                .unwrap()
+        };
+        let mut new = Script {
+            keys: [Key::Enter, Key::Enter].into(), // the app, then the second press as offered
+            ..Default::default()
+        };
+        let made = action_menu(&mut new, 1, mappings::Input::Pad, None, true, None).unwrap();
+        assert_eq!(made, Some(Action::AppToggleQuit(app.clone())));
+        let rows = second_press(&new.screens);
+        let rows = rows
+            .lines()
+            .skip(1)
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            [
+                "> Minimize; hold 1 second to quit (when a window is open, not minimized)",
+                "  Minimize",
+                "  Close",
+            ],
+            "{:?}",
+            new.screens
+        );
+        for (saved, mark) in [
+            (
+                Action::AppToggle {
+                    path: app.clone(),
+                    close: false,
+                },
+                "> Minimize  [x] (saved)",
+            ),
+            (
+                Action::AppToggle {
+                    path: app.clone(),
+                    close: true,
+                },
+                "> Close  [x] (saved)",
+            ),
+        ] {
+            let mut edit = Script {
+                keys: [Key::Enter, Key::Enter].into(),
+                ..Default::default()
+            };
+            let kept =
+                action_menu(&mut edit, 1, mappings::Input::Pad, Some(&saved), true, None).unwrap();
+            assert_eq!(kept.as_ref(), Some(&saved), "Enter keeps the saved choice");
+            assert!(
+                second_press(&edit.screens).contains(mark),
+                "{:?}",
+                edit.screens
+            );
+        }
+    }
+
     #[test]
     fn launcher_pad_can_hold_to_quit() {
         use Key::*;
@@ -21986,11 +22055,9 @@ mod tests {
         let path = dir.join("mappings.tsv");
         mappings::save(&path, &[]).unwrap();
         let mut ui = Script {
-            // learn, Launch application, the app, hold to quit, fire when pressed, save and finish
-            keys: [
-                Enter, Down, Enter, Enter, Down, Down, Enter, Enter, Down, Enter,
-            ]
-            .into(),
+            // learn, Launch application, the app, hold to quit (first, v7.8 ticket 21), fire
+            // when pressed, save and finish
+            keys: [Enter, Down, Enter, Enter, Enter, Enter, Down, Enter].into(),
             pads: [Control::from_note(10, 42).unwrap()].into(),
             ..Default::default()
         };
@@ -22030,7 +22097,7 @@ mod tests {
             ),
         ];
         // learn, Launch application, the app (Downs), then: hold to quit, fire when, save and finish
-        let quit = [Down, Down, Enter, Enter, Down, Enter];
+        let quit = [Enter, Enter, Down, Enter]; // v7.8 ticket 21: hold to quit is first
         let pick = |downs: usize, then: &[Key]| {
             let mut keys = vec![Enter, Down, Enter];
             keys.extend(vec![Down; downs]);
