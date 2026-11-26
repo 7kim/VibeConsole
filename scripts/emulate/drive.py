@@ -43,10 +43,11 @@ def emulated_left():
 
 
 class Drive:
-    def __init__(self, akai=False, xbox=False, mappings=(), command=()):
+    def __init__(self, akai=False, xbox=False, mappings=(), command=(), devices=None):
         assert shutil.which("bwrap"), "bwrap not found: install it (sudo dnf install bubblewrap)"
         assert not emulated_left(), f"an emulated run is already running: {emulated_left()}"
         self.akai_on, self.xbox_on, self.mappings, self.command = akai, xbox, list(mappings), command
+        self.devices = devices
 
     def __enter__(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -72,7 +73,7 @@ class Drive:
         old = os.environ["PATH"]
         os.environ["PATH"] = path  # run.Run passes the environment on
         try:
-            self.run = Run(str(run_dir), self.mappings, sandbox, self.command).__enter__()
+            self.run = Run(str(run_dir), self.mappings, sandbox, self.command, devices=self.devices).__enter__()
         finally:
             os.environ["PATH"] = old
         return self
@@ -112,8 +113,8 @@ class Drive:
         return self.run.mark()
 
     def pick(self, label, key="enter", seconds=5):
-        """Move the `> ` cursor to the first row with `label` as a whole word, then press `key`
-        (`space` toggles a checkbox row)."""
+        """Move the `> ` cursor to the first row with `label` as a whole word (scrolling down to
+        it when it's off screen), then press `key` (`space` toggles a checkbox row)."""
         word = re.compile(r"(?<!\w)" + re.escape(label) + r"(?!\w)")
         deadline = time.monotonic() + seconds
         while True:
@@ -124,10 +125,11 @@ class Drive:
                 return self.type(key)
             if time.monotonic() > deadline:
                 raise AssertionError(f"no row {label!r} under the cursor:\n" + "\n".join(rows))
-            if at is None or want is None:
+            if at is None:
                 time.sleep(0.1)
                 continue
-            self.type("down" if want > at else "up")
+            # A label below the visible rows of a long list: move down until it scrolls in.
+            self.type("down" if want is None or want > at else "up")
 
     def recorded(self, file="output.log"):
         return self.run.recorded(file)
