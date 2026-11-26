@@ -43,11 +43,11 @@ def emulated_left():
 
 
 class Drive:
-    def __init__(self, akai=False, xbox=False, mappings=(), command=(), devices=None, tuning=None):
+    def __init__(self, akai=False, xbox=False, mappings=(), command=(), devices=None, tuning=None, files=None):
         assert shutil.which("bwrap"), "bwrap not found: install it (sudo dnf install bubblewrap)"
         assert not emulated_left(), f"an emulated run is already running: {emulated_left()}"
         self.akai_on, self.xbox_on, self.mappings, self.command = akai, xbox, list(mappings), command
-        self.devices, self.tuning = devices, tuning
+        self.devices, self.tuning, self.files = devices, tuning, files
 
     def __enter__(self):
         self.run = None
@@ -82,7 +82,7 @@ class Drive:
         os.environ["PATH"] = path  # run.Run passes the environment on
         try:
             self.run = Run(str(run_dir), self.mappings, sandbox, self.command, self.tuning,
-                           self.devices).__enter__()
+                           self.devices, self.files).__enter__()
         finally:
             os.environ["PATH"] = old
         return self

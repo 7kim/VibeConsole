@@ -44,7 +44,7 @@ def without_bus(**extra):
 
 
 class Run:
-    def __init__(self, directory, mappings, sandbox, command=(), tuning=None, devices=None):
+    def __init__(self, directory, mappings, sandbox, command=(), tuning=None, devices=None, files=None):
         assert BINARY.exists(), "build first: cargo build --locked"
         self.dir = Path(directory)
         config = self.dir / ".config/vibeconsole"
@@ -57,6 +57,8 @@ class Run:
             shipped["tuning"] |= tuning or {}
             devices = shipped | (devices or {})
             (config / "devices.json").write_text(json.dumps(devices))
+        for name, value in (files or {}).items():  # other config files, e.g. lights.json (ticket 94)
+            (config / name).write_text(json.dumps(value))
         self.master, self.slave = pty.openpty()
         fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 110, 0, 0))
         self.child = subprocess.Popen([*sandbox, BINARY, "--emulated", directory, *command], stdin=self.slave,

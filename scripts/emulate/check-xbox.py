@@ -8,22 +8,25 @@ Run after cargo build --locked: uv run scripts/emulate/check-xbox.py
 Checks: A (built-in default Enter) records Enter in output.log; RT mapped to F2 and pulled
 straight to full fires once and lets go on release; a normal run beside the
 emulator never lists it; 7 Xbox's Test rumble reaches the emulator with its strength and length
-(ticket 79). The run sees only the emulator's own event node (bwrap hides the rest).
+(ticket 79), and so do agent rumbles, short and long (ticket 94). The run sees only the emulator's own event node (bwrap hides the rest).
 The emulator refuses to start while a VibeConsole older than ticket 01 runs (see xbox.py).
 """
+import json
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from drive import Drive  # noqa: E402
-from run import Run, describe, hide, mapping  # noqa: E402
+from run import BINARY, Run, describe, hide, mapping, without_bus  # noqa: E402
 from xbox import Xbox  # noqa: E402
 
 if not shutil.which("bwrap"):
     raise SystemExit("bwrap not found: install it (sudo dnf install bubblewrap); nothing was run.")
+REPO = Path(__file__).resolve().parents[2]
 GAMEPAD, RT = 239, 7  # mappings::GAMEPAD_CONTEXT, gamepad::BUTTONS' RT
 
 
@@ -80,6 +83,42 @@ def main():
     layer_button()
     high_fire_point()
     test_rumble()
+    agent_rumble()
+
+
+def rumbles(d, count, seconds=5):
+    """The first `count` rumbles the emulator logged, as (strong, weak, ms)."""
+    deadline = time.monotonic() + seconds
+    while len(played := [line.split() for line in d.recorded() if line.startswith("rumble ")]) < count:
+        assert time.monotonic() < deadline, d.recorded()
+        time.sleep(0.05)
+    return [(int(p[2]), int(p[4]), int(p[5])) for p in played]
+
+
+def agent_rumble():
+    """v7.8 ticket 94: with rumble for agents on (light, 200 ms) and finished set to rumble
+    long, an agent newly needing a decision rumbles short (200 ms) and one newly finished long
+    (600 ms). Each state comes from the hook command an agent outside VibeConsole's tmux runs,
+    pointed at the run's own folder (--emulated keeps its states there); a tmux agent can't be
+    used: tmux is only recorded, so its window reads as gone and its state as idle."""
+    lights = json.loads((REPO / "core/defaults/lights.json").read_text())
+    lights["xbox"]["states"]["finished"]["rumble"] = "long"
+    lights["other"]["on"] = True  # light every folder, not only listed ones
+    tuning = {"rumble": True, "rumble_strength": "light", "rumble_ms": 200}
+    with Drive(xbox=True, tuning=tuning, files={"lights.json": lights}) as d:
+        d.run.xbox_ready(d.xbox)
+        env = without_bus(HOME=str(d.run.dir), XDG_RUNTIME_DIR=str(d.run.dir / "run"))
+        env.pop("VIBECONSOLE_AGENT", None)
+        for count, (session, state, ms) in enumerate([("one", "needs-decision", 200),
+                                                      ("two", "finished", 600)], 1):
+            hook = json.dumps({"session_id": session, "cwd": f"/srv/{session}"})
+            subprocess.run([BINARY, "agent-status", "-", state], input=hook, text=True, env=env, check=True)
+            strong, weak, length = rumbles(d, count)[-1]
+            assert (strong, weak) == (20_000, 0) and abs(length - ms) <= 60, (session, state, rumbles(d, count))
+            print(f"ok: an agent newly {state} rumbled {strong} for {length} ms (set: {ms} ms)")
+        time.sleep(1.5)
+        assert len(rumbles(d, 2)) == 2, d.recorded()  # a state that stays rumbles once
+        print("ok: a state that stays doesn't rumble again")
 
 
 def test_rumble():
