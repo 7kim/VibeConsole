@@ -181,6 +181,9 @@ const AKAI_PRESSES: usize = 10;
 trait Ui {
     fn draw(&mut self, text: &str) -> Result<()>;
     fn key(&mut self) -> Result<Option<Key>>;
+    fn details_row_at(&self, _column: u16, _row: u16) -> Option<usize> {
+        None
+    }
     /// v7.7 ticket 211: time since the program started; tests pass a clock.
     fn clock(&mut self) -> Duration {
         static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -825,8 +828,8 @@ impl Terminal {
                 .filter(|_| self.input.is_some()),
         ) {
             (Some(device), _) => format!("MIDI device {device}"),
-            (None, Some(name)) => name.clone(),
-            (None, None) => mappings::program_label(self.context),
+            (None, Some(name)) => format!("Akai MPK mini · {}", named_program(name)),
+            (None, None) => format!("Akai MPK mini · {}", mappings::program_label(self.context)),
         };
         let xbox = self.last_xbox && self.gamepad.is_some();
         let program = if xbox {
@@ -931,16 +934,10 @@ impl Terminal {
             hints: hints.into(),
             panes: Vec::new(),
         };
-        let primary = self.primary_target();
         // `> ` marks the selection only on the menu; a command's screen shows it as `• `.
         let selected = if self.at_menu { self.menu } else { usize::MAX };
         let panes = self.tab_panes(self.tab, crate::screen::pane_width(size.0), selected);
         if self.at_menu {
-            let primary = (panes.iter().flat_map(|(_, entries)| entries))
-                .enumerate()
-                .filter(|(_, (_, open))| open.is_some() && *open == primary)
-                .last()
-                .map(|(number, _)| number);
             let mut number = 0;
             for (title, entries) in panes {
                 let mut pane = crate::screen::Pane {
@@ -948,13 +945,9 @@ impl Terminal {
                     rows: Vec::new(),
                     anchor: 0,
                     focused: false,
-                    primary: None,
                 };
                 for (lines, _) in entries {
                     pane.rows.extend(lines);
-                    if primary == Some(number) {
-                        pane.primary = Some(pane.rows.len() - 1);
-                    }
                     if number == self.menu {
                         pane.anchor = pane.rows.len() - 1;
                         pane.focused = true;
@@ -2741,22 +2734,6 @@ impl Terminal {
         crate::screen::set_theme(&config.look.theme); // v7.7 ticket 154
         self.view = Some(config);
     }
-    /// v7.7 ticket 152: the tab's one primary row (skill `primary-action`), by what it opens;
-    /// the last row opening it is the one drawn. 7 Xbox, 8 System, 9 and 0 have none.
-    fn primary_target(&self) -> Option<Open> {
-        let config = self.view.as_ref();
-        let count = |f: fn(&mappings::Config) -> usize| config.map_or(0, f);
-        let id = match self.tab {
-            0 => 1,
-            1 => 0,
-            2 => AGENT + count(|c| c.agents.len()).min(ROWS - 3),
-            3 => PROMPT + self.prompt_names.len().min(ROWS - 3),
-            4 => 10,
-            5 => PROFILE + count(|c| c.profiles.len()).min(ROWS - 3),
-            _ => return None,
-        };
-        Some(Open::Command(id))
-    }
     /// v7.7 ticket 152: a tab's panes (Live's from [`Self::live_panes`]); one-line entries
     /// that open something get `> ` when `selected`, else two spaces.
     fn tab_panes(&self, tab: usize, width: usize, selected: usize) -> Vec<(String, Vec<Entry>)> {
@@ -2780,6 +2757,10 @@ impl Terminal {
                     one("/configure".into(), Some(0)),
                     one("/list".into(), Some(2)),
                     head("Keep"),
+                    one(
+                        format!("Favourites ({})", favourite_actions(config).len()),
+                        Some(SETTING + 10),
+                    ),
                     one("Presets".into(), Some(SETTING + 11)),
                     head("History · your last 10 saves"),
                     one(format!("Undo last change · {}", self.undo_row), Some(23)),
@@ -4766,6 +4747,9 @@ impl Terminal {
     /// the key (ticket 38: or combination) VibeConsole sent for an Xbox press in the last
     /// 250 ms.
     fn keyboard_used(&mut self, key: &Key) {
+        if matches!(key, Key::Click(..)) {
+            return;
+        }
         let name = match key {
             Key::Enter => "Enter".to_owned(),
             Key::Escape => "Escape".into(),
@@ -5535,7 +5519,10 @@ impl Terminal {
             self.xbox_program = program;
             self.reload_keyboard()?;
         }
-        self.notice = format!("Xbox · {}", self.xbox_program_label());
+        let name = mappings::load_config(&self.path)
+            .map(|c| mappings::xbox_program_name(&c, self.xbox_program))
+            .unwrap_or_default();
+        self.notice = xbox_header(&name, self.xbox_program, "");
         Ok(())
     }
     /// v7.7 ticket 152: Devices' `/prog-select (Xbox)`: the 8 programs by name; picking one
@@ -5552,18 +5539,6 @@ impl Terminal {
         match picked {
             Some(at) => self.set_xbox_program(u8::try_from(at + 1)?),
             None => Ok(()),
-        }
-    }
-    /// "Program N — name" (or "Program N") for the Xbox program in use.
-    fn xbox_program_label(&self) -> String {
-        let name = mappings::load_config(&self.path)
-            .map(|c| mappings::xbox_program_name(&c, self.xbox_program))
-            .unwrap_or_default();
-        let number = format!("Program {}", self.xbox_program);
-        if name.is_empty() || name == number {
-            number
-        } else {
-            format!("{number} — {name}")
         }
     }
     /// LB pressed or let go (v7 ticket 09): a transition. Held keys are released, held pads
@@ -7516,6 +7491,10 @@ impl Ui for Terminal {
         let size = self.size();
         self.screen("").details_size(size.0, size.1).0 + 5
     }
+    fn details_row_at(&self, column: u16, row: u16) -> Option<usize> {
+        self.screen("")
+            .details_row_at(self.size(), (usize::from(column), usize::from(row)))
+    }
     fn key(&mut self) -> Result<Option<Key>> {
         self.resume_configure()?;
         self.tick()?;
@@ -7718,15 +7697,12 @@ fn program_select(
     at: Picked,
 ) -> Result<Option<Picked>> {
     let both = !akai.is_empty() && !xbox.is_empty();
-    let name = |title: &str, device: &str| {
-        let name = title.split_once(" — ").map_or(title, |(_, name)| name);
-        match both {
-            true => format!("{name} · {device}"),
-            false => name.to_owned(),
-        }
+    let name = |name: &str, device: &str| match both {
+        true => format!("{name} · {device}"),
+        false => name.to_owned(),
     };
     let rows = (akai.iter().enumerate())
-        .map(|(i, t)| (name(t, "Akai"), Picked::Akai(i as u8)))
+        .map(|(i, t)| (name(named_program(t), "Akai"), Picked::Akai(i as u8)))
         .chain((xbox.iter().enumerate()).map(|(i, t)| (name(t, "Xbox"), Picked::Xbox(i as u8 + 1))))
         .collect::<Vec<_>>();
     let labels = rows.iter().map(|(l, _)| l.clone()).collect::<Vec<_>>();
@@ -7813,32 +7789,43 @@ fn command_action(
     ui: &mut impl Ui,
     saved: Option<&crate::actions::Action>,
 ) -> Result<Option<crate::actions::Action>> {
-    let (line, dir) = match saved {
+    let (mut line, mut dir) = match saved {
         Some(crate::actions::Action::Command { line, dir, .. }) => (line.clone(), dir.clone()),
         _ => (
             String::new(),
             std::env::var("HOME").unwrap_or_else(|_| "/".into()),
         ),
     };
-    let Some(line) = text_entry(
-        ui,
-        "Command line (runs with sh -c in a new tmux window of session vibe)",
-        &line,
-    )?
-    else {
-        return Ok(None);
-    };
-    let Some(dir) = text_entry(ui, "Working directory (absolute path)", &dir)? else {
-        return Ok(None);
-    };
+    use crate::actions::Action;
     // The window is renamed after the mapping once its label is known.
-    let action = crate::actions::Action::Command {
+    let command = |line: &str, dir: &str| Action::Command {
         window: "command".into(),
-        dir,
-        line,
+        line: line.into(),
+        dir: dir.into(),
     };
-    action.validate()?;
-    Ok(Some(action))
+    loop {
+        let Some(entered) = text_entry(
+            ui,
+            "Command line (runs with sh -c in a new tmux window of session vibe)",
+            &line,
+        )?
+        else {
+            return Ok(None);
+        };
+        line = entered;
+        if let Err(error) = command(&line, "/").validate() {
+            not_saved(ui, &stage("validation")(error))?;
+            continue;
+        }
+        while let Some(entered) = text_entry(ui, "Working directory (absolute path)", &dir)? {
+            dir = entered;
+            let action = command(&line, &dir);
+            match action.validate() {
+                Ok(()) => return Ok(Some(action)),
+                Err(error) => not_saved(ui, &stage("validation")(error))?,
+            }
+        }
+    }
 }
 
 /// 2–16 prompts, one per equal knob zone from the knob's low end.
@@ -8875,6 +8862,7 @@ fn setting(ui: &mut impl Ui, path: &Path, choice: usize) -> Result<()> {
         7 => midi_device_menu(ui, path),
         8 => tuning_menu(ui, path),
         9 => profiles_menu(ui, path),
+        10 => favourites_menu(ui, path),
         12 => sound_menu(ui, path),
         _ => presets_menu(ui, path),
     };
@@ -9208,8 +9196,6 @@ fn presets_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
         }
     }
 }
-
-/// Settings -> Favourites (v7 ticket 24): Enter marks or unmarks one; saved at once.
 
 /// Profile files are shared through one folder beside the config (v7 ticket 14); names
 /// come from its listing, never typed paths.
@@ -10585,57 +10571,60 @@ fn profile_menu(ui: &mut impl Ui, path: &Path, name: &str) -> Result<()> {
 /// through pkexec (`vibeconsole xbox-driver <xpad|xone>`), which asks for the password.
 /// Afterwards it says which driver holds the controller now.
 fn driver_menu(ui: &mut impl Ui) -> Result<()> {
-    let now = ui.xbox_audio().0;
-    let Some(choice) = choose_at(
-        ui,
-        &format!(
-            "Xbox driver (now: {}). xpad: no headset, no button light. xone: headset and light.",
-            now.unwrap_or("no controller connected")
-        ),
-        &strings(&["xpad", "xone", "Back"]),
-        usize::from(now == Some("xone")),
-    )?
-    else {
-        return Ok(());
-    };
-    let driver = match choice {
-        0 => "xpad",
-        1 => "xone",
-        _ => return Ok(()),
-    };
-    if Some(driver) == now {
-        choose(
+    let driver = loop {
+        let now = ui.xbox_audio().0;
+        let Some(choice) = choose_at(
             ui,
-            &format!("{driver} already holds the controller."),
-            &strings(&["Back"]),
-        )?;
-        return Ok(());
-    }
-    if driver == "xone" && !crate::gamepad::xone_installed(&mut |args| ui.run(args)) {
-        choose(
+            &format!(
+                "Xbox driver (now: {}). xpad: no headset, no button light. xone: headset and light.",
+                now.unwrap_or("no controller connected")
+            ),
+            &strings(&["xpad", "xone", "Back"]),
+            usize::from(now == Some("xone")),
+        )?
+        else {
+            return Ok(());
+        };
+        let driver = match choice {
+            0 => "xpad",
+            1 => "xone",
+            _ => return Ok(()),
+        };
+        if Some(driver) == now {
+            choose(
+                ui,
+                &format!("{driver} already holds the controller."),
+                &strings(&["Back"]),
+            )?;
+            continue;
+        }
+        if driver == "xone" && !crate::gamepad::xone_installed(&mut |args| ui.run(args)) {
+            choose(
+                ui,
+                "xone: unavailable: it isn't installed. Install it yourself (github.com/dlundqvist/xone, its README), then come back.",
+                &strings(&["Back"]),
+            )?;
+            continue;
+        }
+        let warning = if driver == "xone" {
+            "The Xbox button light needs the light rule (ticket 130) to work on xone."
+        } else {
+            "The controller headset stops working, and this controller has no Xbox button light on xpad."
+        };
+        let confirm = format!(
+            "Switch the Xbox driver to {driver}? {warning} You're asked for your password; the choice stays after a reboot."
+        );
+        let yes = format!("Yes, switch to {driver}");
+        if question(
             ui,
-            "xone: unavailable: it isn't installed. Install it yourself (github.com/dlundqvist/xone, its README), then come back.",
-            &strings(&["Back"]),
-        )?;
-        return Ok(());
-    }
-    let warning = if driver == "xone" {
-        "The Xbox button light needs the light rule (ticket 130) to work on xone."
-    } else {
-        "The controller headset stops working, and this controller has no Xbox button light on xpad."
+            &confirm,
+            &strings(&[&yes, "Back (discard: nothing changes)"]),
+        )? != Some(0)
+        {
+            continue;
+        }
+        break driver;
     };
-    let confirm = format!(
-        "Switch the Xbox driver to {driver}? {warning} You're asked for your password; the choice stays after a reboot."
-    );
-    let yes = format!("Yes, switch to {driver}");
-    if question(
-        ui,
-        &confirm,
-        &strings(&[&yes, "Back (discard: nothing changes)"]),
-    )? != Some(0)
-    {
-        return Ok(());
-    }
     let exe = std::env::current_exe()?;
     let exe = exe
         .to_str()
@@ -12329,53 +12318,62 @@ fn prompt_choice(ui: &mut impl Ui, path: &Path, index: usize) -> Result<()> {
         return Ok(());
     }
     let result = if index == files.len() {
-        match text_entry(ui, "New prompt name", "")? {
-            Some(name) if files.contains(&name) => {
-                Err(format!("prompt {name} already exists").into())
-            }
-            Some(name) => edit_prompt(ui, &dir, &name),
-            None => Ok(()),
-        }
-    } else if let Some(name) = files.get(index) {
-        match choose(
-            ui,
-            &format!("Prompt {name}"),
-            &strings(&["Read", "Edit", "Delete", "Back"]),
-        )? {
-            Some(0) => {
-                let text = std::fs::read_to_string(dir.join(name))
-                    .unwrap_or_else(|e| format!("(unreadable: {e})"));
-                choose(ui, &format!("{name}\n\n{text}"), &strings(&["Back"])).map(drop)
-            }
-            Some(1) => edit_prompt(ui, &dir, name),
-            Some(2) => {
-                let config = mappings::load_config(path)?;
-                let users = config
-                    .mappings
-                    .iter()
-                    .filter(|m| m.action.prompt_files().contains(&name.as_str()))
-                    .map(|m| format!("{} {}", mappings::program_label(m.context), m.name(None)))
-                    .collect::<Vec<_>>();
-                let warning = if users.is_empty() {
-                    "No mapping uses it.".to_string()
-                } else {
-                    format!(
-                        "Used by: {}. Those pads will report a missing prompt.",
-                        users.join(", ")
-                    )
-                };
-                if question(
-                    ui,
-                    &format!("Delete prompt {name}?\n{warning}"),
-                    &strings(&["Cancel", "Delete"]),
-                )? == Some(1)
-                {
-                    std::fs::remove_file(dir.join(name)).map_err(stage("file I/O"))
-                } else {
-                    Ok(())
+        let mut name = String::new();
+        while let Some(entered) = text_entry(ui, "New prompt name", &name)? {
+            name = entered;
+            if files.contains(&name) {
+                not_saved(ui, &format!("validation: prompt {name} already exists"))?;
+            } else {
+                match edit_prompt(ui, &dir, &name) {
+                    Ok(()) => break,
+                    Err(error) => not_saved(ui, &error)?,
                 }
             }
-            _ => Ok(()),
+        }
+        Ok(())
+    } else if let Some(name) = files.get(index) {
+        loop {
+            match choose(
+                ui,
+                &format!("Prompt {name}"),
+                &strings(&["Read", "Edit", "Delete", "Back"]),
+            )? {
+                Some(0) => {
+                    let text = std::fs::read_to_string(dir.join(name))
+                        .unwrap_or_else(|e| format!("(unreadable: {e})"));
+                    choose(ui, &format!("{name}\n\n{text}"), &strings(&["Back"]))?;
+                }
+                Some(1) => match edit_prompt(ui, &dir, name) {
+                    Ok(()) => break Ok(()),
+                    Err(error) => not_saved(ui, &error)?,
+                },
+                Some(2) => {
+                    let config = mappings::load_config(path)?;
+                    let users = config
+                        .mappings
+                        .iter()
+                        .filter(|m| m.action.prompt_files().contains(&name.as_str()))
+                        .map(|m| format!("{} {}", mappings::program_label(m.context), m.name(None)))
+                        .collect::<Vec<_>>();
+                    let warning = if users.is_empty() {
+                        "No mapping uses it.".to_string()
+                    } else {
+                        format!(
+                            "Used by: {}. Those pads will report a missing prompt.",
+                            users.join(", ")
+                        )
+                    };
+                    if question(
+                        ui,
+                        &format!("Delete prompt {name}?\n{warning}"),
+                        &strings(&["Cancel", "Delete"]),
+                    )? == Some(1)
+                    {
+                        break std::fs::remove_file(dir.join(name)).map_err(stage("file I/O"));
+                    }
+                }
+                _ => break Ok(()),
+            }
         }
     } else {
         // The folder changed since the list was shown (an agent or editor removed a file).
@@ -12394,76 +12392,90 @@ fn prompt_action(
     stars: bool,
 ) -> Result<Option<crate::actions::Action>> {
     let dir = crate::actions::prompts_dir_for(path)?;
-    let mut files = prompt_files(&dir)?;
-    files.push("New prompt".into());
     let saved_file = match saved {
         Some(crate::actions::Action::Prompt { file, .. }) => Some(file),
         _ => None,
     };
-    let Some(index) = family_rows(
-        ui,
-        stars.then_some(path),
-        3,
-        "Prompt file",
-        files
-            .iter()
-            .enumerate()
-            .map(|(i, label)| {
-                (
-                    label.clone(),
-                    if i + 1 == files.len() {
-                        String::new()
-                    } else {
-                        label.clone()
-                    },
-                )
-            })
-            .collect(),
-        saved_file.and_then(|f| files.iter().position(|s| s == f)),
-    )?
-    else {
-        return Ok(None);
-    };
-    let file = if index == files.len() - 1 {
-        let Some(name) = text_entry(
+    'files: loop {
+        let mut files = prompt_files(&dir)?;
+        files.push("New prompt".into());
+        let Some(index) = family_rows(
             ui,
-            "New prompt file name (simple name, no extension required)",
-            "",
+            stars.then_some(path),
+            3,
+            "Prompt file",
+            files
+                .iter()
+                .enumerate()
+                .map(|(i, label)| {
+                    (
+                        label.clone(),
+                        if i + 1 == files.len() {
+                            String::new()
+                        } else {
+                            label.clone()
+                        },
+                    )
+                })
+                .collect(),
+            saved_file.and_then(|f| files.iter().position(|s| s == f)),
         )?
         else {
             return Ok(None);
         };
-        if !mappings::simple_name(&name) {
-            return Err("invalid prompt file name".into());
-        }
-        name
-    } else {
-        files[index].clone()
-    };
-    if index == files.len() - 1
-        || question(
-            ui,
-            "Edit prompt in external editor?",
-            &strings(&["Use existing", "Edit"]),
-        )? == Some(1)
-    {
-        if let Err(error) = edit_prompt(ui, &dir, &file) {
-            not_saved(ui, &error)?;
-            return Ok(None); // back to the menu that asked; nothing else is lost
+        let file = if index == files.len() - 1 {
+            let mut name = String::new();
+            loop {
+                let Some(entered) = text_entry(
+                    ui,
+                    "New prompt file name (simple name, no extension required)",
+                    &name,
+                )?
+                else {
+                    continue 'files;
+                };
+                name = entered;
+                if !mappings::simple_name(&name) {
+                    not_saved(ui, &"validation: invalid prompt file name")?;
+                } else if files[..index].contains(&name) {
+                    not_saved(ui, &"validation: a prompt with that name already exists")?;
+                } else {
+                    match edit_prompt(ui, &dir, &name) {
+                        Ok(()) => break name,
+                        Err(error) => not_saved(ui, &error)?,
+                    }
+                }
+            }
+        } else {
+            let name = &files[index];
+            match question(
+                ui,
+                "Edit prompt in external editor?",
+                &strings(&["Use existing", "Edit", "Back"]),
+            )? {
+                Some(0) => {}
+                Some(1) => {
+                    if let Err(error) = edit_prompt(ui, &dir, name) {
+                        not_saved(ui, &error)?;
+                        continue;
+                    }
+                }
+                _ => continue,
+            }
+            name.clone()
+        };
+        let saved_target = match saved {
+            Some(crate::actions::Action::Prompt { target, .. }) => Some(target),
+            _ => None,
+        };
+        if let Some((target, enter)) = prompt_target(ui, path, saved_target)? {
+            return Ok(Some(crate::actions::Action::Prompt {
+                file,
+                target,
+                enter,
+            }));
         }
     }
-    let saved_target = match saved {
-        Some(crate::actions::Action::Prompt { target, .. }) => Some(target),
-        _ => None,
-    };
-    let Some((target, enter)) = prompt_target(ui, path, saved_target)? else {
-        return Ok(None);
-    };
-    Ok(Some(crate::actions::Action::Prompt {
-        file,
-        target,
-        enter,
-    }))
 }
 
 /// Where a prompt goes and whether Enter follows (a prompt pad, or a sequence step).
@@ -12482,24 +12494,25 @@ fn prompt_target(
     targets.push(Target::Focused { shift: false });
     targets.push(Target::Focused { shift: true });
     let saved_target = saved.and_then(|saved| targets.iter().position(|t| t == saved));
-    let Some(target_index) = choose_saved(
-        ui,
-        "Target: tmux agent, or the focused window (Ctrl+V browser/Claude app, Ctrl+Shift+V terminals; lands wherever focus is)",
-        targets.iter().map(Target::description).collect(),
-        saved_target,
-    )?
-    else {
-        return Ok(None);
-    };
-    let Some(mode) = choose(
-        ui,
-        "Submit prompt?",
-        &strings(&["Paste only", "Paste and Enter"]),
-    )?
-    else {
-        return Ok(None);
-    };
-    Ok(Some((targets.swap_remove(target_index), mode == 1)))
+    loop {
+        let Some(target_index) = choose_saved(
+            ui,
+            "Target: tmux agent, or the focused window (Ctrl+V browser/Claude app, Ctrl+Shift+V terminals; lands wherever focus is)",
+            targets.iter().map(Target::description).collect(),
+            saved_target,
+        )?
+        else {
+            return Ok(None);
+        };
+        match choose(
+            ui,
+            "Submit prompt?",
+            &strings(&["Paste only", "Paste and Enter", "Back"]),
+        )? {
+            Some(row @ 0..=1) => return Ok(Some((targets.swap_remove(target_index), row == 1))),
+            _ => continue,
+        }
+    }
 }
 
 fn reset_file(path: &Path) -> Result<PathBuf> {
@@ -12617,6 +12630,10 @@ fn pick(
 ) -> Result<Option<usize>> {
     Ok(pick_inner(ui, title, options, initial, remembers, false)?.map(|(row, _)| row))
 }
+fn back_label(label: &str) -> bool {
+    label == "Back" || label.starts_with("Back (")
+}
+
 /// [`pick`]; with `star`, F (or f) answers (row, true): star or unstar it (v7.8 ticket 18).
 fn pick_inner(
     ui: &mut impl Ui,
@@ -12666,10 +12683,8 @@ fn pick_inner(
     };
     let title = title.as_str();
     loop {
-        let visible = ui
-            .height()
-            .saturating_sub(crate::screen::wrap(title, ui.width().saturating_sub(5)).len() + 10)
-            .max(want);
+        let title_lines = crate::screen::wrap(title, ui.width().saturating_sub(5)).len();
+        let visible = ui.height().saturating_sub(title_lines + 10).max(want);
         let first = cursor.saturating_sub(visible - 1);
         let rows = options
             .iter()
@@ -12686,11 +12701,30 @@ fn pick_inner(
             .collect::<Vec<_>>()
             .join("\n");
         ui.draw(&format!("{title}\n\n{rows}"))?;
-        match ui.key()? {
+        let key = match ui.key()? {
+            Some(Key::Click(column, row)) => {
+                let Some(option) = ui
+                    .details_row_at(column, row)
+                    .and_then(|row| row.checked_sub(title_lines + 1))
+                    .filter(|row| *row < visible)
+                    .map(|row| first + row)
+                    .filter(|&row| options.get(row).is_some_and(|label| back_label(label)))
+                else {
+                    continue;
+                };
+                cursor = option;
+                Some(Key::Enter)
+            }
+            key => key,
+        };
+        match key {
             Some(Key::Up) => cursor = (cursor + options.len() - 1) % options.len(),
             Some(Key::Down) => cursor = (cursor + 1) % options.len(),
             Some(Key::Enter) => {
-                if let Some(rows) = ui.rows_left().filter(|_| remembers) {
+                if let Some(rows) = ui
+                    .rows_left()
+                    .filter(|_| remembers && !back_label(&options[cursor]))
+                {
                     rows.insert(name, (cursor, options[cursor].clone()));
                 }
                 return Ok(Some((cursor, false)));
@@ -12706,14 +12740,18 @@ thread_local! {
     /// The action key picked in ★ Favourites, consumed by the family's first action list.
     static JUMP: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
-/// v7.8 ticket 18: star or unstar `key` in the config (saved atomically).
-fn toggle_star(path: &Path, key: &str) -> Result<()> {
+/// v7.8 ticket 18: set a favourite in the config (saved atomically).
+fn set_star(path: &Path, key: &str, starred: bool) -> Result<()> {
     let mut config = mappings::load_config(path).map_err(stage("file I/O"))?;
-    match config.favourites.iter().position(|k| k == key) {
-        Some(at) => {
+    if let Some(stars) = migrated_stars(&config) {
+        config.favourites = stars;
+    }
+    match (config.favourites.iter().position(|k| k == key), starred) {
+        (Some(at), false) => {
             config.favourites.remove(at);
         }
-        None => config.favourites.push(key.to_owned()),
+        (None, true) => config.favourites.push(key.to_owned()),
+        _ => return Ok(()),
     }
     mappings::save_config(path, &config).map_err(stage("file I/O"))
 }
@@ -12754,7 +12792,7 @@ fn choose_starred(
             Some((row, true)) => {
                 let key = &rows[order[row]].1;
                 if !key.is_empty() {
-                    toggle_star(path, key)?;
+                    set_star(path, key, !starred(key))?;
                 }
                 at = Some(order[row]);
             }
@@ -12857,6 +12895,46 @@ fn starred_action(key: &str) -> Option<(usize, &str)> {
     Some((FAMILY_WORDS.iter().position(|w| *w == word)?, label))
 }
 
+fn favourite_actions(config: &mappings::Config) -> Vec<(String, String)> {
+    let migrated = migrated_stars(config);
+    migrated
+        .as_deref()
+        .unwrap_or(&config.favourites)
+        .iter()
+        .filter_map(|key| {
+            let (family, label) = starred_action(key)?;
+            Some((format!("★ {label} · {}", FAMILIES[family]), key.clone()))
+        })
+        .collect()
+}
+
+fn favourites_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
+    let mut cursor = 0;
+    loop {
+        let config = mappings::load_config(path).map_err(stage("file I/O"))?;
+        let actions = favourite_actions(&config);
+        let mut rows = actions
+            .iter()
+            .map(|(label, _)| label.clone())
+            .collect::<Vec<_>>();
+        rows.push("Back".into());
+        let title = if actions.is_empty() {
+            "No favourite actions yet. Use F in Configure to star an action."
+        } else {
+            "Favourite actions\nF: unstar the selected action"
+        };
+        match pick_inner(ui, title, &rows, cursor, false, true)? {
+            Some((row, true)) if row < actions.len() => {
+                set_star(path, &actions[row].1, false)?;
+                cursor = row;
+            }
+            Some((row, false)) if row < actions.len() => cursor = row,
+            Some((_, true)) => cursor = actions.len(),
+            _ => return Ok(()),
+        }
+    }
+}
+
 fn available_favourite_rows(
     ui: &mut impl Ui,
     path: &Path,
@@ -12938,13 +13016,21 @@ fn choose_favourite(
 /// a slot with no assignment is dropped; profile stars stay. Saved once, atomically.
 fn migrate_stars(path: &Path) -> Result<()> {
     let mut config = mappings::load_config(path).map_err(stage("file I/O"))?;
+    let Some(stars) = migrated_stars(&config) else {
+        return Ok(());
+    };
+    config.favourites = stars;
+    mappings::save_config(path, &config).map_err(stage("file I/O"))
+}
+
+fn migrated_stars(config: &mappings::Config) -> Option<Vec<String>> {
     let old = |k: &String| {
         !["family:", "action:", "profile:"]
             .iter()
             .any(|p| k.starts_with(p))
     };
     if !config.favourites.iter().any(old) {
-        return Ok(());
+        return None;
     }
     let mut stars = Vec::new();
     for key in &config.favourites {
@@ -12969,8 +13055,7 @@ fn migrate_stars(path: &Path) -> Result<()> {
             }
         }
     }
-    config.favourites = stars;
-    mappings::save_config(path, &config).map_err(stage("file I/O"))
+    Some(stars)
 }
 /// The row an assignment's action has in its family's list, where that list can be starred.
 fn action_row_label(mapping: &Mapping) -> Option<String> {
@@ -13106,9 +13191,13 @@ fn shortcut(ui: &mut impl Ui, saved: &[String]) -> Result<Option<Vec<String>>> {
         match choose(
             ui,
             &format!("Shortcut input{saved_line}"),
-            &strings(&["Select keys", "Record shortcut", "Cancel"]),
+            &strings(&["Select keys", "Record shortcut", "Back"]),
         )? {
-            Some(0) => return select_keys(ui, saved),
+            Some(0) => {
+                if let Some(keys) = select_keys(ui, saved)? {
+                    return Ok(Some(keys));
+                }
+            }
             Some(1) => loop {
                 let keys = match ui.record() {
                     Ok(keys) => keys,
@@ -13126,15 +13215,55 @@ fn shortcut(ui: &mut impl Ui, saved: &[String]) -> Result<Option<Vec<String>>> {
                 match question(
                     ui,
                     &format!("Captured: {}{saved_line}", keys.join("+")),
-                    &strings(&["Use", "Record again", "Cancel"]),
+                    &strings(&["Use", "Record again", "Back"]),
                 )? {
                     Some(0) => return Ok(Some(keys)),
                     Some(1) => continue,
-                    _ => return Ok(None),
+                    _ => break,
                 }
             },
             _ => return Ok(None),
         }
+    }
+}
+
+fn shortcut_mapping(
+    ui: &mut impl Ui,
+    pad: Control,
+    input: mappings::Input,
+    saved: Option<&Mapping>,
+) -> Result<Option<Mapping>> {
+    let saved_behavior = saved.and_then(|m| match m.behavior {
+        mappings::Behavior::Hold => Some(0),
+        mappings::Behavior::Toggle => Some(1),
+        mappings::Behavior::Tap => Some(2),
+        _ => None,
+    });
+    loop {
+        let Some(keys) = shortcut(ui, saved.map_or(&[], |m| &m.keys))? else {
+            return Ok(None);
+        };
+        let behavior = match input {
+            mappings::Input::Knob { .. } | mappings::Input::RelativeKnob { .. } => "pulse",
+            mappings::Input::Joystick { .. } => "hold",
+            _ => match choose_saved(
+                ui,
+                "Activation behavior",
+                strings(&[
+                    "hold",
+                    "toggle",
+                    "one tap (once per press, never repeats)",
+                    "Back",
+                ]),
+                saved_behavior,
+            )? {
+                Some(row @ 0..=2) => ["hold", "toggle", "tap"][row],
+                _ => continue,
+            },
+        };
+        return Mapping::new(pad, &keys.join("+"), behavior)
+            .map(Some)
+            .map_err(stage("validation"));
     }
 }
 
@@ -13241,7 +13370,7 @@ fn feedback_menu(
             },
             3 => {
                 let index = |arp: Option<bool>| arp.map(|on| usize::from(on) + 1).unwrap_or(0);
-                if let Some(choice) = choose_at(
+                while let Some(choice) = choose_at(
                     ui,
                     "Arpeggiator",
                     &mark_saved(
@@ -13256,13 +13385,14 @@ fn feedback_menu(
                             "Tempo blinking requires arpeggiator On. Remove tempo first to select Off.",
                             &strings(&["Back"]),
                         )?;
-                    } else {
-                        feedback.arp = match choice {
-                            0 => None,
-                            1 => Some(false),
-                            _ => Some(true),
-                        };
+                        continue;
                     }
+                    feedback.arp = match choice {
+                        0 => None,
+                        1 => Some(false),
+                        _ => Some(true),
+                    };
+                    break;
                 }
             }
             4 => return Ok(Some(feedback)),
@@ -13574,7 +13704,7 @@ fn action_menu(
         // v7 ticket 48: Orca, T3 Code and herdr first, each shown once (the entry that
         // launches); one that isn't installed says so.
         let (apps, missing) = application_rows(ui)?;
-        let rows = apps
+        let rows: Vec<_> = apps
             .iter()
             .map(|(label, _)| (label.clone(), label.clone()))
             .chain(
@@ -13592,54 +13722,58 @@ fn action_menu(
             Some(Action::Flow) => Some(apps.len() + missing.len()),
             _ => None,
         };
-        let Some(i) = family_rows(
-            ui,
-            stars,
-            1,
-            "Installed visible applications (one native launch request per press)",
-            rows,
-            saved,
-        )?
-        else {
-            return Ok(None);
-        };
-        if let Some(agent) = i.checked_sub(apps.len()).and_then(|m| missing.get(m)) {
-            return Err(format!("validation: {agent} not installed").into());
+        loop {
+            let Some(i) = family_rows(
+                ui,
+                stars,
+                1,
+                "Installed visible applications (one native launch request per press)",
+                rows.clone(),
+                saved,
+            )?
+            else {
+                return Ok(None);
+            };
+            if let Some(agent) = i.checked_sub(apps.len()).and_then(|m| missing.get(m)) {
+                not_saved(ui, &format!("validation: {agent} not installed"))?;
+                continue;
+            }
+            if i == apps.len() + missing.len() {
+                return Ok(Some(Action::Flow));
+            }
+            let path = apps[i].1.clone();
+            if !second_press {
+                return Ok(Some(Action::Application(path)));
+            }
+            // v7.8 ticket 21: hold-to-quit first (where a new assignment starts), then Minimize,
+            // then Close; a saved assignment opens on its own choice.
+            let saved_choice = match saved_action {
+                Some(Action::AppToggleQuit(_)) => Some(0),
+                Some(Action::AppToggle { close, .. }) => Some(1 + usize::from(*close)),
+                _ => None,
+            };
+            let Some(choice @ 0..=2) = choose_saved(
+                ui,
+                "Second press while the app is focused (needs the VibeConsole window extension; see README)",
+                strings(&[
+                    "Minimize; hold 1 second to quit (when a window is open, not minimized)",
+                    "Minimize",
+                    "Close",
+                    "Back",
+                ]),
+                saved_choice,
+            )?
+            else {
+                continue;
+            };
+            if choice == 0 {
+                return Ok(Some(Action::AppToggleQuit(path)));
+            }
+            return Ok(Some(Action::AppToggle {
+                path,
+                close: choice == 2,
+            }));
         }
-        if i == apps.len() + missing.len() {
-            return Ok(Some(Action::Flow));
-        }
-        let path = apps[i].1.clone();
-        if !second_press {
-            return Ok(Some(Action::Application(path)));
-        }
-        // v7.8 ticket 21: hold-to-quit first (where a new assignment starts), then Minimize,
-        // then Close; a saved assignment opens on its own choice.
-        let saved_choice = match saved_action {
-            Some(Action::AppToggleQuit(_)) => Some(0),
-            Some(Action::AppToggle { close, .. }) => Some(1 + usize::from(*close)),
-            _ => None,
-        };
-        let Some(choice) = choose_saved(
-            ui,
-            "Second press while the app is focused (needs the VibeConsole window extension; see README)",
-            strings(&[
-                "Minimize; hold 1 second to quit (when a window is open, not minimized)",
-                "Minimize",
-                "Close",
-            ]),
-            saved_choice,
-        )?
-        else {
-            return Ok(None);
-        };
-        if choice == 0 {
-            return Ok(Some(Action::AppToggleQuit(path)));
-        }
-        return Ok(Some(Action::AppToggle {
-            path,
-            close: choice == 2,
-        }));
     }
     use crate::actions::Media;
     let saved_combo = match saved {
@@ -13655,58 +13789,64 @@ fn action_menu(
         _ => (None, None),
     };
     // v7.8 ticket 10: Music & Sound: wpctl's volume and mute, then the media keys.
-    let Some(i) = family_list(
-        ui,
-        stars,
-        2,
-        "Music & Sound. Volume and mute act on the default device (wpctl, in your desktop session).
-Media keys go to the player that is playing; with none, nothing happens.",
-        music_rows(),
-        saved,
-    )?
-    else {
-        return Ok(None);
-    };
-    if let Some(media) = i.checked_sub(4).and_then(|m| Media::ALL.get(m)) {
-        return Ok(Some(Action::Media(*media)));
-    }
-    if i == COMBO_ROW {
-        // v7.8 ticket 25: one of the combos saved in 8 System › Sound combos.
-        let config =
-            mappings::load_config(stars.ok_or("Music & Sound: sound combos need the config")?)?;
-        let names = (config.sound_combos.iter())
-            .map(|c| c.name.clone())
-            .collect::<Vec<_>>();
-        if names.is_empty() {
-            return Err("no sound combos yet: make one in 8 System › Sound combos".into());
-        }
-        let at = (saved_combo.as_ref()).and_then(|saved| names.iter().position(|n| n == saved));
-        let Some(pick) = choose_saved(ui, "Which sound combo?", names.clone(), at)? else {
-            return Ok(None);
-        };
-        return Ok(Some(Action::SoundCombo(names[pick].clone())));
-    }
-    if i < 2 {
-        let Some(step) = number(
+    loop {
+        let Some(i) = family_list(
             ui,
-            "Volume step (%) per activation; ordinary volume capped at 100%",
-            saved_step.unwrap_or(5).into(),
-            1,
-            100,
+            stars,
+            2,
+            "Music & Sound. Volume and mute act on the default device (wpctl, in your desktop session).
+    Media keys go to the player that is playing; with none, nothing happens.",
+            music_rows(),
+            saved,
         )?
         else {
             return Ok(None);
         };
-        Ok(Some(Action::Volume {
-            up: i == 0,
-            step: step as u8,
-        }))
-    } else {
-        Ok(Some(if i == 2 {
-            Action::OutputMute
+        if let Some(media) = i.checked_sub(4).and_then(|m| Media::ALL.get(m)) {
+            return Ok(Some(Action::Media(*media)));
+        }
+        if i == COMBO_ROW {
+            // v7.8 ticket 25: one of the combos saved in 8 System › Sound combos.
+            let config =
+                mappings::load_config(stars.ok_or("Music & Sound: sound combos need the config")?)?;
+            let names = (config.sound_combos.iter())
+                .map(|c| c.name.clone())
+                .collect::<Vec<_>>();
+            if names.is_empty() {
+                not_saved(
+                    ui,
+                    &"no sound combos yet: make one in 8 System › Sound combos",
+                )?;
+                continue;
+            }
+            let at = (saved_combo.as_ref()).and_then(|saved| names.iter().position(|n| n == saved));
+            let Some(pick) = choose_saved(ui, "Which sound combo?", names.clone(), at)? else {
+                continue;
+            };
+            return Ok(Some(Action::SoundCombo(names[pick].clone())));
+        }
+        if i < 2 {
+            let Some(step) = number(
+                ui,
+                "Volume step (%) per activation; ordinary volume capped at 100%",
+                saved_step.unwrap_or(5).into(),
+                1,
+                100,
+            )?
+            else {
+                continue;
+            };
+            return Ok(Some(Action::Volume {
+                up: i == 0,
+                step: step as u8,
+            }));
         } else {
-            Action::MicrophoneMute
-        }))
+            return Ok(Some(if i == 2 {
+                Action::OutputMute
+            } else {
+                Action::MicrophoneMute
+            }));
+        }
     }
 }
 
@@ -14930,6 +15070,10 @@ fn xbox_header(name: &str, program: u8, link: &str) -> String {
     let label = if name.is_empty() { &number } else { name };
     format!("Xbox · {label}{link}")
 }
+
+fn named_program(title: &str) -> &str {
+    title.split_once(" — ").map_or(title, |(_, name)| name)
+}
 /// " · USB dongle · xone · battery 62%", " · Bluetooth", or "" when nothing is known.
 fn link_text(parts: &[String]) -> String {
     parts.iter().map(|part| format!(" · {part}")).collect()
@@ -15408,13 +15552,372 @@ fn tmux_rows(config: &mappings::Config) -> Vec<String> {
         .collect()
 }
 
+fn assignment_action(
+    ui: &mut impl Ui,
+    path: &Path,
+    pad: Control,
+    input: mappings::Input,
+    family: usize,
+    saved: Option<&Mapping>,
+) -> Result<Option<Mapping>> {
+    let copied = family == 14;
+    let mapping = if copied {
+        let Some(copy) = family_mapping(ui, path, pad, input)? else {
+            return Ok(None);
+        };
+        copy
+    } else if family == 0 {
+        let Some(mapping) = shortcut_mapping(ui, pad, input, saved)? else {
+            return Ok(None);
+        };
+        mapping
+    } else if family == 16 {
+        // v7.8 ticket 11: a click follows the control (held: the button stays down, so it
+        // drags); a scroll is one wheel step per press, or per knob step.
+        let rows = mappings::MOUSE_KEYS
+            .map(|(_, label)| label.to_string())
+            .to_vec();
+        let saved_row =
+            saved.and_then(|m| (mappings::MOUSE_KEYS.iter()).position(|(key, _)| m.keys == [*key]));
+        let Some(row) = family_list(
+            ui,
+            Some(path),
+            16,
+            "Mouse Actions\nA click follows the control: hold it to hold the button (drag). Scroll: one step per press.",
+            rows,
+            saved_row,
+        )?
+        else {
+            return Ok(None);
+        };
+        let behavior = match input {
+            mappings::Input::Knob { .. } | mappings::Input::RelativeKnob { .. } => "pulse",
+            _ => "hold",
+        };
+        Mapping::new(pad, mappings::MOUSE_KEYS[row].0, behavior).map_err(stage("validation"))?
+    } else if family == 18 {
+        let Some(action) = browser_action(ui, path, saved.map(|m| &m.action))? else {
+            return Ok(None);
+        };
+        Mapping::new_action(pad, input, action).map_err(stage("validation"))?
+    } else if family == 17 {
+        let saved_action = saved.map(|m| &m.action);
+        let Some(action) = fedora_system(ui, saved_action, Some(path))? else {
+            return Ok(None);
+        };
+        Mapping::new_action(pad, input, action).map_err(stage("validation"))?
+    } else if family == 11 {
+        if !matches!(input, mappings::Input::Pad | mappings::Input::Piano) {
+            return Err("validation: prompt sequences require a pad or piano press".into());
+        }
+        // v7 ticket 116: a saved sequence, or one built for this pad.
+        let Some(action) = sequence_for_pad(ui, path, saved.map(|m| &m.action))? else {
+            return Ok(None);
+        };
+        Mapping::new_action(pad, input, action).map_err(stage("validation"))?
+    } else if family == 15 {
+        // v7.7 ticket 182: one of 3 Agents' tmux agents, by its window.
+        let windows = tmux_rows(&mappings::load_config(path).map_err(stage("file I/O"))?);
+        if windows.is_empty() && JUMP.with(|jump| jump.borrow().is_none()) {
+            return Err("validation: no tmux agents in 3 Agents; add one first".into());
+        }
+        let Some(index) = family_list(
+            ui,
+            Some(path),
+            15,
+            "Go to which tmux agent?",
+            windows.clone(),
+            None,
+        )?
+        else {
+            return Ok(None);
+        };
+        Mapping::new_action(
+            pad,
+            input,
+            crate::actions::Action::TmuxJump(windows[index].clone()),
+        )
+        .map_err(stage("validation"))?
+    } else if family == 10 {
+        let agents = ui.herdr_agents()?;
+        if agents.is_empty() && JUMP.with(|jump| jump.borrow().is_none()) {
+            return Err("validation: herdr has no agents running; start one first".into());
+        }
+        let Some(index) = family_list(
+            ui,
+            Some(path),
+            10,
+            "Focus which herdr agent?",
+            agents.clone(),
+            None,
+        )?
+        else {
+            return Ok(None);
+        };
+        Mapping::new_action(
+            pad,
+            input,
+            crate::actions::Action::HerdrFocus(agents[index].clone()),
+        )
+        .map_err(stage("validation"))?
+    } else if family == 9 {
+        let Some(action) = t3_action(ui, Some(path))? else {
+            return Ok(None);
+        };
+        Mapping::new_action(pad, input, action).map_err(stage("validation"))?
+    } else if family == 8 {
+        let Some(mapping) = orca_mapping(ui, pad, input, Some(path))? else {
+            return Ok(None);
+        };
+        mapping
+    } else if family == 3 {
+        if !matches!(input, mappings::Input::Pad | mappings::Input::Piano) {
+            return Err("validation: prompts require a pad or piano press".into());
+        }
+        let Some(action) = prompt_action(ui, path, saved.map(|m| &m.action), true)? else {
+            return Ok(None);
+        };
+        Mapping::new_action(pad, input, action).map_err(stage("validation"))?
+    } else if family == 4 || family == 12 {
+        if !matches!(input, mappings::Input::Pad | mappings::Input::Piano) {
+            return Err("validation: commands require a pad or piano press".into());
+        }
+        let Some(action) = command_action(ui, saved.map(|m| &m.action))? else {
+            return Ok(None);
+        };
+        Mapping::new_action(pad, input, action).map_err(stage("validation"))?
+    } else if family == 5 {
+        if !matches!(input, mappings::Input::Pad | mappings::Input::Piano) {
+            return Err("validation: sequences require a pad or piano press".into());
+        }
+        use crate::actions::Action::{PressSequence, Sequence};
+        let (steps, per_press) = match saved.map(|m| &m.action) {
+            Some(Sequence(steps)) => (steps.clone(), Some(0)),
+            Some(PressSequence(steps)) => (steps.clone(), Some(1)),
+            _ => (Vec::new(), None),
+        };
+        let Some(steps) = sequence_menu(ui, path, steps)? else {
+            return Ok(None);
+        };
+        // v7.8 ticket 17: two modes, as prompt sequences have.
+        let Some(mode) = choose_saved(
+            ui,
+            "Sequence mode",
+            strings(&[
+                "All at once (one press runs every step)",
+                "One per press (press 1 runs step 1, press 2 step 2, …; hold 1 s at the end to start over)",
+            ]),
+            per_press,
+        )?
+        else {
+            return Ok(None);
+        };
+        let action = if mode == 1 {
+            PressSequence(steps)
+        } else {
+            Sequence(steps)
+        };
+        Mapping::new_action(pad, input, action).map_err(stage("validation"))?
+    } else if family >= 6 {
+        if !matches!(input, mappings::Input::Knob { .. }) {
+            return Err("validation: choice and value actions need an absolute knob".into());
+        }
+        let saved_action = saved.map(|m| &m.action);
+        let Some(action) = (if family == 6 {
+            choice_menu(ui, path, saved_action)?
+        } else {
+            value_menu(ui, saved_action)?
+        }) else {
+            return Ok(None);
+        };
+        Mapping::new_action(pad, input, action).map_err(stage("validation"))?
+    } else {
+        let Some(action) = action_menu(
+            ui,
+            family,
+            input,
+            saved.map(|m| &m.action),
+            true,
+            Some(path),
+        )?
+        else {
+            return Ok(None);
+        };
+        Mapping::new_action(pad, input, action).map_err(stage("validation"))?
+    };
+    Ok(Some(mapping))
+}
+
+fn review_assignment(
+    ui: &mut impl Ui,
+    path: &Path,
+    current: &[Mapping],
+    mut mapping: Mapping,
+    saved: Option<&Mapping>,
+    motion_label: Option<&str>,
+    family: usize,
+    in_profile: bool,
+) -> Result<Option<(Mapping, bool)>> {
+    enum Step {
+        Movement,
+        Label,
+        Feedback,
+        FireWhen,
+        Status,
+        Review,
+    }
+    let mut steps = Vec::new();
+    if matches!(mapping.input, mappings::Input::RelativeKnob { .. })
+        || (matches!(mapping.input, mappings::Input::Knob { .. }) && !mapping.action.dial())
+    {
+        steps.push(Step::Movement);
+    }
+    if let Some(label) = motion_label.or_else(|| saved.map(|m| m.label.as_str())) {
+        mapping.label = label.to_owned();
+    } else if mapping.input == mappings::Input::Piano {
+        let pad = mapping.control;
+        mapping.label = format!("Piano channel {} note {}", pad.channel, pad.id);
+    } else {
+        steps.push(Step::Label);
+    }
+    let copied = family == 14;
+    if mapping.action != crate::actions::Action::Shortcut
+        || mapping.input != mappings::Input::Pad
+        || mapping.context > 7
+        || in_profile
+    {
+        mapping.feedback = Default::default();
+    } else if !copied {
+        mapping.feedback = saved.map(|m| m.feedback).unwrap_or_default();
+        steps.push(Step::Feedback);
+    }
+    let press = matches!(mapping.input, mappings::Input::Pad | mappings::Input::Piano);
+    // Terminal commands and other risky actions still require a one-second hold.
+    if family == 12 || (matches!(family, 5 | 17) && must_hold(&mapping.action)) {
+        mapping.risky = true;
+    } else if copied {
+        mapping.risky &= press;
+    } else if press {
+        mapping.risky = saved.is_some_and(|m| m.risky);
+        steps.push(Step::FireWhen);
+    }
+    if copied {
+        mapping.status &= mapping.action.observable();
+    } else if mapping.action.observable() {
+        mapping.status = saved.is_some_and(|m| m.status);
+        steps.push(Step::Status);
+    }
+    steps.push(Step::Review);
+
+    let mut at = 0;
+    loop {
+        let forward = match steps[at] {
+            Step::Movement => {
+                use mappings::Input::{Knob, RelativeKnob};
+                let adjusted = match mapping.input {
+                    Knob { step } => number(
+                        ui,
+                        "Absolute knob movement step (one pulse maximum per MIDI sample)",
+                        i32::from(step),
+                        1,
+                        127,
+                    )?
+                    .map(|step| Knob { step: step as u8 }),
+                    RelativeKnob { step } => {
+                        number(ui, "Relative knob pulses per tick", i32::from(step), 1, 8)?
+                            .map(|step| RelativeKnob { step: step as u8 })
+                    }
+                    _ => unreachable!("movement is only for knobs"),
+                };
+                adjusted.map(|input| mapping.input = input).is_some()
+            }
+            Step::Label => ui
+                .label(mapping.control, current)?
+                .map(|label| mapping.label = label)
+                .is_some(),
+            Step::Feedback => feedback_menu(
+                ui,
+                mapping.feedback,
+                saved.is_some_and(|m| m.feedback == mapping.feedback),
+                false,
+            )?
+            .map(|feedback| mapping.feedback = feedback)
+            .is_some(),
+            Step::FireWhen => choose_at(
+                ui,
+                "Fire when",
+                &mark_saved(
+                    strings(&[
+                        "Pressed",
+                        "Held for 1 second (risky; early release sends nothing)",
+                        "Back",
+                    ]),
+                    saved.map(|m| usize::from(m.risky)),
+                ),
+                usize::from(mapping.risky),
+            )?
+            .filter(|row| *row < 2)
+            .map(|row| mapping.risky = row == 1)
+            .is_some(),
+            Step::Status => choose_at(
+                ui,
+                "Status feedback in the live pane (sent, running, stopped, failed)",
+                &mark_saved(
+                    strings(&["Off", "On", "Back"]),
+                    saved.map(|m| usize::from(m.status)),
+                ),
+                usize::from(mapping.status),
+            )?
+            .filter(|row| *row < 2)
+            .map(|row| mapping.status = row == 1)
+            .is_some(),
+            Step::Review => {
+                name_windows(&mut mapping, ui.program().as_ref());
+                let config = mappings::load_config(path).map_err(stage("file I/O"))?;
+                let valid = mapping.validate().and_then(|()| {
+                    for (_, dir) in mapping.action.commands() {
+                        mappings::absolute_directory(dir, &config)?;
+                    }
+                    Ok(())
+                });
+                if let Err(error) = valid {
+                    not_saved(ui, &stage("validation")(error))?;
+                    if at == 0 {
+                        return Ok(None);
+                    }
+                    at -= 1;
+                    continue;
+                }
+                match question(
+                    ui,
+                    &format!(
+                        "Review: {}",
+                        mapping_label(&mapping, ui.program().as_ref(), Some(&config.agents))
+                    ),
+                    &strings(&["Save and configure another", "Save and finish", "Back"]),
+                )? {
+                    Some(choice @ (0 | 1)) => return Ok(Some((mapping, choice == 1))),
+                    _ => false,
+                }
+            }
+        };
+        if forward {
+            at += 1;
+        } else if at == 0 {
+            return Ok(None);
+        } else {
+            at -= 1;
+        }
+    }
+}
+
 fn configure_steps(
     ui: &mut impl Ui,
     path: &Path,
     current: &mut Vec<Mapping>,
     profile: Option<&str>,
 ) -> Result<()> {
-    loop {
+    'control: loop {
         // v7.7 ticket 243: this config's agents, for the labels (read-only peek).
         let agents = mappings::read_config(path).ok().map(|c| c.agents);
         let Some(action) = configure_choice(ui)? else {
@@ -15672,379 +16175,85 @@ fn configure_steps(
         {
             continue;
         }
-        JUMP.with(|j| j.borrow_mut().take()); // a jump never outlives its choice
-        let saved_family = saved.as_ref().map(action_family);
-        // v7.8 ticket 18: families star with F (★ first); "★ Favourites" lists every starred
-        // action this control can take, and opens its family on that row.
-        let offered = families(input);
-        let stars = mappings::load_config(path)
-            .map(|c| c.favourites)
-            .unwrap_or_default();
-        let starred_actions = stars
-            .iter()
-            .filter_map(|k| starred_action(k))
-            .filter(|(f, _)| offered.contains(f))
-            .map(|(f, l)| (f, l.to_owned()))
-            .collect::<Vec<_>>();
-        let top = usize::from(!starred_actions.is_empty());
-        let mut rows = offered
-            .iter()
-            .map(|f| (FAMILIES[*f].to_string(), family_star(*f)))
-            .collect::<Vec<_>>();
-        if top == 1 {
-            let label = format!("★ Favourites ({} starred actions)", starred_actions.len());
-            rows.insert(0, (label, String::new()));
-        }
-        let at = saved_family
-            .and_then(|f| offered.iter().position(|o| *o == f))
-            .map(|i| i + top);
-        let Some(row) = choose_starred(ui, path, "Action family", &rows, at)? else {
-            continue;
-        };
-        let family = if top == 1 && row == 0 {
-            let Some(family) = choose_favourite(ui, path, &starred_actions)? else {
-                continue;
-            };
-            family
-        } else {
-            offered[row - top]
-        };
-        let copied = family == 14;
-        let mut mapping = if copied {
-            let Some(copy) = family_mapping(ui, path, pad, input)? else {
-                continue;
-            };
-            copy
-        } else if family == 0 {
-            let Some(keys) = shortcut(ui, saved.as_ref().map_or(&[], |m| &m.keys))? else {
-                continue;
-            };
-            let behavior = match input {
-                mappings::Input::Knob { .. } | mappings::Input::RelativeKnob { .. } => "pulse",
-                mappings::Input::Joystick { .. } => "hold",
-                _ => {
-                    let saved_behavior = saved.as_ref().and_then(|m| match m.behavior {
-                        mappings::Behavior::Hold => Some(0),
-                        mappings::Behavior::Toggle => Some(1),
-                        mappings::Behavior::Tap => Some(2),
-                        _ => None,
-                    });
-                    // v7 ticket 96: one tap sends the shortcut once per press, however long
-                    // it's held, so the desktop never repeats it.
-                    let Some(b) = choose_saved(
-                        ui,
-                        "Activation behavior",
-                        strings(&["hold", "toggle", "one tap (once per press, never repeats)"]),
-                        saved_behavior,
-                    )?
-                    else {
+        let mut selected_family = saved.as_ref().map(action_family);
+        let mut browsing_favourites = false;
+        loop {
+            JUMP.with(|j| j.borrow_mut().take()); // a jump never outlives its choice
+            // v7.8 ticket 18: families star with F (★ first); "★ Favourites" lists every starred
+            // action this control can take, and opens its family on that row.
+            let offered = families(input);
+            let stars = mappings::load_config(path)
+                .map(|c| c.favourites)
+                .unwrap_or_default();
+            let starred_actions = stars
+                .iter()
+                .filter_map(|k| starred_action(k))
+                .filter(|(f, _)| offered.contains(f))
+                .map(|(f, l)| (f, l.to_owned()))
+                .collect::<Vec<_>>();
+            let top = usize::from(!starred_actions.is_empty());
+            let mut rows = offered
+                .iter()
+                .map(|f| (FAMILIES[*f].to_string(), family_star(*f)))
+                .collect::<Vec<_>>();
+            if top == 1 {
+                let label = format!("★ Favourites ({} starred actions)", starred_actions.len());
+                rows.insert(0, (label, String::new()));
+            }
+            let at = selected_family
+                .and_then(|f| offered.iter().position(|o| *o == f))
+                .map(|i| i + top);
+            let family = if browsing_favourites {
+                match choose_favourite(ui, path, &starred_actions)? {
+                    Some(family) => family,
+                    None => {
+                        browsing_favourites = false;
                         continue;
-                    };
-                    ["hold", "toggle", "tap"][b]
+                    }
                 }
-            };
-            Mapping::new(pad, &keys.join("+"), behavior).map_err(stage("validation"))?
-        } else if family == 16 {
-            // v7.8 ticket 11: a click follows the control (held: the button stays down, so it
-            // drags); a scroll is one wheel step per press, or per knob step.
-            let rows = mappings::MOUSE_KEYS
-                .map(|(_, label)| label.to_string())
-                .to_vec();
-            let saved_row = saved
-                .as_ref()
-                .and_then(|m| (mappings::MOUSE_KEYS.iter()).position(|(key, _)| m.keys == [*key]));
-            let Some(row) = family_list(
-                ui,
-                Some(path),
-                16,
-                "Mouse Actions\nA click follows the control: hold it to hold the button (drag). Scroll: one step per press.",
-                rows,
-                saved_row,
-            )?
-            else {
-                continue;
-            };
-            let behavior = match input {
-                mappings::Input::Knob { .. } | mappings::Input::RelativeKnob { .. } => "pulse",
-                _ => "hold",
-            };
-            Mapping::new(pad, mappings::MOUSE_KEYS[row].0, behavior).map_err(stage("validation"))?
-        } else if family == 18 {
-            let Some(action) = browser_action(ui, path, saved.as_ref().map(|m| &m.action))? else {
-                continue;
-            };
-            Mapping::new_action(pad, input, action).map_err(stage("validation"))?
-        } else if family == 17 {
-            let saved_action = saved.as_ref().map(|m| &m.action);
-            let Some(action) = fedora_system(ui, saved_action, Some(path))? else {
-                continue;
-            };
-            Mapping::new_action(pad, input, action).map_err(stage("validation"))?
-        } else if family == 11 {
-            if !matches!(input, mappings::Input::Pad | mappings::Input::Piano) {
-                return Err("validation: prompt sequences require a pad or piano press".into());
-            }
-            // v7 ticket 116: a saved sequence, or one built for this pad.
-            let Some(action) = sequence_for_pad(ui, path, saved.as_ref().map(|m| &m.action))?
-            else {
-                continue;
-            };
-            Mapping::new_action(pad, input, action).map_err(stage("validation"))?
-        } else if family == 15 {
-            // v7.7 ticket 182: one of 3 Agents' tmux agents, by its window.
-            let windows = tmux_rows(&mappings::load_config(path).map_err(stage("file I/O"))?);
-            if windows.is_empty() && JUMP.with(|jump| jump.borrow().is_none()) {
-                return Err("validation: no tmux agents in 3 Agents; add one first".into());
-            }
-            let Some(index) = family_list(
-                ui,
-                Some(path),
-                15,
-                "Go to which tmux agent?",
-                windows.clone(),
-                None,
-            )?
-            else {
-                continue;
-            };
-            Mapping::new_action(
-                pad,
-                input,
-                crate::actions::Action::TmuxJump(windows[index].clone()),
-            )
-            .map_err(stage("validation"))?
-        } else if family == 10 {
-            let agents = ui.herdr_agents()?;
-            if agents.is_empty() && JUMP.with(|jump| jump.borrow().is_none()) {
-                return Err("validation: herdr has no agents running; start one first".into());
-            }
-            let Some(index) = family_list(
-                ui,
-                Some(path),
-                10,
-                "Focus which herdr agent?",
-                agents.clone(),
-                None,
-            )?
-            else {
-                continue;
-            };
-            Mapping::new_action(
-                pad,
-                input,
-                crate::actions::Action::HerdrFocus(agents[index].clone()),
-            )
-            .map_err(stage("validation"))?
-        } else if family == 9 {
-            let Some(action) = t3_action(ui, Some(path))? else {
-                continue;
-            };
-            Mapping::new_action(pad, input, action).map_err(stage("validation"))?
-        } else if family == 8 {
-            let Some(mapping) = orca_mapping(ui, pad, input, Some(path))? else {
-                continue;
-            };
-            mapping
-        } else if family == 3 {
-            if !matches!(input, mappings::Input::Pad | mappings::Input::Piano) {
-                return Err("validation: prompts require a pad or piano press".into());
-            }
-            let Some(action) = prompt_action(ui, path, saved.as_ref().map(|m| &m.action), true)?
-            else {
-                continue;
-            };
-            Mapping::new_action(pad, input, action).map_err(stage("validation"))?
-        } else if family == 4 || family == 12 {
-            if !matches!(input, mappings::Input::Pad | mappings::Input::Piano) {
-                return Err("validation: commands require a pad or piano press".into());
-            }
-            let Some(action) = command_action(ui, saved.as_ref().map(|m| &m.action))? else {
-                continue;
-            };
-            Mapping::new_action(pad, input, action).map_err(stage("validation"))?
-        } else if family == 5 {
-            if !matches!(input, mappings::Input::Pad | mappings::Input::Piano) {
-                return Err("validation: sequences require a pad or piano press".into());
-            }
-            use crate::actions::Action::{PressSequence, Sequence};
-            let (steps, per_press) = match saved.as_ref().map(|m| &m.action) {
-                Some(Sequence(steps)) => (steps.clone(), Some(0)),
-                Some(PressSequence(steps)) => (steps.clone(), Some(1)),
-                _ => (Vec::new(), None),
-            };
-            let Some(steps) = sequence_menu(ui, path, steps)? else {
-                continue;
-            };
-            // v7.8 ticket 17: two modes, as prompt sequences have.
-            let Some(mode) = choose_saved(
-                ui,
-                "Sequence mode",
-                strings(&[
-                    "All at once (one press runs every step)",
-                    "One per press (press 1 runs step 1, press 2 step 2, …; hold 1 s at the end to start over)",
-                ]),
-                per_press,
-            )?
-            else {
-                continue;
-            };
-            let action = if mode == 1 {
-                PressSequence(steps)
             } else {
-                Sequence(steps)
-            };
-            Mapping::new_action(pad, input, action).map_err(stage("validation"))?
-        } else if family >= 6 {
-            if !matches!(input, mappings::Input::Knob { .. }) {
-                return Err("validation: choice and value actions need an absolute knob".into());
-            }
-            let saved_action = saved.as_ref().map(|m| &m.action);
-            let Some(action) = (if family == 6 {
-                choice_menu(ui, path, saved_action)?
-            } else {
-                value_menu(ui, saved_action)?
-            }) else {
-                continue;
-            };
-            Mapping::new_action(pad, input, action).map_err(stage("validation"))?
-        } else {
-            let Some(action) = action_menu(
-                ui,
-                family,
-                input,
-                saved.as_ref().map(|m| &m.action),
-                true,
-                Some(path),
-            )?
-            else {
-                continue;
-            };
-            Mapping::new_action(pad, input, action).map_err(stage("validation"))?
-        };
-        // v7 ticket 09: layer 2 is what an Xbox button does while LB is held; its layer was
-        // chosen when it was learned (ticket 97), or is the edited assignment's own.
-        mapping.context = if pad.message == crate::Message::Button {
-            pad_context
-        } else {
-            ui.context()
-        };
-        mapping.input = input;
-        if let (mappings::Input::Knob { step }, false) = (input, mapping.action.dial()) {
-            let Some(step) = number(
-                ui,
-                "Absolute knob movement step (one pulse maximum per MIDI sample)",
-                i32::from(step),
-                1,
-                127,
-            )?
-            else {
-                continue;
-            };
-            mapping.input = mappings::Input::Knob { step: step as u8 };
-        }
-        if let mappings::Input::RelativeKnob { step } = input {
-            let Some(step) = number(ui, "Relative knob pulses per tick", i32::from(step), 1, 8)?
-            else {
-                continue;
-            };
-            mapping.input = mappings::Input::RelativeKnob { step: step as u8 };
-        }
-        mapping.label = if let Some((_, _, label)) = &motion {
-            label.clone()
-        } else if let Some(old) = current
-            .iter()
-            .find(|m| m.context == pad_context && m.control == pad)
-        {
-            old.label.clone()
-        } else {
-            if mapping.input == mappings::Input::Piano {
-                format!("Piano channel {} note {}", pad.channel, pad.id)
-            } else {
-                let Some(label) = ui.label(pad, current)? else {
-                    continue;
+                let Some(row) = choose_starred(ui, path, "Action family", &rows, at)? else {
+                    continue 'control;
                 };
-                label
-            }
-        };
-        let previous = current
-            .iter()
-            .find(|m| m.context == pad_context && m.control == pad)
-            .map(|m| m.feedback)
-            .unwrap_or_default();
-        let Some(feedback) = (if mapping.action != crate::actions::Action::Shortcut
-            || mapping.input != mappings::Input::Pad
-            || mapping.context > 7
-            || profile.is_some()
-        {
-            Some(crate::feedback::Feedback::default())
-        } else if copied {
-            Some(mapping.feedback) // a favourite keeps its feedback where the control can show it
-        } else {
-            feedback_menu(ui, previous, saved.is_some(), false)?
-        }) else {
-            continue;
-        };
-        mapping.feedback = feedback;
-        name_windows(&mut mapping, ui.program().as_ref());
-        // v7 ticket 23: a terminal command (sudo and the like) is a risky control: it fires
-        // only after a one-second hold, in a visible terminal where sudo asks for the password.
-        if family == 12 || (matches!(family, 5 | 17) && must_hold(&mapping.action)) {
-            mapping.risky = true;
-        } else if copied {
-            // A favourite keeps its "fire when", but only pads and keys can be held.
-            mapping.risky &= matches!(mapping.input, mappings::Input::Pad | mappings::Input::Piano);
-        } else if matches!(mapping.input, mappings::Input::Pad | mappings::Input::Piano) {
-            let Some(risky) = choose_saved(
-                ui,
-                "Fire when",
-                strings(&[
-                    "Pressed",
-                    "Held for 1 second (risky; early release sends nothing)",
-                ]),
-                saved.as_ref().map(|m| usize::from(m.risky)),
-            )?
-            else {
-                continue;
-            };
-            mapping.risky = risky == 1;
-        }
-        if copied {
-            mapping.status &= mapping.action.observable();
-        } else if mapping.action.observable() {
-            let Some(status) = choose_saved(
-                ui,
-                "Status feedback in the live pane (sent, running, stopped, failed)",
-                strings(&["Off", "On"]),
-                saved.as_ref().map(|m| usize::from(m.status)),
-            )?
-            else {
-                continue;
-            };
-            mapping.status = status == 1;
-        }
-        mapping.validate().map_err(stage("validation"))?;
-        // A directory's ${NAME} must resolve now, not when the pad is pressed (ticket 12).
-        let config = mappings::load_config(path).map_err(stage("file I/O"))?;
-        for (_, dir) in mapping.action.commands() {
-            mappings::absolute_directory(dir, &config).map_err(stage("validation"))?;
-        }
-        match question(
-            ui,
-            &format!(
-                "Review: {}",
-                mapping_label(&mapping, ui.program().as_ref(), Some(&config.agents))
-            ),
-            &strings(&["Save and configure another", "Save and finish", "Cancel"]),
-        )? {
-            Some(choice @ (0 | 1)) => {
-                commit(path, current, pad, mapping.context, Some(mapping), profile)
-                    .map_err(stage("file I/O"))?;
-                ui.applied().map_err(stage("controller I/O"))?;
-                if choice == 1 {
-                    return Ok(());
+                if top == 1 && row == 0 {
+                    browsing_favourites = true;
+                    continue;
                 }
+                offered[row - top]
+            };
+            selected_family = Some(family);
+            let mut mapping = match assignment_action(ui, path, pad, input, family, saved.as_ref())
+            {
+                Ok(Some(mapping)) => mapping,
+                Ok(None) => continue,
+                Err(error) if error.to_string().starts_with("validation: ") => {
+                    not_saved(ui, &error)?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            mapping.context = pad_context;
+            mapping.input = input;
+            let Some((mapping, finish)) = review_assignment(
+                ui,
+                path,
+                current,
+                mapping,
+                saved.as_ref(),
+                motion.as_ref().map(|(_, _, label)| label.as_str()),
+                family,
+                profile.is_some(),
+            )?
+            else {
+                continue;
+            };
+            commit(path, current, pad, mapping.context, Some(mapping), profile)
+                .map_err(stage("file I/O"))?;
+            ui.applied().map_err(stage("controller I/O"))?;
+            if finish {
+                return Ok(());
             }
-            _ => {}
+            break;
         }
     }
 }
@@ -16272,7 +16481,7 @@ const TABS: [(&str, TabRows); 10] = [
             ("Keep", None),
             (
                 "Favourites",
-                Some((SETTING + 10, "★ assignments and profiles, listed first.")),
+                Some((SETTING + 10, "View or unstar favourite actions.")),
             ),
             (
                 "Presets",
@@ -16781,8 +16990,8 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
             }
             3 => ui.pause("pause command"),
             5 => ui.release_all(),
-            6 => ui.learn().and_then(|pad| {
-                if let Some(pad) = pad {
+            6 => (|| {
+                while let Some(pad) = ui.learn()? {
                     let text = current
                         .iter()
                         .find(|m| m.context == ui.context() && m.control == pad)
@@ -16791,7 +17000,7 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
                     choose(&mut ui, &text, &strings(&["Back"]))?;
                 }
                 Ok(())
-            }),
+            })(),
             7 => ui.detect(),
             8 => ui.feedback_trial(),
             9 => (|| {
@@ -17843,7 +18052,7 @@ mod tests {
         assert_eq!(keys(&ui), ["Enter"], "program 1: the default");
         ui.set_xbox_program(3).unwrap();
         assert_eq!(keys(&ui), ["F9"]);
-        assert_eq!(ui.notice, "Xbox · Program 3 — Editor");
+        assert_eq!(ui.notice, "Xbox · Editor");
         assert_eq!(Ui::xbox_program(&ui), 3);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -18750,8 +18959,8 @@ mod tests {
         use Key::*;
         let mut ui = Script {
             keys: [
-                Down, Down, Enter, Down, Enter, Up, Enter, Down, Enter, Up, Enter, Enter, Down,
-                Enter,
+                Down, Down, Enter, Down, Enter, Up, Enter, Down, Enter, Up, Enter, Enter, Escape,
+                Down, Enter,
             ]
             .into(),
             pads: VecDeque::new(),
@@ -18763,6 +18972,12 @@ mod tests {
         assert_eq!(feedback.tempo, Some(121));
         assert_eq!(feedback.arp, Some(true));
         assert!(ui.keys.is_empty());
+        let warning = ui
+            .screens
+            .iter()
+            .position(|s| s.starts_with("Tempo blinking"))
+            .unwrap();
+        assert!(ui.screens[warning + 1].starts_with("Arpeggiator"));
         ui.keys = [Down, Enter, Up, Enter, Down, Enter].into();
         let idle = feedback_menu(&mut ui, feedback, false, true)
             .unwrap()
@@ -18804,11 +19019,11 @@ mod tests {
         assert_eq!(shortcut(&mut ui, &[]).unwrap().unwrap(), ["Shift"]);
         assert!(ui.recordings.is_empty());
         assert!(ui.keys.is_empty());
-        ui.keys = [Down, Enter, Escape].into();
+        ui.keys = [Down, Enter, Escape, Escape].into();
         ui.recordings = [Ok(vec!["Escape".into()])].into();
         assert!(shortcut(&mut ui, &[]).unwrap().is_none());
         assert!(ui.keys.is_empty());
-        ui.keys = [Down, Enter, Enter, Enter, Escape].into();
+        ui.keys = [Down, Enter, Enter, Enter, Escape, Escape].into();
         ui.recordings = [Err("permission denied".into())].into();
         assert!(shortcut(&mut ui, &[]).unwrap().is_none());
         assert!(ui.keys.is_empty());
@@ -18859,7 +19074,8 @@ mod tests {
         );
         ui.screens.clear();
         ui.keys = [
-            Tab, Enter, Enter, Enter, Enter, Enter, Enter, Enter, Up, Enter, Escape, Escape, Escape,
+            Tab, Enter, Enter, Enter, Enter, Enter, Enter, Enter, Up, Enter, Escape, Escape,
+            Escape, Escape,
         ]
         .into();
         configure(&mut ui, &path, &mut current).unwrap();
@@ -18891,6 +19107,7 @@ mod tests {
                 Enter, Enter, Enter, Up, Enter,  // Select keys -> Modifiers -> back -> Done
                 Enter,  // behavior: saved hold
                 Escape, // cancel at feedback
+                Escape, // leave Action family
                 Escape, // leave configure
             ]
             .into(),
@@ -19031,7 +19248,7 @@ mod tests {
         let commands = [
             0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 19, 20, 21, 23, 24,
         ];
-        let settings = [0, 2, 3, 4, 5, 6, 7, 11, 12].map(|row| SETTING + row); // v7.8 18: no 10
+        let settings = [0, 2, 3, 4, 5, 6, 7, 10, 11, 12].map(|row| SETTING + row);
         // Each agent, then Add agent, the two hooks rows and Status lights; no prompts,
         // sequences or profiles, so each of those lists is its "New …" row.
         let agents = mappings::load_config(&dir.join("mappings.tsv"))
@@ -19076,8 +19293,8 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// v7.7 ticket 152: empty lists say what to do; each tab has at most one primary row and
-    /// tabs 1–6 exactly one; the reset row is red under a red rule; `/prog-select (Xbox)`
+    /// v7.7 ticket 152: empty lists say what to do, the cursor gets the primary colour,
+    /// and the reset row is red under a red rule. `/prog-select (Xbox)`
     /// switches the program and releases a held key; `/program-name (Xbox)` renames with no
     /// device question.
     #[test]
@@ -19099,14 +19316,13 @@ mod tests {
         assert!(rows(&ui, 3).contains("No prompts yet · Enter: New prompt"));
         assert!(rows(&ui, 3).contains("No sequences yet · Enter: New sequence"));
         assert!(rows(&ui, 5).contains("No profiles yet · Enter: New profile"));
-        for tab in 0..TABS.len() {
-            ui.tab = tab;
-            let screen = ui.screen("");
-            let primaries = screen.panes.iter().filter(|p| p.primary.is_some()).count();
-            assert_eq!(primaries, usize::from(tab <= 5), "tab {tab}");
-        }
         ui.tab = 1;
+        ui.menu = 2; // /list, one row below /configure
         let frame = ui.screen("").render(100, 30, true);
+        let accent = ";48;2;122;162;247m";
+        let row = |label: &str| frame.lines().find(|line| line.contains(label)).unwrap();
+        assert!(!row("/configure").contains(accent));
+        assert!(row("> /list").contains(accent));
         assert!(frame.contains("━━ Start over (asks first, keeps a backup)"));
         assert!(
             frame.contains(";38;2;247;118;142m  ⚠ Reset settings"),
@@ -22963,7 +23179,7 @@ mod tests {
         let mut keys = vec![Enter, Enter]; // learn, layer 1 (v7 ticket 97)
         keys.extend(vec![Down; 8]); // herdr, with no agents running
         keys.extend([Enter, Enter]); // herdr -> Back
-        keys.extend([Tab, Tab, Enter]); // still in /configure: Finish
+        keys.extend([Escape, Tab, Tab, Enter]); // Action family → Configure → Finish
         let mut ui = Script {
             keys: keys.into(),
             pads: [Control::button(0)].into(),
@@ -22979,6 +23195,66 @@ mod tests {
                 .any(|s| { s.starts_with("Not saved: validation: herdr has no agents running") })
         );
         assert_eq!(config_bytes(&path), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn backing_out_of_shortcut_setup_keeps_the_learned_button() {
+        use Key::*;
+        let (dir, _terminal, _ran, _) = configure_session("shortcut-back");
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let button = Control::button(0);
+        let mut ui = Script {
+            // Learn a button, choose layer 1, open Keyboard shortcut, then Back.
+            // Choose Music & Sound, then Output mute, and save the same button.
+            keys: [
+                Enter, Enter, Enter, Up, Enter, Down, Down, Enter, Down, Down, Enter, Enter, Up,
+                Enter, // Back from Review to Fire when.
+                Down, Enter, Down, Enter, // Hold, then save and finish.
+            ]
+            .into(),
+            pads: [button].into(),
+            ..Default::default()
+        };
+        let mut current = Vec::new();
+        configure(&mut ui, &path, &mut current).unwrap();
+        let saved = mappings::load(&path).unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].control, button);
+        assert_eq!(saved[0].action, crate::actions::Action::OutputMute);
+        assert!(saved[0].risky);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn back_after_an_empty_prompt_name_returns_to_the_name() {
+        use Key::*;
+        let (dir, _terminal, _ran, [pad, ..]) = configure_session("prompt-name-back");
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let folder = crate::actions::prompts_dir_for(&path).unwrap();
+        std::fs::create_dir_all(&folder).unwrap();
+        let before = config_bytes(&path);
+        let mut ui = Script {
+            keys: [
+                Enter, Down, Down, Down, Enter, Enter, Enter, Enter, Escape, Escape, Escape, Escape,
+            ]
+            .into(),
+            pads: [pad].into(),
+            ..Default::default()
+        };
+        configure(&mut ui, &path, &mut vec![]).unwrap();
+        let notice = ui
+            .screens
+            .iter()
+            .position(|screen| screen.contains("Not saved: validation: invalid prompt file name"))
+            .unwrap();
+        assert!(ui.screens[notice + 1].starts_with("New prompt file name"));
+        assert!(ui.screens[notice + 2].starts_with("Prompt file"));
+        assert!(ui.screens[notice + 3].starts_with("Action family"));
+        assert_eq!(config_bytes(&path), before);
+        assert_eq!(std::fs::read_dir(folder).unwrap().count(), 0);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -23141,7 +23417,7 @@ mod tests {
 
         // xone not installed: says so before any password prompt.
         let mut ui = Script {
-            keys: tuning(8, &[Down, Enter, Enter]).into(),
+            keys: tuning(8, &[Down, Enter, Enter, Escape]).into(),
             driver: Some("xpad"),
             xone_missing: true,
             ..Default::default()
@@ -23156,12 +23432,13 @@ mod tests {
 
         // Back at the confirm step (it opens there, ticket 229): only the install check ran.
         let mut ui = Script {
-            keys: tuning(8, &[Down, Enter, Enter]).into(),
+            keys: tuning(8, &[Down, Enter, Enter, Escape]).into(),
             driver: Some("xpad"),
             ..Default::default()
         };
         settings_menu(&mut ui, &path).unwrap();
         assert_eq!(ui.ran, ["modinfo -n xone_wired"]);
+        assert!(ui.screens[ui.screens.len() - 2].starts_with("Xbox driver (now: xpad)"));
 
         // Test speaker and Test mic on xone with the headset card.
         let cards = " 0 [Chroma         ]: USB-Audio - Razer Nommo Chroma\n 3 [Headset        ]: xone-gip-headse - Microsoft Xbox Headset\n".to_owned();
@@ -24185,6 +24462,7 @@ mod tests {
                 "> Minimize; hold 1 second to quit (when a window is open, not minimized)",
                 "  Minimize",
                 "  Close",
+                "  Back",
             ],
             "{:?}",
             new.screens
@@ -24319,7 +24597,7 @@ mod tests {
         );
 
         let before = config_bytes(&path);
-        let (_, screens) = pick(4, &[Escape, Escape]); // herdr (not installed): error, leave
+        let (_, screens) = pick(4, &[Escape, Escape, Escape, Escape]); // dismiss and back out
         assert!(screens.contains("herdr not installed"), "{screens}");
         assert_eq!(config_bytes(&path), before, "nothing saved");
         std::fs::remove_dir_all(dir).unwrap();
@@ -24583,7 +24861,7 @@ mod tests {
             keys.extend(std::iter::repeat_n(Down, at));
             keys.push(Enter);
             keys.extend(std::iter::repeat_n(Down, down));
-            keys.extend([Character(b'f'), Escape, Tab, Tab, Enter]);
+            keys.extend([Character(b'f'), Escape, Escape, Tab, Tab, Enter]);
             ui.keys = keys.into();
             ui.pads = [pad].into();
             let mut current = vec![];
@@ -24631,7 +24909,10 @@ mod tests {
         ];
         mappings::save_config(&path, &config).unwrap();
         let mut ui = Script {
-            keys: [Enter, Enter, Enter, Down, Enter, Escape, Tab, Tab, Enter].into(),
+            keys: [
+                Enter, Enter, Enter, Down, Enter, Escape, Escape, Tab, Tab, Enter,
+            ]
+            .into(),
             pads: [Control::from_note(10, 36).unwrap()].into(),
             apps: vec![(
                 "Editor".into(),
@@ -24654,6 +24935,41 @@ mod tests {
             "{screens}"
         );
         assert_eq!(mappings::load_config(&path).unwrap(), config);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn mappings_favourites_counts_and_lists_only_starred_actions() {
+        let (dir, mut terminal, _ran, _) = configure_session("mappings-favourites");
+        let path = dir.join("mappings.tsv");
+        let mut config = mappings::load_config(&path).unwrap();
+        config.favourites = strings(&[
+            "action:music:Next track",
+            "action:music:Previous track",
+            "family:shortcut",
+            "profile:Firefox",
+        ]);
+        mappings::save_config(&path, &config).unwrap();
+        terminal.tab = 1;
+        terminal.at_menu = true;
+        terminal.read_view(None);
+        let frame = terminal.screen("").render(100, 30, false);
+        assert!(frame.contains("Favourites (2)"), "{frame}");
+
+        let mut ui = Script {
+            keys: [Key::Character(b'f'), Key::Escape].into(),
+            ..Default::default()
+        };
+        tab_row(&mut ui, &path, SETTING + 10).unwrap();
+        assert!(ui.screens[0].contains("★ Next track"));
+        assert!(ui.screens[0].contains("★ Previous track"));
+        assert!(!ui.screens[0].contains("Output mute"));
+        assert!(!ui.screens[0].contains("Firefox"));
+        assert!(!ui.screens[1].contains("Next track"));
+        assert_eq!(
+            mappings::load_config(&path).unwrap().favourites,
+            config.favourites[1..]
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -24721,7 +25037,7 @@ mod tests {
             keys
         };
         let mut ui = Script {
-            keys: keys(&[Enter, Tab, Tab, Enter]).into(), // "Not saved" → Back, finish
+            keys: keys(&[Enter, Escape, Tab, Tab, Enter]).into(), // dismiss, back, finish
             pads: [Control::from_note(10, 40).unwrap()].into(),
             ..Default::default()
         };
@@ -28475,6 +28791,33 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn a_mouse_click_on_back_dismisses_the_details_dialog() {
+        let (dir, mut ui, _ran, _) = configure_session("mouse-back");
+        ui.at_menu = false;
+        let size = ui.size();
+        let frame = ui
+            .screen("Example notice\n\n> Back")
+            .render(size.0, size.1, false);
+        let (row, column) = frame
+            .lines()
+            .enumerate()
+            .find_map(|(row, line)| {
+                let (prefix, _) = line.split_once("Back")?;
+                Some((row + 1, prefix.chars().count() + 1))
+            })
+            .unwrap();
+        ui.script = Some(Play {
+            steps: [Step::Key(Key::Click(column as u16, row as u16))].into(),
+            ..Play::default()
+        });
+        assert_eq!(
+            choose(&mut ui, "Example notice", &strings(&["Back"])).unwrap(),
+            Some(0)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// v7.7 ticket 206: a menu reopens on the row last opened by its text; a row removed
     /// while you were away puts the cursor at the same place. Ticket 229: a question
     /// (`question`) never gets a remembered cursor, whatever its length; every other menu,
@@ -30036,15 +30379,15 @@ mod tests {
         std::fs::write(prompts.join("review"), "Old review text\n").unwrap();
         // Prompts is the last Agents row: Up from the top reaches it.
         let mut keys = vec![Up, Enter];
-        keys.extend([Enter, Enter, Enter]); // review -> Read -> Back
+        keys.extend([Enter, Enter, Enter, Escape]); // review -> Read -> Back -> Prompts
         keys.extend([Down, Enter]); // New prompt
         keys.extend(typed("../escape"));
-        keys.extend([Enter, Enter]); // refused -> Back
+        keys.extend([Enter, Enter, Escape]); // refused -> Back to name -> Prompts
         keys.extend([Down, Enter]); // New prompt
         keys.extend(typed("plan"));
         keys.push(Enter); // created through the editor; list is now plan, review
         keys.extend([Down, Enter, Down, Down, Enter, Enter]); // review -> Delete -> Cancel
-        keys.extend([Escape, Escape]);
+        keys.extend([Escape, Escape, Escape]);
         let mut ui = Script {
             keys: keys.into(),
             ..Default::default()
@@ -30063,7 +30406,10 @@ mod tests {
         assert!(prompts.join("review").exists()); // cancelled
         // A failed edit keeps the old prompt and leaves no partial file behind.
         ui.edit_fails = true;
-        ui.keys = vec![Up, Enter, Down, Enter, Down, Enter, Enter, Escape, Escape].into();
+        ui.keys = [
+            Up, Enter, Down, Enter, Down, Enter, Enter, Escape, Escape, Escape,
+        ]
+        .into();
         agents_menu(&mut ui, &path).unwrap();
         assert!(ui.keys.is_empty());
         assert_eq!(

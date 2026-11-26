@@ -238,8 +238,10 @@ fn base() -> String {
 enum Role {
     Border,
     Focus,
-    /// The selected row: `>` plus the selection background and bold, never the primary look.
+    /// The cursor row, filled with the accent.
     Selected,
+    Pressed,
+    Favourite,
     Heading,
     Title,
     Running,
@@ -250,9 +252,6 @@ enum Role {
     BankB,
     /// The active tab: filled with the accent and underlined (and bracketed, so not colour only).
     ActiveTab,
-    /// A tab's one primary row (v7.7 ticket 152): filled with the accent, unlike the
-    /// selection.
-    Primary,
 }
 fn style(role: Role) -> String {
     let Some(p) = palette() else {
@@ -261,7 +260,9 @@ fn style(role: Role) -> String {
         return match role {
             Role::Border | Role::Muted => "90",
             Role::Focus => "1;34",
-            Role::Selected => "1;7",
+            Role::Selected => "1;30;44",
+            Role::Pressed => "1;7",
+            Role::Favourite => "1;33",
             Role::Heading => "1;35",
             Role::Title => "1;36",
             Role::Running => "32",
@@ -270,7 +271,6 @@ fn style(role: Role) -> String {
             Role::BankA => "1;31",
             Role::BankB => "1;32",
             Role::ActiveTab => "1;4;30;44",
-            Role::Primary => "1;30;44",
         }
         .into();
     };
@@ -279,7 +279,9 @@ fn style(role: Role) -> String {
     match role {
         Role::Border => fg(p.border),
         Role::Focus => format!("1;{}", fg(p.accent)),
-        Role::Selected => format!("1;{};{}", fg(p.text), bg(p.selection)),
+        Role::Selected => format!("1;{};{}", fg(p.background), bg(p.accent)),
+        Role::Pressed => format!("1;{};{}", fg(p.text), bg(p.selection)),
+        Role::Favourite => format!("1;{}", fg(p.yellow)),
         Role::Heading => format!("1;{}", fg(p.heading)),
         Role::Title => format!("1;{}", fg(p.title)),
         Role::Running => fg(p.green),
@@ -289,7 +291,6 @@ fn style(role: Role) -> String {
         Role::BankA => format!("1;{}", fg(p.red)),
         Role::BankB => format!("1;{}", fg(p.green)),
         Role::ActiveTab => format!("1;4;{};{}", fg(p.background), bg(p.accent)),
-        Role::Primary => format!("1;{};{}", fg(p.background), bg(p.accent)),
     }
 }
 
@@ -300,6 +301,22 @@ fn paint(text: &str, role: Role, color: bool) -> String {
     } else {
         text.into()
     }
+}
+
+fn paint_program_row(text: &str, role: Role, color: bool) -> String {
+    for (device, device_role) in [("Xbox", Role::Running), ("Akai MPK mini", Role::Title)] {
+        if let Some(rest) = text
+            .strip_prefix(device)
+            .filter(|rest| rest.starts_with(" · "))
+        {
+            return format!(
+                "{}{}",
+                paint(device, device_role, color),
+                paint(rest, role, color)
+            );
+        }
+    }
+    paint(text, role, color)
 }
 
 /// The frame's rows, each starting from the theme's background and text (v7.7 ticket 154),
@@ -469,7 +486,6 @@ fn pane(
     anchor: usize,
     (width, height): (usize, usize),
     focused: bool,
-    primary: Option<usize>,
     color: bool,
 ) -> Vec<String> {
     if height < 3 || width < 8 {
@@ -488,10 +504,12 @@ fn pane(
     for index in first..first + height - 2 {
         let line = lines.get(index).map(String::as_str).unwrap_or("");
         let text = fit(line, inner);
-        let text = if (line.starts_with("> ") && focused) || line.starts_with("◆ ") {
+        let text = if line.starts_with("> ") && focused {
             paint(&text, Role::Selected, color)
-        } else if primary == Some(index) {
-            paint(&text, Role::Primary, color)
+        } else if line.starts_with("◆ ") {
+            paint(&text, Role::Pressed, color)
+        } else if line.trim_start().starts_with("★ ") {
+            paint(&text, Role::Favourite, color)
         } else if line.starts_with("━━ ") || line.trim_start().starts_with("⚠ ") {
             // Danger: a red rule and red rows (skill `destructive-emphasis`).
             paint(&text, Role::Error, color)
@@ -597,8 +615,6 @@ pub struct Pane {
     pub rows: Vec<String>,
     pub anchor: usize,
     pub focused: bool,
-    /// The tab's primary row, drawn filled unless it is the selection.
-    pub primary: Option<usize>,
 }
 
 /// One tiled screen: the tab bar, a header, the active tab's rows | details | live panes
@@ -660,6 +676,30 @@ impl Screen {
         (width, height.saturating_sub(2 + notice))
     }
 
+    /// Inner Details row under a one-based terminal mouse coordinate.
+    pub fn details_row_at(
+        &self,
+        (columns, height): (usize, usize),
+        (column, row): (usize, usize),
+    ) -> Option<usize> {
+        if columns < 40 || height < 16 || !self.panes.is_empty() || self.focus_commands {
+            return None;
+        }
+        let (header, _, [(commands_width, commands_height), (width, pane_height), _]) =
+            self.sizes(columns, height);
+        let (left, above) = if columns >= 100 {
+            (commands_width, 0)
+        } else {
+            (0, commands_height)
+        };
+        let top = usize::from(!self.tabs.is_empty()) + header.len() + above;
+        let row = row.checked_sub(top + 2)?;
+        let text_height =
+            pane_height.saturating_sub(2 + self.notice_rows(width.saturating_sub(4)).len());
+        (column >= left + 3 && column < left + width.saturating_sub(1) && row < text_height)
+            .then_some(row)
+    }
+
     /// Inner (width, height) available to the live pane at most.
     pub fn live_size(&self, columns: usize, height: usize) -> (usize, usize) {
         let (header, hints, _) = self.sizes(columns, height);
@@ -703,7 +743,7 @@ impl Screen {
             } else {
                 Role::Paused
             };
-            paint_bulbs(&paint(&fit(row, width), role, color), color)
+            paint_bulbs(&paint_program_row(&fit(row, width), role, color), color)
         }));
         if !self.panes.is_empty() {
             let notice = wrap(&self.notice, width.saturating_sub(1));
@@ -720,7 +760,6 @@ impl Screen {
                         p.anchor,
                         (width, size),
                         p.focused,
-                        p.primary,
                         color,
                     ));
                     body -= size;
@@ -733,7 +772,7 @@ impl Screen {
                 } else {
                     Role::Paused
                 };
-                paint(&fit(row, width), role, color)
+                paint_program_row(&fit(row, width), role, color)
             }));
             rows.extend(
                 hints
@@ -750,17 +789,9 @@ impl Screen {
         let title = self.tabs.get(self.active_tab).map_or("Commands", |label| {
             label.split_once(' ').map_or(label.as_str(), |p| p.1)
         });
-        let commands = pane(
-            title,
-            &self.commands,
-            self.anchor,
-            commands,
-            focus,
-            None,
-            color,
-        );
-        let details = pane("Details", &text, 0, details, !focus, None, color);
-        let live = pane("Live", &self.live, 0, live, false, None, color);
+        let commands = pane(title, &self.commands, self.anchor, commands, focus, color);
+        let details = pane("Details", &text, 0, details, !focus, color);
+        let live = pane("Live", &self.live, 0, live, false, color);
         if columns >= 160 {
             for ((a, b), c) in commands.iter().zip(&details).zip(&live) {
                 rows.push(format!("{a}{b}{c}"));
@@ -855,7 +886,6 @@ mod tests {
                 ],
                 anchor: 0,
                 focused: true,
-                primary: None,
             }],
         };
         set_theme("Terminal colours");
@@ -888,7 +918,7 @@ mod tests {
     }
 
     /// v7.7 ticket 151: a tab's panes stack full width, the selected row stays visible as
-    /// panes shrink, the pressed line is drawn like the selection, and the notice keeps its
+    /// panes shrink, the pressed line has its own highlight, and the notice keeps its
     /// place above the hints at every size.
     #[test]
     fn panes_stack_keep_the_selection_and_the_notice() {
@@ -897,7 +927,6 @@ mod tests {
             rows,
             anchor,
             focused,
-            primary: None,
         };
         let agents = (0..30)
             .map(|n| format!("{}● agent-{n} IDLE", if n == 25 { "> " } else { "  " }))
@@ -934,9 +963,34 @@ mod tests {
             }
         }
         let colored = screen.render(120, 30, true);
-        let lit = format!("{}m◆ Pad 5", style(Role::Selected));
-        assert!(colored.contains(&lit), "the pressed line looks selected");
+        let lit = format!("{}m◆ Pad 5", style(Role::Pressed));
+        assert!(
+            colored.contains(&lit),
+            "the pressed line has its own highlight"
+        );
         assert!(colored.contains(&format!("{}mIDLE", style(Role::Muted))));
+    }
+
+    #[test]
+    fn device_names_and_favourites_keep_distinct_styles() {
+        set_theme("Tokyo Night");
+        let xbox = "Xbox · Apps";
+        let akai = "Akai MPK mini · Prompts";
+        assert!(paint_program_row(xbox, Role::Paused, true).contains(";38;2;158;206;106mXbox"));
+        assert!(
+            paint_program_row(akai, Role::Paused, true).contains(";38;2;125;207;255mAkai MPK mini")
+        );
+        assert_eq!(paint_program_row(akai, Role::Paused, false), akai);
+
+        let rows = vec![
+            "> Output mute".into(),
+            "  ★ Next track".into(),
+            "  Previous track".into(),
+        ];
+        let frame = pane("Actions", &rows, 0, (50, 5), true, true);
+        assert!(frame[1].contains(";48;2;122;162;247m> Output mute"));
+        assert!(frame[2].contains(";38;2;224;175;104m  ★ Next track"));
+        assert!(!frame[3].contains(";38;2;224;175;104m"));
     }
 
     #[test]

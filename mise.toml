@@ -6,6 +6,8 @@
 min_version = { soft = "2026.8.10" }
 
 [tools]
+bun = "latest"
+npm = "latest"
 # mise installs Rust through rustup (~/.rustup, ~/.cargo) and pins this toolchain here.
 rust = { version = "1.98.1", components = "rustfmt,clippy" }
 # uv runs the Python checks; each script names its Python in a PEP 723 header.
