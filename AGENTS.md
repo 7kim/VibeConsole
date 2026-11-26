@@ -139,7 +139,7 @@ Rules:
 Specs, tickets and tests are markdown under `docs/<version>/` (git-ignored: the repo is public; `docs/README.md` lists versions). Read `docs/agents/issue-tracker.md` before writing one. New work goes in the working version (`tickets use`); start a new version only when I say so. Domain docs: `docs/agents/domain.md`. Triage labels: `docs/agents/triage-labels.md`.
 
 - **Agent tests** (`docs/<version>/agent-tests/`): what you check yourself: `cargo test`, the installed build's output, files on disk.
-- **Developer tests** (`docs/<version>/developer-tests/`): write them when a ticket is code-complete. Then run every box you can yourself (the emulators in `scripts/emulate/` for every device that has one, the PTY checks, the installed build's output, files on disk) and close each test your run fully shows: boxes ticked, `done <date>`, its Result naming the run. Hand me only what strictly needs me: real hardware effects (lights, rumble, sound heard, Bluetooth, battery, the real device's own bytes or timing), keys reaching a real app, logins, reboots, and judgement calls. When I ask which test to do, offer only those; never ask me to run them otherwise. Template and run order: `docs/agents/live-tests.md`.
+- **Developer tests** (`docs/<version>/developer-tests/`): write them when a ticket is code-complete. Then run every box you can yourself (the emulators in `scripts/emulate/` for every device that has one, the PTY checks, the installed build's output, files on disk) and close each test your run fully shows with `tickets done NN --run "…"` (boxes ticked, `done <date>`, its Result naming the run). Hand me only what strictly needs me: real hardware effects (lights, rumble, sound heard, Bluetooth, battery, the real device's own bytes or timing), keys reaching a real app, logins, reboots, and judgement calls. When I ask which test to do, offer only those; never ask me to run them otherwise. Template and run order: `docs/agents/live-tests.md`.
 
 ### Order of work
 
@@ -148,7 +148,7 @@ Specs, tickets and tests are markdown under `docs/<version>/` (git-ignored: the 
 
 ### Closing a ticket (before the next ticket and before committing)
 
-Before starting the next ticket, follow the closing steps printed by `tickets begin NN`. Use `tickets close` for the status, acceptance checks, and Builder sign-off.
+Before starting the next ticket, follow the closing steps printed by `tickets begin NN`. Use `tickets close` for the status, acceptance checks, and Builder sign-off; a pass I report goes in with `--user-said "<my words>"`.
 
 At a version's end, `tickets check` prints nothing (no implemented ticket still says `ready-for-agent`, no box ticked only in your head).
 
