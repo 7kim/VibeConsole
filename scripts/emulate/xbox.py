@@ -61,35 +61,49 @@ SKIPS_EMULATORS = "7d505be"
 REPO = Path(__file__).resolve().parents[2]
 
 
-def refuse_unless_safe():
-    """Every running VibeConsole must skip emulators: its binary is the one on disk (not a
-    replaced older copy) and was built from a commit that contains SKIPS_EMULATORS."""
-    def refuse(why):
-        raise SystemExit(f"{why}; it would fire real shortcuts from the emulator. Run mise run install "
-                         "first. Nothing was created.")
+def running_builds():
+    """(pid, binary, its --version) of each running VibeConsole but emulated runs (they read
+    only emulators and send nothing to the desktop)."""
     pids = subprocess.run(["pgrep", "-x", "vibeconsole"], capture_output=True, text=True).stdout.split()
     for pid in pids:
         if b"--emulated" in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0"):
-            continue  # an emulated run reads only emulators and sends nothing to the desktop
+            continue
         exe = os.readlink(f"/proc/{pid}/exe")
+        replaced = exe.endswith(" (deleted)")
+        yield pid, exe, "" if replaced else subprocess.run([exe, "--version"], capture_output=True, text=True).stdout
+
+
+def refuse_unless_safe(running=None):
+    """Every running VibeConsole must skip emulators: its binary is the one on disk (not a
+    replaced older copy) and was built from a commit that contains SKIPS_EMULATORS.
+    `running`: (pid, binary, --version) triples instead of the live ones (the self-check)."""
+    def refuse(why):
+        raise SystemExit(f"{why}; it would fire real shortcuts from the emulator. Run mise run install "
+                         "first. Nothing was created.")
+    for pid, exe, version in running_builds() if running is None else running:
         if exe.endswith(" (deleted)"):
             refuse(f"VibeConsole pid {pid} runs a replaced binary ({exe})")
-        version = subprocess.run([exe, "--version"], capture_output=True, text=True).stdout
         # A build from a tree with edits reads "commit abc1234+changes": its base commit is what
         # git can check (the edits are the user's own, outside the filter's file).
-        commit = version.rpartition("commit ")[2].strip(" )\n").partition("+")[0]
+        commit, dirty, _ = version.rpartition("commit ")[2].strip(" )\n").partition("+")
         built = commit and subprocess.run(
             ["git", "-C", str(REPO), "merge-base", "--is-ancestor", SKIPS_EMULATORS, commit],
             capture_output=True).returncode == 0
-        if not built:
-            refuse(f"VibeConsole pid {pid} ({exe}, {version.strip()}) isn't built from {SKIPS_EMULATORS} or later")
+        if built:
+            continue
+        if dirty:  # v7.8 ticket 54: said apart from an older clean build
+            refuse(f"VibeConsole pid {pid} ({exe}, {version.strip()}) is a build with uncommitted changes "
+                   f"on {commit}, which isn't {SKIPS_EMULATORS} or later, so its emulator filter can't be "
+                   "verified")
+        refuse(f"VibeConsole pid {pid} ({exe}, {version.strip()}) isn't built from {SKIPS_EMULATORS} or later")
 
 
 class Xbox:
-    def __init__(self, link="usb"):
-        """`link`: "usb" (xone, the default) or "bluetooth" (xpadneo)."""
+    def __init__(self, link="usb", running=None):
+        """`link`: "usb" (xone, the default) or "bluetooth" (xpadneo); `running`: see
+        refuse_unless_safe."""
         bluetooth = link == "bluetooth"
-        refuse_unless_safe()
+        refuse_unless_safe(running)
         self.fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
         try:
             for ev in (EV_KEY, EV_ABS):
@@ -190,3 +204,22 @@ class Xbox:
         """up, down, left, right, or None for released."""
         x, y = DPAD[direction]
         self._emit((EV_ABS, ABS_HAT0X, x), (EV_ABS, ABS_HAT0Y, y))
+
+
+if __name__ == "__main__":
+    # v7.8 ticket 54's self-check (python3 scripts/emulate/xbox.py): no device is made. A
+    # dirty build and a clean one, both on a commit before SKIPS_EMULATORS, are refused with
+    # their own messages before /dev/uinput is opened.
+    old = subprocess.run(["git", "-C", str(REPO), "rev-parse", "--short", f"{SKIPS_EMULATORS}~1"],
+                         capture_output=True, text=True, check=True).stdout.strip()
+    opened = []
+    os.open = lambda *args, **kwargs: opened.append(args)  # nothing may be opened
+    for suffix, says in [("+changes", "uncommitted changes"), ("", f"isn't built from {SKIPS_EMULATORS}")]:
+        try:
+            Xbox(running=[("1", "/usr/bin/vibeconsole", f"vibeconsole 7.8.0 (commit {old}{suffix})\n")])
+            raise AssertionError("not refused")
+        except SystemExit as refused:
+            assert says in str(refused), refused
+            assert ("uncommitted" in str(refused)) == bool(suffix), refused
+    assert not opened, opened
+    print("ok: a dirty old build and a clean old one are refused, each with its own message, before any device")
