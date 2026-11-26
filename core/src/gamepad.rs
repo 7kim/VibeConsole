@@ -1034,10 +1034,33 @@ pub struct ControllerConnection {
     pub name: String,
     pub details: String,
     pub mapping_source: MappingSource,
+    /// v7.8 ticket 59: the mapping's own name, as gilrs gives it (None: not given).
+    pub mapping_name: Option<String>,
     pub uuid: [u8; 16],
 }
 
 impl ControllerConnection {
+    /// The four kernel input IDs the SDL UUID is built from; "unknown" without a UUID.
+    fn ids(&self) -> String {
+        if self.uuid == [0; 16] {
+            return "bus, vendor, product and version unknown".into();
+        }
+        // The Linux backend builds the SDL UUID from the kernel's input IDs.
+        let [bus, vendor, product, version] =
+            [0, 4, 8, 12].map(|i| u16::from_le_bytes([self.uuid[i], self.uuid[i + 1]]));
+        format!(
+            "bus {bus:04x} · vendor {vendor:04x} · product {product:04x} · version {version:04x}"
+        )
+    }
+    /// v7.8 ticket 59: doctor --all's mapping words for an SDL-mapped controller: its source,
+    /// the mapping's name (even when it is the OS name) and the four IDs; None otherwise
+    /// (the warning says it).
+    pub fn mapping_details(&self) -> Option<String> {
+        (self.mapping_source == MappingSource::SdlMappings).then(|| {
+            let name = self.mapping_name.as_deref().unwrap_or("name unknown");
+            format!("SDL mapping \"{name}\" · {}", self.ids())
+        })
+    }
     pub fn mapping_warning(&self) -> Option<String> {
         let reason = match self.mapping_source {
             MappingSource::SdlMappings => return None,
@@ -1045,12 +1068,7 @@ impl ControllerConnection {
             MappingSource::Driver => "gilrs default mapping · LT and RT may not register",
             MappingSource::None => "gilrs mapping source unknown · LT and RT unverified",
         };
-        // The Linux backend builds the SDL UUID from the kernel's input IDs.
-        let [bus, vendor, product, version] =
-            [0, 4, 8, 12].map(|i| u16::from_le_bytes([self.uuid[i], self.uuid[i + 1]]));
-        Some(format!(
-            "{reason} · bus {bus:04x} · vendor {vendor:04x} · product {product:04x} · version {version:04x}"
-        ))
+        Some(format!("{reason} · {}", self.ids()))
     }
 }
 
@@ -1975,6 +1993,7 @@ impl Pad {
                     name: pad.os_name().into(),
                     details: parts.join(" · "),
                     mapping_source: pad.mapping_source(),
+                    mapping_name: Some(pad.name().to_owned()).filter(|n| !n.is_empty()),
                     uuid: pad.uuid(),
                 }
             })

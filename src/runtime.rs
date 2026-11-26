@@ -1290,19 +1290,7 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
             let controllers = crate::gamepad::Pad::open()
                 .map(|pad| pad.connection_info())
                 .map_err(|error| error.to_string());
-            let report = match controllers.as_deref() {
-                Ok([]) => NO_XBOX_CONTROLLER.to_owned(),
-                Err(error) => error.clone(),
-                Ok(pads) => pads
-                    .iter()
-                    .map(|pad| match pad.mapping_warning() {
-                        Some(warning) => format!("{} ({} · {warning})", pad.name, pad.details),
-                        None => format!("{} ({})", pad.name, pad.details),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            };
-            out.push(format!("Xbox controllers: {report}"));
+            out.push(controllers_line(controllers.as_deref()));
             out.push(crate::wake::line(
                 controllers.as_ref().map(|_| ()).map_err(Clone::clone),
             ));
@@ -1567,6 +1555,26 @@ fn orca_doctor(
         .collect()
 }
 
+/// doctor --all's controller line: each controller with its details, then its mapping:
+/// the fallback warning, or (v7.8 ticket 59) an SDL mapping's name and IDs.
+fn controllers_line(controllers: std::result::Result<&[ControllerConnection], &String>) -> String {
+    let report = match controllers {
+        Ok([]) => NO_XBOX_CONTROLLER.to_owned(),
+        Err(error) => error.clone(),
+        Ok(pads) => pads
+            .iter()
+            .map(
+                |pad| match pad.mapping_warning().or_else(|| pad.mapping_details()) {
+                    Some(mapping) => format!("{} ({} · {mapping})", pad.name, pad.details),
+                    None => format!("{} ({})", pad.name, pad.details),
+                },
+            )
+            .collect::<Vec<_>>()
+            .join(", "),
+    };
+    format!("Xbox controllers: {report}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1638,6 +1646,7 @@ mod tests {
             name: "Xbox Wireless Controller".into(),
             details: "Bluetooth · xpadneo · battery 62% charging · profile 1 · mapped as Microsoft Xbox One".into(),
             mapping_source: crate::gamepad::MappingSource::SdlMappings,
+            mapping_name: Some("Microsoft Xbox One".into()),
             uuid: [0; 16],
         }];
         let list = checklist(&today, &Some("abc1234".into()), Ok(&pads)).join("\n");
@@ -1696,6 +1705,7 @@ mod tests {
             name: name.into(),
             details: "Bluetooth · xpadneo".into(),
             mapping_source,
+            mapping_name: Some(name.into()),
             uuid: [5, 0, 0, 0, 0x5e, 4, 0, 0, 0x8e, 2, 0, 0, 0x30, 0x11, 0, 0],
         };
         let pads = [
@@ -1716,6 +1726,26 @@ mod tests {
                 "🟢 Xbox controller       Xbox with SDL mapping · Bluetooth · xpadneo",
                 "🟡 Xbox controller       Xbox with unknown mapping · Bluetooth · xpadneo · gilrs mapping source unknown · LT and RT unverified · bus 0005 · vendor 045e · product 028e · version 1130",
             ]
+        );
+        // v7.8 ticket 59: doctor --all names an SDL mapping's source, its name (here the same
+        // as the OS name) and its four IDs; unknown IDs say so; the warnings stay as they were.
+        assert_eq!(
+            controllers_line(Ok(&pads[1..2])),
+            "Xbox controllers: Xbox with SDL mapping (Bluetooth · xpadneo · SDL mapping \"Xbox with SDL mapping\" · bus 0005 · vendor 045e · product 028e · version 1130)"
+        );
+        let unknown = ControllerConnection {
+            mapping_name: None,
+            uuid: [0; 16],
+            ..pad("Xbox", MappingSource::SdlMappings)
+        };
+        assert!(
+            controllers_line(Ok(&[unknown])).ends_with(
+                "SDL mapping \"name unknown\" · bus, vendor, product and version unknown)"
+            )
+        );
+        assert!(
+            controllers_line(Ok(&pads[..1]))
+                .contains("gilrs default mapping · LT and RT may not register · bus 0005")
         );
         let unavailable = checklist(
             &[],
