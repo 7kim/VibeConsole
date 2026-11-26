@@ -1083,6 +1083,12 @@ impl Terminal {
             .flat_map(|row| wrap(row, width))
             .collect::<Vec<_>>();
         let mut rows = Vec::new();
+        // v7.8 ticket 58: first, so a short terminal never clips it.
+        if let Some(n) = self.speed.as_ref().map(|s| s.kept.len()).filter(|n| *n > 0) {
+            rows.push(format!(
+                "K: kept results ({n}), each with its device, connection and date"
+            ));
+        }
         if self.speed.as_ref().is_some_and(|speed| {
             [&speed.akai, &speed.xbox]
                 .into_iter()
@@ -1271,9 +1277,73 @@ impl Terminal {
                 Some(Key::Enter | Key::Escape) => return Ok(()),
                 // Only the keyboard's T: controller buttons are what Detect is showing.
                 Some(Key::Character(b't' | b'T')) => self.speed_start(),
+                Some(Key::Character(b'k' | b'K')) => self.kept_view()?,
                 _ => {}
             }
         }
+    }
+    /// v7.8 ticket 58: Detect's kept results on a page of their own (Up/Down scroll; K, Esc
+    /// or Enter: back to live Detect). Only reads speed-tests.tsv: no test starts or is kept.
+    fn kept_view(&mut self) -> Result<()> {
+        let mut first = 0;
+        loop {
+            self.tick()?;
+            let (text, last) = self.kept_text(self.size(), first);
+            first = first.min(last);
+            self.draw(&text)?;
+            match self.key()? {
+                Some(Key::Escape | Key::Enter | Key::Character(b'k' | b'K')) => return Ok(()),
+                Some(Key::Up) => first = first.saturating_sub(1),
+                Some(Key::Down) => first = (first + 1).min(last),
+                _ => {}
+            }
+        }
+    }
+    /// The kept results' page from row `first` at this terminal size, and the last first row.
+    fn kept_text(&self, (columns, rows): (usize, usize), first: usize) -> (String, usize) {
+        let (width, height) = self.screen("").details_size(columns, rows);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let kept = self.speed.as_ref().map_or(&[][..], |s| &s.kept[..]);
+        let mut lines = vec![
+            format!(
+                "Kept results ({}) · {}",
+                kept.len(),
+                self.speed_file().display()
+            ),
+            "Up/Down: scroll | K or Esc: back to live Detect".into(),
+            String::new(),
+        ];
+        let head = lines.len();
+        if kept.is_empty() {
+            lines.push("None kept yet: T on live Detect runs a test and keeps its result.".into());
+        }
+        for record in kept {
+            lines.push(format!(
+                "{} · {} · {}",
+                record.device,
+                record.connection,
+                crate::speed::date(record.when, now)
+            ));
+            lines.push(match &record.result {
+                crate::speed::Kind::Link(link) => format!("  Link: {}", link.text()),
+                crate::speed::Kind::Presses { low, high, average } => format!(
+                    "  Presses: handled after {low:.0}–{high:.0} ms, average {average:.0} ms"
+                ),
+            });
+        }
+        let lines = (lines.iter())
+            .flat_map(|line| crate::screen::wrap(line, width))
+            .collect::<Vec<_>>();
+        let room = height.saturating_sub(head).max(1);
+        let last = lines.len().saturating_sub(head + room);
+        let first = first.min(last);
+        let shown = (lines[..head].iter())
+            .chain(lines[head..].iter().skip(first).take(room))
+            .cloned()
+            .collect::<Vec<_>>();
+        (shown.join("\n"), last)
     }
 
     /// v7.8 ticket 26: the devices Detect measures: how each is connected (read-only), and
@@ -31569,6 +31639,106 @@ mod tests {
                 entry.path()
             );
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.8 ticket 58: in a 24-row terminal every kept result (device, connection, date and
+    /// figures) can be scrolled to on its own page; K or Esc goes back; nothing is kept or
+    /// started there.
+    #[test]
+    fn detect_kept_results_have_their_own_page() {
+        use crate::speed::{Kept, Kind, Link};
+        let (dir, mut ui, _ran, _) = configure_session("detect-kept");
+        let file = ui.speed_file();
+        let devices = [
+            ("Xbox Wireless Controller", ["USB", "Bluetooth"]),
+            ("Akai MPK mini 3", ["USB", "USB hub"]),
+        ];
+        let mut kept = Vec::new();
+        for (d, (device, connections)) in devices.iter().enumerate() {
+            for (c, connection) in connections.iter().enumerate() {
+                let gap_ms = 4.0 + (2 * d + c) as f64;
+                for result in [
+                    Kind::Link(Link {
+                        per_second: 1000.0 / gap_ms,
+                        gap_ms,
+                        jitter_ms: 1.0,
+                        dropped: None,
+                    }),
+                    Kind::Presses {
+                        low: 2.0,
+                        high: 30.0 + (2 * d + c) as f64,
+                        average: 9.0,
+                    },
+                ] {
+                    let record = Kept {
+                        device: (*device).into(),
+                        connection: (*connection).into(),
+                        when: 1_763_000_000,
+                        result,
+                    };
+                    kept = crate::speed::keep(&file, record).unwrap();
+                }
+            }
+        }
+        assert!(kept.len() >= 6, "{kept:?}");
+        ui.speed = Some(Speed {
+            kept: kept.clone(),
+            ..Speed::default()
+        });
+        let live = ui.detection_view((80, 24), true);
+        assert!(
+            live.starts_with(&format!("K: kept results ({})", kept.len())),
+            "{live}"
+        );
+        let (mut seen, mut first) = (String::new(), 0);
+        loop {
+            let (text, last) = ui.kept_text((80, 24), first);
+            let frame = ui.screen(&text).render(80, 24, false);
+            assert!(
+                frame.contains("Kept results (") && frame.contains("K or Esc: back"),
+                "{frame}"
+            );
+            seen.push_str(&frame);
+            if first >= last {
+                break;
+            }
+            first += 1;
+        }
+        let flat = seen.split_whitespace().collect::<Vec<_>>().join(" ");
+        let date = crate::speed::date(1_763_000_000, 1_900_000_000);
+        for record in &kept {
+            assert!(
+                flat.contains(&format!(
+                    "{} · {} · {date}",
+                    record.device, record.connection
+                )),
+                "{record:?}"
+            );
+        }
+        for figure in [
+            "one every 4.0 ms",
+            "one every 7.0 ms",
+            "handled after 2–30 ms, average 9 ms",
+            "handled after 2–33 ms",
+        ] {
+            assert!(flat.contains(figure), "{figure}\n{flat}");
+        }
+        // The page's keys: scroll, then K and Esc each go back; speed-tests.tsv is untouched.
+        let before = std::fs::read(&file).unwrap();
+        for back in [Key::Character(b'k'), Key::Escape] {
+            ui.script = Some(Play {
+                steps: [Key::Down, Key::Down, Key::Up, back].map(Step::Key).into(),
+                ..Play::default()
+            });
+            ui.kept_view().unwrap();
+            assert!(ui.script.as_ref().unwrap().steps.is_empty());
+        }
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+        assert!(
+            ui.speed.as_ref().unwrap().akai_knob.is_none()
+                && ui.speed.as_ref().unwrap().akai_delays.is_none()
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
