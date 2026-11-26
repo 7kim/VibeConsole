@@ -11880,6 +11880,7 @@ fn drive_rgb(
         }
         if let Err(error) = sent {
             *slot = None; // dropping it restores what it can
+            *failed = true; // v8 ticket 204: not reopened every tick (a stuck write waits 2 s)
             *notice = format!("{label}: {error}; given up");
         }
     }
@@ -27330,6 +27331,75 @@ mod tests {
         ui.show_lock_light();
         assert_eq!(writes.lock().unwrap().len(), 2, "nothing more while paused");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v8 ticket 204: the session's light tick with a Razer keyboard that stops answering (its
+    /// effect file a FIFO with no reader, so the write never finishes). The tick gives up within
+    /// the deadline and says so with its stage; the next tick neither reopens the keyboard nor
+    /// writes to it, and returns at once. The opener is injected: no real device is reached.
+    #[test]
+    fn a_stuck_razer_write_is_given_up_once_and_the_keyboard_not_reopened() {
+        use crate::keyboard::RgbKeyboards;
+        use crate::status::Rgb;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-rgb-tick-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let kbd = dir.join("0003:1532:021A.0007");
+        std::fs::create_dir_all(&kbd).unwrap();
+        std::fs::write(kbd.join("matrix_brightness"), "180\n").unwrap();
+        std::fs::write(kbd.join("device_type"), "Stuck board\n").unwrap();
+        for f in ["none", "spectrum", "wave", "static", "breath", "reactive"] {
+            std::fs::write(kbd.join(format!("matrix_effect_{f}")), "").unwrap();
+        }
+        let mut slot = Some(RgbKeyboards::open(&dir, Rgb::SPECTRUM).unwrap());
+        let fifo =
+            std::ffi::CString::new(kbd.join("matrix_effect_static").to_str().unwrap()).unwrap();
+        std::fs::remove_file(kbd.join("matrix_effect_static")).unwrap();
+        // SAFETY: a valid C path and a mode.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let (mut failed, mut notice, mut opened) = (false, String::new(), 0);
+        let started = Instant::now();
+        drive_rgb(
+            (&mut slot, &mut failed, &mut notice),
+            true,
+            Some((Some(Rgb::Static([255, 128, 0])), 120, Rgb::SPECTRUM)),
+            None,
+            |_| unreachable!("open while the keyboard is open"),
+            "RGB keyboard",
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(slot.is_none());
+        assert!(
+            notice.starts_with("RGB keyboard: matrix_effect_static didn't answer within 2 s")
+                && notice.ends_with("given up"),
+            "{notice}"
+        );
+        let again = Instant::now();
+        drive_rgb(
+            (&mut slot, &mut failed, &mut notice),
+            true,
+            Some((Some(Rgb::BreathRandom), 120, Rgb::SPECTRUM)),
+            None,
+            |rest| {
+                opened += 1;
+                RgbKeyboards::open(&dir, rest)
+            },
+            "RGB keyboard",
+        );
+        assert!(
+            again.elapsed() < Duration::from_millis(200),
+            "{:?}",
+            again.elapsed()
+        );
+        assert_eq!(opened, 0, "not reopened after giving up");
+        assert_eq!(
+            std::fs::read(kbd.join("matrix_effect_breath")).unwrap(),
+            b""
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// v7 ticket 128: while output runs, the Razer RGB (fake OpenRazer files) shows the most

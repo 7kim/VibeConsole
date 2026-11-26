@@ -592,6 +592,54 @@ fn led_name(led: evdev::LedCode) -> &'static str {
         _ => "Scroll Lock",
     }
 }
+/// v8 ticket 204: how long the session waits for one OpenRazer write.
+const RAZER_DEADLINE: Duration = Duration::from_secs(2);
+/// v8 ticket 204: OpenRazer device folders with a write that never finished.
+static STUCK: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+/// v8 ticket 204: one OpenRazer sysfs write (an RGB effect, a brightness, the M light), made on
+/// its own thread. A keyboard that stops answering blocks a write in the kernel (each USB try
+/// times out after 5 s: "-110" in the kernel log); the caller waits at most `RAZER_DEADLINE`,
+/// then that device gets no more writes this run, so the session loop, keys and quitting never
+/// wait on it. The stuck write's thread is left to finish on its own.
+fn razer_write(file: &Path, bytes: impl Into<Vec<u8>>) -> io::Result<()> {
+    let device = file.parent().unwrap_or(file).to_path_buf();
+    let name = file
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    if STUCK.lock().is_ok_and(|stuck| stuck.contains(&device)) {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "{name}: an earlier write to this device never finished; no more writes to it this run"
+            ),
+        ));
+    }
+    let (done, result) = std::sync::mpsc::channel();
+    let (path, bytes) = (file.to_path_buf(), bytes.into());
+    thread::Builder::new()
+        .name("razer-write".into())
+        .spawn(move || {
+            let _ = done.send(std::fs::write(&path, bytes));
+        })?;
+    match result.recv_timeout(RAZER_DEADLINE) {
+        Ok(written) => written,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            if let Ok(mut stuck) = STUCK.lock() {
+                stuck.push(device);
+            }
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "{name} didn't answer within {} s (the keyboard or its driver is stuck); no more writes to it this run",
+                    RAZER_DEADLINE.as_secs()
+                ),
+            ))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::other(format!(
+            "{name}: the write ended without a result"
+        ))),
+    }
+}
 /// v7 ticket 128: each Razer keyboard's M (macro) light, from OpenRazer's `macro_led_state`
 /// (read, then written `1`/`0`, github.com/openrazer/openrazer wiki "Using the keyboard
 /// driver"). Only files that can be read and written are used. The G light is never used:
@@ -612,7 +660,7 @@ pub fn macro_leds(driver: &Path) -> Vec<Led> {
             Some(Led::new(
                 &format!("{name}: M light"),
                 was,
-                Box::new(move |on| std::fs::write(&file, if on { "1" } else { "0" })),
+                Box::new(move |on| razer_write(&file, if on { "1" } else { "0" })),
             ))
         })
         .collect()
@@ -838,7 +886,7 @@ impl RgbBoard {
         if !self.can.contains(&file) {
             return Ok(false);
         }
-        std::fs::write(self.dir.join(file), bytes)?;
+        razer_write(&self.dir.join(file), bytes)?;
         Ok(true)
     }
 }
@@ -877,9 +925,13 @@ impl RgbKeyboards {
             .map(|entries| entries.flatten().map(|e| e.path()).collect::<Vec<_>>())
             .unwrap_or_default();
         dirs.sort();
+        // v8 ticket 204: never blocks (a sysfs file opens at once; anything that would wait
+        // counts as not writable).
         let writable = |dir: &Path, file: &str| {
+            use std::os::unix::fs::OpenOptionsExt;
             std::fs::OpenOptions::new()
                 .write(true)
+                .custom_flags(libc::O_NONBLOCK)
                 .open(dir.join(file))
                 .is_ok()
         };
@@ -966,7 +1018,7 @@ impl RgbKeyboards {
             let level = brightness.filter(|l| board.brightness.is_some() && written != Some(*l));
             let sent = level
                 .map_or(Ok(()), |l| {
-                    std::fs::write(board.dir.join("matrix_brightness"), l.to_string())
+                    razer_write(&board.dir.join("matrix_brightness"), l.to_string())
                 })
                 .and_then(|()| board.write(effect))
                 .and_then(|written| {
@@ -976,7 +1028,7 @@ impl RgbKeyboards {
                     // The resting effect goes back with its own brightness.
                     match (brightness, board.brightness) {
                         (None, Some(own)) => {
-                            std::fs::write(board.dir.join("matrix_brightness"), own.to_string())
+                            razer_write(&board.dir.join("matrix_brightness"), own.to_string())
                         }
                         _ => Ok(()),
                     }
@@ -2414,6 +2466,64 @@ mod tests {
     /// v7 ticket 128: a Razer keyboard's M light comes from OpenRazer's `macro_led_state`:
     /// read first, lit with `1`, put back on restore. No driver: the chosen M light is
     /// unavailable with the reason, and nothing is written.
+    /// v8 ticket 204: a Razer keyboard that stops answering. Its effect file becomes a FIFO
+    /// with no reader, so a write to it never finishes (as a stuck razerkbd write blocks in
+    /// the kernel). The write is given up within the deadline, naming the file; every later
+    /// write to that keyboard is refused at once and touches nothing; dropping doesn't hang.
+    #[test]
+    fn razer_write_that_never_finishes_is_given_up_and_never_retried() {
+        use crate::status::Rgb;
+        use std::time::Instant;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-rgb-stuck-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let kbd = dir.join("0003:1532:021A.0009");
+        std::fs::create_dir_all(&kbd).unwrap();
+        std::fs::write(kbd.join("matrix_brightness"), "180\n").unwrap();
+        std::fs::write(kbd.join("device_type"), "Stuck board\n").unwrap();
+        for f in ["none", "spectrum", "wave", "static", "breath", "reactive"] {
+            std::fs::write(kbd.join(format!("matrix_effect_{f}")), "").unwrap();
+        }
+        let mut rgb = RgbKeyboards::open(&dir, Rgb::SPECTRUM).unwrap();
+        let fifo = kbd.join("matrix_effect_static");
+        std::fs::remove_file(&fifo).unwrap();
+        let path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: a valid C path and a mode.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let started = Instant::now();
+        let error = rgb
+            .show(Rgb::Static([1, 2, 3]), 200)
+            .unwrap_err()
+            .to_string();
+        let waited = started.elapsed();
+        assert!(waited < Duration::from_secs(3), "waited {waited:?}");
+        assert!(error.contains("matrix_effect_static"), "{error}");
+        assert!(error.contains("didn't answer within 2 s"), "{error}");
+        // The keyboard is opened again (its files look fine): nothing more is sent to it, not
+        // the next effect, not its brightness, not on drop. The stuck write stays parked on the
+        // FIFO, moved aside, as a stuck kernel write would stay.
+        std::fs::rename(&fifo, kbd.join("stuck.fifo")).unwrap();
+        std::fs::write(&fifo, "").unwrap();
+        let again = Instant::now();
+        let mut rgb = RgbKeyboards::open(&dir, Rgb::SPECTRUM).unwrap();
+        let error = rgb.show(Rgb::BreathRandom, 90).unwrap_err().to_string();
+        assert!(error.contains("no more writes to it this run"), "{error}");
+        drop(rgb);
+        assert!(
+            again.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            again.elapsed()
+        );
+        assert_eq!(
+            std::fs::read(kbd.join("matrix_effect_breath")).unwrap(),
+            b""
+        );
+        assert_eq!(
+            std::fs::read_to_string(kbd.join("matrix_brightness")).unwrap(),
+            "200"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     /// v7 ticket 128: the RGB backlight through fake OpenRazer files: each effect is written
     /// in the driver's format, the brightness read first goes back with the resting effect on
     /// restore (and on drop), nothing is sent before `show` or twice, an unplugged keyboard is
