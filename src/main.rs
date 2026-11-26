@@ -229,7 +229,9 @@ fn emulate(dir: &str) -> Result<()> {
 fn main() -> Result<()> {
     let mut args: Vec<_> = std::env::args().skip(1).collect();
     // v7.8 ticket 01: an emulated run's stand-in for every external program: records the
-    // call in <dir>/tools.log and runs nothing.
+    // call in <dir>/tools.log and runs nothing. v7.8 ticket 95: a call listed in
+    // <dir>/answers.tsv (`<the tools.log line>\t<output>`, written by a check) prints that
+    // fixed output, e.g. a tmux agent's pane as alive; nothing else answers.
     if args.first().is_some_and(|a| a == "emulated-tool") {
         let [_, dir, call @ ..] = &args[..] else {
             return Err("emulated-tool <dir> <program> [args]".into());
@@ -238,7 +240,14 @@ fn main() -> Result<()> {
             return Err("emulated-tool: the folder must be absolute".into());
         }
         vibeconsole_core::set_emulated(dir.into());
-        vibeconsole_core::emulated_log("tools.log", &format!("{call:?}"));
+        let line = format!("{call:?}");
+        vibeconsole_core::emulated_log("tools.log", &line);
+        let answers = std::fs::read_to_string(std::path::Path::new(dir).join("answers.tsv"));
+        if let Some(answer) = (answers.unwrap_or_default().lines())
+            .find_map(|l| l.split_once('\t').filter(|(call, _)| *call == line))
+        {
+            println!("{}", answer.1);
+        }
         return Ok(());
     }
     let emulated = args.first().is_some_and(|a| a == "--emulated");

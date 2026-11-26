@@ -8,7 +8,7 @@ Run after cargo build --locked: uv run scripts/emulate/check-xbox.py
 Checks: A (built-in default Enter) records Enter in output.log; RT mapped to F2 and pulled
 straight to full fires once and lets go on release; a normal run beside the
 emulator never lists it; 7 Xbox's Test rumble reaches the emulator with its strength and length
-(ticket 79), and so do agent rumbles, short and long (ticket 94). The run sees only the emulator's own event node (bwrap hides the rest).
+(ticket 79), and so do agent rumbles, short and long (ticket 94), tmux agents' too (ticket 95). The run sees only the emulator's own event node (bwrap hides the rest).
 The emulator refuses to start while a VibeConsole older than ticket 01 runs (see xbox.py).
 """
 import json
@@ -84,6 +84,34 @@ def main():
     high_fire_point()
     test_rumble()
     agent_rumble()
+    tmux_agent_rumble()
+
+
+def tmux_agent_rumble():
+    """v7.8 ticket 95: a tmux agent's window answered alive (the run's answers.tsv: the
+    recorder prints that call's fixed answer and still runs nothing) keeps its needs-decision
+    state and rumbles short; answered gone, its state goes back to idle, as a normal run's."""
+    tuning = {"rumble": True, "rumble_strength": "light", "rumble_ms": 200}
+    with Drive(xbox=True, tuning=tuning) as d:
+        d.run.xbox_ready(d.xbox)
+        alive = json.dumps(["tmux", "list-panes", "-t", "=vibe:=claude", "-F", "#{pane_dead}"])
+        answers = d.run.dir / "answers.tsv"
+        answers.write_text(f"{alive}\t0\n")
+        env = without_bus(HOME=str(d.run.dir), XDG_RUNTIME_DIR=str(d.run.dir / "run"))
+        subprocess.run([BINARY, "agent-status", "claude", "needs-decision"], env=env, check=True)
+        assert rumbles(d, 1)[0][:2] == (20_000, 0) and abs(rumbles(d, 1)[0][2] - 200) <= 60, rumbles(d, 1)
+        state = d.run.dir / "run/vibeconsole/agent-claude"
+        time.sleep(2.5)  # a few status refreshes
+        assert state.read_text() == "needs-decision\n", state.read_text()
+        assert alive in d.recorded("tools.log"), d.recorded("tools.log")[-5:]
+        print(f"ok: a tmux agent answered alive stays needs-decision and rumbled {rumbles(d, 1)[0]}")
+        answers.write_text("")
+        deadline = time.monotonic() + 5
+        while state.read_text() != "idle\n":
+            assert time.monotonic() < deadline, state.read_text()
+            time.sleep(0.1)
+        assert len(rumbles(d, 1)) == 1, d.recorded()
+        print("ok: answered gone, it goes back to idle without another rumble")
 
 
 def rumbles(d, count, seconds=5):
@@ -99,8 +127,8 @@ def agent_rumble():
     """v7.8 ticket 94: with rumble for agents on (light, 200 ms) and finished set to rumble
     long, an agent newly needing a decision rumbles short (200 ms) and one newly finished long
     (600 ms). Each state comes from the hook command an agent outside VibeConsole's tmux runs,
-    pointed at the run's own folder (--emulated keeps its states there); a tmux agent can't be
-    used: tmux is only recorded, so its window reads as gone and its state as idle."""
+    pointed at the run's own folder (--emulated keeps its states there). Tmux agents: see
+    tmux_agent_rumble."""
     lights = json.loads((REPO / "core/defaults/lights.json").read_text())
     lights["xbox"]["states"]["finished"]["rumble"] = "long"
     lights["other"]["on"] = True  # light every folder, not only listed ones
