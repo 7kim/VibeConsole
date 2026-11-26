@@ -2002,8 +2002,12 @@ impl Pad {
         let effect = EffectBuilder::new()
             .add_effect(BaseEffect {
                 kind: BaseEffectType::Strong { magnitude },
+                // v7.8 ticket 79: gilrs 0.11.2 still plays on ticks N (a replay of N ticks
+                // wraps to its start) and N + 1 (the tick that stops it) of `Repeat::For(N)`,
+                // 100 ms past the length; a pause as long as the rumble keeps both silent.
                 scheduling: Replay {
                     play_for: length,
+                    with_delay: length,
                     ..Default::default()
                 },
                 envelope: Default::default(),

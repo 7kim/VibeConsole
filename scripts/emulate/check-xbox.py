@@ -1,13 +1,14 @@
 # /// script
 # requires-python = ">=3.12"
-# dependencies = []
+# dependencies = ["pyte"]
 # ///
 """v7.8 ticket 02: the real binary, run with --emulated, against the emulated Xbox controller.
 Run after cargo build --locked: uv run scripts/emulate/check-xbox.py
 
 Checks: A (built-in default Enter) records Enter in output.log; RT mapped to F2 and pulled
 straight to full fires once and lets go on release; a normal run beside the
-emulator never lists it. The run sees only the emulator's own event node (bwrap hides the rest).
+emulator never lists it; 7 Xbox's Test rumble reaches the emulator with its strength and length
+(ticket 79). The run sees only the emulator's own event node (bwrap hides the rest).
 The emulator refuses to start while a VibeConsole older than ticket 01 runs (see xbox.py).
 """
 from pathlib import Path
@@ -17,6 +18,7 @@ import tempfile
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from drive import Drive  # noqa: E402
 from run import Run, describe, hide, mapping  # noqa: E402
 from xbox import Xbox  # noqa: E402
 
@@ -77,6 +79,32 @@ def main():
     bluetooth()
     layer_button()
     high_fire_point()
+    test_rumble()
+
+
+def test_rumble():
+    """v7.8 ticket 79: 7 Xbox's Test rumble, as developer test 24 sets it (light 200 ms, then
+    strong 1000 ms), plays that strength and length on the emulator. Length is measured from the
+    first play to the last on gilrs's 50 ms ticks, so it may be one tick off."""
+    for word, magnitude, ms in [("light", 20_000, 200), ("strong", 65_535, 1000)]:
+        with Drive(xbox=True, tuning={"rumble_strength": word, "rumble_ms": ms}) as d:
+            d.run.xbox_ready(d.xbox)
+            d.type("7")
+            d.wait(f"Rumble strength: {word}")
+            d.wait(f"Rumble length: {ms} ms")
+            d.pick("Test rumble")
+            d.wait(f"Rumble sent: {word}, {ms} ms")
+            deadline = time.monotonic() + ms / 1000 + 3
+            while not (played := [line for line in d.recorded() if line.startswith("rumble ")]):
+                assert time.monotonic() < deadline, d.recorded()
+                time.sleep(0.05)
+            time.sleep(0.5)
+            played = [line.split() for line in d.recorded() if line.startswith("rumble ")]
+            assert len(played) == 1, played
+            _, _, strong, _, weak, length, _ = played[0]
+            assert (int(strong), int(weak)) == (magnitude, 0), played
+            assert abs(int(length) - ms) <= 60, played
+            print(f"ok: Test rumble at {word}, {ms} ms played: {' '.join(played[0])}")
 
 
 def high_fire_point():

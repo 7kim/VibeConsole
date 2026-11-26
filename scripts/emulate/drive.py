@@ -43,11 +43,11 @@ def emulated_left():
 
 
 class Drive:
-    def __init__(self, akai=False, xbox=False, mappings=(), command=(), devices=None):
+    def __init__(self, akai=False, xbox=False, mappings=(), command=(), devices=None, tuning=None):
         assert shutil.which("bwrap"), "bwrap not found: install it (sudo dnf install bubblewrap)"
         assert not emulated_left(), f"an emulated run is already running: {emulated_left()}"
         self.akai_on, self.xbox_on, self.mappings, self.command = akai, xbox, list(mappings), command
-        self.devices = devices
+        self.devices, self.tuning = devices, tuning
 
     def __enter__(self):
         self.run = None
@@ -60,6 +60,8 @@ class Drive:
     def _start(self):
         self._tmp = tempfile.TemporaryDirectory()
         directory = Path(self._tmp.name)
+        run_dir = directory / "run"
+        run_dir.mkdir()
         self.akai = self.xbox = None
         if self.akai_on:
             from akai import Akai
@@ -67,7 +69,7 @@ class Drive:
             self.akai.program(1)
         if self.xbox_on:
             from xbox import Xbox
-            self.xbox = Xbox().__enter__()
+            self.xbox = Xbox(log=run_dir / "output.log").__enter__()  # its rumbles (ticket 79)
         sandbox = hide(*([self.xbox.node] if self.xbox else []))
         path = os.environ["PATH"]
         if not self.akai:  # Xbox only: a fake lsusb so no real Akai is looked for
@@ -76,12 +78,11 @@ class Drive:
             (bin_dir / "lsusb").write_text("#!/bin/sh\nexit 1\n")
             (bin_dir / "lsusb").chmod(0o755)
             path = f"{bin_dir}{os.pathsep}{path}"
-        run_dir = directory / "run"
-        run_dir.mkdir()
         old = os.environ["PATH"]
         os.environ["PATH"] = path  # run.Run passes the environment on
         try:
-            self.run = Run(str(run_dir), self.mappings, sandbox, self.command, devices=self.devices).__enter__()
+            self.run = Run(str(run_dir), self.mappings, sandbox, self.command, self.tuning,
+                           self.devices).__enter__()
         finally:
             os.environ["PATH"] = old
         return self

@@ -8,6 +8,9 @@
         xbox.dpad("up"); xbox.dpad(None)
         xbox.guide()
 
+    with Xbox(log=run_dir / "output.log"):   # v7.8 ticket 79: each rumble played is logged
+        ...                                  # "rumble strong 40000 weak 0 300 ms"
+
 A uinput device named `VibeConsole emulator · Xbox Controller` with the codes, ranges and
 ids of the user's controller under xone, as /proc/bus/input/devices and EVIOCGABS read it
 (25 Nov 2026): bus 0x06, 045e:0b12; BTN_A/B/X/Y, TL/TR, SELECT/START/MODE, THUMBL/R, KEY_RECORD
@@ -15,8 +18,14 @@ ids of the user's controller under xone, as /proc/bus/input/devices and EVIOCGAB
 D-pad ABS_HAT0X/Y -1..1. `Xbox("bluetooth")` is the same controller over Bluetooth under
 xpadneo 0.10.2 (v7.8 ticket 04), as its source and the kernel log read it: bus 0x05, 045e:028e
 version 0x1130 (xpadneo's ids, so gilrs picks SDL's "Xbox One Elite 2" line), no Share key,
-sticks fuzz 32 flat 3072, triggers fuzz 4, and ABS_PROFILE 0..3. It has no force feedback (a device that offers it must answer every
-rumble upload), so rumble is never tested here.
+sticks fuzz 32 flat 3072, triggers fuzz 4, and ABS_PROFILE 0..3.
+
+Force feedback (v7.8 ticket 79) as the real controller reports it (B: FF=, 26 Nov 2026): rumble,
+periodic, square, triangle, sine, gain; 16 effect slots, as ff-memless. A thread answers every
+upload and erase (the uploader waits up to 30 s for the answer: the kernel's uinput.c), and every
+gilrs that opens the device uploads and plays its rumble state each 50 ms tick, zero included
+(gilrs 0.11.2 ff/server.rs). A rumble is a run of non-zero plays on one effect: from its first
+play to the play, stop or erase that ends it.
 
 Every program on the desktop sees a uinput device. A VibeConsole built before commit 7d505be
 doesn't skip emulators and fires the user's real shortcuts from it (it happened once, 25 Nov
@@ -26,15 +35,21 @@ known commit, e.g. a debug build).
 import fcntl
 import os
 from pathlib import Path
+import select
 import struct
 import subprocess
+import threading
 import time
 
 NAME = "VibeConsole emulator · Xbox Controller"
 BUS, VENDOR, PRODUCT, VERSION = 0x06, 0x045E, 0x0B12, 0x0509
 BLUETOOTH = (0x05, 0x045E, 0x028E, 0x1130)  # xpadneo's ids (v7.8 ticket 04)
 ABS_PROFILE = 0x21
-EV_SYN, EV_KEY, EV_ABS = 0, 1, 3
+EV_SYN, EV_KEY, EV_ABS, EV_FF, EV_UINPUT = 0, 1, 3, 0x15, 0x0101
+UI_FF_UPLOAD, UI_FF_ERASE = 1, 2
+FF_BITS = (0x50, 0x51, 0x58, 0x59, 0x5A, 0x60)  # rumble, periodic, square, triangle, sine, gain
+FF_EFFECTS = 16
+EVENT = struct.Struct("llHHi")
 BUTTONS = {
     "A": 0x130, "B": 0x131, "X": 0x133, "Y": 0x134, "LB": 0x136, "RB": 0x137,
     "View": 0x13A, "Menu": 0x13B, "Xbox": 0x13C, "LS": 0x13D, "RS": 0x13E, "Share": 167,
@@ -53,6 +68,12 @@ UI_SET_EVBIT, UI_SET_KEYBIT, UI_SET_ABSBIT = _iow(100, 4), _iow(101, 4), _iow(10
 UI_DEV_SETUP, UI_ABS_SETUP = _iow(3, 92), _iow(4, 28)
 UI_DEV_CREATE, UI_DEV_DESTROY = 0x5501, 0x5502
 UI_GET_SYSNAME = (2 << 30) | (64 << 16) | (ord("U") << 8) | 44
+UI_SET_FFBIT = _iow(107, 4)
+# struct uinput_ff_upload (request_id, retval, ff_effect effect, old: 104 bytes on x86-64) and
+# uinput_ff_erase (request_id, retval, effect_id), linux/uinput.h.
+UPLOAD, ERASE = 104, 12
+UI_BEGIN_FF_UPLOAD, UI_END_FF_UPLOAD = (3 << 30) | _iow(200, UPLOAD), _iow(201, UPLOAD)
+UI_BEGIN_FF_ERASE, UI_END_FF_ERASE = (3 << 30) | _iow(202, ERASE), _iow(203, ERASE)
 
 
 # The first commit whose VibeConsole skips an emulated gamepad (by its kernel name: gilrs's
@@ -99,15 +120,18 @@ def refuse_unless_safe(running=None):
 
 
 class Xbox:
-    def __init__(self, link="usb", running=None):
+    def __init__(self, link="usb", running=None, log=None):
         """`link`: "usb" (xone, the default) or "bluetooth" (xpadneo); `running`: see
-        refuse_unless_safe."""
+        refuse_unless_safe; `log`: the file each rumble played is appended to."""
         bluetooth = link == "bluetooth"
         refuse_unless_safe(running)
-        self.fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        self.log = log
+        self.fd = os.open("/dev/uinput", os.O_RDWR | os.O_NONBLOCK)
         try:
-            for ev in (EV_KEY, EV_ABS):
+            for ev in (EV_KEY, EV_ABS, EV_FF):
                 fcntl.ioctl(self.fd, UI_SET_EVBIT, ev)
+            for bit in FF_BITS:
+                fcntl.ioctl(self.fd, UI_SET_FFBIT, bit)
             for button, code in BUTTONS.items():
                 if not (bluetooth and button == "Share"):  # xpadneo clears BTN_SHARE
                     fcntl.ioctl(self.fd, UI_SET_KEYBIT, code)
@@ -123,13 +147,16 @@ class Xbox:
                 fcntl.ioctl(self.fd, UI_ABS_SETUP, struct.pack("HH6i", code, 0, 0, low, high, fuzz, flat, 0))
             name = NAME.encode()
             ids = BLUETOOTH if bluetooth else (BUS, VENDOR, PRODUCT, VERSION)
-            fcntl.ioctl(self.fd, UI_DEV_SETUP, struct.pack("4H80sI", *ids, name, 0))
+            fcntl.ioctl(self.fd, UI_DEV_SETUP, struct.pack("4H80sI", *ids, name, FF_EFFECTS))
             fcntl.ioctl(self.fd, UI_DEV_CREATE)
         except BaseException:
             os.close(self.fd)
             raise
         sysname = bytearray(64)
         fcntl.ioctl(self.fd, UI_GET_SYSNAME, sysname)
+        self._stop = False
+        self._feedback = threading.Thread(target=self._answer, daemon=True)
+        self._feedback.start()
         input_dir = Path("/sys/devices/virtual/input") / sysname.split(b"\0")[0].decode()
         deadline = time.monotonic() + 3
         while not list(input_dir.glob("event*")) and time.monotonic() < deadline:
@@ -160,9 +187,56 @@ class Xbox:
 
     def close(self):
         if self.fd is not None:
+            self._stop = True
+            self._feedback.join()
             fcntl.ioctl(self.fd, UI_DEV_DESTROY)
             os.close(self.fd)
             self.fd = None
+
+    def _answer(self):
+        """Answer each force-feedback request and log each rumble (v7.8 ticket 79)."""
+        effects, playing = {}, {}  # effect id: (strong, weak); id: (since, strong, weak)
+
+        def end(effect):
+            if effect in playing:
+                since, strong, weak = playing.pop(effect)
+                if self.log:
+                    with open(self.log, "a") as log:
+                        log.write(f"rumble strong {strong} weak {weak} {round((time.monotonic() - since) * 1000)} ms\n")
+
+        poll = select.poll()
+        poll.register(self.fd, select.POLLIN)
+        while not self._stop:
+            if not poll.poll(50):
+                continue
+            try:
+                data = os.read(self.fd, EVENT.size * 64)
+            except BlockingIOError:
+                continue
+            for *_, kind, code, value in EVENT.iter_unpack(data):
+                if (kind, code) == (EV_UINPUT, UI_FF_UPLOAD):
+                    request = bytearray(UPLOAD)
+                    struct.pack_into("I", request, 0, value)
+                    fcntl.ioctl(self.fd, UI_BEGIN_FF_UPLOAD, request)
+                    effect, = struct.unpack_from("h", request, 10)  # effect.id
+                    effects[effect] = struct.unpack_from("HH", request, 24)  # effect.u.rumble
+                    struct.pack_into("i", request, 4, 0)
+                    fcntl.ioctl(self.fd, UI_END_FF_UPLOAD, bytes(request))
+                elif (kind, code) == (EV_UINPUT, UI_FF_ERASE):
+                    request = bytearray(ERASE)
+                    struct.pack_into("I", request, 0, value)
+                    fcntl.ioctl(self.fd, UI_BEGIN_FF_ERASE, request)
+                    effect, = struct.unpack_from("I", request, 8)
+                    end(effect)
+                    effects.pop(effect, None)
+                    struct.pack_into("i", request, 4, 0)
+                    fcntl.ioctl(self.fd, UI_END_FF_ERASE, bytes(request))
+                elif kind == EV_FF and code < FF_EFFECTS:  # play (value 1) or stop (0); not gain
+                    strong, weak = effects.get(code, (0, 0))
+                    if not value or not (strong or weak):
+                        end(code)
+                    elif code not in playing:
+                        playing[code] = (time.monotonic(), strong, weak)
 
     def _emit(self, *events):
         now = time.time()
