@@ -176,7 +176,13 @@ for ending in (*STARTUP, "quit", "sigint", "sigterm", "configuration_error", "cu
                 if ending == "startup_enter_held":  # still held after the first frame
                     for _ in range(32):
                         os.write(master, b"\r")
-                        time.sleep(0.031)
+                        # Read while typing, as a terminal does: unread output fills the PTY, the
+                        # app blocks mid-redraw and the queued repeats then look like new presses
+                        # (v7.8 ticket 73).
+                        end = time.monotonic() + 0.031
+                        while (left := end - time.monotonic()) > 0:
+                            if select.select([master], [], [], left)[0]:
+                                initial_screen += os.read(master, 65536)
                 # Nothing queued reached a screen: What moved is still open, nothing paused.
                 time.sleep(0.3)
                 while select.select([master], [], [], 0.2)[0]:
@@ -286,8 +292,9 @@ for ending in (*STARTUP, "quit", "sigint", "sigterm", "configuration_error", "cu
                 # v7 ticket 109: a MIDI keyboard pane (with its Xbox controller part) beside the saved one.
                 assert re.search(rb"MIDI keyboard[^\n]*Saved assignments", wide)
                 assert b"Learn an Xbox button" in wide
-                # v7.7 ticket 150: focus is bold text on the selection background, never the accent fill.
-                assert b";1;38;2;192;202;245;48;2;40;52;87m" in wide or ending == "narrow_resize" or "NO_COLOR" in os.environ
+                # The cursor row is bold, filled with the accent (9e09296 replaced v7.7 ticket 150's
+                # selection background; v7.8 ticket 73).
+                assert b";1;38;2;26;27;38;48;2;122;162;247m" in wide or ending == "narrow_resize" or "NO_COLOR" in os.environ
                 if ending == "narrow_resize":
                     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 18, 50, 0, 0))
                     narrow = read_until(master, b"Tab / Left / Right")
