@@ -2828,6 +2828,31 @@ impl Terminal {
         crate::screen::set_theme(&config.look.theme); // v7.7 ticket 154
         self.view = Some(config);
     }
+    /// v7.8 ticket 66: F on 6 Apps & profiles: star or unstar the profile row `command` opens
+    /// (other rows: nothing), saved atomically as `profile:<name>`; the cursor follows it.
+    fn star_profile(&mut self, command: usize) {
+        let Some(config) = &self.view else {
+            return;
+        };
+        let Some(profile) = command
+            .checked_sub(PROFILE)
+            .and_then(|i| config.profiles.get(i))
+        else {
+            return;
+        };
+        let key = mappings::profile_favourite_key(&profile.name);
+        let starred = config.favourites.contains(&key);
+        if let Err(error) = set_star(&self.path, &key, !starred) {
+            self.notice = format!("{error}; nothing saved");
+        }
+        self.read_view(None);
+        if let Some(row) = (self.tab_panes(5, 80, usize::MAX).into_iter())
+            .flat_map(|(_, entries)| entries.into_iter().map(|(_, open)| open))
+            .position(|open| open == Some(Open::Command(command)))
+        {
+            self.menu = row;
+        }
+    }
     /// v7.8 ticket 50: for Claude Code and Codex, whether the CLI was found, whether its
     /// settings hold every VibeConsole hook, and the last report a hook sent from it.
     fn reporting_rows(&self) -> [String; 2] {
@@ -3117,14 +3142,25 @@ impl Terminal {
             )],
             5 => {
                 let n = cap(config.profiles.len());
-                let mut set = (config.profiles.iter().take(n).enumerate())
-                    .map(|(index, p)| {
+                // v7.8 ticket 66: starred profiles (F) first, with ★, as in every starred list.
+                let starred = |p: &mappings::Profile| {
+                    config
+                        .favourites
+                        .contains(&mappings::profile_favourite_key(&p.name))
+                };
+                let mut order = (0..config.profiles.len()).collect::<Vec<_>>();
+                order.sort_by_key(|&i| !starred(&config.profiles[i]));
+                let mut set = (order.into_iter().take(n))
+                    .map(|index| {
+                        let p = &config.profiles[index];
                         let apps = if p.apps.is_empty() {
                             "no apps".to_owned()
                         } else {
                             p.apps.join(", ")
                         };
-                        let line = format!("{} · {apps} · {} overrides", p.name, p.mappings.len());
+                        let star = if starred(p) { "★ " } else { "" };
+                        let line =
+                            format!("{star}{} · {apps} · {} overrides", p.name, p.mappings.len());
                         one(line, Some(PROFILE + index))
                     })
                     .collect::<Vec<_>>();
@@ -17169,6 +17205,12 @@ fn command_menu(ui: &mut Terminal) -> Result<Option<usize>> {
                 continue;
             }
             Some(Key::Escape) => return Ok(None),
+            Some(Key::Character(b'f' | b'F')) if ui.tab == 5 => {
+                if let Some(Open::Command(command)) = targets[ui.menu] {
+                    ui.star_profile(command);
+                }
+                continue;
+            }
             Some(Key::Character(b'/')) => {
                 ui.find()?;
                 continue;
@@ -20448,6 +20490,69 @@ mod tests {
         assert_eq!(
             play(&mut ui, vec![Character(b'2'), Character(b'5')]),
             (4, devices)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    /// v7.8 ticket 66: on 6 Apps & profiles, F on a profile row stars it (★, listed first,
+    /// saved as `profile:<name>`) with the cursor still on it; F again unstars it; F on a row
+    /// that isn't a profile saves nothing; Enter still opens the profile.
+    #[test]
+    fn f_stars_a_profile_in_the_apps_and_profiles_tab() {
+        use Key::*;
+        let (dir, mut ui, _ran, _) = configure_session("profile-stars");
+        let path = dir.join("mappings.tsv");
+        let mut config = mappings::load_config(&path).unwrap();
+        config.profiles = ["Firefox", "Orca"]
+            .map(|name| mappings::Profile {
+                name: name.into(),
+                apps: vec![format!("{}.desktop", name.to_lowercase())],
+                mappings: Vec::new(),
+            })
+            .into();
+        mappings::save_config(&path, &config).unwrap();
+        ui.at_menu = true;
+        let rows = |ui: &Terminal| {
+            ui.tab_panes(5, 80, usize::MAX)
+                .into_iter()
+                .flat_map(|(_, entries)| entries)
+                .map(|(lines, open)| (lines[0].trim_start().to_owned(), open))
+                .collect::<Vec<_>>()
+        };
+        let play = |ui: &mut Terminal, keys: Vec<Key>| {
+            ui.script = Some(Play {
+                steps: keys.into_iter().map(Step::Key).collect(),
+                ..Play::default()
+            });
+            let picked = command_menu(ui).unwrap();
+            assert!(ui.script.take().unwrap().steps.is_empty());
+            picked
+        };
+        // 6, Down to Orca, F, then Enter: Orca, starred, opens (its command).
+        let picked = play(&mut ui, vec![Character(b'6'), Down, Character(b'f'), Enter]);
+        assert_eq!(picked, Some(PROFILE + 1));
+        assert_eq!(
+            mappings::load_config(&path).unwrap().favourites,
+            ["profile:Orca"]
+        );
+        let shown = rows(&ui);
+        assert!(shown[0].0.starts_with("★ Orca · orca.desktop"), "{shown:?}");
+        assert!(shown[1].0.starts_with("Firefox · "), "{shown:?}");
+        // F again (the cursor stayed on Orca): unstarred, back in place.
+        play(&mut ui, vec![Character(b'f'), Escape]);
+        assert!(mappings::load_config(&path).unwrap().favourites.is_empty());
+        assert!(rows(&ui)[0].0.starts_with("Firefox · "));
+        // F on "New profile" saves nothing.
+        let new = rows(&ui)
+            .iter()
+            .position(|(l, _)| l.starts_with("New profile"))
+            .unwrap();
+        ui.menu = new;
+        let before = std::fs::read(path.with_file_name("mappings.json")).ok();
+        play(&mut ui, vec![Character(b'f'), Escape]);
+        assert!(mappings::load_config(&path).unwrap().favourites.is_empty());
+        assert_eq!(
+            std::fs::read(path.with_file_name("mappings.json")).ok(),
+            before
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
