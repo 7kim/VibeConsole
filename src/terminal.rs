@@ -15608,27 +15608,40 @@ fn change_input(
     let what = original.action_label();
     let moved = move_to(original, (to, to_context, input), &to_name, to_label)?;
     let summary = format!("{from_name} → {to_name}: {what}");
-    let choice = match &occupied {
-        Some((other, default)) => {
-            let now = other.action_label();
-            let suffix = if *default { " (default)" } else { "" };
-            question(
-                ui,
-                &format!(
-                    "{summary}\n{to_name} does {now}{suffix} now. Swap moves it to {from_name}."
-                ),
-                &strings(&["Cancel", "Replace", "Swap"]),
-            )?
-        }
-        None => question(ui, &summary, &strings(&["Cancel", "Move"]))?,
-    };
-    let left = match (choice, occupied) {
-        (Some(2), Some((other, _))) => Some(move_to(
-            other,
+    // v7.8 ticket 56: the reverse move is checked before asking; when it can't be made the
+    // question says why and offers no Swap.
+    let reverse = occupied.as_ref().map(|(other, _)| {
+        move_to(
+            other.clone(),
             (from, from_context, from_input),
             &from_name,
             from_label,
-        )?),
+        )
+    });
+    let choice = match (&occupied, &reverse) {
+        (Some((other, default)), Some(reverse)) => {
+            let now = other.action_label();
+            let suffix = if *default { " (default)" } else { "" };
+            let (swap, options) = match reverse {
+                Ok(_) => (
+                    format!("Swap moves it to {from_name}."),
+                    strings(&["Cancel", "Replace", "Swap"]),
+                ),
+                Err(error) => (
+                    format!("Swap isn't available: {error}"),
+                    strings(&["Cancel", "Replace"]),
+                ),
+            };
+            question(
+                ui,
+                &format!("{summary}\n{to_name} does {now}{suffix} now. {swap}"),
+                &options,
+            )?
+        }
+        _ => question(ui, &summary, &strings(&["Cancel", "Move"]))?,
+    };
+    let left = match (choice, reverse) {
+        (Some(2), Some(reverse)) => Some(reverse?),
         (Some(1), _) if builtin_default(profile, from_context, from).is_some() => {
             // A move off a built-in default must leave silence in its old slot.
             let mut silent = Mapping::new_action(from, Input::Pad, crate::actions::Action::Nothing)
@@ -23566,22 +23579,47 @@ mod tests {
         let before = config_bytes(&path);
         let expected = current.clone();
         let mut ui = Script {
-            keys: [Down, Down, Enter].into(),
+            keys: [Down, Down, Enter].into(), // Replace, Cancel: no Swap row to land on
             pads: [pad].into(),
             context,
             program: Some((context, program)),
             ..Default::default()
         };
-        let error = change_input(&mut ui, &path, &mut current, None, knob, context)
-            .unwrap_err()
-            .to_string();
-        assert!(error.starts_with("validation: "), "{error}");
-        assert!(error.contains("one-second hold"), "{error}");
-        assert!(error.contains("Knob 1"), "{error}");
+        change_input(&mut ui, &path, &mut current, None, knob, context).unwrap();
+        // v7.8 ticket 56: the question names the refused reverse move and has no Swap.
+        let asked = ui.screens.last().unwrap();
+        assert!(
+            asked.contains("Swap isn't available: validation: "),
+            "{asked}"
+        );
+        assert!(
+            asked.contains("one-second hold") && asked.contains("Knob 1"),
+            "{asked}"
+        );
+        assert!(
+            asked.contains("Replace") && !asked.contains("> Swap") && !asked.contains("  Swap"),
+            "{asked}"
+        );
         assert!(ui.keys.is_empty());
         assert_eq!(ui.applied, 0);
         assert_eq!(current, expected);
         assert_eq!(config_bytes(&path), before);
+        // Replace still works: the knob's volume moves to the pad, the knob is left empty.
+        let mut ui = Script {
+            keys: [Down, Enter].into(),
+            pads: [pad].into(),
+            context,
+            program: Some((context, program)),
+            ..Default::default()
+        };
+        change_input(&mut ui, &path, &mut current, None, knob, context).unwrap();
+        assert_eq!(ui.applied, 1);
+        let saved = mappings::load(&path).unwrap();
+        assert_eq!(saved.len(), 1, "{saved:?}");
+        assert_eq!(
+            (saved[0].control, saved[0].action.clone()),
+            (pad, expected[0].action.clone())
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
