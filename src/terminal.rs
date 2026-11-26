@@ -547,6 +547,8 @@ struct Terminal {
     skills_installed: bool,
     /// Install status of each agent on 3 Agents.
     agents_found: Vec<Option<String>>,
+    /// v7.8 ticket 50: 3 Agents' Claude Code and Codex rows: CLI, hooks, last report.
+    reporting: [String; 2],
     lookup_path: Option<String>,
     #[cfg(test)]
     lookup_home: Option<PathBuf>,
@@ -1694,6 +1696,7 @@ impl Terminal {
             problems_at: None,
             skills_installed: false,
             agents_found: Vec::new(),
+            reporting: Default::default(),
             lookup_path: None,
             #[cfg(test)]
             lookup_home: None,
@@ -2730,6 +2733,7 @@ impl Terminal {
                 .iter()
                 .map(|(_, binary, _)| agent_install_status(&path_var, home.as_deref(), binary))
                 .collect();
+            self.reporting = self.reporting_rows();
         }
         if self.tab == 7 {
             // v7.7 ticket 179: asked each time, never a saved copy (ticket 21).
@@ -2738,6 +2742,52 @@ impl Terminal {
         self.agent_cards = config.look.agent_cards;
         crate::screen::set_theme(&config.look.theme); // v7.7 ticket 154
         self.view = Some(config);
+    }
+    /// v7.8 ticket 50: for Claude Code and Codex, whether the CLI was found, whether its
+    /// settings hold every VibeConsole hook, and the last report a hook sent from it.
+    fn reporting_rows(&self) -> [String; 2] {
+        #[cfg(test)]
+        let test_home = self.lookup_home.clone();
+        #[cfg(not(test))]
+        let test_home: Option<PathBuf> = None;
+        let (hooks, dir) = match test_home {
+            Some(home) => (
+                [
+                    home.join(".claude/settings.json"),
+                    home.join(".codex/hooks.json"),
+                ]
+                .map(Ok),
+                Ok(home.join("run")),
+            ),
+            None => (
+                [false, true].map(crate::status::hooks_file),
+                crate::status::state_dir(),
+            ),
+        };
+        let now = std::time::SystemTime::now();
+        [(0, "Claude Code", "claude"), (1, "Codex", "codex")].map(|(i, tool, kind)| {
+            let cli = match self.agents_found.get(i) {
+                Some(Some(_)) => "CLI found",
+                _ => "CLI not found",
+            };
+            let hooks = match &hooks[i] {
+                Ok(path) => crate::status::hooks_summary(path, i == 1),
+                Err(_) => "hooks unreadable".into(),
+            };
+            let report = match dir
+                .as_ref()
+                .ok()
+                .and_then(|d| crate::status::last_report(d, kind))
+            {
+                Some((at, state)) => format!(
+                    "last report{} ago: {}",
+                    wait_text(Some(now.duration_since(at).unwrap_or_default()), false),
+                    state_word(state)
+                ),
+                None => "no report received yet".into(),
+            };
+            format!("{tool} · {cli} · {hooks} · {report} · Enter: hook setup")
+        })
     }
     /// v7.7 ticket 152: a tab's panes (Live's from [`Self::live_panes`]); one-line entries
     /// that open something get `> ` when `selected`, else two spaces.
@@ -2841,8 +2891,8 @@ impl Terminal {
                         Some(SETTING + 5),
                     ),
                     head("Reporting"),
-                    one("Claude Code status hooks".into(), Some(AGENT + n + 1)),
-                    one("Codex status hooks".into(), Some(AGENT + n + 2)),
+                    one(self.reporting[0].clone(), Some(AGENT + n + 1)),
+                    one(self.reporting[1].clone(), Some(AGENT + n + 2)),
                     (
                         vec![format!(
                             "Install /skills · {} VibeConsole skills → ~/.claude/skills · {}",
@@ -2870,7 +2920,7 @@ impl Terminal {
                     ),
                     one(
                         format!(
-                            "Default agent · {} · the AI tab asks it · Enter: next installed agent",
+                            "Default AI agent · {} · answers 0 AI's asks · Enter: next installed agent",
                             config.look.agent_label()
                         ),
                         Some(DEFAULT_AGENT_SWITCH),
@@ -20153,6 +20203,119 @@ mod tests {
         assert_eq!(
             play(&mut ui, vec![Character(b'2'), Character(b'5')]),
             (4, devices)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    /// v7.8 ticket 50: 3 Agents' Claude Code and Codex rows tell apart a missing CLI, hooks
+    /// not set up or incomplete, installed hooks with no report, and a report filed under
+    /// the tool that sent it; each opens its own hook setup, whose Back changes nothing.
+    #[test]
+    fn agents_rows_show_cli_hooks_and_last_report_per_tool() {
+        use Key::*;
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, mut ui, _ran, _) = configure_session("agents-reporting");
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        ui.lookup_path = Some(bin.display().to_string());
+        ui.lookup_home = Some(dir.clone());
+        ui.tab = 2;
+        let path = dir.join("mappings.tsv");
+        let n = mappings::load_config(&path).unwrap().agents.len();
+        let rows = |ui: &mut Terminal| {
+            ui.read_view(None);
+            let rows = ui
+                .tab_panes(2, 200, usize::MAX)
+                .into_iter()
+                .flat_map(|(_, entries)| entries)
+                .map(|(lines, open)| (lines[0].trim_start().to_owned(), open))
+                .collect::<Vec<_>>();
+            let row = |tool: &str| {
+                rows.iter()
+                    .find(|(l, _)| l.starts_with(&format!("{tool} · CLI")))
+                    .cloned()
+                    .unwrap()
+            };
+            (row("Claude Code"), row("Codex"))
+        };
+        // Nothing yet: no CLI, no settings file, no report.
+        let ((claude, open), (codex, _)) = rows(&mut ui);
+        assert_eq!(
+            claude,
+            "Claude Code · CLI not found · hooks not set up · no report received yet · Enter: hook setup"
+        );
+        assert!(
+            codex.starts_with("Codex · CLI not found · hooks not set up · no report"),
+            "{codex}"
+        );
+        assert_eq!(open, Some(Open::Command(AGENT + n + 1))); // after Add agent: Claude Code's setup
+        // Claude found, its hooks complete; Codex's settings hold one of its hooks.
+        std::fs::write(bin.join("claude"), "").unwrap();
+        std::fs::set_permissions(bin.join("claude"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(
+            dir.join(".claude/settings.json"),
+            crate::status::claude_hooks(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join(".codex")).unwrap();
+        let one_hook = r#"{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "vibeconsole agent-status - finished"}]}]}}"#;
+        std::fs::write(dir.join(".codex/hooks.json"), one_hook).unwrap();
+        let ((claude, _), (codex, _)) = rows(&mut ui);
+        assert!(
+            claude
+                .starts_with("Claude Code · CLI found · hooks installed · no report received yet"),
+            "{claude}"
+        );
+        assert!(
+            codex.contains("· hooks incomplete (4 of 5 missing) · no report received yet"),
+            "{codex}"
+        );
+        std::fs::write(dir.join(".codex/hooks.json"), "{ not json").unwrap();
+        assert!(rows(&mut ui).1.0.contains("· hooks unreadable ·"));
+        // A report from Codex shows on Codex's row only.
+        std::fs::create_dir_all(dir.join("run")).unwrap();
+        std::fs::write(dir.join("run/report-codex"), "needs-input\n").unwrap();
+        let ((claude, _), (codex, open)) = rows(&mut ui);
+        assert!(claude.contains("no report received yet"), "{claude}");
+        assert!(
+            codex.contains("· last report 0 s ago: NEEDS INPUT ·"),
+            "{codex}"
+        );
+        assert_eq!(open, Some(Open::Command(AGENT + n + 2)));
+        // The page still names the skills destination, the default AI agent, the folder and lights.
+        let all = ui
+            .tab_panes(2, 200, usize::MAX)
+            .into_iter()
+            .flat_map(|(_, entries)| entries)
+            .map(|(lines, _)| lines[0].clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for text in [
+            "→ ~/.claude/skills",
+            "Default AI agent · ",
+            "Default agent directory · ",
+            "Status lights · ",
+        ] {
+            assert!(all.contains(text), "{text}\n{all}");
+        }
+        // Each opens its own setup; Back writes nothing.
+        let before = std::fs::read(dir.join(".claude/settings.json")).unwrap();
+        for (index, tool) in [(n + 1, "Claude Code"), (n + 2, "Codex")] {
+            let mut script = Script {
+                keys: [Down, Down, Enter].into(), // Back
+                ..Default::default()
+            };
+            agent_choice(&mut script, &path, index).unwrap();
+            assert!(
+                script.screens[0].starts_with(&format!("{tool} status hooks: ")),
+                "{}",
+                script.screens[0]
+            );
+        }
+        assert_eq!(
+            std::fs::read(dir.join(".claude/settings.json")).unwrap(),
+            before
         );
         std::fs::remove_dir_all(dir).unwrap();
     }

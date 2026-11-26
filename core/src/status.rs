@@ -69,6 +69,19 @@ pub fn command(args: &[String]) -> Result<()> {
     // SessionEnd: the agent is gone; nothing waits on it any more.
     let state = if state == "ended" { "idle" } else { state };
     let hook = agent == "-";
+    let reported = report(agent, state, hook);
+    // v7.8 ticket 50: a hook's report is filed under the program it ran under (Agents shows
+    // each tool's last one); a report no tool can be named for isn't.
+    if hook && reported.is_ok() && STATES.contains(&state) {
+        let (_, kind) = agent_process();
+        if !kind.is_empty() {
+            let _ = note_report(&state_dir()?, kind, state);
+        }
+    }
+    reported
+}
+
+fn report(agent: String, state: &str, hook: bool) -> Result<()> {
     let agent = if hook {
         match std::env::var(AGENT_ENV) {
             Ok(name) if !name.is_empty() => name,
@@ -1537,6 +1550,41 @@ fn merge(text: Option<&str>, events: &Events) -> Result<Option<String>> {
     Ok(Some(serde_json::to_string_pretty(&settings)? + "\n"))
 }
 
+/// v7.8 ticket 50: the last hook report from `kind` (`claude`, `codex`): its state, and its
+/// time from the file's.
+fn note_report(dir: &Path, kind: &str, state: &str) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    crate::actions::write_atomic(&dir.join(format!("report-{kind}")), &format!("{state}\n"))
+}
+pub fn last_report(dir: &Path, kind: &str) -> Option<(std::time::SystemTime, &'static str)> {
+    let path = dir.join(format!("report-{kind}"));
+    let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    let state = STATES.into_iter().find(|s| *s == text.trim())?;
+    Some((modified, state))
+}
+
+/// v7.8 ticket 50: Agents' words for a tool's settings file at `path`: hooks installed, not
+/// set up, incomplete (how many missing) or unreadable.
+pub fn hooks_summary(path: &Path, codex: bool) -> String {
+    let events = if codex { CODEX } else { CLAUDE };
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return "hooks not set up".into(),
+        Err(_) => return "hooks unreadable".into(),
+    };
+    let settings = serde_json::from_str(&text).map_err(|e| e.to_string().into());
+    match settings.and_then(|settings| missing(&settings, events)) {
+        Ok(missing) if missing.is_empty() => "hooks installed".into(),
+        Ok(missing) => format!(
+            "hooks incomplete ({} of {} missing)",
+            missing.len(),
+            events.len()
+        ),
+        Err(_) => "hooks unreadable".into(),
+    }
+}
+
 /// doctor's line for one tool.
 pub fn hooks_status(codex: bool) -> String {
     let tool = if codex { "Codex" } else { "Claude Code" };
@@ -1774,6 +1822,23 @@ fn hooks(events: &[(&str, Option<&str>, &str)]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// v7.8 ticket 50: a tool's last report keeps its state and its time; a file that isn't
+    /// a state reads as none.
+    #[test]
+    fn last_report_reads_what_note_report_wrote() {
+        use super::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-report-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(last_report(&dir, "claude"), None);
+        note_report(&dir, "claude", "finished").unwrap();
+        let (at, state) = last_report(&dir, "claude").unwrap();
+        assert_eq!(state, "finished");
+        assert!(at.elapsed().unwrap() < std::time::Duration::from_secs(5));
+        assert_eq!(last_report(&dir, "codex"), None);
+        std::fs::write(dir.join("report-codex"), "rm -rf\n").unwrap();
+        assert_eq!(last_report(&dir, "codex"), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     /// v7.7 ticket 212: in-step frames: breath fades from dark to its colour at half the
     /// period, scaled by its intensity, by its form; spectrum turns the hue once a period;
     /// static and the firmware-only effects aren't stepped; the G502 gets the same period.
