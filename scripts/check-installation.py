@@ -32,7 +32,9 @@ binary = Path(__file__).resolve().parents[1] / "target/debug/vibeconsole"
 # v7.8 ticket 63: install.sh's ticket lookup reads every subject style the repo uses.
 lookup = Path(__file__).resolve().parent / "build-ticket.sh"
 for subjects, ticket in [
-    ("emulate: a fix\nv7.8 ticket 38: x\nv7.7 271 y\n", "v7.8 ticket 38"),
+    # v7.8 ticket 78: commits after the ticket commit are counted; at the ticket, no +N.
+    ("emulate: a fix\nv7.8 ticket 38: x\nv7.7 271 y\n", "v7.8 ticket 38 +1"),
+    ("7 Xbox: a fix\nCLAUDE.md: shorter\nv7.8 ticket 45: x\n", "v7.8 ticket 45 +2"),
     ("v7.8 tickets 61, 62: x\nv7.8 ticket 38: y\n", "v7.8 tickets 61, 62"),
     ("v7 128 x\n", "v7 128"),
     ("no ticket here\n", ""),
