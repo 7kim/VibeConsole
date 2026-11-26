@@ -50,6 +50,14 @@ class Drive:
         self.devices = devices
 
     def __enter__(self):
+        self.run = None
+        try:
+            return self._start()
+        except BaseException:
+            self.__exit__()  # what did start (an emulator, the temp folder) is closed again
+            raise
+
+    def _start(self):
         self._tmp = tempfile.TemporaryDirectory()
         directory = Path(self._tmp.name)
         self.akai = self.xbox = None
@@ -80,12 +88,14 @@ class Drive:
 
     def __exit__(self, *exc):
         try:
-            self.run.__exit__(*exc)
+            if self.run:
+                self.run.__exit__(*exc)
         finally:
-            for device in (self.xbox, self.akai):
+            for device in (getattr(self, "xbox", None), getattr(self, "akai", None)):
                 if device:
                     device.__exit__(*exc)
-            self._tmp.cleanup()
+            if hasattr(self, "_tmp"):
+                self._tmp.cleanup()
         left = emulated_left()
         assert not left, f"emulated run left running: {left}"
 

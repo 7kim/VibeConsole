@@ -2896,7 +2896,7 @@ impl Terminal {
                 ),
                 None => "no report received yet".into(),
             };
-            format!("{tool} · {cli} · {hooks} · {report} · Enter: hook setup")
+            format!("{tool} · {cli} · {hooks} · {report} · Enter: install or repair hooks")
         })
     }
     /// v7.7 ticket 152: a tab's panes (Live's from [`Self::live_panes`]); one-line entries
@@ -20591,7 +20591,7 @@ mod tests {
         let ((claude, open), (codex, _)) = rows(&mut ui);
         assert_eq!(
             claude,
-            "Claude Code · CLI not found · hooks not set up · no report received yet · Enter: hook setup"
+            "Claude Code · CLI not found · hooks not set up · no report received yet · Enter: install or repair hooks"
         );
         assert!(
             codex.starts_with("Codex · CLI not found · hooks not set up · no report"),

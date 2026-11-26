@@ -74,8 +74,10 @@ pub fn command(args: &[String]) -> Result<()> {
     // each tool's last one); a report no tool can be named for isn't.
     if hook && reported.is_ok() && STATES.contains(&state) {
         let (_, kind) = agent_process();
-        if !kind.is_empty() {
-            let _ = note_report(&state_dir()?, kind, state);
+        // Best effort: the report itself was written; failing to file it under its tool
+        // only leaves Agents' "last report" older.
+        if let (false, Ok(dir)) = (kind.is_empty(), state_dir()) {
+            let _ = note_report(&dir, kind, state);
         }
     }
     reported
