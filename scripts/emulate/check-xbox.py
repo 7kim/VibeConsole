@@ -29,6 +29,9 @@ def main():
     with tempfile.TemporaryDirectory() as directory, Xbox() as xbox:
         sandbox = hide(xbox.node)
         with Run(directory, [mapping(GAMEPAD, "Xbox RT", "button", 1, RT, "F2")], sandbox) as run:
+            # v7.8 ticket 72: a controller there at startup says so (gilrs sends no Connected).
+            run.read_until("Xbox controller ready: Microsoft Xbox One", 15)
+            print("ok: the controller there at startup shows Xbox controller ready")
             run.xbox_ready(xbox)
             assert run.recorded()[:2] == ["key KEY_ENTER down", "key KEY_ENTER up"], run.recorded()
             print("ok: xbox.tap('A') records Enter in output.log")

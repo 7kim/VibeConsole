@@ -502,6 +502,9 @@ struct Terminal {
     /// v7.7 ticket 269: why the pads wait while the program is unverified (ticket 253's
     /// recovery, or why detection can't run), kept apart from later notices.
     waiting: String,
+    /// v7.8 ticket 72: the Xbox controller's last ready, connected or unavailable notice, kept
+    /// in front of MIDI detection's status notices until another notice replaces it.
+    xbox_notice: String,
     /// v7.7 ticket 255: what Quit did about the login service, printed once the screen is back.
     quit_note: String,
     /// How the last Live row was opened: "Enter", "click", or "Find" (it put the cursor there).
@@ -1747,6 +1750,7 @@ impl Terminal {
             pointer_moving: false,
             pause_cause: String::new(),
             waiting: String::new(),
+            xbox_notice: String::new(),
             quit_note: String::new(),
             opened_by: "Enter",
             flow_rescue: None,
@@ -5144,12 +5148,27 @@ impl Terminal {
                 }
                 if let Some(name) = pad.connected().first() {
                     self.notice = format!("Xbox controller ready: {name}");
+                    self.xbox_notice = self.notice.clone();
                 }
                 self.xbox_link = link_text(&pad.details());
                 self.gamepad = Some(pad);
                 self.open_button_light();
             }
-            Err(error) => self.notice = error.to_string(),
+            Err(error) => {
+                self.notice = error.to_string();
+                self.xbox_notice = self.notice.clone();
+            }
+        }
+    }
+    /// v7.8 ticket 72: a status notice (detecting the program, waiting to detect it) keeps the
+    /// Xbox controller's notice in front while that notice is still showing; a notice set in
+    /// between replaced it, so it isn't brought back.
+    fn status_notice(&mut self, status: String) {
+        if self.xbox_notice.is_empty() || !self.notice.contains(&self.xbox_notice) {
+            self.xbox_notice.clear();
+            self.notice = status;
+        } else {
+            self.notice = format!("{} · {status}", self.xbox_notice);
         }
     }
     /// The light exists only while a controller on xone is plugged in; unavailable is
@@ -5450,6 +5469,7 @@ impl Terminal {
         if let Some(pad) = &mut self.gamepad {
             pad.drain();
         }
+        self.xbox_notice = notice.clone();
         self.notice = notice;
         Ok(())
     }
@@ -6253,8 +6273,8 @@ impl Terminal {
         if self.at_menu && self.controller.is_none() && Instant::now() >= self.follow_retry {
             if let Err(error) = self.controller() {
                 self.follow_retry = Instant::now() + Duration::from_secs(1);
-                self.notice = format!("Waiting to detect controller program: {error}");
-                self.waiting = self.notice.clone();
+                self.waiting = format!("Waiting to detect controller program: {error}");
+                self.status_notice(self.waiting.clone());
                 return Ok(());
             }
         }
@@ -17262,6 +17282,7 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
     ui.use_device(&config, &current)?;
     ui.open_gamepad();
     ui.follow_apps = true;
+    let xbox = std::mem::take(&mut ui.notice);
     let flow_ready = match ui.startup_flow() {
         Ok(()) => true,
         Err(error) => {
@@ -17270,9 +17291,18 @@ fn session(path: &Path, mut current: Vec<Mapping>, initial: &str) -> Result<()> 
             false
         }
     };
+    // v7.8 ticket 72: Flow's startup notice comes after the Xbox controller's, not over it.
+    let flow = std::mem::replace(&mut ui.notice, xbox);
+    if !flow.is_empty() {
+        ui.status_notice(flow);
+    }
     if (initial == "run" || initial == "session") && flow_ready {
         ui.wanted_run = true;
-        ui.notice = "Detecting the controller’s current program before enabling actions.".into();
+        // v7.8 ticket 72: after open_gamepad's notice (gilrs sends no Connected for a
+        // controller already there, so it is the only one that says so).
+        ui.status_notice(
+            "Detecting the controller’s current program before enabling actions.".into(),
+        );
     }
     if let Some(notice) = look_notice.filter(|n| !ui.notice.starts_with(n.as_str())) {
         ui.notice = if ui.notice.is_empty() {
@@ -27820,6 +27850,59 @@ mod tests {
         assert!(lines[0].starts_with("  Xbox B · "), "{lines:?}");
         ui.set_layer(false).unwrap();
         assert!(ui.status_lines()[0].starts_with("  Xbox X · "));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.8 ticket 72: the Xbox controller's notice stays on screen through MIDI detection's
+    /// status notices (detecting, waiting, the Xbox-only line), and a notice that replaced it
+    /// isn't overwritten by it again. The emulator check covers a controller there at startup.
+    #[test]
+    fn the_xbox_controller_notice_stays_through_detection_notices() {
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-xbox-notice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let mut ui = Terminal::open_mode(&path, true).unwrap();
+        ui.output = Some(crate::keyboard::Output::recording(&[]).unwrap());
+        ui.gamepad_transition(
+            "Xbox controller connected: Pad; buttons fire on their next press".into(),
+        )
+        .unwrap();
+        ui.status_notice(
+            "Detecting the controller’s current program before enabling actions.".into(),
+        );
+        for _ in 0..3 {
+            ui.status_notice("Waiting to detect controller program: no MIDI port".into());
+        }
+        ui.context_verified = false;
+        ui.wanted_run = true;
+        ui.at_menu = true;
+        ui.suspended = true;
+        ui.gamepad_only(true).unwrap();
+        assert!(
+            ui.notice.starts_with("Xbox controller connected: Pad"),
+            "{}",
+            ui.notice
+        );
+        assert_eq!(
+            ui.notice.matches("Waiting to detect").count(),
+            1,
+            "{}",
+            ui.notice
+        );
+        assert!(
+            ui.notice.contains("the Xbox controller runs on its own"),
+            "{}",
+            ui.notice
+        );
+        ui.notice = "Profile: Code".into(); // something else replaced it
+        ui.status_notice("Waiting to detect controller program: no MIDI port".into());
+        assert_eq!(
+            ui.notice,
+            "Waiting to detect controller program: no MIDI port"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

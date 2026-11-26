@@ -117,8 +117,8 @@ class Run:
 
     def xbox_ready(self, xbox, seconds=15):
         """Tap A until the run records its Enter (the built-in default): the controller is open
-        and startup is over. Not the "Xbox controller connected" notice: under load gilrs's
-        Connected event is drained with startup's transition and never drawn (v7.8 ticket 68)."""
+        and startup is over. Not a notice: gilrs sends no Connected for a controller already
+        there; the startup notice is "Xbox controller ready" (v7.8 tickets 68, 72)."""
         deadline = time.monotonic() + seconds
         while "key KEY_ENTER up" not in self.recorded():
             assert time.monotonic() < deadline, ("the run never read the Xbox emulator", screen(self.data)[-1500:])
