@@ -23481,6 +23481,60 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7.8 ticket 55: one Undo puts back both sides of a Swap: two pads get their own
+    /// assignments again, and a swapped built-in Xbox default is a default again (no saved
+    /// override left behind).
+    #[test]
+    fn one_undo_restores_both_sides_of_a_swap() {
+        use Key::*;
+        let (dir, _ui, _ran, [a, b, ..]) = configure_session("swap-undo");
+        let path = dir.join("mappings.tsv");
+        let mut first = Mapping::new(a, "Shift", "hold").unwrap();
+        first.label = "First pad".into();
+        let mut second = Mapping::new(b, "Enter", "tap").unwrap();
+        second.label = "Second pad".into();
+        let original = vec![first, second];
+        let mut current = original.clone();
+        mappings::save(&path, &current).unwrap();
+        let mut ui = Script {
+            keys: [Down, Down, Enter].into(), // Swap
+            pads: [b].into(),
+            ..Default::default()
+        };
+        change_input(&mut ui, &path, &mut current, None, a, 0).unwrap();
+        assert_ne!(mappings::load(&path).unwrap(), original, "swapped");
+        let note = undo_last(&path).unwrap();
+        assert!(note.starts_with("Undone: "), "{note}");
+        assert_eq!(mappings::load(&path).unwrap(), original);
+
+        // A pad swapped with Xbox A's built-in Enter.
+        let pad = Mapping::new(a, "F2", "tap").unwrap();
+        let mut current = vec![pad.clone()];
+        mappings::save(&path, &current).unwrap();
+        let button = Control::button(0);
+        let mut ui = Script {
+            keys: [Enter, Down, Down, Enter].into(), // Layer 1, then Swap.
+            pads: [button].into(),
+            xbox: true,
+            xbox_program: 3,
+            ..Default::default()
+        };
+        change_input(&mut ui, &path, &mut current, None, a, 0).unwrap();
+        assert_eq!(
+            mappings::load(&path).unwrap().len(),
+            2,
+            "A saved as an override"
+        );
+        undo_last(&path).unwrap();
+        let restored = mappings::load(&path).unwrap();
+        assert_eq!(restored, [pad]);
+        assert!(
+            !restored.iter().any(|m| m.control == button),
+            "no override left for A: its built-in Enter applies again"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn change_mapped_input_refuses_a_swap_when_the_reverse_move_is_unsafe() {
         use crate::actions::Action;
