@@ -1183,17 +1183,97 @@ pub fn power_parts(power: gilrs::PowerInfo, profile: Option<i32>) -> Vec<String>
         .chain(profile.map(|p| format!("profile {p}")))
         .collect()
 }
+/// v7.8 ticket 81: BlueZ's `org.bluez.Battery1` `Percentage` for one device object path,
+/// read through `run` (a property read only). None: no level, or the read failed.
+fn read_level(run: &mut Runner, path: &str) -> Option<u8> {
+    // gdbus prints `(<byte 0x43>,)`; an absent Percentage (level unknown) is an error.
+    let reply = run(&[
+        "gdbus",
+        "call",
+        "--system",
+        "--timeout",
+        "1",
+        "--dest",
+        "org.bluez",
+        "--object-path",
+        path,
+        "--method",
+        "org.freedesktop.DBus.Properties.Get",
+        "org.bluez.Battery1",
+        "Percentage",
+    ]);
+    let hex = reply
+        .ok()?
+        .split_once("<byte 0x")?
+        .1
+        .split_once('>')?
+        .0
+        .to_owned();
+    u8::from_str_radix(&hex, 16).ok().filter(|n| *n <= 100)
+}
+/// v7.8 ticket 84: how long a background BlueZ answer counts as current, and how often the
+/// header asks again.
+pub const FRESH: std::time::Duration = std::time::Duration::from_secs(15);
+const ASK_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+type Answers = std::collections::HashMap<String, (std::time::Instant, Option<u8>)>;
+/// v7.8 ticket 84: BlueZ levels read on a background thread (one read in flight at a time),
+/// so the session loop never waits on BlueZ: the caller gets the last current answer.
+pub struct Levels {
+    runner: fn() -> Runner,
+    answers: std::sync::Arc<std::sync::Mutex<Answers>>,
+    asking: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+impl Levels {
+    pub fn new(runner: fn() -> Runner) -> Self {
+        Self {
+            runner,
+            answers: Default::default(),
+            asking: Default::default(),
+        }
+    }
+    /// The first of `paths` with a level answered within [`FRESH`] of `now` (a stale or
+    /// failed answer is none); starts a read when the last is [`ASK_EVERY`] old. Never blocks.
+    pub fn level(&self, paths: &[String], now: std::time::Instant) -> Option<u8> {
+        use std::sync::atomic::Ordering;
+        let answers = self.answers.lock().ok()?;
+        let answered = |path: &String| answers.get(path).filter(|(at, _)| now < *at + FRESH);
+        let level = paths
+            .iter()
+            .find_map(|p| answered(p).and_then(|(_, level)| *level));
+        let due = paths.iter().any(|p| {
+            (answers.get(p)).is_none_or(|(at, _)| now.saturating_duration_since(*at) >= ASK_EVERY)
+        });
+        drop(answers);
+        if due && !self.asking.swap(true, Ordering::AcqRel) {
+            let (runner, answers, asking) =
+                (self.runner, self.answers.clone(), self.asking.clone());
+            let paths = paths.to_vec();
+            std::thread::spawn(move || {
+                let mut run = runner();
+                for path in paths {
+                    let level = read_level(&mut run, &path);
+                    if let Ok(mut answers) = answers.lock() {
+                        answers.insert(path, (std::time::Instant::now(), level));
+                    }
+                }
+                asking.store(false, Ordering::Release);
+            });
+        }
+        level
+    }
+}
+/// The header's background BlueZ reads (v7.8 ticket 84).
+static LEVELS: std::sync::LazyLock<Levels> = std::sync::LazyLock::new(|| Levels::new(run_program));
 /// v7.8 ticket 81: when the driver reports no level and the controller is on Bluetooth,
-/// BlueZ's
-/// `org.bluez.Battery1` `Percentage` for its address (`uniq`), read through `run`. A property
-/// read only; a malformed address, no level or a failed read leaves `power` as it was.
+/// BlueZ's level for its address (`uniq`), from `level` (given the device's object path on
+/// each adapter). A malformed address or no level leaves `power` as it was.
 pub fn bluez_power(
     power: PowerInfo,
     sys: &std::path::Path,
     name: &str,
     vendor: u16,
     product: u16,
-    run: &mut Runner,
+    level: &mut dyn FnMut(&[String]) -> Option<u8>,
 ) -> PowerInfo {
     // With no `power_supply` (xpadneo 7), gilrs-core 0.6.8 says Wired, not Unknown
     // (src/platform/linux/gamepad.rs:979); on Bluetooth both mean "no level".
@@ -1223,34 +1303,14 @@ pub fn bluez_power(
     });
     adapters.sort();
     let device = address.replace(':', "_");
-    for adapter in adapters {
-        let path = format!("/org/bluez/{adapter}/dev_{device}");
-        // gdbus prints `(<byte 0x43>,)`; an absent Percentage (level unknown) is an error.
-        // ponytail: a blocking 1 s read at the status refresh; move to the probe thread if BlueZ ever stalls it.
-        let reply = run(&[
-            "gdbus",
-            "call",
-            "--system",
-            "--timeout",
-            "1",
-            "--dest",
-            "org.bluez",
-            "--object-path",
-            &path,
-            "--method",
-            "org.freedesktop.DBus.Properties.Get",
-            "org.bluez.Battery1",
-            "Percentage",
-        ]);
-        let level = reply.ok().and_then(|r| {
-            let hex = r.split_once("<byte 0x")?.1.split_once('>')?.0.to_owned();
-            u8::from_str_radix(&hex, 16).ok().filter(|n| *n <= 100)
-        });
-        if let Some(n) = level {
-            return PowerInfo::Discharging(n);
-        }
-    }
-    power
+    let paths = (adapters.iter())
+        .map(|adapter| format!("/org/bluez/{adapter}/dev_{device}"))
+        .collect::<Vec<_>>();
+    level(&paths).map_or(power, PowerInfo::Discharging)
+}
+/// Each path read now, in turn, through `run`: for one-shot commands (doctor, describe).
+fn read_now(mut run: Runner) -> impl FnMut(&[String]) -> Option<u8> {
+    move |paths| paths.iter().find_map(|path| read_level(&mut run, path))
 }
 /// v7.8 ticket 82: where the battery shown (`shown`, after the BlueZ fallback) comes from, or
 /// why there is none, for `doctor --all`. `driver` is what gilrs read; never guessed.
@@ -1273,8 +1333,9 @@ pub fn battery_source(driver: PowerInfo, shown: PowerInfo, link: Option<&str>) -
     }
 }
 /// A controller's link, driver, battery and profile, as the header and doctor show them, and
-/// where its battery comes from (v7.8 ticket 82).
-fn details(pad: gilrs::Gamepad<'_>) -> (Vec<String>, String) {
+/// where its battery comes from (v7.8 ticket 82). `wait`: read BlueZ now (one-shot commands);
+/// else its last background answer, so the session loop never waits (v7.8 ticket 84).
+fn details(pad: gilrs::Gamepad<'_>, wait: bool) -> (Vec<String>, String) {
     let sys = std::path::Path::new("/sys");
     let ids = (
         pad.os_name(),
@@ -1283,14 +1344,12 @@ fn details(pad: gilrs::Gamepad<'_>) -> (Vec<String>, String) {
     );
     let (link, driver) = link_at(sys, ids.0, ids.1, ids.2);
     let profile = profile_at(sys, ids.0, ids.1, ids.2);
-    let power = bluez_power(
-        pad.power_info(),
-        sys,
-        ids.0,
-        ids.1,
-        ids.2,
-        &mut run_program(),
-    );
+    let mut level: Box<dyn FnMut(&[String]) -> Option<u8>> = if wait {
+        Box::new(read_now(run_program()))
+    } else {
+        Box::new(|paths: &[String]| LEVELS.level(paths, std::time::Instant::now()))
+    };
+    let power = bluez_power(pad.power_info(), sys, ids.0, ids.1, ids.2, &mut level);
     let source = battery_source(pad.power_info(), power, link);
     let parts = [link.map(str::to_owned), driver]
         .into_iter()
@@ -2095,7 +2154,7 @@ impl Pad {
         self.gilrs
             .gamepads()
             .find(|(_, pad)| crate::ours(pad.os_name()))
-            .map_or_else(Vec::new, |(_, pad)| details(pad).0)
+            .map_or_else(Vec::new, |(_, pad)| details(pad, false).0)
     }
     /// Each controller's name and connection, for `describe`.
     pub fn connections(&self) -> Vec<String> {
@@ -2111,7 +2170,7 @@ impl Pad {
             .filter(|(_, pad)| crate::ours(pad.os_name()))
             .map(|(_, pad)| {
                 // v7.8 tickets 08, 09: link, driver, battery, profile; else the bus as before.
-                let (mut parts, battery_source) = details(pad);
+                let (mut parts, battery_source) = details(pad, true);
                 if parts.is_empty() {
                     parts.push(connection(pad.uuid()));
                 }
@@ -2326,6 +2385,49 @@ mod tests {
     /// v7.8 ticket 81: gilrs Wired or Unknown over Bluetooth → BlueZ's level through the runner, shown
     /// as `battery 67%`; no answer → no battery part; a malformed address calls nothing.
     #[test]
+    fn bluez_level_is_read_off_the_callers_thread() {
+        use std::time::{Duration, Instant};
+        let quick = Duration::from_millis(50);
+        // A BlueZ that answers only after 1.5 s (past gdbus's 1 s timeout).
+        let slow = Levels::new(|| {
+            Box::new(|_: &[&str]| {
+                std::thread::sleep(Duration::from_millis(1500));
+                Ok("(<byte 0x43>,)".into())
+            })
+        });
+        let paths = ["/org/bluez/hci0/dev_78_86_2E_B2_7D_D1".to_owned()];
+        let asked = Instant::now();
+        assert_eq!(
+            slow.level(&paths, Instant::now()),
+            None,
+            "nothing yet: no battery part"
+        );
+        assert!(
+            asked.elapsed() < quick,
+            "the caller never waits: {:?}",
+            asked.elapsed()
+        );
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let level = loop {
+            let at = Instant::now();
+            let level = slow.level(&paths, at);
+            assert!(at.elapsed() < quick, "{:?}", at.elapsed());
+            if level.is_some() || Instant::now() > deadline {
+                break level;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(level, Some(67), "the answer lands on a later call");
+        // An answer older than FRESH is never shown as current.
+        assert_eq!(slow.level(&paths, Instant::now() + FRESH), None);
+        // A failed read shows nothing, never an older level.
+        let failing = Levels::new(|| Box::new(|_: &[&str]| Err("gdbus: timed out".into())));
+        failing.level(&paths, Instant::now());
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(failing.level(&paths, Instant::now()), None);
+    }
+
+    #[test]
     fn battery_comes_from_bluez_when_the_driver_reports_none() {
         let root = std::env::temp_dir().join(format!("vibeconsole-bluez-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -2358,19 +2460,19 @@ mod tests {
         // v7.8 ticket 82: what doctor --all says the battery came from, for each case below.
         let bt = Some("Bluetooth");
         let source = |driver, shown, link| battery_source(driver, shown, link);
-        let read = |run: &mut Runner| {
+        let read = |run: Runner| {
             bluez_power(
                 PowerInfo::Wired, // what gilrs says with no power_supply
                 &root,
                 "Xbox Wireless Controller",
                 0x045e,
                 0x0b13,
-                run,
+                &mut read_now(run),
             )
         };
 
         input("78:86:2e:b2:7d:d1", "0005");
-        let power = read(&mut fake(Ok("(<byte 0x43>,)\n".into())));
+        let power = read(fake(Ok("(<byte 0x43>,)\n".into())));
         assert_eq!(header(power), "battery 67% · profile 0");
         assert_eq!(
             source(PowerInfo::Wired, power, bt),
@@ -2384,18 +2486,18 @@ mod tests {
               org.freedesktop.DBus.Properties.Get org.bluez.Battery1 Percentage"
             ]
         );
-        let mut run = fake(Ok("(<byte 0x43>,)".into()));
+        let run = fake(Ok("(<byte 0x43>,)".into()));
         let unknown = bluez_power(
             PowerInfo::Unknown,
             &root,
             "Xbox Wireless Controller",
             0x045e,
             0x0b13,
-            &mut run,
+            &mut read_now(run),
         );
         assert_eq!(header(unknown), "battery 67% · profile 0");
         // No level (Percentage absent, BlueZ down) → no battery part, never guessed.
-        let power = read(&mut fake(Err("gdbus: UnknownProperty".into())));
+        let power = read(fake(Err("gdbus: UnknownProperty".into())));
         assert_eq!(header(power), "profile 0");
         assert_eq!(
             source(PowerInfo::Wired, power, bt),
@@ -2403,14 +2505,14 @@ mod tests {
         );
         // The driver's own level wins; nothing is asked.
         calls.lock().unwrap().clear();
-        let mut run = fake(Ok("(<byte 0x43>,)".into()));
+        let run = fake(Ok("(<byte 0x43>,)".into()));
         let charging = bluez_power(
             PowerInfo::Charging(40),
             &root,
             "Xbox Wireless Controller",
             0x045e,
             0x0b13,
-            &mut run,
+            &mut read_now(run),
         );
         assert_eq!(header(charging), "battery 40% charging · profile 0");
         assert_eq!(
@@ -2419,7 +2521,7 @@ mod tests {
         );
         // USB, or a malformed address: refused before any call.
         input("78:86:2e:b2:7d:d1", "0003");
-        let usb = read(&mut fake(Ok("(<byte 0x43>,)".into())));
+        let usb = read(fake(Ok("(<byte 0x43>,)".into())));
         assert_eq!(header(usb), "profile 0");
         assert_eq!(
             source(PowerInfo::Wired, usb, Some("USB")),
@@ -2430,10 +2532,7 @@ mod tests {
             "unavailable: the driver publishes no battery"
         );
         input("78:86:2e:b2:7d:d1; reboot", "0005");
-        assert_eq!(
-            header(read(&mut fake(Ok("(<byte 0x43>,)".into())))),
-            "profile 0"
-        );
+        assert_eq!(header(read(fake(Ok("(<byte 0x43>,)".into())))), "profile 0");
         assert!(calls.lock().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
