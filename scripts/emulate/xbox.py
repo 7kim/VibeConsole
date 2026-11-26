@@ -120,7 +120,23 @@ class Xbox:
         deadline = time.monotonic() + 3
         while not list(input_dir.glob("event*")) and time.monotonic() < deadline:
             time.sleep(0.02)
-        self.node = Path("/dev/input") / next(input_dir.glob("event*")).name
+        event = next(input_dir.glob("event*"))
+        self.node = Path("/dev/input") / event.name
+        # v7.8 ticket 68: ready only once udev has finished with it, as a controller plugged in
+        # before the run. The node exists ~30 ms before udev tags it ID_INPUT_JOYSTICK and gives
+        # the user access; gilrs lists only tagged nodes, and a run started in that gap never
+        # saw the emulator.
+        record = Path("/run/udev/data") / f"c{(event / 'dev').read_text().strip()}"
+        while time.monotonic() < deadline:
+            try:
+                if "E:ID_INPUT_JOYSTICK=1" in record.read_text().splitlines():
+                    os.close(os.open(self.node, os.O_RDWR | os.O_NONBLOCK))
+                    return
+            except OSError:
+                pass
+            time.sleep(0.01)
+        self.close()
+        raise TimeoutError(f"udev didn't finish with the emulator's {self.node} within 3 s")
 
     def __enter__(self):
         return self

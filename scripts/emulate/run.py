@@ -114,6 +114,18 @@ class Run:
             time.sleep(0.05)
         assert flat(token) in flat(screen(self.data[since:])), (token, flat(screen(self.data[since:]))[-1500:])
 
+    def xbox_ready(self, xbox, seconds=15):
+        """Tap A until the run records its Enter (the built-in default): the controller is open
+        and startup is over. Not the "Xbox controller connected" notice: under load gilrs's
+        Connected event is drained with startup's transition and never drawn (v7.8 ticket 68)."""
+        deadline = time.monotonic() + seconds
+        while "key KEY_ENTER up" not in self.recorded():
+            assert time.monotonic() < deadline, ("the run never read the Xbox emulator", screen(self.data)[-1500:])
+            xbox.tap("A")
+            ends = time.monotonic() + 1
+            while "key KEY_ENTER up" not in self.recorded() and time.monotonic() < ends:
+                time.sleep(0.05)
+
     def recorded(self, file="output.log"):
         path = self.dir / file
         return path.read_text().splitlines() if path.exists() else []

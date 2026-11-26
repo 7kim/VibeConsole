@@ -29,9 +29,7 @@ def main():
     with tempfile.TemporaryDirectory() as directory, Xbox() as xbox:
         sandbox = hide(xbox.node)
         with Run(directory, [mapping(GAMEPAD, "Xbox RT", "button", 1, RT, "F2")], sandbox) as run:
-            run.read_until("Xbox controller connected", 15)
-            xbox.tap("A")
-            run.wait_recorded("key KEY_ENTER up")
+            run.xbox_ready(xbox)
             assert run.recorded()[:2] == ["key KEY_ENTER down", "key KEY_ENTER up"], run.recorded()
             print("ok: xbox.tap('A') records Enter in output.log")
             xbox.trigger("RT", 1.0)
@@ -84,7 +82,8 @@ def layer_button():
     rows = [mapping(GAMEPAD, "Xbox LB", "button", 1, LB, "F3"), mapping(LAYER_2, "Xbox A", "button", 1, A, "F4")]
     with tempfile.TemporaryDirectory() as directory, Xbox() as xbox:
         with Run(directory, rows, hide(xbox.node), layer_button="RB") as run:
-            run.read_until("Xbox controller connected", 15)
+            run.xbox_ready(xbox)
+            enters = run.recorded().count("key KEY_ENTER up")
             xbox.tap("LB")
             run.wait_recorded("key KEY_F3 up")
             xbox.press("RB")
@@ -94,7 +93,10 @@ def layer_button():
             xbox.release("RB")
             time.sleep(0.2)
             xbox.tap("A")
-            run.wait_recorded("key KEY_ENTER up")
+            deadline = time.monotonic() + 5
+            while run.recorded().count("key KEY_ENTER up") == enters and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert run.recorded().count("key KEY_ENTER up") == enters + 1, run.recorded()
             assert run.recorded().count("key KEY_F4 down") == 1, run.recorded()
     print("ok: with RB as the layer 2 button, LB fires its mapping and RB held gives layer 2")
 
@@ -117,7 +119,7 @@ def bluetooth():
     print("ok: over Bluetooth (xpadneo's ids) Detect reads LT, RT and the right stick")
     with tempfile.TemporaryDirectory() as directory, Xbox("bluetooth") as xbox:
         with Run(directory, [mapping(GAMEPAD, "Xbox RT", "button", 1, RT, "F2")], hide(xbox.node)) as run:
-            run.read_until("Xbox controller connected", 15)
+            run.xbox_ready(xbox)
             for pull in (0.1, 0.5, 0.8, 1.0, 0.6):
                 xbox.trigger("RT", pull)
                 time.sleep(0.1)
