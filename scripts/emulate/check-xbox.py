@@ -73,6 +73,27 @@ def main():
             print("ok: Detect reads LT, RT, both sticks (up is up) and the Xbox button")
     bluetooth()
     layer_button()
+    high_fire_point()
+
+
+def high_fire_point():
+    """v7.8 ticket 53: with RT's fire point at 90% (hard point 91, the default above it), a
+    pull to 80% sends nothing; full travel sends one key-down, rest one key-up."""
+    rt = mapping(GAMEPAD, "Xbox RT", "button", 1, RT, "F2")
+    with tempfile.TemporaryDirectory() as directory, Xbox() as xbox:
+        with Run(directory, [rt], hide(xbox.node), tuning={"trigger": 90, "hard_point": 91}) as run:
+            run.xbox_ready(xbox)
+            f2 = lambda: [line for line in run.recorded() if line.startswith("key KEY_F2 ")]
+            xbox.trigger("RT", 0.8)
+            time.sleep(1)
+            assert f2() == [], f2()
+            xbox.trigger("RT", 1.0)
+            run.wait_recorded("key KEY_F2 down")
+            xbox.trigger("RT", 0.0)
+            run.wait_recorded("key KEY_F2 up")
+            time.sleep(0.3)
+            assert f2() == ["key KEY_F2 down", "key KEY_F2 up"], f2()
+    print("ok: with RT firing at 90%, 80% sends nothing; full sends one down, rest one up")
 
 
 def layer_button():
@@ -81,7 +102,7 @@ def layer_button():
     LB, RB, A, LAYER_2 = 4, 5, 0, 238  # gamepad::BUTTONS indexes; mappings::GAMEPAD_LAYER_2
     rows = [mapping(GAMEPAD, "Xbox LB", "button", 1, LB, "F3"), mapping(LAYER_2, "Xbox A", "button", 1, A, "F4")]
     with tempfile.TemporaryDirectory() as directory, Xbox() as xbox:
-        with Run(directory, rows, hide(xbox.node), layer_button="RB") as run:
+        with Run(directory, rows, hide(xbox.node), tuning={"layer_button": "RB"}) as run:
             run.xbox_ready(xbox)
             enters = run.recorded().count("key KEY_ENTER up")
             xbox.tap("LB")

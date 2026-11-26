@@ -44,7 +44,7 @@ def without_bus(**extra):
 
 
 class Run:
-    def __init__(self, directory, mappings, sandbox, command=(), layer_button=None):
+    def __init__(self, directory, mappings, sandbox, command=(), tuning=None):
         assert BINARY.exists(), "build first: cargo build --locked"
         self.dir = Path(directory)
         config = self.dir / ".config/vibeconsole"
@@ -52,9 +52,9 @@ class Run:
         (config / "mappings.json").write_text(json.dumps({
             "version": 1, "vars": [], "profiles": [], "lock": None, "favourites": [], "sequences": [],
             "mappings": mappings}))
-        if layer_button:  # v7.8 ticket 23: the shipped devices.json with another layer 2 button
+        if tuning:  # the shipped devices.json with these tuning values (v7.8 tickets 23, 53)
             devices = json.loads((Path(__file__).resolve().parents[2] / "core/defaults/devices.json").read_text())
-            devices["tuning"]["layer_button"] = layer_button
+            devices["tuning"] |= tuning
             (config / "devices.json").write_text(json.dumps(devices))
         self.master, self.slave = pty.openpty()
         fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 110, 0, 0))
