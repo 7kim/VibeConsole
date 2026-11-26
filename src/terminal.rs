@@ -5516,6 +5516,18 @@ impl Terminal {
         if let Some(pad) = &mut self.gamepad {
             pad.drain();
         }
+        // v7.8 ticket 97: Detect's Xbox row follows the controller (connected, gone, or on
+        // another link); a stick test spanning the change ends and is never kept.
+        if self.speed.is_some() {
+            let xbox = self.speed_devices().xbox;
+            if let Some(speed) = &mut self.speed {
+                speed.xbox = xbox;
+                speed.xbox_since = None;
+            }
+            if let Some(pad) = &mut self.gamepad {
+                pad.reports = None;
+            }
+        }
         self.xbox_notice = notice.clone();
         self.notice = notice;
         Ok(())

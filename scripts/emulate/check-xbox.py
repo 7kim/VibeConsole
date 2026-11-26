@@ -8,7 +8,7 @@ Run after cargo build --locked: uv run scripts/emulate/check-xbox.py
 Checks: A (built-in default Enter) records Enter in output.log; RT mapped to F2 and pulled
 straight to full fires once and lets go on release; a normal run beside the
 emulator never lists it; 7 Xbox's Test rumble reaches the emulator with its strength and length
-(ticket 79), and so do agent rumbles, short and long (ticket 94), tmux agents' too (ticket 95). The run sees only the emulator's own event node (bwrap hides the rest).
+(ticket 79), and so do agent rumbles, short and long (ticket 94), tmux agents' too (ticket 95); Detect drops a controller that leaves mid-test (ticket 97). The run sees only the emulator's own event node (bwrap hides the rest).
 The emulator refuses to start while a VibeConsole older than ticket 01 runs (see xbox.py).
 """
 import json
@@ -85,6 +85,32 @@ def main():
     test_rumble()
     agent_rumble()
     tmux_agent_rumble()
+    detect_follows_the_controller()
+
+
+def detect_follows_the_controller():
+    """v7.8 ticket 97: Detect's Xbox row follows the controller. The stick test starts, the
+    controller leaves halfway: the row goes, the test ends, and nothing is kept (a result is
+    kept only under the connection it was measured on)."""
+    with Drive(xbox=True, command=["detect"]) as d:
+        d.wait("T: move the right stick", 15)
+        time.sleep(1)
+        d.type("t")
+        end, x = time.monotonic() + 1.2, 1.0
+        while time.monotonic() < end:
+            d.xbox.stick("right", x, 0.0)
+            x = -x
+            time.sleep(0.01)
+        mark = d.mark()
+        d.xbox.close()
+        d.wait("Xbox controller disconnected", 8, since=mark)
+        time.sleep(3.5)  # past the test's 3 s
+        rows = "\n".join(d.screen())
+        row = [r for r in d.screen() if "Microsoft Xbox One" in r and "disconnected" not in r]
+        assert not row and "right stick" not in rows, rows  # only the notice names it
+        kept = d.run.dir / ".config/vibeconsole/speed-tests.tsv"
+        assert not kept.exists() or "Microsoft Xbox One" not in kept.read_text(), kept.read_text()
+    print("ok: a controller that leaves mid-test drops its Detect row; nothing is kept")
 
 
 def tmux_agent_rumble():
