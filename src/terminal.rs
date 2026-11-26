@@ -31,6 +31,11 @@ enum Key {
     Escape,
     Other,
     Character(u8),
+    /// v7.8 ticket 49: a non-ASCII character (UTF-8), typed or pasted.
+    Unicode(char),
+    /// v7.8 ticket 49: Ctrl+S (save the prompt box) and Ctrl+E (open it in the editor).
+    CtrlS,
+    CtrlE,
     Backspace,
     InvalidInput,
 }
@@ -2939,7 +2944,10 @@ impl Terminal {
                     (
                         "Commands".into(),
                         vec![
-                            one("New prompt · write it in $EDITOR".into(), Some(PROMPT + n)),
+                            one(
+                                "New prompt · write it here (Ctrl+E: your editor)".into(),
+                                Some(PROMPT + n),
+                            ),
                             one(
                                 "New sequence · pick prompts in order".into(),
                                 Some(SEQUENCE + m),
@@ -4761,6 +4769,7 @@ impl Terminal {
             Key::Space => "Space".into(),
             Key::Backspace => "Backspace".into(),
             Key::Character(c) => char::from(*c).to_string(),
+            Key::Unicode(c) => c.to_string(),
             _ => String::new(),
         };
         // Ticket 38: a combination (RB's built-in Ctrl+Tab) arrives as its last key when the terminal
@@ -4786,6 +4795,8 @@ impl Terminal {
                 Key::Tab => ctrl_byte == Some(b'\t'),
                 Key::Enter => matches!(ctrl_byte, Some(b'\n' | b'\r')),
                 Key::Backspace => ctrl_byte == Some(8),
+                Key::CtrlS => ctrl_byte == Some(0x13),
+                Key::CtrlE => ctrl_byte == Some(0x05),
                 Key::InvalidInput => ctrl_byte.is_some_and(|b| ![8, 9, 10, 13].contains(&b)),
                 _ => false,
             };
@@ -7532,6 +7543,21 @@ impl Ui for Terminal {
             }),
             Some(8 | 127) => Some(Key::Backspace),
             Some(byte @ 33..=126) => Some(Key::Character(byte)),
+            Some(0x13) => Some(Key::CtrlS),
+            Some(0x05) => Some(Key::CtrlE),
+            // v7.8 ticket 49: a UTF-8 lead byte and its continuation bytes are one character.
+            Some(lead @ 0xC2..=0xF4) => {
+                let mut bytes = vec![lead];
+                for _ in 0..[1, 2, 3][usize::from(lead >= 0xE0) + usize::from(lead >= 0xF0)] {
+                    bytes.extend(self.byte(30)?);
+                }
+                Some(
+                    match std::str::from_utf8(&bytes).map(|t| t.chars().next()) {
+                        Ok(Some(c)) => Key::Unicode(c),
+                        _ => Key::InvalidInput,
+                    },
+                )
+            }
             Some(_) => Some(Key::InvalidInput),
             None => None,
         };
@@ -7738,7 +7764,7 @@ fn program_name_prompt(ui: &mut impl Ui, label: &str) -> Result<Option<String>> 
             }
             Some(Key::Character(b)) => name.push(char::from(b)),
             Some(Key::Space) => name.push(' '),
-            Some(Key::InvalidInput) => {
+            Some(Key::InvalidInput | Key::Unicode(_) | Key::CtrlS | Key::CtrlE) => {
                 return Err(
                     "Unsupported name character; use printable ASCII; nothing written".into(),
                 );
@@ -7783,6 +7809,99 @@ fn text_entry(ui: &mut impl Ui, title: &str, initial: &str) -> Result<Option<Str
             _ => {}
         }
     }
+}
+
+/// v7.8 ticket 49: prompt text in a box inside VibeConsole, opened on `scratch`'s draft:
+/// Enter is a new line, Ctrl+S accepts (the draft is then in `scratch`), Esc cancels, Ctrl+E
+/// opens the configured editor on the current draft and comes back with what it saved.
+fn prompt_box(ui: &mut impl Ui, title: &str, scratch: &Path) -> Result<bool> {
+    let mut text: Vec<char> = std::fs::read_to_string(scratch)?.chars().collect();
+    let mut at = text.len();
+    loop {
+        let rows = ui.height().saturating_sub(11).max(3);
+        let width = ui.width().saturating_sub(9).max(10);
+        ui.draw(&format!(
+            "{title}\nEnter: new line | Ctrl+S: save | Esc: cancel | Ctrl+E: external editor\n\n{}",
+            prompt_box_rows(&text, at, width, rows).join("\n")
+        ))?;
+        let line_start = |at: usize| {
+            text[..at]
+                .iter()
+                .rposition(|c| *c == '\n')
+                .map_or(0, |i| i + 1)
+        };
+        match ui.key()? {
+            Some(Key::Escape) => return Ok(false),
+            Some(Key::CtrlS) => {
+                std::fs::write(scratch, String::from_iter(&text))?;
+                return Ok(true);
+            }
+            Some(Key::CtrlE) => {
+                std::fs::write(scratch, String::from_iter(&text))?;
+                ui.edit_file(scratch)?;
+                text = std::fs::read_to_string(scratch)?.chars().collect();
+                at = text.len();
+            }
+            Some(Key::Left) => at = at.saturating_sub(1),
+            Some(Key::Right) => at = (at + 1).min(text.len()),
+            Some(Key::Up) => {
+                let start = line_start(at);
+                if start > 0 {
+                    let above = line_start(start - 1);
+                    at = above + (at - start).min(start - 1 - above);
+                }
+            }
+            Some(Key::Down) => {
+                let start = line_start(at);
+                if let Some(end) = text[at..].iter().position(|c| *c == '\n').map(|i| at + i) {
+                    let below_end = text[end + 1..]
+                        .iter()
+                        .position(|c| *c == '\n')
+                        .map_or(text.len(), |i| end + 1 + i);
+                    at = (end + 1 + at - start).min(below_end);
+                }
+            }
+            Some(Key::Backspace) if at > 0 => {
+                at -= 1;
+                text.remove(at);
+            }
+            Some(key) => {
+                let typed = match key {
+                    Key::Character(b) => char::from(b),
+                    Key::Unicode(c) => c,
+                    Key::Space => ' ',
+                    Key::Tab => '\t',
+                    Key::Enter => '\n',
+                    _ => continue,
+                };
+                text.insert(at, typed);
+                at += 1;
+            }
+            None => {}
+        }
+    }
+}
+/// The box's rows: the text with `▌` at the cursor, tabs as four spaces, long lines wrapped
+/// at `width`, the `rows` around the cursor; each row starts `│ ` (never a menu marker).
+fn prompt_box_rows(text: &[char], at: usize, width: usize, rows: usize) -> Vec<String> {
+    let mut shown = String::from_iter(&text[..at]);
+    shown.push('▌');
+    shown.extend(&text[at..]);
+    let mut lines = Vec::new();
+    for line in shown.replace('\t', "    ").split('\n') {
+        let chars: Vec<char> = line.chars().collect();
+        lines.extend(chars.chunks(width).map(String::from_iter));
+        if chars.is_empty() {
+            lines.push(String::new());
+        }
+    }
+    let cursor = lines.iter().position(|l| l.contains('▌')).unwrap_or(0);
+    let first = cursor.saturating_sub(rows - 1);
+    lines[first..]
+        .iter()
+        .take(rows)
+        .map(|l| format!("│ {l}"))
+        .collect()
 }
 
 fn command_action(
@@ -10034,7 +10153,7 @@ fn ask_setup_agents(ui: &mut impl Ui, path: &Path) -> Result<()> {
     mappings::save_config(path, &new)
 }
 /// v7.7 ticket 169: Ask for a prompt: what it's for, up to three questions from the agent
-/// (each answered in a text entry), then the prompt it writes; Name it opens it in $EDITOR
+/// (each answered in a text entry), then the prompt it writes; Name it opens it in the prompt box
 /// and saves it under a checked name. Esc at any step saves nothing.
 fn ask_prompt(ui: &mut impl Ui, path: &Path) -> Result<()> {
     let Some(wish) = text_entry(ui, "What should the prompt do?", "")? else {
@@ -10089,7 +10208,7 @@ fn ask_prompt(ui: &mut impl Ui, path: &Path) -> Result<()> {
             mappings::load_config(path)?.look.default_agent,
             sent_skill(AskKind::Prompt)
         ),
-        &strings(&["Cancel", "Name it, then open it in $EDITOR"]),
+        &strings(&["Cancel", "Name it, then edit it"]),
     )? != Some(1)
     {
         return Ok(());
@@ -12282,7 +12401,9 @@ fn edit_prompt_from(ui: &mut impl Ui, dir: &Path, name: &str, start: Option<&str
             other => other?,
         };
         std::fs::write(&scratch, old)?;
-        ui.edit_file(&scratch)?;
+        if !prompt_box(ui, &format!("Prompt {name}"), &scratch)? {
+            return Ok(()); // Esc: the saved prompt (or none) stays
+        }
         if std::fs::read(&scratch)?.iter().all(u8::is_ascii_whitespace) {
             return Err("prompt is empty; nothing saved".into());
         }
@@ -14862,7 +14983,9 @@ fn edit_step(
         };
         std::fs::create_dir_all(&dir)?;
         std::fs::write(&scratch, &start)?;
-        ui.edit_file(&scratch)?;
+        if !prompt_box(ui, &format!("Step {file}: this sequence's text"), &scratch)? {
+            return Ok(String::new()); // Esc: the step stays as it was
+        }
         let text = std::fs::read_to_string(&scratch)?;
         Ok(if text == start { String::new() } else { text })
     })();
@@ -17301,6 +17424,8 @@ mod tests {
         motions: VecDeque<(Control, mappings::Input, String)>,
         /// The editor fails after writing part of the file.
         edit_fails: bool,
+        /// v7.8 ticket 49: what each external-editor call found in its file (the draft).
+        editor_saw: Vec<String>,
         /// Login service state and every request Settings made (ticket 21).
         login: (bool, bool),
         login_calls: Vec<crate::runtime::Login>,
@@ -17532,6 +17657,7 @@ mod tests {
             self.learn_knob()
         }
         fn edit_file(&mut self, path: &Path) -> Result<()> {
+            self.editor_saw.push(std::fs::read_to_string(path)?);
             if self.edit_fails {
                 std::fs::write(path, "half-written")?;
                 return Err("editor exited unsuccessfully".into());
@@ -20389,7 +20515,7 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
     /// v7.7 ticket 169: Ask for a prompt makes two calls: the questions, answered in text
-    /// entries, then the prompt; Name it saves it through $EDITOR. Esc at a question or Cancel
+    /// entries, then the prompt; Name it saves it from the prompt box. Esc at a question or Cancel
     /// saves nothing.
     #[test]
     fn ask_for_a_prompt_asks_its_questions_then_writes_it() {
@@ -20439,14 +20565,19 @@ mod tests {
                 .any(|s| s.contains("wrote this prompt:\n\nReview the Rust diff and its tests."))
         );
         assert!(prompt_files(&prompts).unwrap().is_empty());
-        // Name it: saved through the editor under the checked name.
+        // Name it: the box opens on the draft (v7.8 ticket 49); Ctrl+S saves it under the
+        // checked name.
         keys.extend([Down, Enter]);
         keys.extend(typed("review-diff"));
-        keys.push(Enter);
+        keys.extend([Enter, CtrlS]);
         run(keys.clone()).0.unwrap();
         assert_eq!(prompt_files(&prompts).unwrap(), ["review-diff"]);
+        assert_eq!(
+            std::fs::read_to_string(prompts.join("review-diff")).unwrap(),
+            "Review the Rust diff and its tests.\n"
+        );
         // A name that leaves the folder is refused.
-        let mut bad = keys[..keys.len() - 12].to_vec();
+        let mut bad = keys[..keys.len() - 13].to_vec();
         bad.extend(typed("../x"));
         bad.push(Enter);
         assert!(run(bad).0.is_err());
@@ -24069,7 +24200,7 @@ mod tests {
         };
         let done = |n: usize| [vec![Down; n + 1], vec![Enter]].concat(); // past n steps and Add
         // Step 1 → Edit for this sequence only → Done.
-        let keys = [vec![Enter, Down, Down, Enter], done(1)].concat();
+        let keys = [vec![Enter, Down, Down, Enter, CtrlE, CtrlS], done(1)].concat();
         let (result, _) = run(keys, &Action::PromptSequence(vec![plan.clone()]), false);
         assert_eq!(
             result.unwrap(),
@@ -24129,7 +24260,7 @@ mod tests {
         );
         // A failed edit keeps the step and the file; so does an update that can't be written.
         std::fs::write(prompts.join("plan"), "Saved plan.\n").unwrap();
-        let keys = vec![Enter, Down, Down, Enter];
+        let keys = vec![Enter, Down, Down, Enter, CtrlE];
         let (result, _) = run(keys, &Action::PromptSequence(vec![plan.clone()]), true);
         assert!(
             result
@@ -24152,6 +24283,57 @@ mod tests {
             std::fs::read(prompts.join("plan")).unwrap(),
             b"Saved plan.\n"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.8 ticket 49: a step's own text reopens in the box with its lines and indentation;
+    /// what's typed there is the step's text after Ctrl+S, and Esc keeps it as it was.
+    #[test]
+    fn a_sequence_step_reopens_in_the_box_with_its_formatting() {
+        use crate::actions::{Action, Target};
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-seq-box-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let own = |text: &str| {
+            Action::PromptSequence(vec![Action::PromptOwn {
+                file: "plan".into(),
+                target: Target::Agent("claude".into()),
+                enter: true,
+                text: text.into(),
+            }])
+        };
+        let saved = own("Line 1\n  indented é");
+        let run = |keys: Vec<Key>| {
+            let mut ui = Script {
+                keys: keys.into(),
+                ..Default::default()
+            };
+            let result = prompt_sequence_action(&mut ui, &path, Some(&saved)).unwrap();
+            assert!(ui.keys.is_empty(), "keys left: {:?}", ui.keys);
+            (result, ui.screens)
+        };
+        let done = [Down, Down, Enter]; // past the step and Add
+        let (result, screens) = run([
+            vec![Enter, Down, Down, Enter, Character(b'!'), CtrlS],
+            done.to_vec(),
+        ]
+        .concat());
+        assert!(
+            screens
+                .iter()
+                .any(|s| s.contains("│ Line 1\n│   indented é▌")),
+            "{}",
+            screens.join("\n----\n")
+        );
+        assert_eq!(result, Some(own("Line 1\n  indented é!")));
+        let (result, _) = run([
+            vec![Enter, Down, Down, Enter, Character(b'!'), Escape],
+            done.to_vec(),
+        ]
+        .concat());
+        assert_eq!(result, Some(saved.clone()));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -24249,7 +24431,7 @@ mod tests {
         let keys = [
             vec![Down, Down, Down, Enter],
             typed("fresh"),
-            vec![Enter, Enter, Down, Enter],
+            vec![Enter, Enter, Down, Enter, CtrlE, CtrlS],
             vec![Down; 3],
             vec![Enter],
         ]
@@ -24296,7 +24478,7 @@ mod tests {
         let keys = [
             vec![Down, Down, Down, Enter],
             typed("follow-up"),
-            vec![Enter, Enter, Down, Enter],
+            vec![Enter, Enter, Down, Enter, CtrlE, CtrlS],
             vec![Down; 3],
             vec![Enter],
         ]
@@ -25855,7 +26037,7 @@ mod tests {
         let new_prompt = |name: &[u8]| {
             let mut keys = vec![Enter]; // "New prompt" (the only file entry)
             keys.extend(name.iter().map(|c| Character(*c)));
-            keys.extend([Enter, Enter, Enter]); // name, target claude, paste only
+            keys.extend([Enter, CtrlE, CtrlS, Enter, Enter]); // name, box -> editor -> save, target claude, paste only
             keys
         };
         let mut keys = vec![Enter, Down, Down, Down, Enter]; // learn A -> Prompt
@@ -30352,6 +30534,84 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7.8 ticket 49: a new prompt is written in the box: typed and pasted lines keep their
+    /// indentation, tabs and Unicode, the arrows move through the lines, Ctrl+S saves; it
+    /// reopens with that text, Esc leaves it as saved, and Ctrl+E hands the editor the
+    /// current draft and comes back with what the editor saved.
+    #[test]
+    fn prompt_box_writes_reopens_cancels_and_opens_the_editor() {
+        use Key::*;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-prompt-box-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let prompts = crate::actions::prompts_dir_for(&path).unwrap();
+        let mut keys = vec![Enter]; // New prompt
+        keys.extend(typed("plan"));
+        keys.push(Enter);
+        keys.extend(typed("Fix it"));
+        // Pasted: a newline, four spaces of indentation, Unicode, a tab.
+        keys.extend([Enter, Space, Space, Space, Space]);
+        keys.extend(typed("let"));
+        keys.extend([Space, Unicode('é'), Space, Character(b'='), Space]);
+        keys.extend(typed("1;"));
+        keys.extend([Enter, Tab]);
+        keys.extend(typed("done"));
+        keys.push(Unicode('🦀'));
+        // Up: line 2 at the same column; X goes in; Down: line 3's end; Backspace: the crab.
+        keys.extend([Up, Character(b'X'), Down, Backspace, CtrlS]);
+        // Reopen with Edit: the saved text; Z typed, then Esc.
+        keys.extend([Enter, Down, Enter, Character(b'Z'), Escape]);
+        // Edit again: ! typed, Ctrl+E opens the editor on that draft, Ctrl+S keeps its text.
+        keys.extend([Enter, Down, Enter, Character(b'!'), CtrlE, CtrlS, Escape]);
+        let mut ui = Script {
+            keys: keys.into(),
+            ..Default::default()
+        };
+        // The first save is checked when the Edit opens it again: hold the screens.
+        prompts_menu(&mut ui, &path).unwrap();
+        assert!(ui.keys.is_empty(), "keys left: {:?}", ui.keys);
+        let saved = "Fix it\n    leXt é = 1;\n\tdone";
+        let reopened = ui
+            .screens
+            .iter()
+            .find(|s| s.starts_with("Prompt plan\n") && s.contains("Z"))
+            .expect("the Edit box");
+        assert!(
+            reopened.contains("│ Fix it\n│     leXt é = 1;\n│     doneZ▌"),
+            "{reopened}"
+        );
+        assert_eq!(ui.editor_saw, [format!("{saved}!")]);
+        assert!(
+            ui.screens
+                .iter()
+                .any(|s| s.contains("│ Review this change."))
+        );
+        assert_eq!(
+            std::fs::read_to_string(prompts.join("plan")).unwrap(),
+            "Review this change.\n"
+        );
+        assert!(
+            !prompts.join(".plan.edit").exists(),
+            "no scratch left behind"
+        );
+        // Esc on a new prompt saves nothing.
+        let mut keys = vec![Down, Enter]; // New prompt (below plan)
+        keys.extend(typed("draft"));
+        keys.push(Enter);
+        keys.extend(typed("Not this"));
+        keys.extend([Escape, Escape]);
+        let mut ui = Script {
+            keys: keys.into(),
+            ..Default::default()
+        };
+        prompts_menu(&mut ui, &path).unwrap();
+        assert!(ui.keys.is_empty(), "keys left: {:?}", ui.keys);
+        assert_eq!(prompt_files(&prompts).unwrap(), ["plan"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// Ticket 13: the Prompts list reads, creates, edits and deletes; deleting a used prompt
     /// names its users; names that would leave the directory and failed edits change nothing.
     #[test]
@@ -30385,7 +30645,7 @@ mod tests {
         keys.extend([Enter, Enter, Escape]); // refused -> Back to name -> Prompts
         keys.extend([Down, Enter]); // New prompt
         keys.extend(typed("plan"));
-        keys.push(Enter); // created through the editor; list is now plan, review
+        keys.extend([Enter, CtrlE, CtrlS]); // the box -> external editor -> save; plan, review
         keys.extend([Down, Enter, Down, Down, Enter, Enter]); // review -> Delete -> Cancel
         keys.extend([Escape, Escape, Escape]);
         let mut ui = Script {
@@ -30407,7 +30667,7 @@ mod tests {
         // A failed edit keeps the old prompt and leaves no partial file behind.
         ui.edit_fails = true;
         ui.keys = [
-            Up, Enter, Down, Enter, Down, Enter, Enter, Escape, Escape, Escape,
+            Up, Enter, Down, Enter, Down, Enter, CtrlE, Enter, Escape, Escape, Escape,
         ]
         .into();
         agents_menu(&mut ui, &path).unwrap();

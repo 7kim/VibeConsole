@@ -289,7 +289,7 @@ New actions in `/configure` → **Action family**:
 
 A launcher pad can also **hold to quit**: holding it for one second while the app's window is open and not minimized closes the app; letting go early cancels. Shortcuts can be **one-tap**: they fire once per press, however long it's held. The T3 Code and herdr families exist but are parked.
 
-Prompts are plain UTF-8 files in `$XDG_CONFIG_HOME/vibeconsole/prompts/` (default `~/.config/vibeconsole/prompts/`); **New/Edit** opens `$VISUAL`, `$EDITOR`, or `nano`. Content is read at press time; empty or missing files show an error and send nothing.
+Prompts are plain UTF-8 files in `$XDG_CONFIG_HOME/vibeconsole/prompts/` (default `~/.config/vibeconsole/prompts/`); **New/Edit** opens a box inside VibeConsole (Enter: new line, Ctrl+S: save, Esc: cancel); Ctrl+E there opens `$VISUAL`, `$EDITOR`, or `nano` on the draft. Content is read at press time; empty or missing files show an error and send nothing.
 
 Any pad or piano mapping can fire **Held for 1 second (risky)**: an earlier release sends nothing, the screen shows arming progress, and pause, program change, disconnect, and exit cancel it. Prompt, command, and sequence actions fire once per press; pause cancels work not yet sent.
 

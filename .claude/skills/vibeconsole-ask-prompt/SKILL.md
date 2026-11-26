@@ -32,4 +32,4 @@ A good pad prompt:
 
 ## Before it's saved
 
-The prompt is shown; the user picks "Name it, then open it in $EDITOR", names it (letters, digits, `-`, `_` and `.`), edits, saves. A name that exists is refused.
+The prompt is shown; the user picks "Name it, then edit it", names it (letters, digits, `-`, `_` and `.`), edits it in the prompt box and saves with Ctrl+S. A name that exists is refused.
