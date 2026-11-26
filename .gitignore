@@ -19,6 +19,7 @@ v6-testedissues.md
 # Source licence unknown (assets/devices/split/CREDITS.md): never publish
 assets/devices/split/mpk-mini-blend-split.glb
 docs/claude-scripts/
+docs/claude-agents/
 docs/.working-version
 
 # Personal mise tasks (v7.7 ticket 263)
