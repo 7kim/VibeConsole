@@ -162,8 +162,10 @@ struct SpeedDevice {
     /// The Akai link test's line. Other MIDI inputs have only a press test.
     knob_test: Option<String>,
 }
+/// v7.8 ticket 57: armed by T; its three seconds start with the first knob report after it.
 struct KnobTest {
-    started: Instant,
+    armed: Instant,
+    first: Option<Instant>,
     source: Option<(u8, u8)>,
     stamps: Vec<u64>,
 }
@@ -181,6 +183,7 @@ struct Speed {
     kept: Vec<crate::speed::Kept>,
 }
 const LINK_TEST: Duration = Duration::from_secs(3);
+const KNOB_WAITS: &str = "ready: turn one knob; the 3 s start with its first report";
 const AKAI_PRESSES: usize = 10;
 
 trait Ui {
@@ -1350,11 +1353,12 @@ impl Terminal {
             device.test = format!("running: press pads (0 of {AKAI_PRESSES})");
             if let Some(row) = &mut device.knob_test {
                 speed.akai_knob = Some(KnobTest {
-                    started,
+                    armed: started,
+                    first: None,
                     source: None,
                     stamps: Vec::new(),
                 });
-                *row = "running: turn one knob (3 s left)".into();
+                *row = KNOB_WAITS.into();
             }
         }
     }
@@ -1371,8 +1375,8 @@ impl Terminal {
             return;
         };
         let source = (status & 0xf, cc);
-        if timing.received < test.started || timing.received - test.started >= LINK_TEST {
-            return;
+        if timing.received < test.armed {
+            return; // queued before T
         }
         if test.source.is_none()
             && program.is_some_and(|(_, payload)| (0..8).all(|k| payload[0x55 + 20 * k] != cc))
@@ -1381,7 +1385,11 @@ impl Terminal {
         }
         // Use just one CC source. With no verified program, the first CC can be identified
         // only by channel and number, so the test asks the user to turn one knob.
-        if *test.source.get_or_insert(source) == source {
+        if *test.source.get_or_insert(source) != source {
+            return;
+        }
+        let first = *test.first.get_or_insert(timing.received);
+        if timing.received.saturating_duration_since(first) < LINK_TEST {
             test.stamps.push(timing.stamp_us);
         }
     }
@@ -1468,12 +1476,18 @@ impl Terminal {
         if let (Some(test), Some(device)) = (&speed.akai_knob, &mut speed.akai)
             && let Some(row) = &mut device.knob_test
         {
-            let left = LINK_TEST.saturating_sub(test.started.elapsed());
-            if left.is_zero() {
-                let test = speed.akai_knob.take().unwrap();
-                finish_link(&device.name, &device.connection, row, "knob", &test.stamps);
-            } else {
-                *row = format!("running: turn one knob ({} s left)", left.as_secs() + 1);
+            match test
+                .first
+                .map(|first| LINK_TEST.saturating_sub(first.elapsed()))
+            {
+                None => *row = KNOB_WAITS.into(),
+                Some(left) if left.is_zero() => {
+                    let test = speed.akai_knob.take().unwrap();
+                    finish_link(&device.name, &device.connection, row, "knob", &test.stamps);
+                }
+                Some(left) => {
+                    *row = format!("running: turn one knob ({} s left)", left.as_secs() + 1)
+                }
             }
         }
         if let (Some(delays), Some(device)) = (&speed.akai_delays, &mut speed.akai)
@@ -31578,20 +31592,26 @@ mod tests {
             ..Speed::default()
         });
         ui.speed_start();
+        // v7.8 ticket 57: T arms it; the countdown waits for the first knob report.
+        ui.speed_tick();
+        assert!(ui.speed_rows().join("\n").contains(KNOB_WAITS));
+        ui.speed_knob(
+            [0xb0, program[0x55], 1],
+            midi::Timing {
+                received: Instant::now(),
+                stamp_us: 0,
+            },
+        );
+        ui.speed_tick();
         assert!(
             ui.speed_rows()
                 .join("\n")
                 .contains("turn one knob (3 s left)")
         );
+        ui.speed_start(); // again, armed three seconds ago, with no report yet
 
         let started = Instant::now() - LINK_TEST;
-        ui.speed
-            .as_mut()
-            .unwrap()
-            .akai_knob
-            .as_mut()
-            .unwrap()
-            .started = started;
+        ui.speed.as_mut().unwrap().akai_knob.as_mut().unwrap().armed = started;
         let cc = program[0x55];
         let other = (0..=127)
             .find(|cc| (0..8).all(|k| program[0x55 + 20 * k] != *cc))
@@ -31657,6 +31677,26 @@ mod tests {
         assert!(ui.speed_rows().join("\n").contains("MIDI input changed"));
         ui.speed_tick();
         assert_eq!(crate::speed::load(&ui.speed_file()), kept);
+
+        // v7.8 ticket 57: armed 10 s before the knob first moves, the window still gets its
+        // full three seconds from that first report.
+        ui.speed_start();
+        let now = Instant::now();
+        ui.speed.as_mut().unwrap().akai_knob.as_mut().unwrap().armed =
+            now - Duration::from_secs(13);
+        for i in 0..=10u64 {
+            let received = now - LINK_TEST + Duration::from_millis(i * 250);
+            ui.speed_knob(
+                [0xb0, cc, 1],
+                midi::Timing {
+                    received,
+                    stamp_us: 20_000_000 + 8_000 * i,
+                },
+            );
+        }
+        ui.speed_tick();
+        let rows = ui.speed_rows().join("\n");
+        assert!(rows.contains("knob, 3 s: 125 reports/s"), "{rows}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
