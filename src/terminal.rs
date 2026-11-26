@@ -13331,15 +13331,17 @@ fn set_star(path: &Path, key: &str, starred: bool) -> Result<()> {
     mappings::save_config(path, &config).map_err(stage("file I/O"))
 }
 /// v7.8 ticket 18: a list whose rows can be starred with F: (label, star key; "" can't be
-/// starred). Starred rows come first with ★; the answer is the row's own index.
+/// starred). Starred rows come first with ★; the answer is the row's own index. The cursor
+/// opens on `at`; only `saved` is marked "(saved)" (v7 ticket 55; v7.8 ticket 92: a row only
+/// visited isn't).
 fn choose_starred(
     ui: &mut impl Ui,
     path: &Path,
     title: &str,
     rows: &[(String, String)],
     mut at: Option<usize>,
+    saved: Option<usize>,
 ) -> Result<Option<usize>> {
-    let saved = at; // the saved choice keeps its "(saved)" mark (v7 ticket 55)
     loop {
         let stars = mappings::load_config(path)
             .map(|c| c.favourites)
@@ -13433,7 +13435,7 @@ fn family_rows(
         choose(ui, "That favourite is unavailable", &strings(&["Back"]))?;
         return Ok(None);
     }
-    choose_starred(ui, path, title, &rows, at)
+    choose_starred(ui, path, title, &rows, at, at)
 }
 
 /// v7.8 ticket 18: the word a family's star is saved under (`family:<word>`).
@@ -16808,9 +16810,11 @@ fn configure_steps(
                 let label = format!("★ Favourites ({} starred actions)", starred_actions.len());
                 rows.insert(0, (label, String::new()));
             }
-            let at = selected_family
-                .and_then(|f| offered.iter().position(|o| *o == f))
-                .map(|i| i + top);
+            let row_of = |family: Option<usize>| {
+                (family.and_then(|f| offered.iter().position(|o| *o == f))).map(|i| i + top)
+            };
+            let at = row_of(selected_family);
+            let saved_row = row_of(saved.as_ref().map(action_family));
             let family = if browsing_favourites {
                 match choose_favourite(ui, path, &starred_actions)? {
                     Some(family) => family,
@@ -16820,7 +16824,8 @@ fn configure_steps(
                     }
                 }
             } else {
-                let Some(row) = choose_starred(ui, path, "Action family", &rows, at)? else {
+                let Some(row) = choose_starred(ui, path, "Action family", &rows, at, saved_row)?
+                else {
                     continue 'control;
                 };
                 if top == 1 && row == 0 {
@@ -24334,6 +24339,59 @@ mod tests {
         assert_eq!(saved[0].control, button);
         assert_eq!(saved[0].action, crate::actions::Action::OutputMute);
         assert!(saved[0].risky);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.8 ticket 92: leaving a family the control isn't saved in puts the cursor back on it
+    /// without a "(saved)" mark; the saved family keeps its mark wherever the cursor is.
+    #[test]
+    fn only_the_saved_family_shows_saved() {
+        use Key::*;
+        let (dir, _terminal, _ran, [pad, ..]) = configure_session("visited-family");
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let families = |ui: &Script| {
+            (ui.screens.iter())
+                .filter(|s| s.starts_with("Action family"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        // Learn the pad, open Music & Sound, Esc back to the families, leave.
+        let mut ui = Script {
+            keys: [Enter, Down, Down, Enter, Escape, Escape, Escape].into(),
+            pads: [pad].into(),
+            ..Default::default()
+        };
+        configure(&mut ui, &path, &mut vec![]).unwrap();
+        let back = families(&ui).pop().unwrap();
+        assert!(back.contains("> Music & Sound"), "{back}");
+        assert!(!back.contains("(saved)"), "{back}");
+        assert!(mappings::load(&path).unwrap().is_empty());
+
+        let up = crate::actions::Action::Volume { up: true, step: 5 };
+        let volume = Mapping::new_action(pad, mappings::Input::Pad, up).unwrap();
+        mappings::save(&path, std::slice::from_ref(&volume)).unwrap();
+        // Learn it again, Replace, open Launch application, Esc back, leave.
+        let mut ui = Script {
+            keys: [
+                Enter, Down, Enter, Up, Enter, Escape, Escape, Escape, Escape,
+            ]
+            .into(),
+            pads: [pad].into(),
+            ..Default::default()
+        };
+        configure(&mut ui, &path, &mut vec![volume.clone()]).unwrap();
+        let screens = families(&ui);
+        assert!(
+            screens[0].contains("> Music & Sound  [x] (saved)"),
+            "{}",
+            screens[0]
+        );
+        let back = screens.last().unwrap();
+        assert!(back.contains("> Launch application"), "{back}");
+        assert!(back.contains("  Music & Sound  [x] (saved)"), "{back}");
+        assert!(!back.contains("Launch application  [x]"), "{back}");
+        assert_eq!(mappings::load(&path).unwrap(), [volume]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
