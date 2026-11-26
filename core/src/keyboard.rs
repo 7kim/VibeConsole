@@ -1382,7 +1382,9 @@ impl Output {
 impl Drop for Output {
     fn drop(&mut self) {
         if let Err(error) = self.pause() {
-            eprintln!("Key release failed: {error}; desktop recovery is unverified.");
+            crate::note(format_args!(
+                "Key release failed: {error}; desktop recovery is unverified."
+            ));
         }
     }
 }

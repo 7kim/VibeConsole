@@ -974,8 +974,8 @@ impl Drop for Controller {
     fn drop(&mut self) {
         if self.worker.is_some() {
             match self.finish() {
-                Ok(message) => eprintln!("{message}"),
-                Err(error) => eprintln!("{error}"),
+                Ok(message) => crate::note(message),
+                Err(error) => crate::note(error),
             }
         }
     }

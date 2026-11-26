@@ -31,7 +31,7 @@ impl<O, F: FnMut(&[&str]) -> Result<()>> Drop for Session<O, F> {
                 Ok(()) => "Login service: started again".to_owned(),
                 Err(e) => format!("Login service: not started: {e}; run vibeconsole startup-start"),
             };
-            eprintln!("{line}");
+            vibeconsole_core::note(&line); // v8 ticket 203: never panics on a closed terminal
             #[cfg(not(test))]
             journal(&line);
         }

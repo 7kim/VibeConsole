@@ -7,7 +7,7 @@ use vibeconsole_core::{
     keyboard, mappings, midi, motion, recording, screen, speed, status, usage, wake,
 };
 
-pub use vibeconsole_core::Result;
+pub use vibeconsole_core::{Result, note};
 /// Commands that only print die quietly on a closed pipe (`vibeconsole doctor | head`)
 /// instead of panicking. Not for the session or daemon: they must outlive a dead child's
 /// pipe so held keys are always released.

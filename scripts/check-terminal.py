@@ -412,3 +412,53 @@ for ending in (*STARTUP, "quit", "sigint", "sigterm", "configuration_error", "cu
                         child.wait(timeout=3)
             os.close(master)
             os.close(slave)
+
+
+# v8 ticket 203: the user closes the terminal window of a session that paused the login service.
+# A stand-in "service" holds the per-user lock (inside bwrap's own network namespace, so never the
+# real one); the fake systemctl reports it active and `stop` ends it, so the session takes over
+# (ticket 20). Closing the PTY's master is the closed window: every write then fails (EIO). The
+# session must exit without aborting and start the service again, as Ctrl+C does.
+HOLDER = ("import os, socket, sys, time\n"
+          "s = socket.socket(socket.AF_UNIX); s.bind('\\0vibeconsole-owner-%d' % os.geteuid()); s.listen(1)\n"
+          "open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(60)\n")
+with tempfile.TemporaryDirectory(prefix="vibeconsole-pty-") as directory:
+    config = Path(directory) / "vibeconsole"
+    config.mkdir()
+    contents = b"vibeconsole-mappings-v4\nidle\t-\t-\t-\n"
+    (config / "mappings.tsv").write_bytes(contents)
+    bin_dir = Path(directory) / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "lsusb").write_text("#!/bin/sh\nexit 1\n")
+    (bin_dir / "lsusb").chmod(0o755)
+    (bin_dir / "holder.py").write_text(HOLDER)
+    (bin_dir / "systemctl").write_text(
+        '#!/bin/sh\nd="$(dirname "$0")"\necho "$@" >> "$d/systemctl.log"\n[ "$1" = --user ] && shift\ncase "$1" in\n'
+        '  is-active) [ -e "$d/holder.pid" ] && exit 0; exit 3;;\n'
+        '  stop) kill "$(cat "$d/holder.pid")"; rm -f "$d/holder.pid"; sleep 0.3; exit 0;;\n'
+        '  start) exit 0;;\nesac\nexit 1\n')
+    (bin_dir / "systemctl").chmod(0o755)
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+    script = ('python3 "$0/holder.py" "$0/holder.pid" & '
+              'while [ ! -e "$0/holder.pid" ]; do sleep 0.05; done; '
+              '"$1"; echo $? > "$0/exit"')
+    child = subprocess.Popen(
+        [*HIDE_INPUT, "sh", "-c", script, str(bin_dir), str(binary)], stdin=slave, stdout=slave, stderr=slave,
+        env=dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ["PATH"], XDG_CONFIG_HOME=directory, XDG_RUNTIME_DIR=directory, XDG_DATA_HOME=directory, XDG_DATA_DIRS=directory, XDG_STATE_HOME=directory, TERM="xterm-256color"),
+    )
+    try:
+        screen = read_until_any(master, [MENU, b"What moved in 7.7"], seconds=8)
+        assert b"Login service paused for this session" in screen, screen[-300:]
+        os.close(master)  # the window closes
+        child.wait(timeout=10)
+        status = (bin_dir / "exit").read_text().strip()
+        assert status in ("0", "1"), f"exit status {status} (134 is SIGABRT: a panic during cleanup)"
+        calls = (bin_dir / "systemctl.log").read_text()
+        assert "start vibeconsole.service" in calls, calls
+        print("terminal_closed: PASS (no crash, the paused login service started again)")
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=3)
+        os.close(slave)

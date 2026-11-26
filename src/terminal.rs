@@ -1887,7 +1887,7 @@ impl Terminal {
         #[cfg(not(test))]
         match crate::status::state_dir().and_then(|dir| crate::control_socket::Server::bind(&dir)) {
             Ok(socket) => terminal.control_socket = Some(socket),
-            Err(error) => eprintln!("control socket unavailable: {error}"),
+            Err(error) => crate::note(format_args!("control socket unavailable: {error}")),
         }
         let Some(original) = original else {
             return Ok(terminal);
@@ -4571,7 +4571,9 @@ impl Terminal {
             };
             let last = Instant::now() + every > deadline;
             if !last && !self.stop.load(Ordering::Relaxed) {
-                eprintln!("Automatic Flow startup failed (try {tries}), retrying: {error}");
+                crate::note(format_args!(
+                    "Automatic Flow startup failed (try {tries}), retrying: {error}"
+                ));
                 let next = Instant::now() + every;
                 while Instant::now() < next && !self.stop.load(Ordering::Relaxed) {
                     if let Err(e) = self.tick() {
@@ -4589,12 +4591,12 @@ impl Terminal {
             }
             self.pause("automatic Flow startup failed")?;
             self.error = format!("Automatic Flow startup failed after {tries} tries: {error}");
-            eprintln!("{}", self.error);
+            crate::note(&self.error);
             return Ok(false);
         }
         self.pause("automatic Flow startup stopped")?;
         self.error = format!("Automatic Flow startup stopped after {tries} tries");
-        eprintln!("{}", self.error);
+        crate::note(&self.error);
         Ok(false)
     }
     fn transition(&mut self, pad: Control, active: bool) -> Result<()> {
@@ -6292,7 +6294,7 @@ impl Terminal {
         match restored {
             Ok(message) => {
                 if self.stop.load(Ordering::Relaxed) {
-                    eprintln!("{message}");
+                    crate::note(&message); // v8 ticket 203: the terminal may be gone
                 }
                 // v7 ticket 103: a restore result is a notice; a failed one is the Err below.
                 self.error.clear();
@@ -7526,7 +7528,7 @@ impl Drop for Terminal {
         }
         let _ = io::stdout().flush();
         if !self.quit_note.is_empty() {
-            eprintln!("{}", self.quit_note); // v7.7 ticket 255: on the restored terminal
+            crate::note(&self.quit_note); // v7.7 ticket 255: on the restored terminal
         }
     }
 }
@@ -7731,17 +7733,20 @@ impl Ui for Terminal {
                 && std::env::var("TERM").as_deref() != Ok("dumb"),
         );
         if screen != self.rendered {
+            // v8 ticket 203: a closed terminal is an error that ends the run through its normal
+            // cleanup, never a panic (`print!` panics on EIO).
+            let mut out = io::stdout().lock();
             if self.rendered_size != size {
-                print!("\x1b[2J\x1b[H{screen}");
+                write!(out, "\x1b[2J\x1b[H{screen}")?;
             } else {
                 let mut previous = self.rendered.lines();
                 for (index, row) in screen.lines().enumerate() {
                     if previous.next() != Some(row) {
-                        print!("\x1b[{};1H{row}\x1b[K", index + 1);
+                        write!(out, "\x1b[{};1H{row}\x1b[K", index + 1)?;
                     }
                 }
             }
-            io::stdout().flush()?;
+            out.flush()?;
             self.rendered = screen;
             self.rendered_size = size;
         }

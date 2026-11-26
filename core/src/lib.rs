@@ -60,9 +60,18 @@ pub fn emulated_log(file: &str, line: &str) {
             .open(dir.join(file))
             .and_then(|mut f| writeln!(f, "{line}"));
         if let Err(error) = written {
-            eprintln!("emulated run: {file}: {error}");
+            note(format_args!("emulated run: {file}: {error}"));
         }
     }
+}
+
+/// v8 ticket 203: a line on stderr that never panics. `eprintln!` panics when the terminal is
+/// gone (closed window: EIO); in a cleanup that panic aborts the run before held keys are
+/// released, owned lights restored or the login service started again. Cleanup and session
+/// notes use this instead: on a closed terminal they are simply not shown.
+pub fn note(line: impl std::fmt::Display) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "{line}");
 }
 
 use std::{collections::HashSet, process::Command};
