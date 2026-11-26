@@ -1747,6 +1747,16 @@ mod tests {
             controllers_line(Ok(&pads[..1]))
                 .contains("gilrs default mapping · LT and RT may not register · bus 0005")
         );
+        // A mapping name unlike the OS name shows once, as the details' "mapped as".
+        let renamed = ControllerConnection {
+            details: "USB · xone · mapped as Microsoft Xbox One".into(),
+            mapping_name: Some("Microsoft Xbox One".into()),
+            ..pad("Microsoft Xbox Controller", MappingSource::SdlMappings)
+        };
+        assert_eq!(
+            controllers_line(Ok(&[renamed])),
+            "Xbox controllers: Microsoft Xbox Controller (USB · xone · mapped as Microsoft Xbox One · SDL mapping · bus 0005 · vendor 045e · product 028e · version 1130)"
+        );
         let unavailable = checklist(
             &[],
             &None,

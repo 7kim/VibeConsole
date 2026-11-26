@@ -1057,8 +1057,12 @@ impl ControllerConnection {
     /// (the warning says it).
     pub fn mapping_details(&self) -> Option<String> {
         (self.mapping_source == MappingSource::SdlMappings).then(|| {
-            let name = self.mapping_name.as_deref().unwrap_or("name unknown");
-            format!("SDL mapping \"{name}\" · {}", self.ids())
+            match self.mapping_name.as_deref() {
+                // A name unlike the OS name is in the details already ("mapped as …").
+                Some(name) if name != self.name => format!("SDL mapping · {}", self.ids()),
+                Some(name) => format!("SDL mapping \"{name}\" · {}", self.ids()),
+                None => format!("SDL mapping \"name unknown\" · {}", self.ids()),
+            }
         })
     }
     pub fn mapping_warning(&self) -> Option<String> {
