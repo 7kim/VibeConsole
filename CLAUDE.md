@@ -13,15 +13,7 @@ Sections in this order, skipping empty ones:
 - **The idea**: ≤5 bullets.
 - **What we agreed on**: ≤5 bullets.
 - **How we will do it**: ≤3 bullets.
-- **Next ticket**: one box with the ticket Order of work picks next. When I ask what's left, show **Still open** instead: `tickets left` prints it (the working version's `ready-for-agent` and `ready-for-human` files as three box arrays titled with a count: Tickets left, Agent tests left, Developer tests left; three per row, wrapped; empty arrays skipped).
-
-  ```
-  Tickets left (2)
-  ┌────────────────────────┬────────────────────────┐
-  │ 03 first press fires   │ 04 flow start or       │
-  │                        │    repair              │
-  └────────────────────────┴────────────────────────┘
-  ```
+- **Next ticket**: the box `tickets next` prints. When I ask what's left, show **Still open** instead: the boxes `tickets left` prints. Show their output as is.
 - **What needs to be done**: ≤3 bullets.
 - **What we can do to make this better**: ≤3 numbered items.
 
@@ -29,10 +21,10 @@ Rules:
 
 - Short sentences, one idea per bullet, no preamble or conclusion.
 - "How does X work?" → answer with an ASCII/UML diagram.
-- Start "What needs to be done" only after I say `approved` or ask directly. One `approved` covers the whole list.
+- Start "What needs to be done" only after I say `approved`, `implement` or `go ahead`, or ask directly. One go-ahead covers one ticket.
 - `x` files every "make this better" item as a ticket, `x 2` only item 2; build nothing. Each is one `tickets file ideas <slug> "<title>" --section "<spec heading>" --body <file>` call (the next free number in the working version, plus its agent-test and developer-test files, all `Status: needs-triage`); the body file has `## Asked`, `Where`, `What`, `Today`, `Rules`, `Boxes`, `How to do`. When I ask to make them ready: one `tickets set NN … ready`.
-- Second-to-last line: what you skipped or didn't check, and any risk.
-- Last line, nothing after it: `Say approved to start.` when there's a "What needs to be done", `Reply x to file all as tickets, or x 2 for one.` when there's a "make this better".
+- Before the closing lines: what you skipped or didn't check, and any risk.
+- Closing lines, nothing after them: `Reply x to file all as tickets, or x 2 for one.` when there's a "make this better", then `Say approved to start.` when there's a "What needs to be done".
 
 ## Start here
 
@@ -77,7 +69,7 @@ Specs, tickets and tests are markdown under `docs/<version>/` (git-ignored: the 
 
 ### Order of work
 
-1. After `approved`, implement the working version's `ready-for-agent` tickets in the order `tickets next` gives (number order, blockers first), without stopping between them. A ticket's own acceptance tests (TDD, `cargo test`) belong to implementing it. Still stop before any controller write or real keyboard output the spec gates.
+1. After a go-ahead, implement the next `ready-for-agent` ticket `tickets next` gives (number order, blockers first), close it, then stop and show the next one. A ticket's own acceptance tests (TDD, `cargo test`) belong to implementing it. Still stop before any controller write or real keyboard output the spec gates.
 2. Only when all are implemented, test: run the agent tests, write the developer tests and their run order, run and close every developer test you can (above), record results. Then `mise run install`: it builds, stops VibeConsole (the login service and any terminal session), installs, and starts the service again. A running VibeConsole is no reason to skip it.
 
 ### Closing a ticket (before the next ticket and before committing)
