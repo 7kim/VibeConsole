@@ -1685,7 +1685,7 @@ mod tests {
         let mut config = Config::default();
         assert_eq!(config.tuning.layer, LAYER_DEFAULT, "LB by default");
         config.tuning.layer = 5;
-        let mut on = |control| {
+        let on = |control| {
             let mut m = mappings::Mapping::new(control, "F3", "hold").unwrap();
             m.context = mappings::GAMEPAD_CONTEXT;
             m
