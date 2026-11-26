@@ -57,6 +57,14 @@ How: by the builder, <in `cargo test` (name the test) / with the installed build
 ## Comments
 ```
 
+## Filing with `x`
+
+When the user replies `x` to "make this better", file every item as a ticket; `x 2` files only item 2. Build nothing.
+
+- Each item is one `tickets file ideas <slug> "<title>" --section "<spec heading>" --body <file>` call: the next free number in the working version, plus its agent-test and developer-test files, all `Status: needs-triage`.
+- The body file has `## Asked`, `Where`, `What`, `Today`, `Rules`, `Boxes`, `How to do` (`tickets help` lists them; a missing or extra section writes nothing).
+- When the user asks to make them ready: one `tickets set NN … ready`.
+
 ## When a skill says "publish to the issue tracker"
 
 Create a new file under `docs/<version>/tickets/<version>-<feature>/issues/` (next free number in the version, creating the directory if needed), plus its agent-test and developer-test files when it needs testing.

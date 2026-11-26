@@ -22,7 +22,7 @@ Rules:
 - Short sentences, one idea per bullet, no preamble or conclusion.
 - "How does X work?" → answer with an ASCII/UML diagram.
 - Start "What needs to be done" only after I say `approved`, `implement` or `go ahead`, or ask directly. One go-ahead covers one ticket.
-- `x` files every "make this better" item as a ticket, `x 2` only item 2; build nothing. Each is one `tickets file ideas <slug> "<title>" --section "<spec heading>" --body <file>` call (the next free number in the working version, plus its agent-test and developer-test files, all `Status: needs-triage`); the body file has `## Asked`, `Where`, `What`, `Today`, `Rules`, `Boxes`, `How to do`. When I ask to make them ready: one `tickets set NN … ready`.
+- `x` files every "make this better" item as a ticket, `x 2` only item 2; build nothing. How: "Filing with `x`" in `docs/agents/issue-tracker.md`.
 - Before the closing lines: what you skipped or didn't check, and any risk.
 - Closing lines, nothing after them: `Reply x to file all as tickets, or x 2 for one.` when there's a "make this better", then `Say approved to start.` when there's a "What needs to be done".
 
@@ -62,10 +62,9 @@ Rules:
 
 ## Agent skills
 
-Specs, tickets and tests are markdown under `docs/<version>/` (git-ignored: the repo is public; `docs/README.md` lists versions). Read `docs/agents/issue-tracker.md` before writing one. New work goes in the working version (`tickets use`); start a new version only when I say so. Domain docs: `docs/agents/domain.md`. Triage labels: `docs/agents/triage-labels.md`.
+Specs, tickets and tests: read `docs/agents/issue-tracker.md` (folders, templates, what each test holds) before writing one. New work goes in the working version (`tickets use`); start a new version only when I say so. Domain docs: `docs/agents/domain.md`. Triage labels: `docs/agents/triage-labels.md`.
 
-- **Agent tests** (`docs/<version>/agent-tests/`): what you check yourself: `cargo test`, the installed build's output, files on disk.
-- **Developer tests** (`docs/<version>/developer-tests/`): write them when a ticket is code-complete. Then run every box you can yourself (the emulators in `scripts/emulate/` for every device that has one, the PTY checks, the installed build's output, files on disk) and close each test your run fully shows with `tickets done NN --run "…"` (boxes ticked, `done <date>`, its Result naming the run). Hand me only what strictly needs me: real hardware effects (lights, rumble, sound heard, Bluetooth, battery, the real device's own bytes or timing), keys reaching a real app, logins, reboots, and judgement calls. When I ask which test to do, offer only those; never ask me to run them otherwise. Template and run order: `docs/agents/live-tests.md`.
+- **Developer tests:** write them when a ticket is code-complete. Then run every box you can yourself (the emulators in `scripts/emulate/` for every device that has one, the PTY checks, the installed build's output, files on disk) and close each test your run fully shows with `tickets done NN --run "…"` (boxes ticked, `done <date>`, its Result naming the run). Hand me only what strictly needs me: real hardware effects (lights, rumble, sound heard, Bluetooth, battery, the real device's own bytes or timing), keys reaching a real app, logins, reboots, and judgement calls. When I ask which test to do, offer only those; never ask me to run them otherwise. Template and run order: `docs/agents/live-tests.md`.
 
 ### Order of work
 
@@ -80,9 +79,4 @@ At a version's end, `tickets check` prints nothing (no implemented ticket still 
 
 ## Front end
 
-Before changing any page or window UI (today there is none; the Tauri desktop app idea would be the first), design it as a Claude design artifact (claude-artifacts `list_types`, a Design type) with the `ui-ux-pro-max` skill (scripts: `python3`).
-
-Components: add them with `bunx --bun shadcn@latest add @<registry>/<name>` in the front end's folder. Its registries are in that folder's `components.json`: `@shadcn` for dashboards, `@aceternity` for landing pages. Not there → 21st, through the `21st` plugin (`mcp__21st__*`, `21st:` skills). 21st free plan: search plus 2 code fetches a day, no AI generation.
-
-- "Change X in the artifact" → publish a new artifact version as the draft; leave the page's code alone.
-- `approved` → read the artifact's full code, `/to-spec` it with the artifact's slug and approved version, then build the page to match it exactly.
+Before changing any page or window UI (today there is none), load the `front-end` skill.
