@@ -1037,6 +1037,8 @@ pub struct ControllerConnection {
     /// v7.8 ticket 59: the mapping's own name, as gilrs gives it (None: not given).
     pub mapping_name: Option<String>,
     pub uuid: [u8; 16],
+    /// v7.8 ticket 82: where its battery comes from, or why there is none.
+    pub battery_source: String,
 }
 
 impl ControllerConnection {
@@ -1250,8 +1252,29 @@ pub fn bluez_power(
     }
     power
 }
-/// A controller's link, driver, battery and profile, as the header and doctor show them.
-fn details(pad: gilrs::Gamepad<'_>) -> Vec<String> {
+/// v7.8 ticket 82: where the battery shown (`shown`, after the BlueZ fallback) comes from, or
+/// why there is none, for `doctor --all`. `driver` is what gilrs read; never guessed.
+pub fn battery_source(driver: PowerInfo, shown: PowerInfo, link: Option<&str>) -> String {
+    let level = |power| power_parts(power, None).pop();
+    match (level(driver), level(shown), link) {
+        (Some(level), _, _) => format!("the driver reports {level}"),
+        (None, Some(level), _) => format!(
+            "the driver publishes none; BlueZ reports {}",
+            level.trim_start_matches("battery ")
+        ),
+        (None, None, Some("USB")) => "wired (no battery reported)".into(),
+        (None, None, Some("Bluetooth")) if crate::emulated().is_some() => {
+            "unavailable: the driver publishes no battery; an emulated run doesn't ask BlueZ".into()
+        }
+        (None, None, Some("Bluetooth")) => {
+            "unavailable: the driver publishes no battery and BlueZ reports none".into()
+        }
+        (None, None, _) => "unavailable: the driver publishes no battery".into(),
+    }
+}
+/// A controller's link, driver, battery and profile, as the header and doctor show them, and
+/// where its battery comes from (v7.8 ticket 82).
+fn details(pad: gilrs::Gamepad<'_>) -> (Vec<String>, String) {
     let sys = std::path::Path::new("/sys");
     let ids = (
         pad.os_name(),
@@ -1268,11 +1291,13 @@ fn details(pad: gilrs::Gamepad<'_>) -> Vec<String> {
         ids.2,
         &mut run_program(),
     );
-    [link.map(str::to_owned), driver]
+    let source = battery_source(pad.power_info(), power, link);
+    let parts = [link.map(str::to_owned), driver]
         .into_iter()
         .flatten()
         .chain(power_parts(power, profile))
-        .collect()
+        .collect();
+    (parts, source)
 }
 /// v7 ticket 129: which driver holds the controller now, from `bound_drivers`.
 pub fn driver_in_use(bound: &[&str]) -> Option<&'static str> {
@@ -2039,6 +2064,7 @@ impl Pad {
                     mapping_source: pad.mapping_source(),
                     mapping_name: None,
                     uuid: pad.uuid(),
+                    battery_source: String::new(),
                 };
                 let warning = connection.mapping_warning()?;
                 Some(format!("{}: {warning}", connection.name))
@@ -2069,7 +2095,7 @@ impl Pad {
         self.gilrs
             .gamepads()
             .find(|(_, pad)| crate::ours(pad.os_name()))
-            .map_or_else(Vec::new, |(_, pad)| details(pad))
+            .map_or_else(Vec::new, |(_, pad)| details(pad).0)
     }
     /// Each controller's name and connection, for `describe`.
     pub fn connections(&self) -> Vec<String> {
@@ -2085,7 +2111,7 @@ impl Pad {
             .filter(|(_, pad)| crate::ours(pad.os_name()))
             .map(|(_, pad)| {
                 // v7.8 tickets 08, 09: link, driver, battery, profile; else the bus as before.
-                let mut parts = details(pad);
+                let (mut parts, battery_source) = details(pad);
                 if parts.is_empty() {
                     parts.push(connection(pad.uuid()));
                 }
@@ -2099,6 +2125,7 @@ impl Pad {
                     mapping_source: pad.mapping_source(),
                     mapping_name: Some(pad.name().to_owned()).filter(|n| !n.is_empty()),
                     uuid: pad.uuid(),
+                    battery_source,
                 }
             })
             .collect()
@@ -2328,6 +2355,9 @@ mod tests {
             })
         };
         let header = |power| power_parts(power, Some(0)).join(" · ");
+        // v7.8 ticket 82: what doctor --all says the battery came from, for each case below.
+        let bt = Some("Bluetooth");
+        let source = |driver, shown, link| battery_source(driver, shown, link);
         let read = |run: &mut Runner| {
             bluez_power(
                 PowerInfo::Wired, // what gilrs says with no power_supply
@@ -2342,6 +2372,10 @@ mod tests {
         input("78:86:2e:b2:7d:d1", "0005");
         let power = read(&mut fake(Ok("(<byte 0x43>,)\n".into())));
         assert_eq!(header(power), "battery 67% · profile 0");
+        assert_eq!(
+            source(PowerInfo::Wired, power, bt),
+            "the driver publishes none; BlueZ reports 67%"
+        );
         assert_eq!(
             calls.lock().unwrap().as_slice(),
             [
@@ -2363,6 +2397,10 @@ mod tests {
         // No level (Percentage absent, BlueZ down) → no battery part, never guessed.
         let power = read(&mut fake(Err("gdbus: UnknownProperty".into())));
         assert_eq!(header(power), "profile 0");
+        assert_eq!(
+            source(PowerInfo::Wired, power, bt),
+            "unavailable: the driver publishes no battery and BlueZ reports none"
+        );
         // The driver's own level wins; nothing is asked.
         calls.lock().unwrap().clear();
         let mut run = fake(Ok("(<byte 0x43>,)".into()));
@@ -2375,11 +2413,21 @@ mod tests {
             &mut run,
         );
         assert_eq!(header(charging), "battery 40% charging · profile 0");
+        assert_eq!(
+            source(PowerInfo::Charging(40), charging, bt),
+            "the driver reports battery 40% charging"
+        );
         // USB, or a malformed address: refused before any call.
         input("78:86:2e:b2:7d:d1", "0003");
+        let usb = read(&mut fake(Ok("(<byte 0x43>,)".into())));
+        assert_eq!(header(usb), "profile 0");
         assert_eq!(
-            header(read(&mut fake(Ok("(<byte 0x43>,)".into())))),
-            "profile 0"
+            source(PowerInfo::Wired, usb, Some("USB")),
+            "wired (no battery reported)"
+        );
+        assert_eq!(
+            source(PowerInfo::Unknown, usb, Some("USB dongle")),
+            "unavailable: the driver publishes no battery"
         );
         input("78:86:2e:b2:7d:d1; reboot", "0005");
         assert_eq!(

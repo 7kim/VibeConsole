@@ -1293,6 +1293,7 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                 .map(|pad| pad.connection_info())
                 .map_err(|error| error.to_string());
             out.push(controllers_line(controllers.as_deref()));
+            out.extend(battery_lines(controllers.as_deref().unwrap_or_default()));
             out.push(crate::wake::line(
                 controllers.as_ref().map(|_| ()).map_err(Clone::clone),
             ));
@@ -1557,6 +1558,14 @@ fn orca_doctor(
         .collect()
 }
 
+/// v7.8 ticket 82: doctor --all's battery line for each controller: where its level comes
+/// from, or why there is none.
+fn battery_lines(controllers: &[ControllerConnection]) -> Vec<String> {
+    (controllers.iter())
+        .map(|pad| format!("Xbox battery: {}: {}", pad.name, pad.battery_source))
+        .collect()
+}
+
 /// doctor --all's controller line: each controller with its details, then its mapping:
 /// the fallback warning, or (v7.8 ticket 59) an SDL mapping's name and IDs.
 fn controllers_line(controllers: std::result::Result<&[ControllerConnection], &String>) -> String {
@@ -1650,6 +1659,7 @@ mod tests {
             mapping_source: crate::gamepad::MappingSource::SdlMappings,
             mapping_name: Some("Microsoft Xbox One".into()),
             uuid: [0; 16],
+            battery_source: String::new(),
         }];
         let list = checklist(&today, &Some("abc1234".into()), Ok(&pads)).join("\n");
         for line in [
@@ -1701,6 +1711,33 @@ mod tests {
     }
 
     #[test]
+    fn doctor_all_names_each_controllers_battery_source() {
+        let pad = |name: &str, source: &str| ControllerConnection {
+            name: name.into(),
+            details: "Bluetooth · xpadneo".into(),
+            mapping_source: crate::gamepad::MappingSource::SdlMappings,
+            mapping_name: None,
+            uuid: [0; 16],
+            battery_source: source.into(),
+        };
+        let pads = [
+            pad(
+                "Xbox Wireless Controller",
+                "the driver publishes none; BlueZ reports 67%",
+            ),
+            pad("Xbox Controller", "wired (no battery reported)"),
+        ];
+        assert_eq!(
+            battery_lines(&pads),
+            [
+                "Xbox battery: Xbox Wireless Controller: the driver publishes none; BlueZ reports 67%",
+                "Xbox battery: Xbox Controller: wired (no battery reported)",
+            ]
+        );
+        assert!(battery_lines(&[]).is_empty()); // none connected: the controller line says so
+    }
+
+    #[test]
     fn doctor_warns_for_default_and_unknown_xbox_mappings() {
         use crate::gamepad::MappingSource;
         let pad = |name: &str, mapping_source| ControllerConnection {
@@ -1709,6 +1746,7 @@ mod tests {
             mapping_source,
             mapping_name: Some(name.into()),
             uuid: [5, 0, 0, 0, 0x5e, 4, 0, 0, 0x8e, 2, 0, 0, 0x30, 0x11, 0, 0],
+            battery_source: String::new(),
         };
         let pads = [
             pad("Xbox, rev B", MappingSource::Driver),

@@ -18382,6 +18382,7 @@ mod tests {
                 mapping_source,
                 mapping_name: None,
                 uuid: [5, 0, 0, 0, 0x5e, 4, 0, 0, 0x8e, 2, 0, 0, 0x30, 0x11, 0, 0],
+                battery_source: String::new(),
             };
             pad.mapping_warning().map(|w| format!("{}: {w}", pad.name))
         };
