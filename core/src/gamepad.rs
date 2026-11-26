@@ -1941,6 +1941,25 @@ impl Pad {
             let _ = effect.stop();
         }
     }
+    /// v7.8 ticket 60: doctor's fallback-mapping warning for each connected controller that
+    /// has one, named (read from gilrs only: no sysfs, no write).
+    pub fn mapping_warnings(&self) -> Vec<String> {
+        self.gilrs
+            .gamepads()
+            .filter(|(_, pad)| crate::ours(pad.os_name()))
+            .filter_map(|(_, pad)| {
+                let connection = ControllerConnection {
+                    name: pad.os_name().into(),
+                    details: String::new(),
+                    mapping_source: pad.mapping_source(),
+                    mapping_name: None,
+                    uuid: pad.uuid(),
+                };
+                let warning = connection.mapping_warning()?;
+                Some(format!("{}: {warning}", connection.name))
+            })
+            .collect()
+    }
     pub fn connected(&self) -> Vec<String> {
         self.gilrs
             .gamepads()

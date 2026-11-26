@@ -1234,7 +1234,8 @@ impl Terminal {
             .as_ref()
             .zip(connected.as_deref())
             .map(|(pad, names)| (names, &pad.down, pad.analog));
-        xbox_group(xbox, |c| live && self.note_light(c, now), width)
+        let warnings = (self.gamepad.as_ref()).map_or_else(Vec::new, |pad| pad.mapping_warnings());
+        xbox_group(xbox, &warnings, |c| live && self.note_light(c, now), width)
     }
 
     fn detect(&mut self) -> Result<()> {
@@ -7809,6 +7810,7 @@ fn xbox_group(
         &std::collections::HashSet<Control>,
         crate::gamepad::Analog,
     )>,
+    warnings: &[String],
     lit: impl Fn(Control) -> bool,
     width: usize,
 ) -> Vec<String> {
@@ -7838,11 +7840,15 @@ fn xbox_group(
     for (name, (x, y)) in [("Left", analog.left), ("Right", analog.right)] {
         items.push(format!("{name} stick x {x:+.2} y {y:+.2}"));
     }
-    group(
-        &format!("Xbox · {}", names.join(", ")),
-        &grid(&items, width.saturating_sub(4)),
-        width,
-    )
+    // v7.8 ticket 60: doctor's warning when LT and RT may not register (red rows).
+    let mut lines = grid(&items, width.saturating_sub(4));
+    for warning in warnings {
+        lines.extend(crate::screen::wrap(
+            &format!("⚠ {warning}"),
+            width.saturating_sub(4),
+        ));
+    }
+    group(&format!("Xbox · {}", names.join(", ")), &lines, width)
 }
 
 /// v7.8 ticket 07: a program picked in program select.
@@ -18028,6 +18034,7 @@ mod tests {
         let now = Instant::now();
         let rows = xbox_group(
             Some((&["Xbox Series X Controller".to_string()], &held, analog)),
+            &[],
             |c| ui.note_light(c, now),
             120,
         )
@@ -18042,8 +18049,46 @@ mod tests {
         assert!(rows.contains("LT 50%") && rows.contains("RT 0%"), "{rows}");
         assert!(rows.contains("Left stick x +0.00 y -1.00"), "{rows}");
         assert!(rows.contains("Right stick x +0.25 y +0.00"), "{rows}");
-        let none = xbox_group(None, |_| false, 120).join("\n");
+        let none = xbox_group(None, &[], |_| false, 120).join("\n");
         assert!(none.contains("No Xbox controller"), "{none}");
+        // v7.8 ticket 60: doctor's fallback warning, with that controller's IDs; an SDL
+        // mapping has none; an unknown source says it is unknown.
+        use crate::gamepad::{ControllerConnection, MappingSource};
+        let warning = |mapping_source| {
+            let pad = ControllerConnection {
+                name: "Xbox, rev B".into(),
+                details: String::new(),
+                mapping_source,
+                mapping_name: None,
+                uuid: [5, 0, 0, 0, 0x5e, 4, 0, 0, 0x8e, 2, 0, 0, 0x30, 0x11, 0, 0],
+            };
+            pad.mapping_warning().map(|w| format!("{}: {w}", pad.name))
+        };
+        let shown = |warnings: Vec<String>| {
+            xbox_group(
+                Some((&["Xbox, rev B".to_string()], &held, analog)),
+                &warnings,
+                |_| false,
+                120,
+            )
+            .join("\n")
+            .replace('│', " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+        };
+        let default = shown(warning(MappingSource::Driver).into_iter().collect());
+        assert!(
+            default.contains("⚠ Xbox, rev B: gilrs default mapping · LT and RT may not register · bus 0005 · vendor 045e · product 028e · version 1130"),
+            "{default}"
+        );
+        assert_eq!(warning(MappingSource::SdlMappings), None);
+        assert!(!shown(Vec::new()).contains('⚠'));
+        let unknown = shown(warning(MappingSource::None).into_iter().collect());
+        assert!(
+            unknown.contains("⚠ Xbox, rev B: gilrs mapping source unknown · LT and RT unverified"),
+            "{unknown}"
+        );
     }
 
     /// v7 ticket 44: detect suspends the session, so pressing mapped Xbox buttons there
