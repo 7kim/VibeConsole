@@ -65,7 +65,7 @@ Read `docs/agents/issue-tracker.md` before writing a spec, ticket or test. New w
 
 1. After a go-ahead: one `ready-for-agent` ticket from `tickets next`, test-first, then stop. Stop before any spec-gated controller write or real keyboard output.
 2. Close: `cargo-gate` → `tickets close` (my passes: `--user-said`) → re-read → commit and push (`claude-scripts` too if it changed).
-3. Version end: agent tests → developer tests (above) → `tickets check` silent → `mise run install`, even if VibeConsole runs.
+3. Version end: agent tests → developer tests (above) → `tickets check` silent → `mise run install`, even if VibeConsole runs → `version-end`, whose last step pushes the closed version to GitHub (`tickets push`).
 
 ## Front end
 
