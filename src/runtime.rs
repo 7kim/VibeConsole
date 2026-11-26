@@ -1106,7 +1106,9 @@ fn checklist(
         out.push(row(mark, label, detail));
     }
     // Agents and hooks.
-    let hooks = group(&["Claude Code status hooks", "Codex status hooks"]);
+    // v7.8 ticket 74: each agent tool's line (`status::Tool::hooks_status`).
+    let labels = crate::status::TOOLS.map(|tool| format!("{} status hooks", tool.name));
+    let hooks = group(&labels.each_ref().map(String::as_str));
     if !hooks.is_empty() {
         let missing = hooks
             .iter()
@@ -1454,8 +1456,8 @@ pub fn command(command: &str, flags: &[String]) -> Result<()> {
                     ));
                 }
             }
-            for codex in [false, true] {
-                out.push(format!("{}", crate::status::hooks_status(codex)));
+            for tool in crate::status::TOOLS {
+                out.push(tool.hooks_status());
             }
             let answering = vibeconsole_core::program("gdbus")
                 .args([

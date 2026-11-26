@@ -554,7 +554,7 @@ struct Terminal {
     /// Install status of each agent on 3 Agents.
     agents_found: Vec<Option<String>>,
     /// v7.8 ticket 50: 3 Agents' Claude Code and Codex rows: CLI, hooks, last report.
-    reporting: [String; 2],
+    reporting: [String; crate::status::TOOLS.len()],
     lookup_path: Option<String>,
     #[cfg(test)]
     lookup_home: Option<PathBuf>,
@@ -2857,41 +2857,40 @@ impl Terminal {
             self.menu = row;
         }
     }
-    /// v7.8 ticket 50: for Claude Code and Codex, whether the CLI was found, whether its
-    /// settings hold every VibeConsole hook, and the last report a hook sent from it.
-    fn reporting_rows(&self) -> [String; 2] {
+    /// v7.8 ticket 50: for each agent tool (v7.8 ticket 74: `status::TOOLS`), whether the
+    /// CLI was found, whether its settings hold every VibeConsole hook, and the last report a
+    /// hook sent from it.
+    fn reporting_rows(&self) -> [String; crate::status::TOOLS.len()] {
         #[cfg(test)]
         let test_home = self.lookup_home.clone();
         #[cfg(not(test))]
         let test_home: Option<PathBuf> = None;
-        let (hooks, dir) = match test_home {
-            Some(home) => (
-                [
-                    home.join(".claude/settings.json"),
-                    home.join(".codex/hooks.json"),
-                ]
-                .map(Ok),
-                Ok(home.join("run")),
-            ),
-            None => (
-                [false, true].map(crate::status::hooks_file),
-                crate::status::state_dir(),
-            ),
+        let dir = match &test_home {
+            Some(home) => Ok(home.join("run")),
+            None => crate::status::state_dir(),
         };
         let now = std::time::SystemTime::now();
-        [(0, "Claude Code", "claude"), (1, "Codex", "codex")].map(|(i, tool, kind)| {
-            let cli = match self.agents_found.get(i) {
+        crate::status::TOOLS.map(|tool| {
+            let found = mappings::AGENT_TABLE
+                .iter()
+                .position(|(_, program, _)| *program == tool.program)
+                .and_then(|i| self.agents_found.get(i));
+            let cli = match found {
                 Some(Some(_)) => "CLI found",
                 _ => "CLI not found",
             };
-            let hooks = match &hooks[i] {
-                Ok(path) => crate::status::hooks_summary(path, i == 1),
+            let file = match &test_home {
+                Some(home) => Ok(home.join(tool.folder).join(tool.file)),
+                None => tool.hooks_file(),
+            };
+            let hooks = match file {
+                Ok(path) => tool.hooks_summary(&path),
                 Err(_) => "hooks unreadable".into(),
             };
             let report = match dir
                 .as_ref()
                 .ok()
-                .and_then(|d| crate::status::last_report(d, kind))
+                .and_then(|d| crate::status::last_report(d, tool.program))
             {
                 Some((at, state)) => format!(
                     "last report{} ago: {}",
@@ -2900,7 +2899,10 @@ impl Terminal {
                 ),
                 None => "no report received yet".into(),
             };
-            format!("{tool} · {cli} · {hooks} · {report} · Enter: install or repair hooks")
+            format!(
+                "{} · {cli} · {hooks} · {report} · Enter: install or repair hooks",
+                tool.name
+            )
         })
     }
     /// v7.7 ticket 152: a tab's panes (Live's from [`Self::live_panes`]); one-line entries
@@ -2987,7 +2989,7 @@ impl Terminal {
                     head("Lights"),
                     one(
                         format!("Status lights · {}", on(config.status_lights)),
-                        Some(AGENT + n + 3),
+                        Some(AGENT + n + crate::status::TOOLS.len() + 1),
                     ),
                     one(
                         format!(
@@ -3005,8 +3007,12 @@ impl Terminal {
                         Some(SETTING + 5),
                     ),
                     head("Reporting"),
-                    one(self.reporting[0].clone(), Some(AGENT + n + 1)),
-                    one(self.reporting[1].clone(), Some(AGENT + n + 2)),
+                ]);
+                // v7.8 ticket 74: one row per agent tool, opening its hook setup.
+                for (i, row) in self.reporting.iter().enumerate() {
+                    rows.push(one(row.clone(), Some(AGENT + n + 1 + i)));
+                }
+                rows.extend([
                     (
                         vec![format!(
                             "Install /skills · {} VibeConsole skills → ~/.claude/skills · {}",
@@ -8867,11 +8873,8 @@ fn agents_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 format!("{} | {host} | {}", a.name, crate::status::read(&a.name))
             })
             .collect::<Vec<_>>();
-        choices.extend(strings(&[
-            "Add agent",
-            "Claude Code status hooks",
-            "Codex status hooks",
-        ]));
+        choices.push("Add agent".into());
+        choices.extend(crate::status::TOOLS.map(|tool| format!("{} status hooks", tool.name)));
         choices.push(format!(
             "Status lights: {} (tempo, arpeggiator and octave lights follow agent status)",
             if config.status_lights { "On" } else { "Off" }
@@ -8884,44 +8887,43 @@ fn agents_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
     }
 }
 /// One row of the Agents list (v7.7 ticket 152: also a row of 3 Agents): agent `index`,
-/// then Add agent, Claude Code hooks, Codex hooks, Status lights, Prompts.
+/// then Add agent, each agent tool's hooks (`status::TOOLS`), Status lights, Prompts.
 fn agent_choice(ui: &mut impl Ui, path: &Path, index: usize) -> Result<()> {
     let mut config = mappings::load_config(path)?;
-
-    if index == config.agents.len() + 4 {
+    let lights = config.agents.len() + crate::status::TOOLS.len() + 1;
+    if index == lights + 1 {
         prompts_menu(ui, path)?;
         return Ok(());
     }
-    if index == config.agents.len() + 3 {
+    if index == lights {
         config.status_lights = !config.status_lights;
         if let Err(error) = mappings::save_config(path, &config) {
             not_saved(ui, &error)?;
         }
         return Ok(());
     }
-    if let Some(which @ (1 | 2)) = index.checked_sub(config.agents.len()) {
-        let codex = which == 2;
-        let hooks = if codex {
-            crate::status::codex_hooks()
-        } else {
-            crate::status::claude_hooks()
-        };
+    // v7.8 ticket 74: one row per agent tool, after the agents.
+    if let Some(tool) = (index.checked_sub(config.agents.len() + 1))
+        .and_then(|i| crate::status::TOOLS.get(i))
+        .copied()
+    {
+        let hooks = tool.hooks();
         let text = format!(
             "{}\nInstall merges only the missing entries, after a backup. Hooks report only for agents VibeConsole started in tmux; `vibeconsole` must be on PATH.\n\n{hooks}",
-            crate::status::hooks_status(codex)
+            tool.hooks_status()
         );
         match question(
             ui,
             &text,
             &strings(&["Install (merge, with backup)", "Copy with wl-copy", "Back"]),
         )? {
-            Some(0) => match crate::status::install_hooks(codex).and_then(|note| {
-                if codex {
+            Some(0) => match tool.install_hooks().and_then(|note| {
+                if !tool.statusline {
                     return Ok(note);
                 }
                 // v7.7 ticket 162: Claude Code's status line reports context and tokens.
                 let line = crate::status::install_statusline(
-                    &crate::status::hooks_file(false)?,
+                    &tool.hooks_file()?,
                     &crate::runtime::statusline_saved()?,
                 )
                 .unwrap_or_else(|e| format!("Status line not changed: {e}"));
@@ -9151,10 +9153,6 @@ fn settings_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
                 config.tuning.dead_zone, config.tuning.trigger
             ),
             format!(
-                "App profiles ({}): pads that change with the focused app",
-                config.profiles.len()
-            ),
-            format!(
                 "Favourites ({}): ★ assignments and profiles, listed first",
                 config.favourites.len()
             ),
@@ -9163,7 +9161,8 @@ fn settings_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
         let Some(choice) = choose(ui, "Settings", &rows)? else {
             return Ok(());
         };
-        setting(ui, path, choice)?;
+        // v7.8 ticket 74: App profiles (9) is only the 6 Apps & profiles tab now.
+        setting(ui, path, choice + usize::from(choice >= 9))?;
     }
 }
 
@@ -9201,7 +9200,6 @@ fn setting(ui: &mut impl Ui, path: &Path, choice: usize) -> Result<()> {
         6 => login_menu(ui),
         7 => midi_device_menu(ui, path),
         8 => tuning_menu(ui, path),
-        9 => profiles_menu(ui, path),
         10 => favourites_menu(ui, path),
         12 => sound_menu(ui, path),
         _ => presets_menu(ui, path),
@@ -9333,60 +9331,9 @@ fn sound_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
     }
 }
 
-/// Settings -> App profiles (v7 ticket 12): while one of a profile's apps is focused, its
-/// pads and buttons replace Default; every other control and every other app use Default.
-fn profiles_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
-    loop {
-        let config = mappings::load_config(path)?;
-        let mut items = config
-            .profiles
-            .iter()
-            .map(|p| {
-                format!(
-                    "{} ({}; {} overrides)",
-                    p.name,
-                    if p.apps.is_empty() {
-                        "no apps".to_owned()
-                    } else {
-                        p.apps.join(", ")
-                    },
-                    p.mappings.len()
-                )
-            })
-            .collect::<Vec<_>>();
-        items.push("New profile".into());
-        items.push(format!(
-            "Import a profile file (from {})",
-            beside(path, "profiles").display()
-        ));
-        items.push("Ask Claude for a profile…".into());
-        // v7.8 ticket 18: F stars a profile (it lists first); the other rows can't be starred.
-        let rows = items
-            .into_iter()
-            .enumerate()
-            .map(|(i, label)| {
-                let key = config
-                    .profiles
-                    .get(i)
-                    .map_or_else(String::new, |p| mappings::profile_favourite_key(&p.name));
-                (label, key)
-            })
-            .collect::<Vec<_>>();
-        let Some(choice) = choose_starred(
-            ui,
-            path,
-            "App profiles: apps without a profile use Default",
-            &rows,
-            None,
-        )?
-        else {
-            return Ok(());
-        };
-        profile_choice(ui, path, choice)?;
-    }
-}
-/// One row of App profiles (v7.7 ticket 152: also a row of 6 Apps & profiles): profile
-/// `choice`, then New profile, Import a profile file, Ask Claude for a profile.
+/// One row of 6 Apps & profiles (v7.7 ticket 152; v7.8 ticket 74: the only profiles list):
+/// profile `choice`, then New profile, Import a profile file, Ask Claude for a profile. While
+/// one of a profile's apps is focused, its pads and buttons replace Default (v7 ticket 12).
 fn profile_choice(ui: &mut impl Ui, path: &Path, choice: usize) -> Result<()> {
     let config = mappings::load_config(path)?;
     let result = match config.profiles.get(choice) {
@@ -16946,13 +16893,8 @@ const TABS: [(&str, TabRows); 10] = [
             ),
         ],
     ),
-    (
-        "6 Apps & profiles",
-        &[(
-            "App profiles",
-            Some((SETTING + 9, "Pads that change with the focused app.")),
-        )],
-    ),
+    // v7.8 ticket 74: its rows are the profiles themselves (`Terminal::tab_panes`).
+    ("6 Apps & profiles", &[]),
     (
         "7 Xbox",
         &[(
@@ -20635,7 +20577,7 @@ mod tests {
         std::fs::create_dir_all(dir.join(".claude")).unwrap();
         std::fs::write(
             dir.join(".claude/settings.json"),
-            crate::status::claude_hooks(),
+            crate::status::TOOLS[0].hooks(),
         )
         .unwrap();
         std::fs::create_dir_all(dir.join(".codex")).unwrap();
@@ -22231,6 +22173,14 @@ mod tests {
         assert_eq!(
             login[0].0,
             "Start the service when this session closes → 8 System"
+        );
+        // v7.8 ticket 74: the old Settings › App profiles is the 6 Apps & profiles tab.
+        let profiles = ui.find_matches("app profiles");
+        assert!(
+            profiles.iter().any(|(label, tab, _)| label
+                == "Settings › App profiles → 6 Apps & profiles"
+                && *tab == 5),
+            "{profiles:?}"
         );
 
         // What moved: a v32 file hasn't seen it.
@@ -24443,8 +24393,9 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// v7 ticket 12: Settings -> App profiles creates a profile for an installed app, maps
-    /// its pads (overrides only, no feedback step) and deletes it; Default is untouched.
+    /// v7 ticket 12: 6 Apps & profiles creates a profile for an installed app, maps its pads
+    /// (overrides only, no feedback step) and deletes it; Default is untouched. Each part is
+    /// Enter on a row of the tab (v7.8 ticket 74: the only profiles list).
     #[test]
     fn app_profiles_are_created_edited_and_deleted() {
         use Key::*;
@@ -24456,28 +24407,29 @@ mod tests {
         let pad = Control::from_note(10, 36).unwrap();
         let default = Mapping::new(pad, "F1", "hold").unwrap();
         mappings::save(&path, &[default.clone()]).unwrap();
-        let mut keys = vec![Down; 9];
-        keys.push(Enter); // App profiles
-        keys.push(Enter); // New profile
-        keys.extend(b"Firefox".iter().map(|b| Character(*b)));
+        let mut keys = b"Firefox".iter().map(|b| Character(*b)).collect::<Vec<_>>();
         keys.extend([Enter, Enter]); // name, the app
-        keys.extend([Enter, Enter]); // Firefox, edit its pads
-        keys.extend([Enter, Enter, Enter, Enter, Space, Enter]); // learn, Ctrl
-        keys.extend(std::iter::repeat_n(Down, 7));
-        keys.extend([Enter, Enter, Enter]); // done, hold, fire when: no feedback step
-        keys.extend([Down, Enter]); // save and finish
-        keys.push(Escape); // leave the profiles list
-        keys.push(Escape); // leave Settings
         let mut ui = Script {
             keys: keys.into(),
-            pads: [pad].into(),
             apps: vec![(
                 "Firefox".into(),
                 "/usr/share/applications/firefox.desktop".into(),
             )],
             ..Default::default()
         };
-        settings_menu(&mut ui, &path).unwrap();
+        tab_row(&mut ui, &path, PROFILE).unwrap(); // New profile: no profile yet
+        assert!(ui.keys.is_empty());
+        let mut keys = vec![Enter]; // edit its pads
+        keys.extend([Enter, Enter, Enter, Enter, Space, Enter]); // learn, Ctrl
+        keys.extend(std::iter::repeat_n(Down, 7));
+        keys.extend([Enter, Enter, Enter]); // done, hold, fire when: no feedback step
+        keys.extend([Down, Enter]); // save and finish
+        let mut ui = Script {
+            keys: keys.into(),
+            pads: [pad].into(),
+            ..Default::default()
+        };
+        tab_row(&mut ui, &path, PROFILE).unwrap(); // Firefox, now the first row
         assert!(ui.keys.is_empty());
         let config = mappings::load_config(&path).unwrap();
         assert_eq!(config.mappings, [default.clone()], "Default untouched");
@@ -24488,13 +24440,12 @@ mod tests {
         let set = mappings::overlay(&config.mappings, Some(profile), 0);
         assert_eq!(set[0].keys, ["Ctrl"]);
 
-        let mut keys = vec![Down; 9];
-        keys.extend([Enter, Enter, Down, Down, Enter, Down, Enter, Escape, Escape]);
         let mut ui = Script {
-            keys: keys.into(),
+            keys: [Down, Down, Enter, Down, Enter].into(), // Delete, Yes
             ..Default::default()
         };
-        settings_menu(&mut ui, &path).unwrap();
+        tab_row(&mut ui, &path, PROFILE).unwrap(); // Firefox
+        assert!(ui.keys.is_empty());
         let config = mappings::load_config(&path).unwrap();
         assert!(config.profiles.is_empty());
         assert_eq!(config.mappings, [default]);
@@ -24519,21 +24470,18 @@ mod tests {
             mappings: vec![Mapping::new(pad, "Ctrl+T", "hold").unwrap()],
         });
         mappings::save_config(&path, &config).unwrap();
-        let profiles = |keys: Vec<Key>| {
-            let mut all = vec![Down; 9];
-            all.push(Enter);
-            all.extend(keys);
-            all.extend([Escape, Escape]);
+        // Enter on row `row` of 6 Apps & profiles (v7.8 ticket 74), then `keys`.
+        let profiles = |row: usize, keys: Vec<Key>| {
             let mut ui = Script {
-                keys: all.into(),
+                keys: keys.into(),
                 ..Default::default()
             };
-            settings_menu(&mut ui, &path).unwrap();
+            tab_row(&mut ui, &path, PROFILE + row).unwrap();
             assert!(ui.keys.is_empty());
             ui.screens
         };
         // Export: Firefox -> Export to a file -> Back.
-        profiles(vec![Enter, Down, Down, Down, Enter, Enter]);
+        profiles(0, vec![Down, Down, Down, Enter, Enter]);
         let file = dir.join("profiles/Firefox.profile");
         assert!(
             std::fs::read_to_string(&file)
@@ -24541,9 +24489,9 @@ mod tests {
                 .starts_with("vibeconsole-profile-v1\n")
         );
         // Delete it, then import it back.
-        profiles(vec![Enter, Down, Down, Enter, Down, Enter]);
+        profiles(0, vec![Down, Down, Enter, Down, Enter]);
         assert!(mappings::load_config(&path).unwrap().profiles.is_empty());
-        profiles(vec![Down, Enter, Enter]);
+        profiles(1, vec![Enter]); // Import a profile file
         assert_eq!(
             mappings::load_config(&path).unwrap().profiles,
             config.profiles
@@ -24555,7 +24503,7 @@ mod tests {
         )
         .unwrap();
         let before = config_bytes(&path);
-        let screens = profiles(vec![Down, Down, Enter, Enter, Enter]);
+        let screens = profiles(2, vec![Enter, Enter]); // Import a profile file
         assert!(
             screens
                 .iter()
@@ -26005,7 +25953,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("presets")).unwrap();
         let tsv = "vibeconsole-mappings-v1\n09e8:1049\tnote\t10\t36\thold\tShift\n";
         std::fs::write(dir.join("presets/Old.preset"), tsv).unwrap();
-        let mut keys = vec![Down; 11];
+        let mut keys = vec![Down; 10]; // Presets (v7.8 ticket 74: App profiles left Settings)
         keys.extend([Enter, Enter, Enter, Enter, Escape, Escape]); // Presets -> Old -> Load -> Back
         let mut ui = Script {
             keys: keys.into(),
@@ -26057,7 +26005,7 @@ mod tests {
         let a = Mapping::new(Control::from_note(10, 36).unwrap(), "F1", "hold").unwrap();
         mappings::save(&path, &[a.clone()]).unwrap();
         let presets = |keys: Vec<Key>| {
-            let mut all = vec![Down; 11];
+            let mut all = vec![Down; 10]; // Presets
             all.push(Enter);
             all.extend(keys);
             all.extend([Escape, Escape]);
@@ -26138,7 +26086,7 @@ mod tests {
                 .map(|m| m.keys.join("+"))
         };
         let presets = |keys: Vec<Key>| {
-            let mut all = vec![Down; 11];
+            let mut all = vec![Down; 10]; // Presets
             all.push(Enter);
             all.extend(keys);
             all.extend([Escape, Escape]);
@@ -26259,12 +26207,9 @@ mod tests {
             mappings::export_profile(&profile).unwrap()
         );
         let ask = |claude: String, confirm: Vec<Key>| {
-            let mut keys = vec![Down; 9];
-            keys.extend([Enter, Down, Down, Enter]); // App profiles -> Ask Claude
-            keys.extend([Enter, Enter]); // the app, no wish
+            let mut keys = vec![Enter, Enter]; // the app, no wish
             keys.extend([Space, Enter]); // the Akai
             keys.extend(confirm);
-            keys.extend([Escape, Escape]);
             let mut ui = Script {
                 keys: keys.into(),
                 claude,
@@ -26274,7 +26219,7 @@ mod tests {
                 )],
                 ..Default::default()
             };
-            settings_menu(&mut ui, &path).unwrap();
+            tab_row(&mut ui, &path, PROFILE + 2).unwrap(); // Ask Claude for a profile (no profiles)
             assert!(ui.keys.is_empty());
             ui.screens
         };
@@ -26340,12 +26285,9 @@ mod tests {
         };
         let reply = format!("```\n{}```\n", mappings::export_profile(&profile).unwrap());
         let run = |claude: String, devices: Vec<Key>, then: Vec<Key>| {
-            let mut keys = vec![Down; 9];
-            keys.extend([Enter, Down, Down, Enter]); // App profiles -> Ask Claude
-            keys.extend([Enter, Enter]); // the app, no wish
+            let mut keys = vec![Enter, Enter]; // the app, no wish
             keys.extend(devices);
             keys.extend(then);
-            keys.extend([Escape, Escape]);
             let mut ui = Script {
                 keys: keys.into(),
                 claude,
@@ -26355,7 +26297,7 @@ mod tests {
                 )],
                 ..Default::default()
             };
-            settings_menu(&mut ui, &path).unwrap();
+            tab_row(&mut ui, &path, PROFILE + 2).unwrap(); // Ask Claude for a profile (no profiles)
             assert!(ui.keys.is_empty());
             (ui.screens, ui.asked)
         };

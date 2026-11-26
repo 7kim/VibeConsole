@@ -180,7 +180,7 @@ fn agent_process() -> (u32, &'static str) {
         let (Some(open), Some(close)) = (stat.find('('), stat.rfind(')')) else {
             return (0, "");
         };
-        if let Some(kind) = KINDS.into_iter().find(|k| *k == &stat[open + 1..close]) {
+        if let Some(kind) = programs().find(|k| *k == &stat[open + 1..close]) {
             return (pid, kind);
         }
         match stat[close + 1..]
@@ -194,8 +194,6 @@ fn agent_process() -> (u32, &'static str) {
     }
     (0, "")
 }
-/// Agent programs whose hooks report sessions.
-const KINDS: [&str; 2] = ["claude", "codex"];
 
 /// A session outside VibeConsole's tmux: its state and working folder.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -443,7 +441,7 @@ fn sessions_in(dir: &Path, alive: impl Fn(u32) -> bool) -> Vec<Session> {
             continue;
         };
         let (kind, cwd) = match fields.next() {
-            Some(cwd) => (KINDS.into_iter().find(|k| *k == third).unwrap_or(""), cwd),
+            Some(cwd) => (programs().find(|k| *k == third).unwrap_or(""), cwd),
             None => ("", third),
         };
         let state = STATES.into_iter().find(|s| *s == state);
@@ -1474,30 +1472,107 @@ const CODEX: &Events = &[
     ("SessionEnd", None, "ended"),
 ];
 
-pub fn claude_hooks() -> String {
-    hooks(CLAUDE)
+/// v7.8 ticket 74: an agent tool whose hooks report to VibeConsole: its name, its program,
+/// the settings file it reads hooks from, and the hooks VibeConsole puts there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tool {
+    pub name: &'static str,
+    pub program: &'static str,
+    /// The variable naming its settings folder, and the folder under HOME without it.
+    folder_variable: &'static str,
+    pub folder: &'static str,
+    pub file: &'static str,
+    events: &'static Events,
+    /// Said after an install, before "Restart running agents".
+    install_note: &'static str,
+    /// Its status line reports context and tokens (v7.7 ticket 162).
+    pub statusline: bool,
+}
+pub const TOOLS: [Tool; 2] = [
+    Tool {
+        name: "Claude Code",
+        program: "claude",
+        folder_variable: "CLAUDE_CONFIG_DIR",
+        folder: ".claude",
+        file: "settings.json",
+        events: CLAUDE,
+        install_note: "",
+        statusline: true,
+    },
+    Tool {
+        name: "Codex",
+        program: "codex",
+        folder_variable: "CODEX_HOME",
+        folder: ".codex",
+        file: "hooks.json",
+        events: CODEX,
+        install_note: ". Codex runs new hooks only after you trust them in Codex",
+        statusline: false,
+    },
+];
+/// The agent programs whose hooks report sessions.
+fn programs() -> impl Iterator<Item = &'static str> {
+    TOOLS.iter().map(|tool| tool.program)
 }
 
-pub fn codex_hooks() -> String {
-    hooks(CODEX)
+impl Tool {
+    /// The hooks to paste into its settings file.
+    pub fn hooks(self) -> String {
+        hooks(self.events)
+    }
+    /// Ticket 15: the user settings file it reads hooks from.
+    pub fn hooks_file(self) -> Result<PathBuf> {
+        let dir = match std::env::var_os(self.folder_variable).filter(|v| !v.is_empty()) {
+            Some(dir) => PathBuf::from(dir),
+            None => {
+                PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set")?).join(self.folder)
+            }
+        };
+        Ok(dir.join(self.file))
+    }
+    /// v7.8 ticket 50: Agents' words for its settings file at `path`: hooks installed, not
+    /// set up, incomplete (how many missing) or unreadable.
+    pub fn hooks_summary(self, path: &Path) -> String {
+        let events = self.events;
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return "hooks not set up".into(),
+            Err(_) => return "hooks unreadable".into(),
+        };
+        let settings = serde_json::from_str(&text).map_err(|e| e.to_string().into());
+        match settings.and_then(|settings| missing(&settings, events)) {
+            Ok(missing) if missing.is_empty() => "hooks installed".into(),
+            Ok(missing) => format!(
+                "hooks incomplete ({} of {} missing)",
+                missing.len(),
+                events.len()
+            ),
+            Err(_) => "hooks unreadable".into(),
+        }
+    }
+    /// doctor's line.
+    pub fn hooks_status(self) -> String {
+        match self
+            .hooks_file()
+            .and_then(|path| status_in(&path, self.events))
+        {
+            Ok(state) => format!("{} status hooks: {state}", self.name),
+            Err(error) => format!("{} status hooks: unreadable: {error}", self.name),
+        }
+    }
+    /// Merges the missing hooks into its settings file, after a backup.
+    pub fn install_hooks(self) -> Result<String> {
+        let note = install_in(&self.hooks_file()?, self.events)?;
+        Ok(if note.starts_with("Installed") {
+            note.replacen(". Restart", &format!("{}. Restart", self.install_note), 1)
+        } else {
+            note
+        })
+    }
 }
 
 fn hook_command(state: &str) -> String {
     format!("vibeconsole agent-status - {state}")
-}
-
-/// Ticket 15: the user settings file each tool reads hooks from.
-pub fn hooks_file(codex: bool) -> Result<PathBuf> {
-    let (variable, default, file) = if codex {
-        ("CODEX_HOME", ".codex", "hooks.json")
-    } else {
-        ("CLAUDE_CONFIG_DIR", ".claude", "settings.json")
-    };
-    let dir = match std::env::var_os(variable).filter(|v| !v.is_empty()) {
-        Some(dir) => PathBuf::from(dir),
-        None => PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set")?).join(default),
-    };
-    Ok(dir.join(file))
 }
 
 /// Events whose VibeConsole hook `settings` lacks. Refuses anything but a JSON object.
@@ -1564,36 +1639,6 @@ pub fn last_report(dir: &Path, kind: &str) -> Option<(std::time::SystemTime, &'s
     let text = std::fs::read_to_string(&path).ok()?;
     let state = STATES.into_iter().find(|s| *s == text.trim())?;
     Some((modified, state))
-}
-
-/// v7.8 ticket 50: Agents' words for a tool's settings file at `path`: hooks installed, not
-/// set up, incomplete (how many missing) or unreadable.
-pub fn hooks_summary(path: &Path, codex: bool) -> String {
-    let events = if codex { CODEX } else { CLAUDE };
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return "hooks not set up".into(),
-        Err(_) => return "hooks unreadable".into(),
-    };
-    let settings = serde_json::from_str(&text).map_err(|e| e.to_string().into());
-    match settings.and_then(|settings| missing(&settings, events)) {
-        Ok(missing) if missing.is_empty() => "hooks installed".into(),
-        Ok(missing) => format!(
-            "hooks incomplete ({} of {} missing)",
-            missing.len(),
-            events.len()
-        ),
-        Err(_) => "hooks unreadable".into(),
-    }
-}
-
-/// doctor's line for one tool.
-pub fn hooks_status(codex: bool) -> String {
-    let tool = if codex { "Codex" } else { "Claude Code" };
-    match hooks_file(codex).and_then(|path| status_in(&path, if codex { CODEX } else { CLAUDE })) {
-        Ok(state) => format!("{tool} status hooks: {state}"),
-        Err(error) => format!("{tool} status hooks: unreadable: {error}"),
-    }
 }
 
 fn status_in(path: &Path, events: &Events) -> Result<String> {
@@ -1761,18 +1806,6 @@ pub fn install_statusline(settings: &Path, saved: &Path) -> Result<String> {
     }
     crate::actions::write_atomic(settings, &(serde_json::to_string_pretty(&json)? + "\n"))?;
     Ok(note)
-}
-
-pub fn install_hooks(codex: bool) -> Result<String> {
-    let note = install_in(&hooks_file(codex)?, if codex { CODEX } else { CLAUDE })?;
-    Ok(if codex && note.starts_with("Installed") {
-        note.replace(
-            ". Restart",
-            ". Codex runs new hooks only after you trust them in Codex. Restart",
-        )
-    } else {
-        note
-    })
 }
 
 fn install_in(path: &Path, events: &Events) -> Result<String> {
@@ -2178,11 +2211,11 @@ mod tests {
         assert!(vanished(&idle, alive).is_empty());
         assert!(command(&["claude".into()]).is_err());
         assert!(command(&["a".into(), "b".into(), "c".into(), "d".into()]).is_err());
-        let claude = claude_hooks();
+        let claude = TOOLS[0].hooks();
         assert!(claude.contains("\"matcher\": \"AskUserQuestion\""));
         assert!(claude.contains("\"PermissionRequest\""));
         assert!(claude.contains("agent-status - finished"));
-        assert!(codex_hooks().contains("\"PermissionRequest\""));
+        assert!(TOOLS[1].hooks().contains("\"PermissionRequest\""));
     }
 
     /// Ticket 15: install merges only VibeConsole's missing hooks, keeps everything else and its
@@ -2271,7 +2304,11 @@ mod tests {
         }
         std::fs::write(&path, "{not json").unwrap();
         assert!(status_in(&path, CODEX).is_err()); // doctor: unreadable
-        assert!(codex_hooks().contains("vibeconsole agent-status - needs-input"));
+        assert!(
+            TOOLS[1]
+                .hooks()
+                .contains("vibeconsole agent-status - needs-input")
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
