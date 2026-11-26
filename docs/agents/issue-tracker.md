@@ -5,7 +5,7 @@ Specs, tickets and tests live as markdown files in the release folder `docs/<ver
 ## Conventions
 
 - `<version>` is the release folder: `v6.1`, `v7`, and so on. New tickets go in the highest one that `docs/README.md` lists; start the next version only when the user says so, and add its row to `docs/README.md`.
-- The spec is `docs/<version>/spec/SPEC-<version>-<name>.md`. Its header records how it was made: the user's messages (quoted), the user's decisions, and the facts checked. It restates the CLAUDE.md Project rules it relies on, under **Safety Rules**. Write it with `/to-spec <version>`.
+- The spec is `docs/<version>/spec/SPEC-<version>-<name>.md`. Its header records how it was made: the user's messages (quoted), the user's decisions, and the facts checked. It restates the CLAUDE.md Project rules it relies on, under **Safety Rules**. It may change a rule only with the user's agreement, and says so. Write it with `/to-spec <version>`.
 - One feature per directory, named with its version first: `docs/<version>/tickets/<version>-<feature>/issues/<NN>-<slug>.md`, numbered from `01` across the version, never a single combined tickets file. "Make this better" items filed with `x` go in `docs/<version>/tickets/<version>-ideas/issues/`.
 - Tickets the user sets aside move to `docs/skipped/` (`tickets/`, `agent-tests/`, `developer-tests/`, `spec/`), numbers kept, each with a `Parked:` line. Order of work skips them. `docs/skipped/README.md` says what each waits on. Git-ignored like `docs/v*/`.
 - Triage state is a `Status:` line near the top: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix` or `resolved` (see `triage-labels.md`).

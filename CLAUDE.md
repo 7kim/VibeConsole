@@ -28,13 +28,8 @@ Rules:
 
 ## Start here
 
-- Ticket work (implement, debug, change scope): `tickets begin NN` first; read its output.
-- No ticket: `tickets spec <heading>` for **Safety Rules** and the sections the task touches.
-- Don't read other tickets; use `tickets next`, `agent`, `blocked`, `triage`. `tickets use <version>` sets the working version; [docs/README.md](docs/README.md) lists versions.
-- Each spec restates the Project rules it uses under **Safety Rules** (`/to-spec` does it). It changes a rule only with my agreement, and says so.
-- Hardware limits: "Known limitations" in [docs/README.md](docs/README.md). Don't reopen them unless a ticket asks.
-- V1–V6: `archive/tickets/`, `archive/tests/`. History only; don't add to them.
-- Trace callers before choosing a change: LSP first for Rust (definition, references, incoming calls; may take a minute to index), then `grep`/`sed`. Spec status lines are history; verify against the tree and runnable checks.
+- Ticket: `tickets begin NN`. No ticket: `tickets spec <heading>`. Queue: `tickets next`, `agent`, `blocked`, `triage`; don't read other tickets. "Known limitations" in [docs/README.md](docs/README.md) stay closed.
+- Trace callers first: LSP for Rust, then `grep`. Spec status lines are history; verify against the tree.
 
 ## Project rules
 
@@ -68,14 +63,9 @@ Read `docs/agents/issue-tracker.md` before writing a spec, ticket or test. New w
 
 ### Order of work
 
-1. After a go-ahead: implement the next `ready-for-agent` ticket from `tickets next`, close it, stop, show the next. Its own acceptance tests (TDD, `cargo test`) are part of it. Stop before any controller write or real keyboard output the spec gates.
-2. When all are implemented: run the agent tests, write the developer tests and run order, run and close all you can, record results. Then `mise run install` (builds, stops the service and any terminal session, installs, restarts). Run it even if VibeConsole is running.
-
-### Closing a ticket (before the next one and before committing)
-
-Follow the closing steps `tickets begin NN` prints. `tickets close` sets status, checks and Builder sign-off; a pass I report goes in with `--user-said "<my words>"`.
-
-Version end: `tickets check` prints nothing.
+1. After a go-ahead: one `ready-for-agent` ticket from `tickets next`, test-first, then stop. Stop before any spec-gated controller write or real keyboard output.
+2. Close: `cargo-gate` → `tickets close` (my passes: `--user-said`) → re-read → commit and push (`claude-scripts` too if it changed).
+3. Version end: agent tests → developer tests (above) → `tickets check` silent → `mise run install`, even if VibeConsole runs.
 
 ## Front end
 
