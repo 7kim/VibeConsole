@@ -8,6 +8,7 @@ Checks only the user can perform (hardware, desktop effects, installs, logins, r
 - `docs/<version>/developer-tests/README.md` is the run order in phases: setup, no controller writes, controller writes, reboot last. Keep it in sync whenever a test is added or its blockers change.
 - Common setup and **Known limitations** (observed unsupported behavior, recorded instead of tested) are in `docs/README.md`.
 - Files a test needs (probe scripts, original payloads) sit beside it.
+- To run a developer test with the emulators, script its steps with `scripts/emulate/drive.py` (v7.8 ticket 67): `Drive(akai=True, xbox=True)` starts `vibeconsole --emulated` in the sandbox; `type`, `pick(label)`, `wait(text)` and `recorded()` drive and read it as the user would. `uv run scripts/emulate/drive.py` replays test 17 as the example.
 - `Status:` is `ready-for-human` while open, `done <date>` once every box is ticked from observed effects.
 
 ## Making a test
