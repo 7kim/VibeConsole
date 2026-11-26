@@ -77,6 +77,12 @@ Open **Configure**, press a pad or button, and choose what it does.
 
 ---
 
+## 🎫 Tickets
+
+The tickets VibeConsole is built from are on the [tickets board](https://github.com/users/7kim/projects/5), grouped by version in the [milestones](https://github.com/7kim/VibeConsole/milestones). They are a mirror of the local tracker, which stays the source of truth.
+
+---
+
 ## 🤝 Contributing
 
 VibeConsole is open source under the [MIT license](LICENSE), and contributions are welcome. The third-party 3D models in `assets/devices/split/` keep their own licences, listed in [CREDITS.md](assets/devices/split/CREDITS.md). Commands, configuration, architecture and testing are in [README-DEVELOPER.md](README-DEVELOPER.md).
