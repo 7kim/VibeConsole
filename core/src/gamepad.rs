@@ -1181,6 +1181,75 @@ pub fn power_parts(power: gilrs::PowerInfo, profile: Option<i32>) -> Vec<String>
         .chain(profile.map(|p| format!("profile {p}")))
         .collect()
 }
+/// v7.8 ticket 81: when the driver reports no level and the controller is on Bluetooth,
+/// BlueZ's
+/// `org.bluez.Battery1` `Percentage` for its address (`uniq`), read through `run`. A property
+/// read only; a malformed address, no level or a failed read leaves `power` as it was.
+pub fn bluez_power(
+    power: PowerInfo,
+    sys: &std::path::Path,
+    name: &str,
+    vendor: u16,
+    product: u16,
+    run: &mut Runner,
+) -> PowerInfo {
+    // With no `power_supply` (xpadneo 7), gilrs-core 0.6.8 says Wired, not Unknown
+    // (src/platform/linux/gamepad.rs:979); on Bluetooth both mean "no level".
+    if !matches!(power, PowerInfo::Unknown | PowerInfo::Wired) || crate::emulated().is_some() {
+        return power;
+    }
+    let Some((dir, 0x05)) = input_dir(sys, name, vendor, product) else {
+        return power;
+    };
+    let address = std::fs::read_to_string(dir.join("uniq"))
+        .unwrap_or_default()
+        .trim()
+        .to_uppercase();
+    if !crate::actions::bluetooth_address(&address) {
+        return power;
+    }
+    let mut adapters = std::fs::read_dir(sys.join("class/bluetooth"))
+        .map(|d| {
+            d.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    adapters.retain(|a| {
+        a.strip_prefix("hci")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    });
+    adapters.sort();
+    let device = address.replace(':', "_");
+    for adapter in adapters {
+        let path = format!("/org/bluez/{adapter}/dev_{device}");
+        // gdbus prints `(<byte 0x43>,)`; an absent Percentage (level unknown) is an error.
+        // ponytail: a blocking 1 s read at the status refresh; move to the probe thread if BlueZ ever stalls it.
+        let reply = run(&[
+            "gdbus",
+            "call",
+            "--system",
+            "--timeout",
+            "1",
+            "--dest",
+            "org.bluez",
+            "--object-path",
+            &path,
+            "--method",
+            "org.freedesktop.DBus.Properties.Get",
+            "org.bluez.Battery1",
+            "Percentage",
+        ]);
+        let level = reply.ok().and_then(|r| {
+            let hex = r.split_once("<byte 0x")?.1.split_once('>')?.0.to_owned();
+            u8::from_str_radix(&hex, 16).ok().filter(|n| *n <= 100)
+        });
+        if let Some(n) = level {
+            return PowerInfo::Discharging(n);
+        }
+    }
+    power
+}
 /// A controller's link, driver, battery and profile, as the header and doctor show them.
 fn details(pad: gilrs::Gamepad<'_>) -> Vec<String> {
     let sys = std::path::Path::new("/sys");
@@ -1191,10 +1260,18 @@ fn details(pad: gilrs::Gamepad<'_>) -> Vec<String> {
     );
     let (link, driver) = link_at(sys, ids.0, ids.1, ids.2);
     let profile = profile_at(sys, ids.0, ids.1, ids.2);
+    let power = bluez_power(
+        pad.power_info(),
+        sys,
+        ids.0,
+        ids.1,
+        ids.2,
+        &mut run_program(),
+    );
     [link.map(str::to_owned), driver]
         .into_iter()
         .flatten()
-        .chain(power_parts(pad.power_info(), profile))
+        .chain(power_parts(power, profile))
         .collect()
 }
 /// v7 ticket 129: which driver holds the controller now, from `bound_drivers`.
@@ -2214,6 +2291,100 @@ impl Drop for ButtonLight {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v7.8 ticket 81: gilrs Wired or Unknown over Bluetooth → BlueZ's level through the runner, shown
+    /// as `battery 67%`; no answer → no battery part; a malformed address calls nothing.
+    #[test]
+    fn battery_comes_from_bluez_when_the_driver_reports_none() {
+        let root = std::env::temp_dir().join(format!("vibeconsole-bluez-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let input = |uniq: &str, bus: &str| {
+            let dir = root.join("class/input/input347");
+            std::fs::create_dir_all(dir.join("id")).unwrap();
+            for (file, text) in [
+                ("name", "Xbox Wireless Controller"),
+                ("uniq", uniq),
+                ("id/vendor", "045e"),
+                ("id/product", "0b13"),
+                ("id/bustype", bus),
+            ] {
+                std::fs::write(dir.join(file), format!("{text}\n")).unwrap();
+            }
+        };
+        for adapter in ["hci0", "hci0:64"] {
+            std::fs::create_dir_all(root.join("class/bluetooth").join(adapter)).unwrap();
+        }
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let fake = |reply: crate::Result<String>| -> Runner {
+            let calls = calls.clone();
+            let reply = reply.map_err(|e| e.to_string());
+            Box::new(move |args: &[&str]| {
+                calls.lock().unwrap().push(args.join(" "));
+                reply.clone().map_err(Into::into)
+            })
+        };
+        let header = |power| power_parts(power, Some(0)).join(" · ");
+        let read = |run: &mut Runner| {
+            bluez_power(
+                PowerInfo::Wired, // what gilrs says with no power_supply
+                &root,
+                "Xbox Wireless Controller",
+                0x045e,
+                0x0b13,
+                run,
+            )
+        };
+
+        input("78:86:2e:b2:7d:d1", "0005");
+        let power = read(&mut fake(Ok("(<byte 0x43>,)\n".into())));
+        assert_eq!(header(power), "battery 67% · profile 0");
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            [
+                "gdbus call --system --timeout 1 --dest org.bluez --object-path \
+              /org/bluez/hci0/dev_78_86_2E_B2_7D_D1 --method \
+              org.freedesktop.DBus.Properties.Get org.bluez.Battery1 Percentage"
+            ]
+        );
+        let mut run = fake(Ok("(<byte 0x43>,)".into()));
+        let unknown = bluez_power(
+            PowerInfo::Unknown,
+            &root,
+            "Xbox Wireless Controller",
+            0x045e,
+            0x0b13,
+            &mut run,
+        );
+        assert_eq!(header(unknown), "battery 67% · profile 0");
+        // No level (Percentage absent, BlueZ down) → no battery part, never guessed.
+        let power = read(&mut fake(Err("gdbus: UnknownProperty".into())));
+        assert_eq!(header(power), "profile 0");
+        // The driver's own level wins; nothing is asked.
+        calls.lock().unwrap().clear();
+        let mut run = fake(Ok("(<byte 0x43>,)".into()));
+        let charging = bluez_power(
+            PowerInfo::Charging(40),
+            &root,
+            "Xbox Wireless Controller",
+            0x045e,
+            0x0b13,
+            &mut run,
+        );
+        assert_eq!(header(charging), "battery 40% charging · profile 0");
+        // USB, or a malformed address: refused before any call.
+        input("78:86:2e:b2:7d:d1", "0003");
+        assert_eq!(
+            header(read(&mut fake(Ok("(<byte 0x43>,)".into())))),
+            "profile 0"
+        );
+        input("78:86:2e:b2:7d:d1; reboot", "0005");
+        assert_eq!(
+            header(read(&mut fake(Ok("(<byte 0x43>,)".into())))),
+            "profile 0"
+        );
+        assert!(calls.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// v7.8 ticket 06: the link and driver from sysfs fixtures shaped like the real trees
     /// (xone wired and dongle, xpadneo over Bluetooth, xpad over USB); unknown is left out.
