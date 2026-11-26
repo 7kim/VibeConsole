@@ -6152,6 +6152,11 @@ impl Terminal {
             )
         {
             // Initial detection can finish while a guidance dialog is open; adopt on return to Commands.
+            // v7.8 ticket 52: its names are shown at once (an open program picker refreshes
+            // them); only names: no program is adopted and nothing is sent.
+            if let crate::feedback::ProgramObservation::Detected { names, .. } = &observation {
+                self.program_names.clone_from(names);
+            }
             controller.program = Some(observation);
             return Ok(());
         }
@@ -7766,8 +7771,10 @@ enum Picked {
 }
 /// v7.8 ticket 07: program select: the Akai's programs (`Program N — name` as read) then the
 /// Xbox programs, each by its name; with both devices listed, each row says which.
-fn program_select(
-    ui: &mut impl Ui,
+/// v7.8 ticket 52: the Akai rows follow the names as they arrive (the watcher's first scan
+/// can finish while it is open); the cursor stays on its row, so on the same program.
+fn program_select<U: Ui>(
+    ui: &mut U,
     akai: &[String],
     xbox: &[String],
     at: Picked,
@@ -7777,16 +7784,34 @@ fn program_select(
         true => format!("{name} · {device}"),
         false => name.to_owned(),
     };
-    let rows = (akai.iter().enumerate())
-        .map(|(i, t)| (name(named_program(t), "Akai"), Picked::Akai(i as u8)))
-        .chain((xbox.iter().enumerate()).map(|(i, t)| (name(t, "Xbox"), Picked::Xbox(i as u8 + 1))))
+    let labels = |akai: &[String]| {
+        (akai.iter())
+            .map(|t| name(named_program(t), "Akai"))
+            .chain(xbox.iter().map(|t| name(t, "Xbox")))
+            .collect::<Vec<_>>()
+    };
+    let rows = (0..akai.len() as u8)
+        .map(Picked::Akai)
+        .chain((1..=xbox.len() as u8).map(Picked::Xbox))
         .collect::<Vec<_>>();
-    let labels = rows.iter().map(|(l, _)| l.clone()).collect::<Vec<_>>();
-    let initial = rows.iter().position(|(_, p)| *p == at).unwrap_or(0);
+    let initial = rows.iter().position(|p| *p == at).unwrap_or(0);
     let title = "/prog-select — pick a program.
 An Akai program replaces its RAM with the stored preset; an Xbox program switches as View/Menu + bumper does.
 Running/paused mode is retained; held keys and toggles start inactive.";
-    Ok(choose_at(ui, title, &labels, initial)?.map(|i| rows[i].1))
+    let refresh = |ui: &U| match akai.is_empty() {
+        true => Vec::new(),
+        false => labels(&ui.program_names()),
+    };
+    let picked = pick_inner(
+        ui,
+        title,
+        &labels(akai),
+        initial,
+        true,
+        false,
+        Some(&refresh),
+    )?;
+    Ok(picked.map(|(i, _)| rows[i]))
 }
 
 fn choose(ui: &mut impl Ui, title: &str, options: &[String]) -> Result<Option<usize>> {
@@ -12799,24 +12824,28 @@ fn pick(
     initial: usize,
     remembers: bool,
 ) -> Result<Option<usize>> {
-    Ok(pick_inner(ui, title, options, initial, remembers, false)?.map(|(row, _)| row))
+    Ok(pick_inner(ui, title, options, initial, remembers, false, None)?.map(|(row, _)| row))
 }
 fn back_label(label: &str) -> bool {
     label == "Back" || label.starts_with("Back (")
 }
 
 /// [`pick`]; with `star`, F (or f) answers (row, true): star or unstar it (v7.8 ticket 18).
-fn pick_inner(
-    ui: &mut impl Ui,
+/// v7.8 ticket 52: `refresh` gives the rows' labels again each turn; used only when it gives
+/// as many rows, so the cursor stays on the same row.
+fn pick_inner<U: Ui>(
+    ui: &mut U,
     title: &str,
     options: &[String],
     initial: usize,
     remembers: bool,
     star: bool,
+    refresh: Option<&dyn Fn(&U) -> Vec<String>>,
 ) -> Result<Option<(usize, bool)>> {
     if options.is_empty() {
         return Ok(None);
     }
+    let mut options = options.to_vec();
     // v7.7 ticket 206: a menu opens on the row last opened in it, so coming back from a
     // submenu lands where you were: the same row by its text, else the same place (a row
     // removed or renamed). Ticket 229: every menu but a question (`ask`), whatever its
@@ -12854,6 +12883,9 @@ fn pick_inner(
     };
     let title = title.as_str();
     loop {
+        if let Some(fresh) = refresh.map(|r| r(ui)).filter(|f| f.len() == options.len()) {
+            options = fresh;
+        }
         let title_lines = crate::screen::wrap(title, ui.width().saturating_sub(5)).len();
         let visible = ui.height().saturating_sub(title_lines + 10).max(want);
         let first = cursor.saturating_sub(visible - 1);
@@ -12957,7 +12989,7 @@ fn choose_starred(
         let saved_row = saved.and_then(|a| order.iter().position(|&i| i == a));
         let labels = mark_saved(labels, saved_row);
         let title = format!("{title}\nF: star or unstar a row; starred rows come first");
-        match pick_inner(ui, &title, &labels, initial, false, true)? {
+        match pick_inner(ui, &title, &labels, initial, false, true, None)? {
             None => return Ok(None),
             Some((row, false)) => return Ok(Some(order[row])),
             Some((row, true)) => {
@@ -13094,7 +13126,7 @@ fn favourites_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
         } else {
             "Favourite actions\nF: unstar the selected action"
         };
-        match pick_inner(ui, title, &rows, cursor, false, true)? {
+        match pick_inner(ui, title, &rows, cursor, false, true, None)? {
             Some((row, true)) if row < actions.len() => {
                 set_star(path, &actions[row].1, false)?;
                 cursor = row;
@@ -17476,6 +17508,10 @@ mod tests {
         edit_fails: bool,
         /// v7.8 ticket 49: what each external-editor call found in its file (the draft).
         editor_saw: Vec<String>,
+        /// v7.8 ticket 52: the Akai's names, as the watcher's first scan gives them after
+        /// the first key.
+        late_names: Option<Vec<String>>,
+        names: Vec<String>,
         /// Login service state and every request Settings made (ticket 21).
         login: (bool, bool),
         login_calls: Vec<crate::runtime::Login>,
@@ -17675,6 +17711,9 @@ mod tests {
         }
         fn key(&mut self) -> Result<Option<Key>> {
             self.clock += Duration::from_secs(1);
+            if let Some(names) = self.late_names.take() {
+                self.names = names;
+            }
             Ok(Some(self.keys.pop_front().unwrap_or_else(|| {
                 panic!(
                     "script exhausted at:\n{}",
@@ -17705,6 +17744,12 @@ mod tests {
         }
         fn learn_joystick(&mut self) -> Result<Option<Learned>> {
             self.learn_knob()
+        }
+        fn program_names(&self) -> Vec<String> {
+            match self.names.is_empty() {
+                true => (1..=8).map(|n| format!("Program {n}")).collect(),
+                false => self.names.clone(),
+            }
         }
         fn edit_file(&mut self, path: &Path) -> Result<()> {
             self.editor_saw.push(std::fs::read_to_string(path)?);
@@ -18690,6 +18735,64 @@ mod tests {
         assert_eq!(picked, Some(Picked::Akai(1)));
     }
 
+    /// v7.8 ticket 52: names that arrive while the picker is open replace its Akai rows'
+    /// labels; the cursor stays on the same program and the Xbox rows stay as they were.
+    #[test]
+    fn program_select_shows_late_akai_names_on_the_same_row() {
+        use Key::*;
+        let defaults = (1..=8).map(|n| format!("Program {n}")).collect::<Vec<_>>();
+        let late = (1..=8)
+            .map(|n| format!("Program {n} — Late {n}"))
+            .collect::<Vec<_>>();
+        let xbox = strings(&["Apps", "Program 2"]);
+        let mut ui = Script {
+            keys: [Down, Enter].into(),
+            late_names: Some(late),
+            ..Default::default()
+        };
+        let picked = program_select(&mut ui, &defaults, &xbox, Picked::Akai(2)).unwrap();
+        assert!(
+            ui.screens[0].contains("> Program 3 · Akai"),
+            "{}",
+            ui.screens[0]
+        );
+        let screen = ui.screens.last().unwrap();
+        assert!(screen.contains("> Late 4 · Akai"), "{screen}");
+        assert!(
+            screen.contains("Late 1 · Akai") && screen.contains("Apps · Xbox"),
+            "{screen}"
+        );
+        assert_eq!(picked, Some(Picked::Akai(3)));
+    }
+    /// v7.8 ticket 52: the watcher's first scan finishing while a command's menu is open
+    /// gives its names at once; the program itself is adopted only back at Commands.
+    #[test]
+    fn a_first_scan_during_a_menu_gives_its_names_and_waits_to_adopt() {
+        let (dir, mut ui, _ran, _) = configure_session("late-names");
+        ui.controller = Some(crate::feedback::Controller::fake_for_reset(
+            Default::default(),
+        ));
+        ui.follow_programs = true;
+        ui.at_menu = false;
+        ui.context_verified = false;
+        let names = (1..=8)
+            .map(|n| format!("Program {n} — Late {n}"))
+            .collect::<Vec<_>>();
+        ui.controller.as_mut().unwrap().program =
+            Some(crate::feedback::ProgramObservation::Detected {
+                context: Some(2),
+                payload: recorded_program().1,
+                names: names.clone(),
+            });
+        ui.follow_controller().unwrap();
+        assert_eq!(ui.program_names, names);
+        assert!(
+            ui.controller.as_ref().unwrap().program.is_some(),
+            "still waiting to adopt"
+        );
+        assert!(!ui.context_verified);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn xbox_program_pick_keeps_its_notice_and_the_akai_connection() {
         let (dir, mut ui, _ran, _) = configure_session("program-pick");
