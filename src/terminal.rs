@@ -3251,8 +3251,13 @@ impl Terminal {
                         row(4),
                         row(5),
                         row(6),
+                        row(16), // Hard point (v7.8 ticket 29)
+                        row(12), // Layer 2 button (v7.8 ticket 23)
                         head("Feedback"),
                         row(2),
+                        row(13), // Rumble strength, length, Test rumble (v7.8 ticket 24)
+                        row(14),
+                        row(15),
                         row(11),
                         head("Headset and driver"),
                         row(7),
@@ -20013,7 +20018,8 @@ mod tests {
                     .map(|i| INSTALL_AGENT + i),
             )
             .chain((0..3).map(|n| PROFILE + n))
-            .chain((0..12).map(|n| TUNING + n));
+            // Every Xbox tuning row is on 7 Xbox (rumble, hard point and layer button were missing).
+            .chain((0..ui.tuning_rows.len()).map(|n| TUNING + n));
         let mut expected = commands
             .into_iter()
             .chain(settings)
