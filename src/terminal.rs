@@ -10359,13 +10359,7 @@ fn ask_prompt(ui: &mut impl Ui, path: &Path) -> Result<()> {
             "Write the prompt. The user wants: {wish}\n{answers}\nReply with only the prompt text: no code fences, nothing before or after it."
         ),
     )?;
-    let body = reply
-        .lines()
-        .filter(|l| !l.trim_start().starts_with("```"))
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim()
-        .to_owned();
+    let body = prompt_from_reply(&reply);
     if body.is_empty() {
         return Err("the reply has no prompt; nothing saved".into());
     }
@@ -10389,6 +10383,108 @@ fn ask_prompt(ui: &mut impl Ui, path: &Path) -> Result<()> {
         return Err(format!("prompt {} already exists; nothing saved", name.trim()).into());
     }
     edit_prompt_from(ui, &dir, name.trim(), Some(&body))
+}
+/// An agent's prompt reply as prompt text: code fence lines dropped, trimmed.
+fn prompt_from_reply(reply: &str) -> String {
+    reply
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("```"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_owned()
+}
+/// v7.8 ticket 48: how a new prompt (4 Prompts, a prompt pad, a sequence step) is written:
+/// Some(false) Write your own, Some(true) Draft with AI, None cancelled.
+fn authoring(ui: &mut impl Ui, path: &Path) -> Result<Option<bool>> {
+    let agent = mappings::load_config(path)?.look.agent_label();
+    Ok(choose(
+        ui,
+        "New prompt: write it yourself, or start from a rough idea your agent turns into a prompt",
+        &[
+            "Write your own".into(),
+            format!("Draft with AI (sent to {agent} when you choose)"),
+        ],
+    )?
+    .map(|i| i == 1))
+}
+/// v7.8 ticket 48: Draft with AI. A rough idea or a draft goes in the prompt box; Ctrl+S
+/// sends it to the default agent (named in the title), Esc sends nothing. Its reply comes
+/// back in the box to edit; Ctrl+S there gives the text, Esc gives None. A missing or failing
+/// agent keeps the user's own draft in the box, to finish by hand. Nothing is saved here.
+fn draft_with_ai(ui: &mut impl Ui, path: &Path, dir: &Path, name: &str) -> Result<Option<String>> {
+    let agent = mappings::load_config(path)?.look.agent_label();
+    let scratch = dir.join(format!(".{name}.draft"));
+    let result = (|| -> Result<Option<String>> {
+        let io = stage("file I/O");
+        std::fs::create_dir_all(dir).map_err(&io)?;
+        std::fs::write(&scratch, "").map_err(&io)?;
+        let title = format!("{name}: a rough idea or a draft · Ctrl+S sends it to {agent}");
+        if !prompt_box(ui, &title, &scratch)? {
+            return Ok(None); // nothing sent
+        }
+        let draft = std::fs::read_to_string(&scratch).map_err(&io)?;
+        if draft.trim().is_empty() {
+            return Err("validation: nothing to draft from; nothing sent".into());
+        }
+        ui.draw(&format!("Asking {agent}… this can take a minute."))?;
+        let request = format!(
+            "Draft with AI: turn this rough idea or draft into a clear prompt for a coding agent; VibeConsole sends it from a controller pad. Keep what the user asked for; add nothing they didn't.\n\n{draft}\n\nReply with only the prompt text: no code fences, nothing before or after it."
+        );
+        let (start, title) = match ask(ui, path, AskKind::Prompt, &request)
+            .map(|r| prompt_from_reply(&r))
+        {
+            Ok(body) if !body.is_empty() => (
+                body,
+                format!("{name}: {agent}'s draft · edit it, Ctrl+S keeps it, Esc saves nothing"),
+            ),
+            failed => {
+                let why = match failed {
+                    Err(error) => error.to_string(),
+                    Ok(_) => "the reply has no prompt".into(),
+                };
+                choose(
+                    ui,
+                    &format!("Draft with AI failed: {why}\nYour draft is kept: finish it by hand."),
+                    &strings(&["Back"]),
+                )?;
+                (
+                    draft,
+                    format!("{name}: your draft · Ctrl+S keeps it, Esc saves nothing"),
+                )
+            }
+        };
+        std::fs::write(&scratch, start).map_err(&io)?;
+        if !prompt_box(ui, &title, &scratch)? {
+            return Ok(None);
+        }
+        let text = std::fs::read_to_string(&scratch).map_err(&io)?;
+        if text.trim().is_empty() {
+            return Err("validation: the prompt is empty; nothing saved".into());
+        }
+        Ok(Some(text))
+    })();
+    let _ = std::fs::remove_file(&scratch);
+    result
+}
+/// v7.8 ticket 48: a new saved prompt `name` (checked by the caller): Write your own opens
+/// the prompt box; Draft with AI saves the reviewed draft. Esc anywhere saves nothing.
+fn write_new_prompt(ui: &mut impl Ui, path: &Path, dir: &Path, name: &str) -> Result<()> {
+    match authoring(ui, path)? {
+        None => Ok(()),
+        Some(false) => edit_prompt(ui, dir, name),
+        Some(true) => {
+            if !mappings::simple_name(name) {
+                return Err(PROMPT_NAME_RULE.into());
+            }
+            match draft_with_ai(ui, path, dir, name)? {
+                Some(text) => {
+                    crate::actions::write_atomic(&dir.join(name), &text).map_err(stage("file I/O"))
+                }
+                None => Ok(()),
+            }
+        }
+    }
 }
 /// v7.7 ticket 169: Ask for a prompt sequence. Only the installed skills' names and
 /// one-line descriptions (`~/.claude/skills`, the working folder's `.claude/skills`) and the
@@ -12612,8 +12708,10 @@ fn prompt_choice(ui: &mut impl Ui, path: &Path, index: usize) -> Result<()> {
             name = entered;
             if files.contains(&name) {
                 not_saved(ui, &format!("validation: prompt {name} already exists"))?;
+            } else if !mappings::simple_name(&name) {
+                not_saved(ui, &format!("validation: {PROMPT_NAME_RULE}"))?;
             } else {
-                match edit_prompt(ui, &dir, &name) {
+                match write_new_prompt(ui, path, &dir, &name) {
                     Ok(()) => break,
                     Err(error) => not_saved(ui, &error)?,
                 }
@@ -12729,7 +12827,7 @@ fn prompt_action(
                 } else if files[..index].contains(&name) {
                     not_saved(ui, &"validation: a prompt with that name already exists")?;
                 } else {
-                    match edit_prompt(ui, &dir, &name) {
+                    match write_new_prompt(ui, path, &dir, &name) {
                         Ok(()) => break name,
                         Err(error) => not_saved(ui, &error)?,
                     }
@@ -15019,6 +15117,24 @@ fn new_step(
     let Some((target, enter)) = prompt_target(ui, path, None)? else {
         return Ok(None);
     };
+    // v7.8 ticket 48: the step's text written here, or drafted with AI and reviewed; either
+    // way it stays in the sequence (Save as new prompt makes it a saved prompt).
+    let Some(ai) = authoring(ui, path)? else {
+        return Ok(None);
+    };
+    if ai {
+        let Some(text) = draft_with_ai(ui, path, &dir, &name)? else {
+            return Ok(None);
+        };
+        let step = crate::actions::Action::PromptOwn {
+            file: name,
+            target,
+            enter,
+            text,
+        };
+        step.validate().map_err(stage("validation"))?;
+        return Ok(Some(step));
+    }
     let step = crate::actions::Action::Prompt {
         file: name,
         target,
@@ -17606,6 +17722,8 @@ mod tests {
     }
     #[derive(Default)]
     struct Script {
+        /// v7.8 ticket 48: the agent fails with this (missing CLI, an error) instead of replying.
+        ask_error: Option<String>,
         /// v7.8 ticket 13: the paired Bluetooth devices (address, name).
         paired: Vec<(String, String)>,
         /// v7.8 ticket 25: what `pw-dump` prints, and each sound tool call made.
@@ -17749,6 +17867,9 @@ mod tests {
         fn ask_agent(&mut self, argv: &[String]) -> Result<String> {
             self.agent_argv.push(argv.to_vec());
             self.asked.push(argv.last().cloned().unwrap_or_default());
+            if let Some(error) = &self.ask_error {
+                return Err(error.clone().into());
+            }
             Ok(self
                 .replies
                 .pop_front()
@@ -25001,7 +25122,7 @@ mod tests {
         let keys = [
             vec![Down, Down, Down, Enter],
             typed("fresh"),
-            vec![Enter, Enter, Down, Enter, CtrlE, CtrlS],
+            vec![Enter, Enter, Down, Enter, Enter, CtrlE, CtrlS], // name, claude, Paste and Enter, Write your own (v7.8 ticket 48), box
             vec![Down; 3],
             vec![Enter],
         ]
@@ -25048,7 +25169,7 @@ mod tests {
         let keys = [
             vec![Down, Down, Down, Enter],
             typed("follow-up"),
-            vec![Enter, Enter, Down, Enter, CtrlE, CtrlS],
+            vec![Enter, Enter, Down, Enter, Enter, CtrlE, CtrlS], // name, claude, Paste and Enter, Write your own (v7.8 ticket 48), box
             vec![Down; 3],
             vec![Enter],
         ]
@@ -26601,7 +26722,7 @@ mod tests {
         let new_prompt = |name: &[u8]| {
             let mut keys = vec![Enter]; // "New prompt" (the only file entry)
             keys.extend(name.iter().map(|c| Character(*c)));
-            keys.extend([Enter, CtrlE, CtrlS, Enter, Enter]); // name, box -> editor -> save, target claude, paste only
+            keys.extend([Enter, Enter, CtrlE, CtrlS, Enter, Enter]); // name, Write your own (v7.8 ticket 48), box -> editor -> save, target claude, paste only
             keys
         };
         let mut keys = vec![Enter, Down, Down, Down, Enter]; // learn A -> Prompt
@@ -31151,6 +31272,190 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7.8 ticket 48: 4 Prompts › New prompt offers Write your own and Draft with AI. The
+    /// rough idea goes to the named agent only on Ctrl+S; its draft comes back to edit and
+    /// is saved only on Ctrl+S. Esc before sending asks nothing; Esc on the draft, or a failed
+    /// request, saves nothing, and a failed request keeps the user's own draft to finish.
+    #[test]
+    fn new_prompt_is_written_by_hand_or_drafted_with_ai_and_reviewed() {
+        use Key::*;
+        let dir = std::env::temp_dir().join(format!("vibeconsole-draft-ai-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let prompts = crate::actions::prompts_dir_for(&path).unwrap();
+        let new_prompt = |name: &str, then: Vec<Key>, error: Option<&str>| {
+            let mut keys = typed(name); // New prompt's name
+            keys.push(Enter);
+            keys.extend(then);
+            let mut ui = Script {
+                keys: keys.into(),
+                claude: "```\nFix the login bug, then run the tests.\n```\n".into(),
+                ask_error: error.map(str::to_owned),
+                ..Default::default()
+            };
+            let files = prompt_files(&prompts).unwrap_or_default();
+            prompt_choice(&mut ui, &path, files.len()).unwrap();
+            assert!(ui.keys.is_empty(), "keys left: {:?}", ui.keys);
+            (ui.screens, ui.asked)
+        };
+        // Both choices; Write your own asks nothing.
+        let mut by_hand = vec![Enter];
+        by_hand.extend(typed("Mine."));
+        by_hand.push(CtrlS);
+        let (screens, asked) = new_prompt("mine", by_hand, None);
+        assert!(
+            screens.iter().any(|s| s.contains("> Write your own")
+                && s.contains("Draft with AI (sent to Claude Code when you choose)")),
+            "{}",
+            screens.join("\n----\n")
+        );
+        assert!(asked.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(prompts.join("mine")).unwrap(),
+            "Mine."
+        );
+        // Draft with AI: the idea, Ctrl+S sends it; the draft is edited, then Ctrl+S saves.
+        let mut drafted = vec![Down, Enter];
+        drafted.extend(typed("fix login"));
+        drafted.extend([CtrlS, Character(b'!'), CtrlS]);
+        let (screens, asked) = new_prompt("login", drafted, None);
+        assert!(screens.iter().any(|s| {
+            s.starts_with("login: a rough idea or a draft · Ctrl+S sends it to Claude Code")
+        }));
+        assert_eq!(asked.len(), 1);
+        assert!(asked[0].contains("fix login"), "{}", asked[0]);
+        assert_eq!(
+            std::fs::read_to_string(prompts.join("login")).unwrap(),
+            "Fix the login bug, then run the tests.!"
+        );
+        // Esc before sending: nothing asked, nothing saved.
+        let mut idea = vec![Down, Enter];
+        idea.extend(typed("idea"));
+        idea.push(Escape);
+        let (_, asked) = new_prompt("unsent", idea, None);
+        assert!(asked.is_empty());
+        assert!(!prompts.join("unsent").exists());
+        // Esc on the agent's draft: nothing saved.
+        let mut cancel = vec![Down, Enter];
+        cancel.extend(typed("idea"));
+        cancel.extend([CtrlS, Escape]);
+        let (_, asked) = new_prompt("cancelled", cancel, None);
+        assert_eq!(asked.len(), 1);
+        assert!(!prompts.join("cancelled").exists());
+        // A failed request saves nothing; the user's draft stays in the box to finish by hand.
+        let mut failed = vec![Down, Enter];
+        failed.extend(typed("rough idea"));
+        failed.extend([CtrlS, Enter, Escape]); // send, the failure -> Back, then Esc
+        let (screens, _) = new_prompt("failed", failed, Some("agent: claude not found on PATH"));
+        assert!(screens.iter().any(|s| s.contains(
+            "Draft with AI failed: agent: claude not found on PATH\nYour draft is kept"
+        )));
+        assert!(
+            screens
+                .iter()
+                .any(|s| s.starts_with("failed: your draft") && s.contains("│ rough idea▌"))
+        );
+        assert!(!prompts.join("failed").exists());
+        let mut kept = vec![Down, Enter];
+        kept.extend(typed("rough idea"));
+        kept.extend([CtrlS, Enter, CtrlS]);
+        new_prompt("kept", kept, Some("agent: claude not found on PATH"));
+        assert_eq!(
+            std::fs::read_to_string(prompts.join("kept")).unwrap(),
+            "rough idea"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// v7.8 ticket 48: a new sequence step offers the same two choices; a drafted step keeps
+    /// its reviewed text in the sequence (no saved prompt is written), and Save as new prompt
+    /// then makes a reusable copy without touching an existing prompt.
+    #[test]
+    fn a_new_sequence_step_can_be_drafted_with_ai_and_stays_in_the_sequence() {
+        use crate::actions::{Action, Target};
+        use Key::*;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-draft-step-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let prompts = dir.join("prompts");
+        std::fs::create_dir_all(&prompts).unwrap();
+        std::fs::write(prompts.join("plan"), "Saved plan.\n").unwrap();
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let plan = Action::Prompt {
+            file: "plan".into(),
+            target: Target::Agent("claude".into()),
+            enter: true,
+        };
+        let keys = [
+            vec![Down, Down, Down, Enter], // New prompt (this sequence only)
+            typed("check"),
+            vec![Enter, Enter, Down, Enter], // name, claude, Paste and Enter
+            vec![Down, Enter],               // Draft with AI
+            typed("check it"),
+            vec![CtrlS, CtrlS], // send, keep the draft
+            vec![Down; 3],
+            vec![Enter], // Done
+        ]
+        .concat();
+        let mut ui = Script {
+            keys: keys.into(),
+            claude: "Check the change and list what's missing.".into(),
+            ..Default::default()
+        };
+        let result = prompt_sequence_action(
+            &mut ui,
+            &path,
+            Some(&Action::PromptSequence(vec![plan.clone()])),
+        )
+        .unwrap();
+        assert!(ui.keys.is_empty(), "keys left: {:?}", ui.keys);
+        assert!(ui.screens.iter().any(|s| s.contains("> Write your own")));
+        let drafted = Action::PromptOwn {
+            file: "check".into(),
+            target: Target::Agent("claude".into()),
+            enter: true,
+            text: "Check the change and list what's missing.".into(),
+        };
+        assert_eq!(
+            result,
+            Some(Action::PromptSequence(vec![plan.clone(), drafted.clone()]))
+        );
+        assert!(!prompts.join("check").exists(), "kept in the sequence only");
+        // Save as new prompt: step 2 -> Save as new prompt -> its name -> Done.
+        let mut ui = Script {
+            keys: [
+                vec![Down, Enter, Down, Down, Down, Enter, Enter],
+                vec![Down; 3],
+                vec![Enter],
+            ]
+            .concat()
+            .into(),
+            ..Default::default()
+        };
+        let result = prompt_sequence_action(
+            &mut ui,
+            &path,
+            Some(&Action::PromptSequence(vec![plan.clone(), drafted])),
+        )
+        .unwrap();
+        assert!(ui.keys.is_empty(), "keys left: {:?}", ui.keys);
+        assert_eq!(
+            std::fs::read_to_string(prompts.join("check")).unwrap(),
+            "Check the change and list what's missing."
+        );
+        assert_eq!(
+            std::fs::read_to_string(prompts.join("plan")).unwrap(),
+            "Saved plan.\n"
+        );
+        assert!(matches!(
+            result,
+            Some(Action::PromptSequence(steps)) if steps.len() == 2 && steps[0] == plan
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// v7.8 ticket 49: a new prompt is written in the box: typed and pasted lines keep their
     /// indentation, tabs and Unicode, the arrows move through the lines, Ctrl+S saves; it
     /// reopens with that text, Esc leaves it as saved, and Ctrl+E hands the editor the
@@ -31166,7 +31471,7 @@ mod tests {
         let prompts = crate::actions::prompts_dir_for(&path).unwrap();
         let mut keys = vec![Enter]; // New prompt
         keys.extend(typed("plan"));
-        keys.push(Enter);
+        keys.extend([Enter, Enter]); // name, Write your own (v7.8 ticket 48)
         keys.extend(typed("Fix it"));
         // Pasted: a newline, four spaces of indentation, Unicode, a tab.
         keys.extend([Enter, Space, Space, Space, Space]);
@@ -31262,7 +31567,7 @@ mod tests {
         keys.extend([Enter, Enter, Escape]); // refused -> Back to name -> Prompts
         keys.extend([Down, Enter]); // New prompt
         keys.extend(typed("plan"));
-        keys.extend([Enter, CtrlE, CtrlS]); // the box -> external editor -> save; plan, review
+        keys.extend([Enter, Enter, CtrlE, CtrlS]); // Write your own (v7.8 ticket 48), the box -> external editor -> save; plan, review
         keys.extend([Down, Enter, Down, Down, Enter, Enter]); // review -> Delete -> Cancel
         keys.extend([Escape, Escape, Escape]);
         let mut ui = Script {

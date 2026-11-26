@@ -1,6 +1,6 @@
 ---
 name: vibeconsole-ask-prompt
-description: Use when VibeConsole's 0 AI asks for a prompt ("Ask … for a prompt"): first the questions to ask the user, then the prompt a pad will paste into a coding agent.
+description: Use when VibeConsole's 0 AI asks for a prompt ("Ask … for a prompt"), or Draft with AI on a new prompt: the questions to ask the user and the prompt a pad will paste into a coding agent, or one draft from a rough idea.
 ---
 
 # Ask for a prompt
@@ -29,6 +29,10 @@ A good pad prompt:
 - names what to check or do, as a short list;
 - says what to answer with ("List each problem with file and line; say 'no problems' if none.");
 - stays generic enough to paste again tomorrow: no dates, no file names the user didn't give.
+
+## Draft with AI (one call)
+
+From 4 Prompts › New prompt, a pad's New prompt or a new sequence step, the user may pick **Draft with AI** and type a rough idea or a draft. VibeConsole sends it once, asking you to turn it into a clear prompt. Ask no questions: reply with only the prompt text, as in call 2. Keep what the user asked for and add nothing they didn't. The user edits your draft in the prompt box and saves it with Ctrl+S (a sequence step keeps it in the sequence); Esc saves nothing.
 
 ## Before it's saved
 
