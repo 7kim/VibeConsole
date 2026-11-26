@@ -1,7 +1,8 @@
 {
-  "version": 1,
+  "version": 2,
   "default_agent": "Claude Code",
   "agent_model": "",
+  "agent_installer": "auto",
   "agent_dir": null,
   "agents": [
     {

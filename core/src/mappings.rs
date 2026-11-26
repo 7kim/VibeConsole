@@ -684,6 +684,8 @@ pub struct Look {
     /// v7.7 ticket 175: the model Ollama runs when it is the default agent (saved as
     /// `default-agent Ollama <model>`); empty for every other agent.
     pub agent_model: String,
+    /// v7.8 ticket 47: how Install agents installs (agents.json v2; older files: Auto).
+    pub agent_installer: Installer,
     /// Why a saved value was replaced by its default while loading; never saved.
     pub notice: Option<String>,
 }
@@ -817,20 +819,147 @@ pub const AGENT_TABLE: [(&str, &str, Option<&[&str]>); 8] = [
     ("Qwen Code", "qwen", Some(&["-p"])),
     ("GitHub Copilot CLI", "copilot", Some(&["-p"])),
 ];
-/// v7.7 ticket 176: each agent's install command, in [`AGENT_TABLE`]'s order: constants run
-/// in a visible terminal, never typed or taken from a reply. Oh My Pi's and Qwen Code's were
-/// checked against their READMEs on 17 Nov 2026; Ollama's is its own script (it asks for the
-/// password).
-pub const AGENT_INSTALL: [&str; 8] = [
-    "npm install -g @anthropic-ai/claude-code",
-    "npm install -g @openai/codex",
-    "npm install -g opencode-ai",
-    "bun install -g @oh-my-pi/pi-coding-agent",
-    "curl -fsSL https://ollama.com/install.sh | sh",
-    "npm install -g @google/gemini-cli",
-    "npm install -g @qwen-code/qwen-code@latest",
-    "npm install -g @github/copilot",
+/// v7.8 ticket 47: how 3 Agents › Install agents installs an agent: Auto (curl, then bunx,
+/// then npm: the first with a reviewed recipe whose tool is here) or one method.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Installer {
+    #[default]
+    Auto,
+    Curl,
+    /// Bun's global install (`bun install -g`): bunx alone only runs a package from Bun's
+    /// cache, so it would leave nothing on PATH (https://bun.com/docs/pm/bunx).
+    Bunx,
+    Npm,
+    Pnpm,
+}
+impl Installer {
+    pub const ALL: [Installer; 5] = [
+        Installer::Auto,
+        Installer::Curl,
+        Installer::Bunx,
+        Installer::Npm,
+        Installer::Pnpm,
+    ];
+    /// Auto's order (pnpm is chosen by hand only).
+    pub const AUTO: [Installer; 3] = [Installer::Curl, Installer::Bunx, Installer::Npm];
+    pub fn word(self) -> &'static str {
+        match self {
+            Installer::Auto => "auto",
+            Installer::Curl => "curl",
+            Installer::Bunx => "bunx",
+            Installer::Npm => "npm",
+            Installer::Pnpm => "pnpm",
+        }
+    }
+    pub fn parse(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|i| i.word() == word)
+    }
+    /// The program it needs on PATH (bunx comes with Bun).
+    pub fn tool(self) -> Option<&'static str> {
+        match self {
+            Installer::Auto => None,
+            Installer::Curl => Some("curl"),
+            Installer::Bunx => Some("bun"),
+            Installer::Npm => Some("npm"),
+            Installer::Pnpm => Some("pnpm"),
+        }
+    }
+}
+/// v7.8 ticket 47: each agent's reviewed install commands, in [`AGENT_TABLE`]'s order, as
+/// [curl, bunx (Bun's global install), npm, pnpm]; None where the agent's own docs give
+/// none. Constants run in a visible terminal, never typed or taken from a reply. Checked on
+/// 26 Nov 2026 against code.claude.com/docs/en/setup, github.com/openai/codex,
+/// opencode.ai/docs, github.com/can1357/oh-my-pi, ollama.com (v7.7), github.com/google-gemini/
+/// gemini-cli, qwenlm.github.io/qwen-code-docs/en/users/quickstart and docs.github.com's
+/// install-copilot-cli.
+pub const AGENT_RECIPES: [[Option<&str>; 4]; 8] = [
+    [
+        Some("curl -fsSL https://claude.ai/install.sh | bash"),
+        None,
+        Some("npm install -g @anthropic-ai/claude-code"),
+        None,
+    ],
+    [
+        Some("curl -fsSL https://chatgpt.com/codex/install.sh | sh"),
+        None,
+        Some("npm install -g @openai/codex"),
+        None,
+    ],
+    [
+        Some("curl -fsSL https://opencode.ai/v2/install | bash"),
+        Some("bun install -g --trust @opencode/cli"),
+        Some("npm install -g @opencode/cli"),
+        Some("pnpm add -g --allow-build=@opencode/cli @opencode/cli"),
+    ],
+    [
+        Some("curl -fsSL https://omp.sh/install | sh"),
+        Some("bun install -g @oh-my-pi/pi-coding-agent"),
+        None,
+        None,
+    ],
+    [
+        Some("curl -fsSL https://ollama.com/install.sh | sh"),
+        None,
+        None,
+        None,
+    ],
+    [None, None, Some("npm install -g @google/gemini-cli"), None],
+    [
+        Some(
+            "curl -fsSL https://qwen-code-assets.oss-cn-hangzhou.aliyuncs.com/installation/install-qwen-standalone.sh | bash",
+        ),
+        None,
+        Some("npm install -g @qwen-code/qwen-code@latest"),
+        None,
+    ],
+    [
+        Some("curl -fsSL https://gh.io/copilot-install | bash"),
+        None,
+        Some("npm install -g @github/copilot"),
+        None,
+    ],
 ];
+/// Agent `agent`'s reviewed command for `method` (never Auto's).
+pub fn recipe(agent: usize, method: Installer) -> Option<&'static str> {
+    let column = match method {
+        Installer::Auto => return None,
+        Installer::Curl => 0,
+        Installer::Bunx => 1,
+        Installer::Npm => 2,
+        Installer::Pnpm => 3,
+    };
+    AGENT_RECIPES.get(agent)?[column]
+}
+/// v7.8 ticket 47: the method and command that install agent `agent` with `choice`;
+/// `missing(method)` says why a method's tool can't be used here (None: it can). A manual
+/// choice is never swapped for another: when it can't install, the reason comes back.
+pub fn pick_installer(
+    choice: Installer,
+    agent: usize,
+    missing: impl Fn(Installer) -> Option<String>,
+) -> std::result::Result<(Installer, &'static str), String> {
+    let name = AGENT_TABLE
+        .get(agent)
+        .map_or("this agent", |(name, _, _)| name);
+    let one = |method: Installer| match recipe(agent, method) {
+        None => Err(format!("{name} has no reviewed {} install", method.word())),
+        Some(command) => match missing(method) {
+            Some(why) => Err(why),
+            None => Ok((method, command)),
+        },
+    };
+    if choice != Installer::Auto {
+        return one(choice);
+    }
+    let mut why = Vec::new();
+    for method in Installer::AUTO {
+        match one(method) {
+            Ok(found) => return Ok(found),
+            Err(reason) => why.push(reason),
+        }
+    }
+    Err(format!("no installer can be used: {}", why.join("; ")))
+}
 /// v7.7 ticket 175: the default agent's one-shot command for `request`: the binary, its
 /// fixed arguments (and Ollama's model), then the request as one argument.
 pub fn one_shot(look: &Look, request: &str) -> Result<Vec<String>> {
@@ -2248,6 +2377,7 @@ impl Config {
                 seen_moved: false,
                 default_agent: String::new(),
                 agent_model: String::new(),
+                agent_installer: Installer::Auto,
                 notice: None,
             },
             sound_combos: Vec::new(),
@@ -4705,6 +4835,65 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// v7.8 ticket 47: Auto takes curl, then bunx (Bun's global install), then npm: the first
+    /// with a reviewed recipe whose tool is here; curl even with no Bun. A manual method that
+    /// can't install says why and is never swapped; no usable method says each reason.
+    #[test]
+    fn the_installer_picks_curl_then_bunx_then_npm_and_never_swaps_a_choice() {
+        let here = |tools: &'static [&'static str]| {
+            move |m: Installer| {
+                (!tools.contains(&m.tool().unwrap())).then(|| format!("{} missing", m.word()))
+            }
+        };
+        let pick = |choice, agent, tools| pick_installer(choice, agent, here(tools));
+        // Claude Code: curl with no Bun at all.
+        assert_eq!(
+            pick(Installer::Auto, 0, &["curl", "npm"]),
+            Ok((
+                Installer::Curl,
+                "curl -fsSL https://claude.ai/install.sh | bash"
+            ))
+        );
+        // OpenCode: no curl -> Bun's global install; no Bun either -> npm.
+        assert_eq!(
+            pick(Installer::Auto, 2, &["bun", "npm"]),
+            Ok((Installer::Bunx, "bun install -g --trust @opencode/cli"))
+        );
+        assert_eq!(
+            pick(Installer::Auto, 2, &["npm"]),
+            Ok((Installer::Npm, "npm install -g @opencode/cli"))
+        );
+        // Gemini CLI has only npm: none here -> every reason, nothing to run.
+        let none = pick(Installer::Auto, 5, &["curl", "bun"]).unwrap_err();
+        assert!(
+            none.contains("no reviewed curl install") && none.contains("npm missing"),
+            "{none}"
+        );
+        // Manual: pnpm only where reviewed; a missing tool is reported, not replaced.
+        assert_eq!(
+            pick(Installer::Pnpm, 0, &["curl", "pnpm"]),
+            Err("Claude Code has no reviewed pnpm install".into())
+        );
+        assert_eq!(
+            pick(Installer::Npm, 1, &["curl"]),
+            Err("npm missing".into())
+        );
+        assert_eq!(
+            pick(Installer::Pnpm, 2, &["pnpm"]),
+            Ok((
+                Installer::Pnpm,
+                "pnpm add -g --allow-build=@opencode/cli @opencode/cli"
+            ))
+        );
+        assert!(
+            Installer::ALL
+                .iter()
+                .all(|m| Installer::parse(m.word()) == Some(*m))
+        );
+        // Every agent has at least one reviewed recipe.
+        assert!(AGENT_RECIPES.iter().all(|r| r.iter().any(Option::is_some)));
+    }
+
     /// A line only a v20 file has (v7 ticket 86), dropped when a test writes an older one.
     /// The same file without the records only a v26 file has (v7 ticket 113), for tests that
     /// write it under an older header.
@@ -4759,6 +4948,7 @@ mod tests {
             seen_moved: false,
             default_agent: "Codex".into(),
             agent_model: String::new(),
+            agent_installer: Installer::Auto,
             notice: None,
         };
         let text = serialize_config(&config).unwrap();

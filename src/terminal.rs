@@ -553,6 +553,10 @@ struct Terminal {
     skills_installed: bool,
     /// Install status of each agent on 3 Agents.
     agents_found: Vec<Option<String>>,
+    /// v7.8 ticket 47: per agent, the method and command Install agents would use, or why
+    /// none can; and the installer tools found on PATH (looked up, never run).
+    install_plans: Vec<std::result::Result<(mappings::Installer, &'static str), String>>,
+    installer_tools: Vec<&'static str>,
     /// v7.8 ticket 50: 3 Agents' Claude Code and Codex rows: CLI, hooks, last report.
     reporting: [String; crate::status::TOOLS.len()],
     lookup_path: Option<String>,
@@ -1785,6 +1789,8 @@ impl Terminal {
             problems_at: None,
             skills_installed: false,
             agents_found: Vec::new(),
+            install_plans: Vec::new(),
+            installer_tools: Vec::new(),
             reporting: Default::default(),
             lookup_path: None,
             #[cfg(test)]
@@ -2822,6 +2828,20 @@ impl Terminal {
                 .iter()
                 .map(|(_, binary, _)| agent_install_status(&path_var, home.as_deref(), binary))
                 .collect();
+            let choice = mappings::load_config(&self.path)
+                .map(|c| c.look.agent_installer)
+                .unwrap_or_default();
+            self.install_plans = (0..mappings::AGENT_TABLE.len())
+                .map(|agent| {
+                    mappings::pick_installer(choice, agent, |m| {
+                        installer_missing(&path_var, home.as_deref(), m)
+                    })
+                })
+                .collect();
+            self.installer_tools = ["curl", "bun", "npm", "pnpm", "mise"]
+                .into_iter()
+                .filter(|tool| mappings::executable_on_path(&path_var, tool))
+                .collect();
             self.reporting = self.reporting_rows();
         }
         if self.tab == 7 {
@@ -3046,16 +3066,32 @@ impl Terminal {
                         Some(DEFAULT_AGENT_SWITCH),
                     ),
                     head("Install agents · found on PATH or not"),
+                    // v7.8 ticket 47: the method Install agents uses, and the tools here.
+                    one(
+                        format!(
+                            "Agent installer · {} · found: {} · Enter: choose or provision",
+                            installer_label(config.look.agent_installer),
+                            if self.installer_tools.is_empty() {
+                                "none".into()
+                            } else {
+                                self.installer_tools.join(", ")
+                            }
+                        ),
+                        Some(SETTING + 13),
+                    ),
                 ]);
-                // v7.7 ticket 176: each agent found on PATH, or its fixed install command.
+                // v7.7 ticket 176: each agent found on PATH, or how it would be installed
+                // (v7.8 ticket 47: the method and command, or why it can't be).
                 for (i, (name, _, _)) in mappings::AGENT_TABLE.iter().enumerate() {
                     rows.push(if let Some(Some(status)) = self.agents_found.get(i) {
                         (vec![format!("✓ {name} · {status}")], None)
                     } else {
-                        one(
-                            format!("+ {name} · {}", mappings::AGENT_INSTALL[i]),
-                            Some(INSTALL_AGENT + i),
-                        )
+                        let plan = match self.install_plans.get(i) {
+                            Some(Ok((method, command))) => format!("{} · {command}", method.word()),
+                            Some(Err(why)) => format!("can't install: {why}"),
+                            None => "not checked yet".into(),
+                        };
+                        one(format!("+ {name} · {plan}"), Some(INSTALL_AGENT + i))
                     });
                 }
                 rows.push((
@@ -9202,6 +9238,7 @@ fn setting(ui: &mut impl Ui, path: &Path, choice: usize) -> Result<()> {
         8 => tuning_menu(ui, path),
         10 => favourites_menu(ui, path),
         12 => sound_menu(ui, path),
+        13 => installer_menu(ui, path),
         _ => presets_menu(ui, path),
     };
     if let Err(error) = result {
@@ -9960,19 +9997,157 @@ fn agent_install_status(path: &str, home: Option<&Path>, binary: &str) -> Option
     on_path.map(|_| format!("installed ({binary} on PATH)"))
 }
 
-/// v7.7 ticket 176: install a missing agent in a visible terminal after confirmation.
-fn install_agent(ui: &mut impl Ui, index: usize) -> Result<()> {
+/// v7.8 ticket 47: why `method`'s tool can't install here (None: it can). Bun links what
+/// it installs into ~/.bun/bin, so that folder must be on PATH for the agent to be found.
+fn installer_missing(
+    path: &str,
+    home: Option<&Path>,
+    method: mappings::Installer,
+) -> Option<String> {
+    let tool = method.tool()?;
+    if !mappings::executable_on_path(path, tool) {
+        return Some(format!(
+            "{} needs {tool}, which isn't on PATH",
+            method.word()
+        ));
+    }
+    let bun_bin = home.map(|home| home.join(".bun/bin"));
+    if method == mappings::Installer::Bunx
+        && !bun_bin.is_some_and(|bin| std::env::split_paths(path).any(|p| p == bin))
+    {
+        return Some("bunx needs ~/.bun/bin on PATH, where Bun puts what it installs".into());
+    }
+    None
+}
+/// The installer choice as the screen names it.
+fn installer_label(choice: mappings::Installer) -> String {
+    match choice {
+        mappings::Installer::Auto => "Auto (curl, then bunx, then npm)".into(),
+        mappings::Installer::Bunx => "bunx (Bun's global install)".into(),
+        other => other.word().into(),
+    }
+}
+/// v7.8 ticket 47: 3 Agents › Agent installer. Each method with whether its tool is here
+/// (looked up, never run); picking one saves it (Auto or a method, kept until changed); the
+/// last rows install bun (with bunx), npm or pnpm with mise, only after a confirm.
+fn installer_menu(ui: &mut impl Ui, path: &Path) -> Result<()> {
+    use mappings::Installer;
+    loop {
+        let mut config = mappings::load_config(path)?;
+        let (path_var, home, _) = ui.lookup_env();
+        let mut rows = Installer::ALL
+            .map(|method| {
+                let mark = if method == config.look.agent_installer { "●" } else { "○" };
+                let here = match (method, installer_missing(&path_var, home.as_deref(), method)) {
+                    (Installer::Auto, _) => "the first with a reviewed recipe that's here".into(),
+                    (Installer::Bunx, None) => "found · bunx alone only runs from Bun's cache, so this installs with bun install -g".into(),
+                    (_, None) => "found".to_string(),
+                    (_, Some(why)) => why,
+                };
+                format!("{mark} {} · {here}", installer_label(method))
+            })
+            .to_vec();
+        rows.extend(strings(&[
+            "Provision bun (and bunx) with mise",
+            "Provision npm (Node.js LTS) with mise",
+            "Provision pnpm with mise",
+        ]));
+        let Some(choice) = choose(
+            ui,
+            "Agent installer: how 3 Agents › Install agents installs. Nothing is installed until you confirm.",
+            &rows,
+        )?
+        else {
+            return Ok(());
+        };
+        match Installer::ALL.get(choice) {
+            Some(&method) => {
+                config.look.agent_installer = method;
+                mappings::save_config(path, &config)?;
+            }
+            None => {
+                if let Err(error) =
+                    provision(ui, ["bun", "npm", "pnpm"][choice - Installer::ALL.len()])
+                {
+                    not_saved(ui, &error)?;
+                }
+            }
+        }
+    }
+}
+/// v7.8 ticket 47: install `tool` with `mise use -g` after a confirm, then look for it on
+/// PATH again: found, or still missing (said so, never claimed installed).
+fn provision(ui: &mut impl Ui, tool: &str) -> Result<()> {
+    let (spec, needs): (&str, &[&str]) = match tool {
+        "bun" => ("bun@latest", &["bun", "bunx"]),
+        "npm" => ("node@lts", &["npm"]),
+        _ => ("pnpm@latest", &["pnpm"]),
+    };
+    let (path_var, _, _) = ui.lookup_env();
+    if !mappings::executable_on_path(&path_var, "mise") {
+        return Err(format!("mise: not found on PATH, so {tool} can't be provisioned here; install mise (mise.jdx.dev) or {tool} yourself").into());
+    }
+    if question(
+        ui,
+        &format!("Install {tool} with mise?\n  mise use -g {spec}"),
+        &strings(&["Cancel", "Install"]),
+    )? != Some(1)
+    {
+        return Ok(());
+    }
+    ui.draw(&format!(
+        "Installing {tool} with mise… this can take a minute."
+    ))?;
+    ui.run(&["mise", "use", "-g", spec])
+        .map_err(|e| format!("mise: {e}; nothing else changed"))?;
+    let (path_var, _, _) = ui.lookup_env();
+    let missing = (needs.iter())
+        .filter(|t| !mappings::executable_on_path(&path_var, t))
+        .copied()
+        .collect::<Vec<_>>();
+    let note = if missing.is_empty() {
+        format!("mise installed {tool}: {} found on PATH.", needs.join(", "))
+    } else {
+        format!(
+            "mise finished, but {} isn't on PATH yet: activate mise in your shell (mise activate) or add its shims folder, then reopen VibeConsole.",
+            missing.join(", ")
+        )
+    };
+    choose(ui, &note, &strings(&["Back"]))?;
+    Ok(())
+}
+/// v7.7 ticket 176: install a missing agent in a visible terminal after confirmation;
+/// v7.8 ticket 47: with the saved installer's method, shown before it runs, or why none can.
+/// A method that started and failed is never swapped for another.
+fn install_agent(ui: &mut impl Ui, path: &Path, index: usize) -> Result<()> {
     let (name, binary, _) = *mappings::AGENT_TABLE.get(index).ok_or("no such agent")?;
-    let install = mappings::AGENT_INSTALL[index];
     let (path_var, home, _) = ui.lookup_env();
     if let Some(status) = agent_install_status(&path_var, home.as_deref(), binary) {
         choose(ui, &format!("{name} is {status}."), &strings(&["Back"]))?;
         return Ok(());
     }
+    let choice = mappings::load_config(path)?.look.agent_installer;
+    let (method, install) = match mappings::pick_installer(choice, index, |m| {
+        installer_missing(&path_var, home.as_deref(), m)
+    }) {
+        Ok(found) => found,
+        Err(why) => {
+            choose(
+                ui,
+                &format!(
+                    "Can't install {name} with {}: {why}.\nChoose another method or provision a tool in 3 Agents › Agent installer.",
+                    installer_label(choice)
+                ),
+                &strings(&["Back"]),
+            )?;
+            return Ok(());
+        }
+    };
     if question(
         ui,
         &format!(
-            "Install {name}?\n\nThis runs in a visible terminal, where you see every line and answer any password prompt:\n  {install}"
+            "Install {name} with {}?\n\nThis runs in a visible terminal, where you see every line and answer any password prompt:\n  {install}",
+            method.word()
         ),
         &strings(&["Cancel", "Install in a terminal"]),
     )? != Some(1)
@@ -9988,7 +10163,8 @@ fn install_agent(ui: &mut impl Ui, index: usize) -> Result<()> {
     choose(
         ui,
         &format!(
-            "{shown}.\nWhen it finishes, 3 Agents shows {name} as installed if {binary} is on PATH."
+            "{shown}.\n3 Agents shows {name} as installed only once {binary} is found on PATH; if it isn't after the install, add the folder the {} install used to PATH.",
+            method.word()
         ),
         &strings(&["Back"]),
     )?;
@@ -16835,7 +17011,7 @@ fn tab_row(ui: &mut impl Ui, path: &Path, id: usize) -> Result<()> {
                 ok => ok,
             }
         }
-        INSTALL_AGENT => match install_agent(ui, row) {
+        INSTALL_AGENT => match install_agent(ui, path, row) {
             Err(error) => not_saved(ui, &error),
             ok => ok,
         },
@@ -19804,7 +19980,8 @@ mod tests {
         let commands = [
             0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 19, 20, 21, 23, 24,
         ];
-        let settings = [0, 2, 3, 4, 5, 6, 7, 10, 11, 12].map(|row| SETTING + row);
+        // v7.8 ticket 47: 13 is 3 Agents › Agent installer.
+        let settings = [0, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13].map(|row| SETTING + row);
         // Each agent, then Add agent, the two hooks rows and Status lights; no prompts,
         // sequences or profiles, so each of those lists is its "New …" row.
         let agents = mappings::load_config(&dir.join("mappings.tsv"))
@@ -20762,8 +20939,107 @@ mod tests {
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
+    /// v7.8 ticket 47: 3 Agents › Agent installer shows which tools are here without running
+    /// anything; a picked method is saved and kept, Auto brings it back; provisioning asks
+    /// first, runs `mise use -g` through the runner, then says whether the tool is on PATH; a
+    /// missing mise or a failed run says why.
+    #[test]
+    fn agent_installer_is_saved_and_mise_provisions_only_after_a_confirm() {
+        use Key::*;
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("vibeconsole-installer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for name in ["curl", "mise"] {
+            std::fs::write(bin.join(name), "").unwrap();
+            std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        let path = dir.join("mappings.tsv");
+        mappings::save(&path, &[]).unwrap();
+        let menu = |keys: Vec<Key>, path_var: &Path, error: Option<&str>| {
+            let mut ui = Script {
+                keys: keys.into(),
+                lookup: (path_var.display().to_string(), Some(dir.clone()), None),
+                run_error: error.map(str::to_owned),
+                ..Default::default()
+            };
+            installer_menu(&mut ui, &path).unwrap();
+            assert!(ui.keys.is_empty(), "keys left: {:?}", ui.keys);
+            (ui.screens, ui.ran)
+        };
+        let installer = || mappings::load_config(&path).unwrap().look.agent_installer;
+        // npm (row 3) is saved, though npm isn't here; looking runs nothing.
+        let (screens, ran) = menu(vec![Down, Down, Down, Enter, Escape], &bin, None);
+        assert!(ran.is_empty(), "{ran:?}");
+        assert!(
+            screens[0].contains("● Auto (curl, then bunx, then npm)"),
+            "{}",
+            screens[0]
+        );
+        assert!(screens[0].contains("○ curl · found"));
+        assert!(screens[0].contains("○ npm · npm needs npm, which isn't on PATH"));
+        assert_eq!(installer(), mappings::Installer::Npm);
+        assert!(menu(vec![Escape], &bin, None).0[0].contains("● npm"));
+        menu(vec![Enter, Escape], &bin, None); // Auto again
+        assert_eq!(installer(), mappings::Installer::Auto);
+        // Provision bun: Cancel runs nothing; Install runs mise, and bun is still not here.
+        let (_, ran) = menu(
+            vec![Down, Down, Down, Down, Down, Enter, Enter, Escape],
+            &bin,
+            None,
+        );
+        assert!(ran.is_empty());
+        let (screens, ran) = menu(
+            vec![
+                Down, Down, Down, Down, Down, Enter, Down, Enter, Enter, Escape,
+            ],
+            &bin,
+            None,
+        );
+        assert_eq!(ran, ["mise use -g bun@latest"]);
+        assert!(
+            screens
+                .iter()
+                .any(|s| s.contains("mise finished, but bun, bunx isn't on PATH yet"))
+        );
+        // A failed mise says so.
+        let (screens, _) = menu(
+            vec![
+                Down, Down, Down, Down, Down, Down, Enter, Down, Enter, Enter, Escape,
+            ],
+            &bin,
+            Some("exit status 1"),
+        );
+        assert!(
+            screens
+                .iter()
+                .any(|s| s.contains("mise: exit status 1; nothing else changed"))
+        );
+        // No mise: nothing runs, and why.
+        let empty = dir.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let (screens, ran) = menu(
+            vec![
+                Down, Down, Down, Down, Down, Down, Down, Enter, Enter, Escape,
+            ],
+            &empty,
+            None,
+        );
+        assert!(ran.is_empty());
+        assert!(
+            screens
+                .iter()
+                .any(|s| s.contains("mise: not found on PATH, so pnpm can't be provisioned here"))
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// v7.7 ticket 176: 3 Agents lists each agent as installed when its binary is on a fake
-    /// PATH, else with its fixed install command; Enter on a missing one asks first, then
+    /// PATH, else with how it would be installed (v7.8 ticket 47: the method and its reviewed
+    /// command, or why none can); Enter on a missing one asks first, naming the method, then
     /// runs exactly that command in a visible terminal; Cancel runs nothing.
     #[test]
     fn install_agents_marks_found_ones_and_installs_after_the_confirm() {
@@ -20772,7 +21048,7 @@ mod tests {
         let (dir, mut ui, _ran, _) = configure_session("install-agents");
         let bin = dir.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        for name in ["claude", "codex"] {
+        for name in ["claude", "codex", "curl"] {
             std::fs::write(bin.join(name), "").unwrap();
             std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755))
                 .unwrap();
@@ -20795,14 +21071,18 @@ mod tests {
         };
         assert_eq!(row("✓ Claude Code · installed (claude on PATH)"), None);
         assert_eq!(row("✓ Codex · installed (codex on PATH)"), None);
+        // v7.8 ticket 47: Auto uses curl where the agent has a reviewed curl install.
         assert_eq!(
-            row("+ OpenCode · npm install -g opencode-ai"),
+            row("+ OpenCode · curl · curl -fsSL https://opencode.ai/v2/install | bash"),
             Some(Open::Command(INSTALL_AGENT + 2))
         );
         assert_eq!(
-            row("+ Oh My Pi · bun install -g @oh-my-pi/pi-coding-agent"),
+            row("+ Oh My Pi · curl · curl -fsSL https://omp.sh/install | sh"),
             Some(Open::Command(INSTALL_AGENT + 3))
         );
+        assert!(row("+ Gemini CLI · can't install: no installer can be used: Gemini CLI has no reviewed curl install;").is_some());
+        assert!(row("Agent installer · Auto (curl, then bunx, then npm) · found: curl").is_some());
+        let path = dir.join("mappings.tsv");
         assert_eq!(row("Others… · added as plugins later"), None);
         let install = |keys: Vec<Key>, index| {
             let mut script = Script {
@@ -20810,15 +21090,15 @@ mod tests {
                 lookup: (bin.display().to_string(), Some(dir.clone()), None),
                 ..Default::default()
             };
-            install_agent(&mut script, index).unwrap();
+            install_agent(&mut script, &path, index).unwrap();
             assert!(script.keys.is_empty());
             (script.shown, script.screens)
         };
         let (shown, screens) = install(vec![Enter], 2); // Cancel
         assert!(shown.is_empty());
         assert!(
-            screens[0].contains("Install OpenCode?")
-                && screens[0].contains("  npm install -g opencode-ai")
+            screens[0].contains("Install OpenCode with curl?")
+                && screens[0].contains("  curl -fsSL https://opencode.ai/v2/install | bash")
         );
         let (shown, _) = install(vec![Down, Enter, Enter], 2);
         assert_eq!(
@@ -20828,7 +21108,7 @@ mod tests {
                 dir.to_str().unwrap(),
                 "sh",
                 "-c",
-                "npm install -g opencode-ai"
+                "curl -fsSL https://opencode.ai/v2/install | bash"
             ]]
         );
         let (shown, screens) = install(vec![Enter], 0); // installed already

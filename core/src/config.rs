@@ -27,6 +27,8 @@ pub const MAPPINGS_VERSION: u64 = 4;
 /// v4 adds the hard point. Older files keep their fire point and get a compatible default.
 /// v5 (v7.8 ticket 25) adds `sound_combos`; older files load none.
 pub const DEVICES_VERSION: u64 = 5;
+/// agents.json: v2 (v7.8 ticket 47) adds `agent_installer`; v1 files load Auto.
+pub const AGENTS_VERSION: u64 = 2;
 /// The files, in the order they are applied: each one's references (variables, MIDI
 /// devices, idle settings) are in place before it is checked.
 pub const FILES: [&str; 5] = [
@@ -330,6 +332,7 @@ fn apply(file: &str, value: &Value, config: &mut Config) -> Result<()> {
         "lights.json" => Obj::top_of(value, LIGHTS_VERSION)?,
         "mappings.json" => Obj::top_of(value, MAPPINGS_VERSION)?,
         "devices.json" => Obj::top_of(value, DEVICES_VERSION)?,
+        "agents.json" => Obj::top_of(value, AGENTS_VERSION)?,
         _ => Obj::top(value)?,
     };
     match file {
@@ -1074,9 +1077,10 @@ fn agents(config: &Config) -> Value {
         })
         .collect::<Vec<_>>();
     json!({
-        "version": VERSION,
+        "version": AGENTS_VERSION,
         "default_agent": config.look.default_agent,
         "agent_model": config.look.agent_model,
+        "agent_installer": config.look.agent_installer.word(),
         "agent_dir": config.agent_dir,
         "agents": agents,
     })
@@ -1086,9 +1090,22 @@ fn apply_agents(at: &Obj, config: &mut Config) -> Result<()> {
         "version",
         "default_agent",
         "agent_model",
+        "agent_installer",
         "agent_dir",
         "agents",
     ])?;
+    // v7.8 ticket 47: a v1 file has no installer: Auto.
+    let installer = if at.int::<u64>("version")? >= 2 {
+        let word = at.str("agent_installer")?;
+        at.check(
+            "agent_installer",
+            mappings::Installer::parse(word)
+                .ok_or_else(|| "must be auto, curl, bunx, npm or pnpm".into()),
+        )?
+    } else {
+        mappings::Installer::Auto
+    };
+    config.look.agent_installer = installer;
     let optional = |at: &Obj, key: &str| -> Result<Option<String>> {
         match at.get(key)? {
             Value::Null => Ok(None),
@@ -1746,6 +1763,34 @@ mod tests {
             .replace("\"Nord\"", "\"Dracula\"");
         fs::write(dir.join("settings.json"), edited).unwrap();
         assert_eq!(mappings::load_config(&path).unwrap().look.theme, "Dracula");
+    }
+
+    /// v7.8 ticket 47: agents.json v2 keeps the agent installer; a v1 file (none saved)
+    /// loads Auto; an unknown method is refused by name and the last valid file stays.
+    #[test]
+    fn agents_json_keeps_the_installer_and_v1_loads_auto() {
+        let dir = folder("installer");
+        let path = dir.join("mappings.tsv");
+        let mut config = changed();
+        config.look.agent_installer = mappings::Installer::Npm;
+        mappings::save_config(&path, &config).unwrap();
+        assert_eq!(mappings::load_config(&path).unwrap(), config);
+        let file = dir.join("agents.json");
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(saved["version"], 2);
+        assert_eq!(saved["agent_installer"], "npm");
+        let mut v1 = saved.clone();
+        v1["version"] = 1.into();
+        v1.as_object_mut().unwrap().remove("agent_installer");
+        fs::write(&file, serde_json::to_string_pretty(&v1).unwrap()).unwrap();
+        let loaded = mappings::load_config(&path).unwrap();
+        assert_eq!(loaded.look.agent_installer, mappings::Installer::Auto);
+        assert_eq!(loaded.agents, config.agents);
+        let mut bad = saved;
+        bad["agent_installer"] = "yarn".into();
+        fs::write(&file, serde_json::to_string_pretty(&bad).unwrap()).unwrap();
+        let error = mappings::load_config(&path).unwrap_err().to_string();
+        assert!(error.contains("agent_installer"), "{error}");
     }
 
     /// Ticket 194: a v34 and an older `mappings.tsv` move into settings.json once, equal to
