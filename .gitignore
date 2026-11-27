@@ -30,3 +30,6 @@ docs/claude-scripts-recommendation/
 
 # script-scout's scan history: holds the home path (26 Nov 2026)
 .claude/script-scout/
+
+# Orca agent inbox: per-session plans, never published
+.inbox/
